@@ -569,6 +569,17 @@ hf_compile_shaders(
     # --gi1-probe runs the CPU gi::TraceProbeRays (byte-identical by construction). The Vulkan side carries the
     # HW==CPU radiance memcmp proof.
     "shaders/gi_probe_trace.comp.hlsl:csrq"
+    # Deterministic Lumen-class GI Slice 2 (Slice GI2, THE CRUX of FLAGSHIP #29): gi_sh_encode.comp is the
+    # DETERMINISTIC INTEGER 3rd-order SH ENCODE kernel — ONE thread per PROBE folds its 16 GI1 GiRadiance rays
+    # into a 9x3 FxProbeSH via an int64 (Q32.32) accumulator (acc += (int64)rad.ch * (int64)kGiSHBasis[r][i]),
+    # quantized to Q16.16 EXACTLY ONCE at the final /N >> kFrac normalize — bit-identical to the CPU
+    # gi::FxSHEncodeProbe / EncodeAllProbes (the GPU SH SSBO == CPU SH memcmp proof). NO RayQuery / NO accel
+    # structure (pure-integer compute over the GI1 radiance buffer), so the :cs stage compiles it cs_6_x; but
+    # the int64 accumulator (a single radiance*basis Q32.32 product overflows int32) makes it VULKAN-SPIR-V-ONLY
+    # (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; on Metal the --gi2-shencode
+    # showcase runs the CPU gi::EncodeAllProbes (byte-identical by construction, the grain_integrate.comp
+    # convention). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU SH array + cross-backend.
+    "shaders/gi_sh_encode.comp.hlsl:cs"
     # Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: deterministic GPU crowds —
     # boids + steering + path-following): boids_steer.comp runs the Q16.16 Reynolds STEERING tick — ONE thread
     # per AGENT reads the FROZEN input buffer (gAgentsIn), computes SteerSeek (proportional pull toward the

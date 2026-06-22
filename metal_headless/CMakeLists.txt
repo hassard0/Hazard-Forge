@@ -344,6 +344,16 @@ hf_gen_msl(fract_reduce.comp     fract_reduce.comp.hlsl     comp fract_reduce_ma
 # showcase runs the CPU gi::TraceProbeRays (the SAME bit-exact reference the Vulkan HW==CPU memcmp compares
 # against) -> the Metal result is byte-identical to the Vulkan HW result BY CONSTRUCTION, while the Vulkan
 # side carries the HW probe-radiance == CPU proof. So gi_probe_trace.comp gets NO hf_gen_msl line.
+# Deterministic Lumen-class GI Slice 2 (Slice GI2, THE CRUX of FLAGSHIP #29): gi_sh_encode.comp is the
+# DETERMINISTIC INTEGER 3rd-order SH ENCODE kernel — ONE thread per PROBE folds its 16 GI1 GiRadiance rays
+# into a 9x3 FxProbeSH via an int64 (Q32.32) accumulator (acc += (int64)rad.ch * (int64)kGiSHBasis[r][i]),
+# quantized to Q16.16 EXACTLY ONCE at the final /N >> kFrac normalize — bit-identical to gi::FxSHEncodeProbe.
+# It has NO RayQuery / NO accel structure (pure-integer compute over the GI1 radiance buffer), but the int64
+# accumulator (a single radiance*basis Q32.32 product overflows int32) keeps it VULKAN-SPIR-V-ONLY: DXC -spirv
+# compiles int64_t, but glslc (the Metal HLSL->SPIR-V->MSL frontend) cannot parse int64_t in HLSL (the
+# grain_integrate.comp / fluid_integrate.comp convention). So gi_sh_encode.comp gets NO hf_gen_msl line; on
+# Metal the --gi2-shencode showcase runs the CPU gi::EncodeAllProbes (byte-identical by construction), while
+# the Vulkan side carries the GPU SH == CPU SH memcmp proof.
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): cloth_integrate.comp runs the
 # Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per particle runs `steps` iterations
 # of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp) on its OWN particle, the fxmul

@@ -308,4 +308,197 @@ inline int GiProbeDispatchGroups(const GiProbeGrid& grid) {
     return (n <= 0) ? 0 : (n + kGiProbeThreads - 1) / kGiProbeThreads;
 }
 
+// =====================================================================================================
+// ===== Slice GI2 — INTEGER 3rd-order SH ENCODE (the crux of FLAGSHIP #29) =============================
+// =====================================================================================================
+// APPEND-ONLY (everything above this banner is GI1, BYTE-FROZEN). GI2 encodes the GI1 per-probe-per-ray
+// radiance (GiRadiance[probe*16 + dir], TraceProbeRays) into a deterministic INTEGER 3rd-order spherical-
+// harmonics record (9 coeffs x RGB, Q16.16) — the strict-zero twin of the float DDGI probe_sh.h. The
+// later multi-bounce loop (GI4) re-injects these coeffs, so the dynamic range must be managed EXACTLY.
+//
+// THE CRUX (the "stay wide, narrow once" discipline, from rtrace::IntersectSphere's Q32.32 discriminant):
+// each encode term is radiance(Q16.16) * basis(Q16.16) -> a Q32.32 product that OVERFLOWS int32 (a single
+// ~1.0*~1.0 product is 65536^2 = 4.29e9 > 2^31). So we accumulate every term in an int64 (long), keep the
+// 16-ray sum wide, and QUANTIZE TO Q16.16 EXACTLY ONCE at the final normalize (the / N then >> kFrac). No
+// per-sample re-quantization. (This int64 accumulator is why gi_sh_encode.comp is Vulkan-SPIR-V-ONLY, the
+// grain_integrate.comp/fluid_integrate.comp convention — glslc can't lower int64 to MSL; on Metal the
+// --gi2-shencode showcase runs the CPU EncodeAllProbes, byte-identical by construction.)
+//
+// THE SCALE (the dynamic-range envelope, proven CPU-first in tests/gi_sh_test.cpp):
+//   * Stored coeff convention: coeff_lm = (1/N) * Sum_j rad_j * Y_lm(dir_j)  -- a plain N-average of the
+//     radiance-weighted basis. For rad in [0,1] this keeps every stored coeff in [-0.29, 0.29] (the DC
+//     l=0 term is the largest at Y00=0.282 for a fully-lit probe) -- WELL within the [-2,2] Q16.16
+//     headroom, AND the band-2 coeffs for a directional input stay ~0.003..0.03 (>>LSB -> NO underflow).
+//   * Reconstruction (FxSHEvaluate, the cosine-lobe irradiance): irr(n) = Sum_l B_l * Sum_m coeff_lm *
+//     Y_lm(n), with B_l = 4*A_l = {4*pi, 8*pi/3, pi} (A_l = {pi, 2pi/3, pi/4} the Ramamoorthi-Hanrahan
+//     cosine-lobe band factors). The 4* folds the 4*pi full-sphere measure AND a 1/pi so a UNIFORM unit-
+//     radiance field reconstructs to UNIT irradiance (irr(uniform R=1) ~= 1.002), and the worst-case
+//     all-lit R=1 irradiance is ~1.02 -- both < 2. B_l exceed the +-32768 fx range (4*pi ~= 12.57), so
+//     they are PLAIN int Q16.16 constants and the reconstruction multiply (coeff*basis*B_l, a triple
+//     Q16.16 product) is done in int64 and narrowed once.
+//
+// THE BASIS TABLE is HOST-PRECOMPUTED (kGiSHBasis below): Y_lm evaluated in double at table-definition
+// time on the SAME baked kGiProbeDirs the GPU reads, rounded to Q16.16 literals -- NO sqrt/cos/pow on the
+// GPU hot path, both backends read identical bits (the probe_sh.h discipline, in integer). The directions
+// are not exactly unit (|q| in [0.99999,1.00001]); the basis is evaluated on the decoded stored direction
+// exactly, so CPU and GPU agree to the bit.
+
+// ----- The 9-basis 3rd-order SH record (std430: 9 coeffs x 3 RGB channels). --------------------------
+// FxProbeSH stores the integer SH projection of one probe's 16-ray radiance, per RGB channel. Laid out as
+// a tight int32 array of 9*3 = 27 ints + 1 pad int -> 112 bytes, a clean std430 stride the GPU mirror
+// (RWStructuredBuffer<FxProbeSH>) matches byte-for-byte. coeff[basis][channel]; channel 0=r,1=g,2=b.
+struct FxProbeSH {
+    fx coeff[9][3];   // Q16.16; coeff[basis][channel]
+    fx _pad = 0;      // 27 ints -> pad to 28 ints (112 B) for a clean std430 stride
+};
+static_assert(sizeof(FxProbeSH) == 28 * 4, "FxProbeSH must be 112 bytes (9*3 coeffs + pad, std430)");
+
+// ----- The host-precomputed integer SH basis table (Y_lm(dir) for the 16 baked dirs, Q16.16). --------
+// GENERATOR (run once in double; see the GI2 design spec). For each baked kGiProbeDirs[k] decoded to
+// double (x,y,z) = kGiProbeDirs[k]/65536:
+//   Y[0] = kY00                          (kY00 = 0.5*sqrt(1/pi))
+//   Y[1] = kY1*y, Y[2] = kY1*z, Y[3] = kY1*x   (kY1 = 0.5*sqrt(3/pi))
+//   Y[4] = kY2a*x*y, Y[5] = kY2a*y*z, Y[6] = kY2b*(3z^2-1), Y[7] = kY2a*x*z, Y[8] = kY2c*(x^2-y^2)
+//     (kY2a = 0.5*sqrt(15/pi), kY2b = 0.25*sqrt(5/pi), kY2c = 0.25*sqrt(15/pi))
+//   literal = round(Y * 65536)           (Q16.16, round-to-nearest)
+// These are the EXACT integer counterparts of probe_sh.h::SHBasis9; the shader reads an IDENTICAL array.
+static constexpr fx kGiSHBasis[kGiRaysPerProbe][9] = {
+    {   18487,       0,   30020,   11143,       0,       0,   33830,   23359,    4335 },  // i= 0
+    {   18487,   12609,   26017,  -13764,  -12120,   22909,   20266,  -25007,    1064 },  // i= 1
+    {   18487,  -23164,   22014,    2033,   -3289,  -35610,    8639,    3125,  -18591 },  // i= 2
+    {   18487,   21010,   18012,   16108,   23634,   26427,   -1050,   20261,   -6353 },  // i= 3
+    {   18487,   -5016,   14009,  -28354,    9931,   -4907,   -8801,  -27738,   27191 },  // i= 4
+    {   18487,  -16326,   10007,   25665,  -29259,  -11408,  -14614,   17934,   13692 },  // i= 5
+    {   18487,   30375,    6004,   -8166,  -17320,   12735,  -18490,   -3424,  -29886 },  // i= 6
+    {   18487,  -28361,    2001,  -14730,   29173,   -3964,  -20427,   -2059,  -20509 },  // i= 7
+    {   18487,   10963,   -2001,   30019,   22981,   -1532,  -20427,   -4195,   27268 },  // i= 8
+    {   18487,   12001,   -6004,  -29074,  -24365,   -5032,  -18490,   12190,   24485 },  // i= 9
+    {   18487,  -27550,  -10007,   12892,  -24803,   19251,  -14614,   -9009,  -20697 },  // i=10
+    {   18487,   27474,  -14009,    8617,   16533,  -26877,   -8801,   -8430,  -23762 },  // i=11
+    {   18487,  -13275,  -18012,  -22906,   21234,   16697,   -1050,   28811,   12167 },  // i=12
+    {   18487,   -4993,  -22014,   22711,   -7919,    7676,    8639,  -34913,   17138 },  // i=13
+    {   18487,   15271,  -26017,  -10736,  -11449,  -27744,   20266,   19505,   -4118 },  // i=14
+    {   18487,  -11050,  -30020,   -1432,    1105,   23165,   33830,    3002,   -4192 },  // i=15
+};
+
+// The cosine-lobe RECONSTRUCTION band factors B_l = 4*A_l, baked Q16.16 (PLAIN int, NOT fx-bounded:
+// 4*pi ~= 12.57 exceeds the +-32768 fx range, so the reconstruction multiply is widened to int64).
+// A_l = {pi, 2pi/3, pi/4} (Ramamoorthi-Hanrahan); 4* folds the 4*pi measure + a 1/pi normalization so a
+// uniform unit-radiance field reconstructs to unit irradiance.
+inline constexpr int64_t kGiSHReconB0 = 823550;   // 4*pi    in Q16.16
+inline constexpr int64_t kGiSHReconB1 = 549033;   // 8*pi/3  in Q16.16
+inline constexpr int64_t kGiSHReconB2 = 205887;   // pi      in Q16.16  (== 4*(pi/4))
+
+// ----- FxSHEncodeProbe — the int64-accumulator encode (THE CRUX), quantize once. ---------------------
+// Encodes one probe's kGiRaysPerProbe radiances into an FxProbeSH. acc[i][c] (int64, Q32.32) accumulates
+// (int64)rays[r].ch * (int64)kGiSHBasis[r][i] over the 16 rays -- STAYING WIDE; then the single normalize
+// divides by N (the average) and narrows >> kFrac to Q16.16 EXACTLY ONCE. The shader copies this VERBATIM.
+inline FxProbeSH FxSHEncodeProbe(const GiRadiance* rays, int rayCount) {
+    int64_t acc[9][3] = {};
+    for (int r = 0; r < rayCount; ++r) {
+        const GiRadiance& rad = rays[r];
+        int64_t ch[3] = {(int64_t)rad.r, (int64_t)rad.g, (int64_t)rad.b};
+        for (int i = 0; i < 9; ++i) {
+            int64_t b = (int64_t)kGiSHBasis[r][i];   // Q16.16 basis weight
+            acc[i][0] += ch[0] * b;                  // Q32.32 term -- WIDE, no narrow yet
+            acc[i][1] += ch[1] * b;
+            acc[i][2] += ch[2] * b;
+        }
+    }
+    FxProbeSH sh{};
+    if (rayCount <= 0) return sh;
+    for (int i = 0; i < 9; ++i)
+        for (int c = 0; c < 3; ++c)
+            // Quantize ONCE: average over N (Q32.32 / int stays Q32.32) then narrow >> kFrac -> Q16.16.
+            // Arithmetic right shift on int64 (round-toward-negative-infinity, identical CPU<->DXC).
+            sh.coeff[i][c] = (fx)((acc[i][c] / (int64_t)rayCount) >> kFrac);
+    return sh;
+}
+
+// ----- FxSHEvaluate — the integer cosine-lobe irradiance reconstruction (probe_sh::SHEvaluate twin). --
+// irr(n) = clamp(Sum_l B_l * Sum_m coeff_lm * Y_lm(n), >= 0), per RGB channel. The triple Q16.16 product
+// coeff(Q16.16) * basis(Q16.16) * B_l(Q16.16) is accumulated in int64 and narrowed >> (2*kFrac) once.
+// `normal` is a Q16.16 direction (need not be exactly unit -- the basis is evaluated on it directly).
+inline GiRadiance FxSHEvaluate(const FxProbeSH& sh, const FxVec3& normal) {
+    // SHBasis9 at `normal` (integer; the kGiSHBasis generator's formula, evaluated live in fxmul).
+    // kY* constants baked Q16.16 (round-to-nearest): kY00=18487, kY1=32021, kY2a=71601, kY2b=20670, kY2c=35801.
+    const fx x = normal.x, y = normal.y, z = normal.z;
+    const fx kY00f = 18487, kY1f = 32021, kY2af = 71601, kY2bf = 20670, kY2cf = 35801;
+    fx Y[9];
+    Y[0] = kY00f;
+    Y[1] = fxmul(kY1f, y);
+    Y[2] = fxmul(kY1f, z);
+    Y[3] = fxmul(kY1f, x);
+    Y[4] = fxmul(kY2af, fxmul(x, y));
+    Y[5] = fxmul(kY2af, fxmul(y, z));
+    Y[6] = fxmul(kY2bf, (fx)(fxmul(fxmul((fx)(3 * (int64_t)kOne), z), z) - kOne));
+    Y[7] = fxmul(kY2af, fxmul(x, z));
+    Y[8] = fxmul(kY2cf, (fx)(fxmul(x, x) - fxmul(y, y)));
+
+    const int64_t B[9] = {kGiSHReconB0,
+                          kGiSHReconB1, kGiSHReconB1, kGiSHReconB1,
+                          kGiSHReconB2, kGiSHReconB2, kGiSHReconB2, kGiSHReconB2, kGiSHReconB2};
+    GiRadiance out{};
+    fx* outc[3] = {&out.r, &out.g, &out.b};
+    for (int c = 0; c < 3; ++c) {
+        int64_t acc = 0;   // Q48.48-ish wide accumulator (coeff*basis*B, three Q16.16 -> Q48.48)
+        for (int i = 0; i < 9; ++i)
+            acc += (int64_t)sh.coeff[i][c] * (int64_t)Y[i] * B[i];   // WIDE triple product
+        fx v = (fx)(acc >> (2 * kFrac));   // narrow ONCE: Q48.48 >> 32 -> Q16.16
+        *outc[c] = (v < 0) ? 0 : v;        // clamp >= 0 (a surface receives no negative irradiance)
+    }
+    return out;
+}
+
+// ----- EncodeAllProbes — encode every probe's 16-ray radiance slice into out[probe]. -----------------
+// `radiance` is the GI1 buffer (ProbeCount*kGiRaysPerProbe), `out` the SH buffer (ProbeCount). A 0-probe
+// grid writes nothing (the no-op). One probe per output element, matching the shader's one-thread-per-probe.
+inline void EncodeAllProbes(const GiProbeGrid& grid, std::span<const GiRadiance> radiance,
+                            std::span<FxProbeSH> out) {
+    int probes = ProbeCount(grid);
+    for (int p = 0; p < probes; ++p)
+        out[p] = FxSHEncodeProbe(radiance.data() + (size_t)p * kGiRaysPerProbe, kGiRaysPerProbe);
+}
+
+// ----- GiSHToImage — the deterministic SH-irradiance grid viz (the GI2 golden). ----------------------
+// A flat 2D TILE GRID (the GiProbesToImage layout): each probe tile is colored by FxSHEvaluate(sh[p],
+// evalDir) (e.g. evalDir = +Y) quantized to RGBA8 -- a SMOOTHER lighting grid than GI1's raw mean radiance.
+// Strict integer -> identical both backends. `img` is row-major RGBA8 (top row first), size == w*h.
+inline void GiSHToImage(const GiProbeGrid& grid, std::span<const FxProbeSH> sh, FxVec3 evalDir,
+                        std::span<uint32_t> img, uint32_t w, uint32_t h) {
+    const uint32_t kBg = PackRGBA8(18, 18, 22, 255);
+    for (uint32_t i = 0; i < w * h; ++i) img[i] = kBg;
+
+    int probes = ProbeCount(grid);
+    if (probes <= 0) return;
+
+    int cols = 1;
+    while (cols * cols < probes) ++cols;
+    int rows = (probes + cols - 1) / cols;
+    uint32_t tileW = w / (uint32_t)cols;
+    uint32_t tileH = h / (uint32_t)rows;
+    if (tileW == 0) tileW = 1;
+    if (tileH == 0) tileH = 1;
+
+    auto q = [](fx v) -> int32_t {
+        int64_t t = ((int64_t)v * 255) >> kFrac;   // Q16.16 [0,1+] -> [0,255]
+        if (t < 0) t = 0; if (t > 255) t = 255;     // clamp (irradiance can be >1 within the headroom)
+        return (int32_t)t;
+    };
+
+    for (int p = 0; p < probes; ++p) {
+        int col = p % cols;
+        int row = p / cols;
+        GiRadiance irr = FxSHEvaluate(sh[p], evalDir);
+        uint32_t color = PackRGBA8(q(irr.r), q(irr.g), q(irr.b), 255);
+        uint32_t x0 = (uint32_t)col * tileW;
+        uint32_t y0 = (uint32_t)row * tileH;
+        uint32_t x1 = x0 + (tileW > 1 ? tileW - 1 : tileW);
+        uint32_t y1 = y0 + (tileH > 1 ? tileH - 1 : tileH);
+        for (uint32_t y = y0; y < y1 && y < h; ++y)
+            for (uint32_t x = x0; x < x1 && x < w; ++x)
+                img[(size_t)y * w + x] = color;
+    }
+}
+
 }  // namespace hf::render::gi

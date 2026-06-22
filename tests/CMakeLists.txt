@@ -739,6 +739,18 @@ hf_add_pure_test(rt_simrender_test)
 # rtrace.h #includes sim/fpx.h read-only. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(gi_probe_test)
 
+# Deterministic Lumen-class GI Slice 2 (Slice GI2, THE CRUX of FLAGSHIP #29): the CPU-side validation that
+# SETTLES THE INTEGER-SH CRUX before any GPU trust. The GPU SH == CPU SH memcmp proof lives in the
+# --gi2-shencode-shot showcase (needs a GPU); this pure-CPU test pins the integer 3rd-order SH contract:
+# zero radiance -> zero SH; a constant ambient -> only the DC (l=0) coeff dominates (SH orthogonality); a
+# directional input -> band-2 coeffs NON-ZERO (NO underflow-to-zero) and in-range; the encode round-trips
+# the directional SENSE (a +Y-lit probe reads brighter in +Y); FxSHEvaluate is clamped >= 0; the
+# DYNAMIC-RANGE ENVELOPE on the pinned GI1 scene (no coeff / no reconstructed irradiance exceeds the < 2.0
+# Q16.16 headroom, band-2 non-zero) — the int64-accumulator "stay wide, narrow once" bound; and two encodes
+# are byte-identical (determinism). gi.h #includes render/rtrace.h read-only (byte-frozen), rtrace.h
+# #includes sim/fpx.h read-only. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(gi_sh_test)
+
 # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
 # integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
 # copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/

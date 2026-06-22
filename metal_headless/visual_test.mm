@@ -18270,6 +18270,102 @@ static int RunGi1ProbeShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GI2 — Deterministic Lumen-class GI INTEGER 3rd-order SH ENCODE showcase (--gi2-shencode) (THE
+// CRUX of FLAGSHIP #29). The Vulkan --gi2-shencode-shot dispatches shaders/gi_sh_encode.comp (the int64-
+// accumulator SH encode, one thread per probe) and memcmp's the GPU FxProbeSH buffer == CPU gi::EncodeAllProbes.
+// gi_sh_encode.comp uses an int64 accumulator -> Vulkan-SPIR-V-ONLY (glslc can't parse int64_t), so on Metal
+// --gi2-shencode runs the CPU gi::EncodeAllProbes reference (the SAME bit-exact reference the Vulkan GPU==CPU
+// memcmp compares against) -> the Metal image is byte-identical to the Vulkan GPU image BY CONSTRUCTION. Builds
+// the SAME gi::BuildGi1Scene enclosure + 4x4x4 GiProbeGrid, CPU-traces the GI1 radiance, encodes it to the
+// integer SH, proves the dynamic-range envelope (maxAbsCoeff/maxIrr < 2.0, band-2 nonzero) + zero->zero +
+// determinism, renders gi::GiSHToImage (each tile colored by FxSHEvaluate(sh,+Y)) at 256x256, writes the PNG.
+// Because the encode is INTEGER, the gi2_shencode golden is STRICT-ZERO cross-vendor. New golden
+// tests/golden/metal/gi2_shencode.png (Mac-baked by the CONTROLLER).
+static int RunGi2ShencodeShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    namespace gi = hf::render::gi;
+    using rt::fx; using rt::FxVec3; using rt::kOne;
+
+    const uint32_t kImgW = 256, kImgH = 256;
+
+    gi::GiScene1 sc = gi::BuildGi1Scene();
+    gi::GiProbeGrid grid;
+    grid.origin  = FxVec3{gi::GiF(-2,1), gi::GiF(1,1), gi::GiF(0,1)};
+    grid.spacing = gi::GiF(1,1);
+    grid.nx = 4; grid.ny = 4; grid.nz = 4;
+    const uint32_t kProbes = (uint32_t)gi::ProbeCount(grid);
+    const uint32_t kRays   = (uint32_t)gi::kGiRaysPerProbe;
+    const size_t   kRadCount = (size_t)kProbes * kRays;
+
+    auto fxd = [](fx v) -> double { return (double)v / (double)(int)kOne; };
+
+    // CPU radiance (GI1) + the CPU SH reference (the SAME bit-exact buffer the Vulkan GPU==CPU memcmp proves).
+    std::vector<gi::GiRadiance> rad(kRadCount);
+    gi::TraceProbeRays(grid, sc.scene, std::span<gi::GiRadiance>(rad));
+    std::vector<gi::FxProbeSH> sh(kProbes);
+    gi::EncodeAllProbes(grid, std::span<const gi::GiRadiance>(rad), std::span<gi::FxProbeSH>(sh));
+    std::printf("gi2-shencode: {probes:%u, coeffs:9} [Metal: CPU gi::EncodeAllProbes, byte-identical to the "
+                "Vulkan GPU result by construction]\n", kProbes);
+
+    // The dynamic-range envelope (the crux) — maxAbsCoeff / maxIrr < 2.0, band-2 nonzero.
+    const int64_t kHeadroom = 2 * (int64_t)kOne;
+    int64_t maxAbsCoeff = 0; bool band2NonZero = false;
+    for (uint32_t p = 0; p < kProbes; ++p)
+        for (int i = 0; i < 9; ++i)
+            for (int c = 0; c < 3; ++c) {
+                int64_t a = sh[p].coeff[i][c]; if (a < 0) a = -a;
+                if (a > maxAbsCoeff) maxAbsCoeff = a;
+                if (i >= 4 && sh[p].coeff[i][c] != 0) band2NonZero = true;
+            }
+    int64_t maxIrr = 0;
+    for (uint32_t p = 0; p < kProbes; ++p)
+        for (uint32_t d = 0; d < kRays; ++d) {
+            gi::GiRadiance irr = gi::FxSHEvaluate(sh[p], gi::kGiProbeDirs[d]);
+            int64_t vals[3] = {irr.r, irr.g, irr.b};
+            for (int k = 0; k < 3; ++k) { int64_t a = vals[k] < 0 ? -vals[k] : vals[k];
+                if (a > maxIrr) maxIrr = a; }
+        }
+    if (!(maxAbsCoeff < kHeadroom && maxIrr < kHeadroom && band2NonZero))
+        return fail("gi2-shencode: dynamic-range envelope FAILED (underflow/overflow)");
+    std::printf("gi2-shencode: SH in-range (maxAbsCoeff:%.5f < 2.0, maxIrr:%.5f < 2.0, nonzero-band2:%s)\n",
+                fxd((fx)maxAbsCoeff), fxd((fx)maxIrr), band2NonZero ? "true" : "false");
+
+    // zero-radiance -> zero SH.
+    {
+        std::vector<gi::GiRadiance> zeroRays(kRays);
+        gi::FxProbeSH zsh = gi::FxSHEncodeProbe(zeroRays.data(), (int)kRays);
+        for (int i = 0; i < 9; ++i) for (int c = 0; c < 3; ++c)
+            if (zsh.coeff[i][c] != 0) return fail("gi2-shencode: zero-radiance did NOT encode to zero SH");
+        std::printf("gi2-shencode: zero-radiance -> zero SH\n");
+    }
+
+    // Two-run determinism (the CPU encode is a pure function).
+    {
+        std::vector<gi::FxProbeSH> sh2(kProbes);
+        gi::EncodeAllProbes(grid, std::span<const gi::GiRadiance>(rad), std::span<gi::FxProbeSH>(sh2));
+        if (std::memcmp(sh.data(), sh2.data(), kProbes * sizeof(gi::FxProbeSH)) != 0)
+            return fail("gi2-shencode: two CPU runs differ (nondeterministic)");
+        std::printf("gi2-shencode determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // --- Render the SH-irradiance tile-grid viz + write the image. ---
+    std::vector<uint32_t> img((size_t)kImgW * kImgH, 0);
+    gi::GiSHToImage(grid, std::span<const gi::FxProbeSH>(sh), FxVec3{0, kOne, 0},
+                    std::span<uint32_t>(img), kImgW, kImgH);
+    std::vector<uint8_t> bgra((size_t)kImgW * kImgH * 4, 0);
+    for (size_t p = 0; p < (size_t)kImgW * kImgH; ++p) {
+        uint32_t px = img[p];
+        bgra[p * 4 + 0] = (uint8_t)((px >> 16) & 0xFF);
+        bgra[p * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+        bgra[p * 4 + 2] = (uint8_t)(px & 0xFF);
+        bgra[p * 4 + 3] = (uint8_t)((px >> 24) & 0xFF);
+    }
+    if (!WritePNG(outPath, bgra, kImgW, kImgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — deterministic integer SH-irradiance grid [CPU reference] (%u probes)\n",
+                outPath, kImgW, kImgH, kProbes);
+    return 0;
+}
+
 // ===== Slice RT3 — Hardware Ray Tracing DETERMINISTIC RT HARD SHADOWS showcase (--rt3-shadow) (FLAGSHIP
 // #28). The Vulkan --rt3-shadow-shot wires REAL HW inline ray query: a PRIMARY RayQuery closest-hit THEN a
 // SECOND any-hit shadow ray (toward the directional light) whose order-independent occlusion OR GATES the
@@ -58078,6 +58174,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gi1-probe") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gi1_probe.png";
             try { return RunGi1ProbeShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gi2-shencode <out.png>: render the Deterministic Lumen-class GI INTEGER 3rd-order SH ENCODE
+        // showcase (Slice GI2, THE CRUX of FLAGSHIP #29). gi_sh_encode.comp uses an int64 accumulator ->
+        // Vulkan-SPIR-V-ONLY (glslc can't parse int64_t), so Metal runs the CPU gi::EncodeAllProbes +
+        // GiSHToImage reference (byte-identical to the Vulkan GPU result by construction). New golden
+        // tests/golden/metal/gi2_shencode.png.
+        if (argc > 1 && std::strcmp(argv[1], "--gi2-shencode") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_gi2_shencode.png";
+            try { return RunGi2ShencodeShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --rt3-shadow <out.png>: render the Hardware Ray Tracing DETERMINISTIC RT HARD SHADOWS showcase
