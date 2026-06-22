@@ -699,6 +699,143 @@ int main() {
         }
     }
 
+    // =============================================================================================
+    // Slice VD5 — WHOLE-WORLD LOCKSTEP + ROLLBACK — THE NETCODE HEADLINE. Pure CPU integer. Two peers
+    // fed only commands re-derive the WHOLE world byte-for-byte (RunVerdictLockstep); a rollback re-sims
+    // from a VD4 snapshot bit-for-bit (RunVerdictRollback), correcting a misprediction that diverges
+    // across BOTH gameplay (a mis-spawned entity / a score) AND physics (a perturbed body). THE
+    // NON-COPYABLE CONSTRAINT: VerdictWorld holds a unique_ptr ECS -> the peers are cloned via
+    // RestoreWorld(world0Snap), NOT a copy (assert the clone is VerdictStatesEqual to world0).
+    // =============================================================================================
+    {
+        const warmhull::HullSleepConfig kSleepCfg = [](){
+            const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            convex::ConvexStepConfig c;
+            c.gravity = FxVec3{0, kGravY, 0};
+            c.dt = kOne / 60; c.solveIters = 8; c.restitution = 0; c.slop = kOne / 64;
+            c.beta = (fx)((int64_t)2 * kOne / 10); c.linDamp = (fx)((int64_t)95 * kOne / 100);
+            c.angDamp = kOne; c.posIters = 4;
+            warmhull::HullSleepConfig sc;
+            sc.warm = c; sc.sleepThreshold = kOne; sc.wakeThreshold = (fx)(2 * (int)kOne); sc.sleepTicks = 30;
+            return sc;
+        }();
+        const verdict::HazardRegion kHazard{V(-9,-9,0).x, V(-9,-9,0).y, V(-9,-9,0).x, V(-9,-9,0).y}; // empty
+        const fx kCollectR = kOne;
+        const int kStackN = 2;
+        const uint32_t kTicks = 24u;
+        const uint32_t kRollbackAt = 8u;
+        const fpx::FxQuat kI{0,0,0,kOne};
+
+        auto buildSimScene = [&]() {
+            gjk::HullWorld sim;
+            { fpx::FxBody b; b.pos={0,0,0}; b.orient={0,0,0,kOne}; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            { fpx::FxBody b; b.pos={0, (fx)((int64_t)3*kOne), 0}; b.orient={0,0,0,kOne}; b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            for (int k = 0; k < kStackN; ++k) {
+                fpx::FxBody b; b.pos={0, (fx)((int64_t)(5 + 2 * k)*kOne), 0}; b.orient={0,0,0,kOne};
+                b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0};
+                sim.bodies.push_back(b);
+                sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            }
+            return sim;
+        };
+        const std::vector<verdict::Command> kStream = {
+            verdict::Command{0u, verdict::kCmdImpulse, 2u /*player*/, V(1,0,0)},
+            verdict::Command{2u, verdict::kCmdSpawn,   verdict::kNoEntity, V(-3,2,0)},
+        };
+        auto buildWorld = [&](verdict::VerdictWorld& w, verdict::EntityId& outPlayer) {
+            w = verdict::VerdictWorld{};
+            w.sim = buildSimScene();
+            const verdict::EntityId support = verdict::SpawnEntity(w, verdict::Transform2D{V(0,0,0), kI});
+            verdict::BindBody(w, support, 0u);
+            const verdict::EntityId player = verdict::SpawnEntity(w, verdict::Transform2D{V(0,3,0), kI},
+                                                                  verdict::Health{77}, verdict::BodyRef{verdict::kNoBody});
+            w.reg.add<verdict::Score>(w.handle.at(player), verdict::Score{0});
+            verdict::BindBody(w, player, 1u);
+            const verdict::EntityId pk0 = verdict::SpawnEntity(w, verdict::Transform2D{V(0,3,0), kI});
+            w.reg.add<verdict::Pickup>(w.handle.at(pk0), verdict::Pickup{5});
+            const verdict::EntityId pk1 = verdict::SpawnEntity(w, verdict::Transform2D{V(5,5,0), kI});
+            w.reg.add<verdict::Pickup>(w.handle.at(pk1), verdict::Pickup{3});
+            const verdict::EntityId mover = verdict::SpawnMover(w, verdict::Transform2D{V(4,4,0), kI},
+                                                               verdict::Health{10}, verdict::Velocity2D{V(0,0,0)});
+            for (int k = 0; k < kStackN; ++k) {
+                const verdict::EntityId se = verdict::SpawnEntity(w, verdict::Transform2D{V(0, 5 + 2 * k, 0), kI});
+                verdict::BindBody(w, se, (uint32_t)(2 + k));
+            }
+            (void)support; (void)pk0; (void)pk1; (void)mover;
+            outPlayer = player;
+        };
+
+        verdict::VerdictWorld world0; verdict::EntityId player; buildWorld(world0, player);
+        const verdict::VerdictSnapshot world0Snap = verdict::SnapshotWorld(world0);
+        verdict::VerdictParams params{kHazard, player, kCollectR, kSleepCfg, world0.sim.hulls};
+
+        // ---- THE NON-COPYABLE CLONE: ClonePeer(world0Snap, params) is determinism-faithful (== world0) ----
+        {
+            verdict::VerdictWorld clone = verdict::ClonePeer(world0Snap, params);
+            check(verdict::VerdictStatesEqual(world0, clone),
+                  "vd5: peer clone via ClonePeer(world0Snap) == world0 (the non-copyable clone)");
+        }
+
+        // ---- PROOF (1) LOCKSTEP: two peers fed INPUTS ONLY converge over the WHOLE world ----
+        bool lockstepIdentical = false;
+        const verdict::VerdictSnapshot authority =
+            verdict::RunVerdictLockstep(world0Snap, params, kStream, kTicks, &lockstepIdentical);
+        check(lockstepIdentical, "vd5: authority==replica BIT-IDENTICAL over the whole world (lockstep)");
+
+        // ---- PROOF (2) DETERMINISM: two full runs byte-identical ----
+        const verdict::VerdictSnapshot authority2 =
+            verdict::RunVerdictLockstep(world0Snap, params, kStream, kTicks);
+        check(verdict::VerdictSnapshotsEqual(authority, authority2), "vd5: two runs BYTE-IDENTICAL");
+
+        // ---- PROOF (3) + (4) ROLLBACK + THE HETEROGENEOUS DIVERGENCE ----
+        std::vector<verdict::Command> mispredictStream = kStream;
+        mispredictStream.push_back(verdict::Command{kRollbackAt, verdict::kCmdImpulse, player, V(-9,0,0)}); // physics
+        mispredictStream.push_back(verdict::Command{kRollbackAt, verdict::kCmdSpawn, verdict::kNoEntity, V(4,-3,0)}); // gameplay
+
+        bool rollbackCorrected = false, mispredictDiverged = false;
+        const verdict::VerdictSnapshot rolledBack =
+            verdict::RunVerdictRollback(world0Snap, params, kStream, mispredictStream, kTicks, kRollbackAt,
+                                        &rollbackCorrected, &mispredictDiverged);
+        check(rollbackCorrected, "vd5: rollback corrected == authority");
+        check(verdict::VerdictSnapshotsEqual(rolledBack, authority),
+              "vd5: rolledBack snapshot == authority snapshot BIT-EXACT (whole world)");
+        check(mispredictDiverged, "vd5: the mispredict genuinely diverged before rollback (not vacuous)");
+
+        // The heterogeneous-divergence assertion: re-derive the speculative + authority-at-spec snapshots
+        // and prove the divergence spans BOTH gameplay (order[]/nextId — the mis-spawn) AND physics (the
+        // player's bound body pos — the wrong impulse).
+        {
+            const uint32_t kSpec = (kTicks - kRollbackAt) > 3u ? 3u : (kTicks - kRollbackAt);
+            verdict::VerdictWorld specW = verdict::ClonePeer(world0Snap, params);
+            for (uint32_t t = 0; t < kRollbackAt; ++t) verdict::SimVerdictTick(specW, params, kStream, t);
+            for (uint32_t s = 0; s < kSpec; ++s) verdict::SimVerdictTick(specW, params, mispredictStream, kRollbackAt + s);
+            const verdict::VerdictSnapshot specSnap = verdict::SnapshotWorld(specW);
+            verdict::VerdictWorld authSpecW = verdict::ClonePeer(world0Snap, params);
+            for (uint32_t t = 0; t < kRollbackAt + kSpec; ++t) verdict::SimVerdictTick(authSpecW, params, kStream, t);
+            const verdict::VerdictSnapshot authSpecSnap = verdict::SnapshotWorld(authSpecW);
+
+            const bool gameplayDiverged = (specSnap.order != authSpecSnap.order) ||
+                                          (specSnap.nextId != authSpecSnap.nextId);
+            bool physicsDiverged = false;
+            if (specSnap.simSnap.bodies.size() > 1 && authSpecSnap.simSnap.bodies.size() > 1) {
+                const fpx::FxBody& a = specSnap.simSnap.bodies[1];
+                const fpx::FxBody& b = authSpecSnap.simSnap.bodies[1];
+                physicsDiverged = (a.pos.x != b.pos.x) || (a.pos.y != b.pos.y) || (a.pos.z != b.pos.z);
+            }
+            check(gameplayDiverged, "vd5: mispredict diverged in GAMEPLAY (order[]/nextId — the mis-spawn)");
+            check(physicsDiverged, "vd5: mispredict diverged in PHYSICS (the player body pos — the wrong impulse)");
+            if (gameplayDiverged && physicsDiverged && rollbackCorrected)
+                std::printf("vd5-net mispredict: diverged across gameplay+physics, corrected\n");
+        }
+
+        if (lockstepIdentical)
+            std::printf("vd5-net: {entities:%u, bodies:%u, ticks:%u, commands:%u} authority==replica BIT-IDENTICAL "
+                        "(whole world)\n", (uint32_t)authority.order.size(),
+                        (uint32_t)authority.simSnap.bodies.size(), kTicks, (uint32_t)kStream.size());
+    }
+
     if (g_fail == 0) std::printf("verdict_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

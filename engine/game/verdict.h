@@ -788,5 +788,152 @@ inline bool VerdictStatesEqual(const VerdictWorld& a, const VerdictWorld& b) {
     return VerdictSnapshotsEqual(SnapshotWorld(a), SnapshotWorld(b));
 }
 
+// =================================================================================================
+// Slice VD5 — WHOLE-WORLD LOCKSTEP + ROLLBACK — THE NETCODE HEADLINE (APPEND-ONLY; VD1/VD2/VD3/VD4
+// above are BYTE-FROZEN). The 5th slice of FLAGSHIP #27 (DETERMINISTIC GAMEPLAY / NETCODE,
+// hf::game::verdict; the warmhull::WH5 / persist::PS5 / gjk::GJ5 twin at the WHOLE-WORLD level).
+//
+// VD1-VD4 built the deterministic entity world + command bus, the gameplay systems, the one composed
+// StepWorld tick (gameplay + the frozen physics sim), and the heterogeneous snapshot/restore/equality.
+// VD5 is THE PRODUCT CLAIM: the ENTIRE game world — entities + gameplay rules + the embedded physics
+// sim — is LOCKSTEP- and ROLLBACK-replayable from an input stream ALONE, bit-identical
+// CPU/Vulkan/Metal. Two peers fed only commands re-derive the WHOLE world byte-for-byte; a rollback
+// re-sims from a VD4 snapshot bit-for-bit, and a misprediction that diverges across BOTH gameplay (a
+// spawned/despawned entity / a score) AND physics (a perturbed body) is corrected. This falls out by
+// retargeting the WH5 lockstep/rollback harness over StepWorld + the VD4 snapshot/restore — PURE CPU.
+//
+// THE NON-COPYABLE CONSTRAINT (the ONE structural difference vs WH5): VerdictWorld holds an
+// ecs::Registry whose pools are unique_ptr — it is NON-COPYABLE. So the two peers CANNOT be cloned by
+// `VerdictWorld b = a;`. They are cloned via RestoreWorld(world0Snap) into a FRESH world — the VD4
+// determinism-faithful clone (the restored peers are VerdictStatesEqual to world0). Snapshots
+// (VerdictSnapshot) ARE copyable and cross the harness boundaries; a fresh world is materialized from
+// one by RestoreWorld. The harness therefore takes an initial VerdictSnapshot (world0Snap), NOT a world.
+//
+// PURE CPU INTEGER (strict 0px): NO new render RHI, NO new shader, NO new compute. StepWorld + the VD4
+// SnapshotWorld/RestoreWorld/VerdictStatesEqual are reused VERBATIM. warmhull.h/ecs.h + ALL sim headers
+// + ALL shaders BYTE-UNCHANGED; verdict.h is APPEND-ONLY (VD1-VD4 code byte-frozen).
+// =================================================================================================
+
+// ----- VerdictParams: the StepWorld scene knobs bundled (so the harness signatures stay clean) -------
+// StepWorld takes {hazard, player, collectRadius, cfg}; these are CONSTANT across a match (the same on
+// every peer + NOT snapshotted — only the world state + the command stream are replayable). Bundling
+// them keeps RunVerdictLockstep/RunVerdictRollback to (world0Snap, params, streams, ticks, ...).
+//
+// `hulls` is the IMMUTABLE per-body hull geometry (world.sim.hulls). It is CONSTANT scene data — NOT
+// replayable state — and therefore (like the WarmHullSnapshot's `hulls` lesson) is NOT carried in the
+// VerdictSnapshot (SnapshotWorld captures bodies/cache/sleep, the warmhull::SnapshotWarmHull does NOT
+// copy hulls). The harness clones a peer via RestoreWorld(world0Snap) into a FRESH VerdictWorld whose
+// sim.hulls START EMPTY, so the harness MUST seed `params.hulls` into each fresh peer's sim.hulls BEFORE
+// the restore, or the embedded sim step indexes an empty hulls[] (the non-copyable-clone subtlety).
+struct VerdictParams {
+    HazardRegion              hazard;          // the fixed integer hazard AABB (SystemDamage)
+    EntityId                  player = kNoEntity;  // the collect/score player entity
+    fx                        collectRadius = 0;   // the Q16.16 collect overlap radius
+    warmhull::HullSleepConfig cfg;             // the frozen WH4 warm+sleep step config
+    std::vector<gjk::FxHull>  hulls;           // the IMMUTABLE per-body hull geometry (seeded into each peer)
+};
+
+// ----- ClonePeer(snap, params) -> VerdictWorld: the determinism-faithful non-copyable clone --------
+// Materialize a fresh peer from a copyable snapshot: seed the immutable hull geometry (NOT in the
+// snapshot — constant scene data), then RestoreWorld the bodies/components/cache/sleep. The result is
+// VerdictStatesEqual to the world the snapshot was taken from (the snapshot-faithful clone — the
+// non-copyable-world replacement for `VerdictWorld b = a;`).
+inline VerdictWorld ClonePeer(const VerdictSnapshot& snap, const VerdictParams& params) {
+    VerdictWorld w;
+    w.sim.hulls = params.hulls;   // seed the immutable geometry BEFORE the restore (it is NOT in the snapshot)
+    RestoreWorld(w, snap);        // restore bodies/components/cache/sleep into the seeded world
+    return w;
+}
+
+// ----- SimVerdictTick(world, params, commands, tick): ONE deterministic composed world tick + inputs --
+// = StepWorld(world, commands, tick, params.hazard, params.player, params.collectRadius, params.cfg) —
+// the VD3 composed tick (the gameplay verbs + the lowered sim verbs in one bus). The WH5 SimWarmHullTick
+// analog at the WHOLE-WORLD level. Pure integer, fixed order -> bit-identical on every peer/platform.
+inline void SimVerdictTick(VerdictWorld& world, const VerdictParams& params,
+                           const std::vector<Command>& commands, uint32_t tick) {
+    StepWorld(world, commands, tick, params.hazard, params.player, params.collectRadius, params.cfg);
+}
+
+// ----- RunVerdictLockstep(world0Snap, params, commands, ticks, outIdentical) -> the authority snapshot -
+// THE peer entry point (the warmhull::RunWarmHullLockstep control flow over SimVerdictTick, with the
+// NON-COPYABLE world cloned via RestoreWorld instead of a copy). RestoreWorld(world0Snap) into BOTH a
+// fresh `authority` and a fresh `replica` VerdictWorld (the VD4 determinism-faithful clone — NOT a copy);
+// BOTH run SimVerdictTick for `ticks` with the SAME command stream (INPUTS ONLY — no state shared) ->
+// BIT-IDENTICAL by determinism, each re-deriving the entities + every component pool + the sim TRIPLE
+// every tick. Sets *outIdentical (if non-null) to whether the two final WHOLE worlds are byte-identical
+// (VerdictStatesEqual — the make-or-break lockstep proof) + returns the converged AUTHORITY's snapshot
+// (SnapshotWorld(authority) — copyable, so the caller renders it WITHOUT copying the non-copyable world).
+// The peer step order is PINNED.
+inline VerdictSnapshot RunVerdictLockstep(const VerdictSnapshot& world0Snap, const VerdictParams& params,
+                                          const std::vector<Command>& commands, uint32_t ticks,
+                                          bool* outIdentical = nullptr) {
+    VerdictWorld authority = ClonePeer(world0Snap, params);   // the VD4 clone (NOT a copy; hulls seeded)
+    VerdictWorld replica   = ClonePeer(world0Snap, params);   // the second peer fed the SAME inputs
+    for (uint32_t t = 0; t < ticks; ++t) {
+        SimVerdictTick(authority, params, commands, t);
+        SimVerdictTick(replica,   params, commands, t);
+    }
+    if (outIdentical)
+        *outIdentical = VerdictStatesEqual(authority, replica);   // the WHOLE world (entities+components+sim)
+    return SnapshotWorld(authority);   // a copyable snapshot the caller restores+renders (world is non-copyable)
+}
+
+// ----- RunVerdictRollback(world0Snap, params, authStream, mispredictStream, ticks, rollbackAt, ...) ---
+// The rollback harness (the warmhull::RunWarmHullRollback control flow over SimVerdictTick + the VD4
+// heterogeneous snapshot). (1) RestoreWorld(world0Snap) + advance 0..rollbackAt with authStream; (2)
+// SnapshotWorld AT rollbackAt (the VD4 restore point — entities + EVERY component pool + the sim TRIPLE);
+// (2b) speculatively advance a few ticks (<=3) with the MISPREDICTED stream (a WRONG stream that diverges
+// across BOTH gameplay [a mis-spawn/despawn or a different score] AND physics [a wrong kCmdImpulse] — the
+// client prediction that diverges), capturing that diverged snapshot; (3) ROLLBACK — RestoreWorld back to
+// the snapshot + re-sim rollbackAt..ticks with the CORRECT authStream -> the corrected world. Returns the
+// corrected authority's snapshot; sets *outCorrectedEqAuthority (if non-null) to whether the corrected
+// world == RunVerdictLockstep(world0Snap, params, authStream, ticks) over the WHOLE world, and
+// *outMispredictDiverged (if non-null) to whether the speculative pre-rollback world DIFFERED from the
+// authority-at-that-tick (proving a REAL divergence was corrected). THE HEADLINE: the divergence spans
+// BOTH gameplay AND physics — see the showcase/test, which assert it component-wise. params + the streams
+// are CONSTANT, NOT snapshotted.
+inline VerdictSnapshot RunVerdictRollback(const VerdictSnapshot& world0Snap, const VerdictParams& params,
+                                          const std::vector<Command>& authStream,
+                                          const std::vector<Command>& mispredictStream,
+                                          uint32_t ticks, uint32_t rollbackAt,
+                                          bool* outCorrectedEqAuthority = nullptr,
+                                          bool* outMispredictDiverged = nullptr) {
+    VerdictWorld w = ClonePeer(world0Snap, params);   // the VD4 clone (NOT a copy; hulls seeded)
+    // (1) advance 0..rollbackAt with the authoritative stream.
+    for (uint32_t t = 0; t < rollbackAt; ++t)
+        SimVerdictTick(w, params, authStream, t);
+    // (2) SAVE the VD4 snapshot at rollbackAt (the rollback restore point — entities + components + sim).
+    const VerdictSnapshot snap = SnapshotWorld(w);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong prediction that
+    // diverges across gameplay AND physics). Bounded to the remaining ticks (<=3). Capture the diverged snap.
+    uint32_t specTicks = ticks - rollbackAt;
+    if (specTicks > 3u) specTicks = 3u;
+    for (uint32_t s = 0; s < specTicks; ++s)
+        SimVerdictTick(w, params, mispredictStream, rollbackAt + s);
+    const VerdictSnapshot specSnap = SnapshotWorld(w);   // the diverged pre-rollback world (the "real divergence")
+    // (3) ROLLBACK: restore the snapshot + re-sim rollbackAt..ticks with the authStream.
+    RestoreWorld(w, snap);
+    for (uint32_t t = rollbackAt; t < ticks; ++t)
+        SimVerdictTick(w, params, authStream, t);
+
+    if (outCorrectedEqAuthority || outMispredictDiverged) {
+        // The authority advanced the SAME number of speculative ticks (rollbackAt + specTicks) with the
+        // CORRECT stream — the apples-to-apples comparison point for the misprediction-diverged proof.
+        VerdictWorld authAtSpec = ClonePeer(world0Snap, params);
+        for (uint32_t t = 0; t < rollbackAt + specTicks; ++t)
+            SimVerdictTick(authAtSpec, params, authStream, t);
+        if (outMispredictDiverged) {
+            VerdictWorld specWorld = ClonePeer(specSnap, params);
+            *outMispredictDiverged = !VerdictStatesEqual(specWorld, authAtSpec);
+        }
+        if (outCorrectedEqAuthority) {
+            // The corrected world == a full lockstep authority over the WHOLE world (snapshot-level compare).
+            const VerdictSnapshot authFinal = RunVerdictLockstep(world0Snap, params, authStream, ticks);
+            *outCorrectedEqAuthority = VerdictSnapshotsEqual(SnapshotWorld(w), authFinal);
+        }
+    }
+    return SnapshotWorld(w);   // the corrected authority's snapshot (copyable — the caller restores+renders)
+}
+
 }  // namespace verdict
 }  // namespace hf::game
