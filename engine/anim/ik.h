@@ -238,4 +238,175 @@ inline fx FxAtan2Lut(fx y, fx x) {
     return r;
 }
 
+// ===================================================================================================
+// Slice IK2 — DETERMINISTIC TWO-BONE IK (the law-of-cosines limb solve). APPENDED to ik.h (the IK1 lines
+// above are BYTE-FROZEN). Given a root, a target, a pole/hint, and the two bone lengths, solve the
+// elbow/knee bend via the law of cosines (the ONE acos, from IK1's FxAcosLut) and emit the two bone LOCAL
+// rotations as FxQuats — all Q16.16 fixed-point, bit-identical CPU/Vulkan/Metal. This is the limb
+// primitive the rig (IK4) + the lockstep headline (IK5) + the render capstone (IK6) drive.
+//
+// THE int64 REALITY (the FPX3/JT1 lesson): TwoBoneSolve uses FxLength/fxdiv (int64) for the reach `d` +
+// the cosine ratios, so shaders/ik_twobone.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot
+// lower it to MSL) — NOT in the Metal hf_gen_msl list. The Metal --ik2-twobone showcase runs THIS CPU
+// TwoBoneSolve over the same targets -> byte-identical to the Vulkan GPU result by construction, while the
+// Vulkan side carries the GPU==CPU memcmp proof. The shader copies the math here VERBATIM.
+//
+// THE WITHIN-BAND CAVEAT (honest): the end-effector will NOT hit the target EXACTLY — FxAcosLut carries
+// IK1's documented LSB band, so forward-kinematics from the solved quats reaches the target within a
+// bounded, DETERMINISTIC residual (NOT zero). The headline is DETERMINISM + cross-platform bit-identity,
+// NOT analytic reach. The over-extended clamp (d >= lenU+lenL -> aElbow=0, straight limb at target) is the
+// deterministic, falsifiable boundary beat.
+
+// Pull the rest of the Q16.16 substrate from fpx.h (READ-ONLY) for the two-bone solve.
+using FxVec3 = hf::sim::fpx::FxVec3;
+using FxQuat = hf::sim::fpx::FxQuat;
+using hf::sim::fpx::fxmul;
+using hf::sim::fpx::fxdiv;
+using hf::sim::fpx::FxLength;
+using hf::sim::fpx::FxNormalize;
+using hf::sim::fpx::FxRotate;
+using hf::sim::fpx::FxQuatMul;
+using hf::sim::fpx::FxQuatNormalize;
+
+// FxCross(a,b): the Q16.16 cross product a×b = (ay*bz-az*by, az*bx-ax*bz, ax*by-ay*bx), each term an
+// int64 fxmul (the FxLength int64 discipline; the fpx.h::FxRotate internal cross, the sim::FxCross twin).
+// A LOCAL helper so ik.h stays self-contained (it does not #include convex.h). The shader copies it VERBATIM.
+inline FxVec3 FxCross(const FxVec3& a, const FxVec3& b) {
+    return FxVec3{
+        fxmul(a.y, b.z) - fxmul(a.z, b.y),
+        fxmul(a.z, b.x) - fxmul(a.x, b.z),
+        fxmul(a.x, b.y) - fxmul(a.y, b.x),
+    };
+}
+
+// FxDot(a,b): the Q16.16 dot product (int64 fxmul terms). A LOCAL helper (joint.h::FxDot twin; ik.h is
+// header-only + self-contained). Used for the pole/axis degeneracy test.
+inline fx FxDotV(const FxVec3& a, const FxVec3& b) {
+    return fxmul(a.x, b.x) + fxmul(a.y, b.y) + fxmul(a.z, b.z);
+}
+
+// The two LOCAL bone rotations produced by the two-bone solve. qUpper rotates the root->target axis by the
+// root angle about the bend-plane normal; qLower is the LOCAL elbow rotation (relative to the upper bone),
+// the π−aElbow bend about the same normal. The world lower rotation is FxQuatMul(qUpper, qLower) (the FK
+// composition EndEffector does). Both feed anim::JointPose.r (the rig integration in IK4).
+struct TwoBoneResult {
+    FxQuat qUpper;   // upper-bone LOCAL rotation (from the root->target axis, about the bend normal)
+    FxQuat qLower;   // lower-bone LOCAL rotation (relative to the upper bone, the elbow bend)
+    fx     aRoot  = 0;   // the root opening angle (Q16.16 radians) — diagnostics/tests
+    fx     aElbow = 0;   // the elbow INTERIOR angle (Q16.16 radians); ~0 over-extended, ~pi folded
+    fx     reach  = 0;   // the clamped reach d (Q16.16) used by the solve
+};
+
+// QuatFromAxisAngle(n, theta): the unit quaternion (n·sin(theta/2), cos(theta/2)) for a UNIT axis n and a
+// Q16.16-radian angle theta — VERBATIM the FxQuat w-last layout (fpx.h:109), the sin/cos via IK1's LUTs
+// (the half-angle). The half-angle is theta>>1 (integer; the LUT lerp absorbs the dropped LSB). Pure
+// integer; the shader copies it VERBATIM. (Not normalized again — n is unit + the LUT sin/cos are within
+// band; the caller may FxQuatNormalize for the strict |q|≈kOne contract.)
+inline FxQuat QuatFromAxisAngle(const FxVec3& n, fx theta) {
+    const fx half = theta >> 1;            // theta/2 (Q16.16; floor — deterministic)
+    const fx s = FxSinLut(half);
+    const fx c = FxCosLut(half);
+    return FxQuat{fxmul(n.x, s), fxmul(n.y, s), fxmul(n.z, s), c};
+}
+
+// TwoBoneSolve(root, target, pole, lenUpper, lenLower) -> the two LOCAL bone rotations.
+//   e = target - root; d = FxLength(e), CLAMPED to the reachable band [|lenU-lenL|, lenU+lenL]
+//     (un-reachable-near AND over-extended both clamp to the boundary -> deterministic).
+//   cosRoot  = fxdiv(lenU² + d² - lenL², 2·lenU·d)     (squares/products in int64, narrowed to Q16.16)
+//   cosElbow = fxdiv(lenU² + lenL² - d², 2·lenU·lenL)
+//   aRoot = FxAcosLut(cosRoot); aElbow = FxAcosLut(cosElbow). Over-extended (d == lenU+lenL) -> the
+//     cosElbow argument is exactly kOne so FxAcosLut returns 0 (straight limb), automatically.
+//   axis = FxNormalize(e); n = FxNormalize(FxCross(axis, pole)) — the bend-plane normal (rotation axis for
+//     both bones); the limb bends in the plane spanned by axis + pole, toward the pole. If the cross
+//     degenerates (pole ∥ axis), use a DETERMINISTIC fallback axis (the world up (0,1,0) crossed with
+//     axis, then the world right (1,0,0) crossed with axis — guaranteed non-zero).
+//   qUpper = axis-angle(n, aRoot)  — rotate the axis by the root angle to the upper-bone direction.
+//   qLower = axis-angle(n, kPi - aElbow) — the LOCAL elbow bend (interior angle aElbow -> exterior bend).
+// Pure integer (int64 in FxLength/fxdiv/fxmul). The shader copies THIS body VERBATIM.
+inline TwoBoneResult TwoBoneSolve(const FxVec3& root, const FxVec3& target, const FxVec3& pole,
+                                  fx lenUpper, fx lenLower) {
+    TwoBoneResult out{};
+
+    const FxVec3 e = FxVec3{target.x - root.x, target.y - root.y, target.z - root.z};
+    fx d = FxLength(e);
+
+    // Clamp d to the reachable band [|lenU-lenL|, lenU+lenL] — deterministic for near AND far.
+    const fx dMin = (lenUpper > lenLower) ? (fx)(lenUpper - lenLower) : (fx)(lenLower - lenUpper);
+    const fx dMax = (fx)(lenUpper + lenLower);
+    if (d < dMin) d = dMin;
+    if (d > dMax) d = dMax;
+    out.reach = d;
+
+    // Q16.16 squares/products in int64 then narrow to Q16.16 (the FxLength discipline): X² = (X*X)>>kFrac.
+    const fx lU2 = (fx)(((int64_t)lenUpper * (int64_t)lenUpper) >> kFrac);
+    const fx lL2 = (fx)(((int64_t)lenLower * (int64_t)lenLower) >> kFrac);
+    const fx d2  = (fx)(((int64_t)d * (int64_t)d) >> kFrac);
+    const fx twoLUd  = (fx)(((int64_t)(2 * (int64_t)lenUpper) * (int64_t)d) >> kFrac);
+    const fx twoLUlL = (fx)(((int64_t)(2 * (int64_t)lenUpper) * (int64_t)lenLower) >> kFrac);
+
+    fx cosRoot  = fxdiv((fx)(lU2 + d2 - lL2), twoLUd);
+    fx cosElbow = fxdiv((fx)(lU2 + lL2 - d2), twoLUlL);
+    // Clamp the cosine arguments to [-kOne, kOne] (rounding can push them a few LSB past; FxAcosLut clamps
+    // internally too, but pin it here for the diagnostic angles).
+    if (cosRoot  >  kOne) cosRoot  =  kOne; if (cosRoot  < -kOne) cosRoot  = -kOne;
+    if (cosElbow >  kOne) cosElbow =  kOne; if (cosElbow < -kOne) cosElbow = -kOne;
+
+    const fx aRoot  = FxAcosLut(cosRoot);
+    const fx aElbow = FxAcosLut(cosElbow);
+    out.aRoot  = aRoot;
+    out.aElbow = aElbow;
+
+    // The bend plane: axis = root->target; n = normalize(axis × pole). Deterministic fallback if degenerate.
+    const FxVec3 axis = FxNormalize(e);
+    FxVec3 cr = FxCross(axis, pole);
+    if (FxLength(cr) == 0) {
+        // pole ∥ axis (or zero pole) -> pick a deterministic non-parallel reference: world up, else world right.
+        cr = FxCross(axis, FxVec3{0, kOne, 0});
+        if (FxLength(cr) == 0) cr = FxCross(axis, FxVec3{kOne, 0, 0});
+    }
+    const FxVec3 n = FxNormalize(cr);
+
+    // qUpper rotates the axis by +aRoot about n (toward the pole). qLower is the LOCAL elbow bend: the
+    // exterior turn (pi - aElbow) in the OPPOSITE rotational sense so the lower bone turns BACK toward the
+    // axis and the chain closes on the target. axis-angle(n, aElbow - kPi) == axis-angle(-n, kPi - aElbow):
+    // we use the NEGATED-axis + POSITIVE-angle form (kPi - aElbow >= 0 always, aElbow in [0, kPi]) so the
+    // half-angle handed to the sin/cos LUT is NON-NEGATIVE — deterministic + identical on the GPU (the LUT
+    // phase-reduce is cleanest for non-negative angles). World lower = FxQuatMul(qUpper, qLower).
+    const FxVec3 nNeg{(fx)(-n.x), (fx)(-n.y), (fx)(-n.z)};
+    out.qUpper = FxQuatNormalize(QuatFromAxisAngle(n, aRoot));
+    out.qLower = FxQuatNormalize(QuatFromAxisAngle(nNeg, (fx)(kPi - aElbow)));
+    return out;
+}
+
+// EndEffector(root, target, pole, lenU, lenL, qU, qL): forward-kinematics from the solved LOCAL quats —
+// place root -> elbow -> end. axis = normalize(target-root); dirUpper = FxRotate(qUpper, axis);
+// elbow = root + lenU·dirUpper; the WORLD lower rotation = FxQuatMul(qUpper, qLower); dirLower =
+// FxRotate(qLowerWorld, axis); end = elbow + lenL·dirLower. The residual |end - target| is the bounded
+// LUT-band reach error (the honest within-band proof). Pure integer; for the test/showcase residual check.
+inline FxVec3 EndEffector(const FxVec3& root, const FxVec3& target, const FxVec3& /*pole*/,
+                          fx lenUpper, fx lenLower, const FxQuat& qUpper, const FxQuat& qLower) {
+    const FxVec3 e = FxVec3{target.x - root.x, target.y - root.y, target.z - root.z};
+    const FxVec3 axis = FxNormalize(e);
+    const FxVec3 dirUpper = FxRotate(qUpper, axis);
+    const FxVec3 elbow = FxVec3{root.x + fxmul(lenUpper, dirUpper.x),
+                                root.y + fxmul(lenUpper, dirUpper.y),
+                                root.z + fxmul(lenUpper, dirUpper.z)};
+    const FxQuat qLowerWorld = FxQuatMul(qUpper, qLower);
+    const FxVec3 dirLower = FxRotate(qLowerWorld, axis);
+    return FxVec3{elbow.x + fxmul(lenLower, dirLower.x),
+                  elbow.y + fxmul(lenLower, dirLower.y),
+                  elbow.z + fxmul(lenLower, dirLower.z)};
+}
+
+// ElbowPos(root, target, lenU, qU): the elbow joint position (root + lenU·FxRotate(qUpper, axis)) — the
+// limb-pose viz draws root->elbow->end as two segments. Pure integer.
+inline FxVec3 ElbowPos(const FxVec3& root, const FxVec3& target, fx lenUpper, const FxQuat& qUpper) {
+    const FxVec3 e = FxVec3{target.x - root.x, target.y - root.y, target.z - root.z};
+    const FxVec3 axis = FxNormalize(e);
+    const FxVec3 dirUpper = FxRotate(qUpper, axis);
+    return FxVec3{root.x + fxmul(lenUpper, dirUpper.x),
+                  root.y + fxmul(lenUpper, dirUpper.y),
+                  root.z + fxmul(lenUpper, dirUpper.z)};
+}
+
 } // namespace hf::anim::ik

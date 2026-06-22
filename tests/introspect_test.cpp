@@ -562,6 +562,8 @@ int main() {
             bool sawHf6HullFeature = false;
             // Slice IK1: the ik1-angle capability is advertised (the fixed-point angle LUT, FLAGSHIP #32).
             bool sawIk1AngleFeature = false;
+            // Slice IK2: the ik2-twobone capability is advertised (the two-bone law-of-cosines limb solve).
+            bool sawIk2TwoboneFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -821,6 +823,7 @@ int main() {
                     if (AsString(el->value) == "hf5-net") sawHf5NetFeature = true;
                     if (AsString(el->value) == "hf6-hull") sawHf6HullFeature = true;
                     if (AsString(el->value) == "ik1-angle") sawIk1AngleFeature = true;
+                    if (AsString(el->value) == "ik2-twobone") sawIk2TwoboneFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -1055,6 +1058,7 @@ int main() {
             check(sawHf5NetFeature, "engine.features includes hf5-net");
             check(sawHf6HullFeature, "engine.features includes hf6-hull");
             check(sawIk1AngleFeature, "engine.features includes ik1-angle");
+            check(sawIk2TwoboneFeature, "engine.features includes ik2-twobone");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1494,6 +1498,8 @@ int main() {
         bool sawHf6HullShot = false;
         // Slice IK1: the --ik1-angle-shot showcase flag is listed in the showcase manifest.
         bool sawIk1AngleShot = false;
+        // Slice IK2: the --ik2-twobone-shot showcase flag is listed in the showcase manifest.
+        bool sawIk2TwoboneShot = false;
         // Slice WH3: the --wh3-warm-shot showcase flag is listed in the showcase manifest.
         bool sawWh3WarmShot = false;
         // Slice WH4: the --wh4-stack-shot showcase flag is listed in the showcase manifest.
@@ -1789,6 +1795,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--hf5-net-shot") sawHf5NetShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--hf6-hull-shot") sawHf6HullShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ik1-angle-shot") sawIk1AngleShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--ik2-twobone-shot") sawIk2TwoboneShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--wh3-warm-shot") sawWh3WarmShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--wh4-stack-shot") sawWh4StackShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--wh5-lockstep-shot") sawWh5LockstepShot = true;
@@ -2020,6 +2027,7 @@ int main() {
         check(sawHf5NetShot, "showcases manifest includes --hf5-net-shot");
         check(sawHf6HullShot, "showcases manifest includes --hf6-hull-shot");
         check(sawIk1AngleShot, "showcases manifest includes --ik1-angle-shot");
+        check(sawIk2TwoboneShot, "showcases manifest includes --ik2-twobone-shot");
         check(sawWh3WarmShot, "showcases manifest includes --wh3-warm-shot");
         check(sawWh4StackShot, "showcases manifest includes --wh4-stack-shot");
         check(sawWh5LockstepShot, "showcases manifest includes --wh5-lockstep-shot");

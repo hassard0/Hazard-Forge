@@ -476,6 +476,16 @@ hf_compile_shaders(
     # ReadBuffer reads the sweep, PROVEN BIT-EXACT vs the CPU ik.h lookups (memcmp, no tol). Behind
     # --ik1-angle-shot only; existing shaders + goldens untouched.
     "shaders/ik_angle.comp.hlsl:cs"
+    # Deterministic IK Control-Rig Slice 2 (Slice IK2, the 2nd slice of FLAGSHIP #32): ik_twobone.comp
+    # solves the law-of-cosines two-bone limb IK — ONE thread per target reads the host-baked acos/sin/cos
+    # Q16.16 LUTs + runs engine/anim/ik.h::TwoBoneSolve VERBATIM, writing the two LOCAL bone FxQuats
+    # (8 ints {qUpper.xyzw, qLower.xyzw}) per target. UNLIKE IK1's ik_angle.comp (pure int32, MSL-native),
+    # the law-of-cosines reach d (FxLength) + the cosine ratios (fxdiv) are int64, so ik_twobone.comp is
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal
+    # --ik2-twobone runs the CPU TwoBoneSolve (byte-identical by construction). ReadBuffer reads the quats,
+    # PROVEN BIT-EXACT vs the CPU ik.h TwoBoneSolve (memcmp, no tol). Behind --ik2-twobone-shot only;
+    # existing shaders + goldens untouched.
+    "shaders/ik_twobone.comp.hlsl:cs"
     # Deterministic Rigid-Body Fracture Slice 2 (Slice FR2): FRAGMENT EXTRACTION — the GR2/FL2
     # count->scan->emit CSR over FR1's cellId[] (cells == seedCount) + a per-fragment reduction. PURE
     # INT32 -> MSL-native, a TRUE GPU pass on both backends. fract_emit_count (ONE thread per sample:

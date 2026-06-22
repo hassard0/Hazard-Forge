@@ -634,6 +634,16 @@ hf_add_pure_test(fract_test)
 # anim/animation.h read-only.
 hf_add_pure_test(ik_angle_test)
 
+# Deterministic IK Control-Rig Slice 2 (Slice IK2, the 2nd slice of FLAGSHIP #32): the law-of-cosines
+# TWO-BONE limb solver (engine/anim/ik.h::TwoBoneSolve / EndEffector) the GPU shaders/ik_twobone.comp copies
+# VERBATIM + proves bit-identical. Pins determinism (TwoBoneSolve a pure function); the elbow FOLDS on a
+# near-target (aElbow away from 0 and pi); the end-effector residual within a documented LSB band over a
+# reachable forward-kinematics sweep (the honest LUT-acos within-band caveat, NOT zero); over-extended
+# (d >= lenU+lenL) -> aElbow ~= 0 straight limb + end-effector on the root->target ray; un-reachable-near
+# (d < |lenU-lenL|) -> the deterministic reach clamp to dMin; the pole controls the bend side (flipping it
+# flips the elbow half-plane). Pure C++ (hf_core), ASan-eligible. ik.h #includes sim/fpx.h read-only.
+hf_add_pure_test(ik_twobone_test)
+
 # Deterministic Articulated-Body Ragdoll Slice 1 (Slice JT1, the BEACHHEAD of FLAGSHIP #15): the JOINT
 # GRAPH + BALL-JOINT CONSTRAINT integer core (engine/sim/joint.h) the GPU
 # shaders/joint_ball_solve.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16

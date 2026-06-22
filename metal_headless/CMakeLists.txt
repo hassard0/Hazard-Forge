@@ -260,6 +260,12 @@ hf_gen_msl(fract_classify.comp   fract_classify.comp.hlsl   comp fract_classify_
 # part (engine/anim/ik.h::FxAtan2Lut) and is NOT in this sweep. Behind --ik1-angle / --ik1-angle-shot only;
 # existing shaders + goldens untouched.
 hf_gen_msl(ik_angle.comp         ik_angle.comp.hlsl         comp ik_angle_main)
+# Deterministic IK Control-Rig Slice 2 (Slice IK2, the 2nd slice of FLAGSHIP #32): ik_twobone.comp solves
+# the law-of-cosines two-bone limb IK (engine/anim/ik.h::TwoBoneSolve). UNLIKE IK1's ik_angle.comp (pure
+# int32, MSL-native), the reach d (FxLength) + the cosine ratios (fxdiv) are int64, so ik_twobone.comp is
+# VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot lower it to MSL) -> NO hf_gen_msl line here. The
+# Metal --ik2-twobone showcase runs the CPU TwoBoneSolve over the same targets (byte-identical to the
+# Vulkan GPU result by construction; the Vulkan side carries the GPU==CPU memcmp proof — the FPX3/JT1 split).
 # Deterministic Rigid-Body Fracture Slice 2 (Slice FR2): FRAGMENT EXTRACTION — turns each non-empty FR1
 # Voronoi cell into a FRAGMENT RECORD (integer centroid, AABB, boundRadiusSq/boundRadius, volume, cellId,
 # invMass) via the GR2/FL2 count->scan->emit CSR over FR1's cellId[] (cells == seedCount) + a per-fragment

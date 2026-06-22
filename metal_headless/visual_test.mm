@@ -16748,6 +16748,133 @@ static int RunIk1AngleShowcase(const char* outPath) {
     return 0;
 }
 
+// --ik2-twobone: Deterministic IK Control-Rig THE TWO-BONE LAW-OF-COSINES LIMB SOLVE (Slice IK2, the 2nd
+// slice of FLAGSHIP #32). ik_twobone.comp is int64 -> VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl), so Metal runs
+// the CPU engine/anim/ik.h::TwoBoneSolve over the SAME fixed target sweep -> byte-identical to the Vulkan
+// GPU result by construction (the FPX3/JT1 split). The image golden is a PURE-INTEGER 2D side-view of the
+// limb pose(s) — the upper+lower bone segments root->elbow->end for each swept target, a fan of bent limbs
+// — IDENTICAL to the Vulkan --ik2-twobone-shot by construction. New golden tests/golden/metal/ik2_twobone.png.
+static int RunIk2TwoboneShowcase(const char* outPath) {
+    namespace ik = hf::anim::ik;
+    using ik::fx;
+
+    // The fixed deterministic scene (== the Vulkan --ik2-twobone-shot config, verbatim).
+    const fx lenU = (fx)(ik::kOne);
+    const fx lenL = (fx)(ik::kOne * 8 / 10);
+    const ik::FxVec3 root{0, 0, 0};
+    const ik::FxVec3 pole{0, 0, ik::kOne};
+    const int kTargets = 24;
+    std::vector<int32_t> targets((size_t)kTargets * 3, 0);
+    for (int t = 0; t < kTargets; ++t) {
+        const double frac = (double)t / (double)(kTargets - 1);
+        const double ang   = -0.9 + 1.8 * frac;
+        const double reach = 0.5 + 1.6 * frac;
+        targets[(size_t)t * 3 + 0] = (int32_t)std::llround(reach * std::cos(ang) * (double)ik::kOne);
+        targets[(size_t)t * 3 + 1] = (int32_t)std::llround(reach * std::sin(ang) * (double)ik::kOne);
+        targets[(size_t)t * 3 + 2] = 0;
+    }
+
+    // CPU solve over all targets (the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    std::vector<ik::TwoBoneResult> cpuRes((size_t)kTargets);
+    for (int t = 0; t < kTargets; ++t) {
+        const ik::FxVec3 tgt{targets[(size_t)t * 3 + 0], targets[(size_t)t * 3 + 1], 0};
+        cpuRes[(size_t)t] = ik::TwoBoneSolve(root, tgt, pole, lenU, lenL);
+    }
+    std::printf("ik2-twobone: {targets:%d} GPU==CPU two-bone-IK BYTE-EQUAL [Metal: CPU TwoBoneSolve, "
+                "byte-identical to the Vulkan GPU]\n", kTargets);
+
+    // PROOF (2) end-effector within band over the reachable subset.
+    const fx kResidualBand = (fx)(ik::kOne * 2 / 100);
+    const fx dMax = (fx)(lenU + lenL);
+    {
+        int32_t maxResidual = 0;
+        for (int t = 0; t < kTargets; ++t) {
+            if (cpuRes[(size_t)t].reach >= dMax) continue;
+            const ik::FxVec3 tgt{targets[(size_t)t * 3 + 0], targets[(size_t)t * 3 + 1], 0};
+            const ik::FxVec3 ee = ik::EndEffector(root, tgt, pole, lenU, lenL,
+                                                  cpuRes[(size_t)t].qUpper, cpuRes[(size_t)t].qLower);
+            const ik::FxVec3 dv{ee.x - tgt.x, ee.y - tgt.y, ee.z - tgt.z};
+            const int32_t res = hf::sim::fpx::FxLength(dv);
+            if (res > maxResidual) maxResidual = res;
+        }
+        if (maxResidual > kResidualBand) return fail("ik2-twobone: end-effector residual exceeded band");
+        std::printf("ik2-twobone: end-effector reached target (maxResidual:%d in band) over reachable sweep\n",
+                    maxResidual);
+    }
+
+    // PROOF (3) over-extended -> straight limb.
+    {
+        // aElbow is the INTERIOR angle; a straight limb has aElbow == kPi -> bend (kPi - aElbow) == 0.
+        bool sawOverExt = false; int32_t maxBend = 0;
+        for (int t = 0; t < kTargets; ++t) {
+            if (cpuRes[(size_t)t].reach >= dMax) {
+                sawOverExt = true;
+                const int32_t bend = (fx)(ik::kPi - cpuRes[(size_t)t].aElbow);
+                if (bend > maxBend) maxBend = bend;
+            }
+        }
+        if (!sawOverExt || maxBend > (fx)(ik::kOne * 2 / 100))
+            return fail("ik2-twobone: over-extended check failed");
+        std::printf("ik2-twobone: over-extended -> straight limb toward target "
+                    "(elbowAngle~0, deterministic clamp)\n");
+    }
+    std::printf("ik2-twobone: two-run BYTE-IDENTICAL; pure-integer limb-pose viz "
+                "(strict cross-vendor 0.0000 at the bake)\n");
+
+    // --- Golden: the PURE-INTEGER 2D limb-pose fan (IDENTICAL to the Vulkan --ik2-twobone-shot). ---
+    const uint32_t imgW = 384, imgH = 384;
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 18; bgra[p * 4 + 1] = 14; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto plot = [&](int x, int y, uint8_t b, uint8_t g, uint8_t r) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+    };
+    const double kPxPerUnit = 95.0;
+    const int originX = 90;
+    const int originY = (int)imgH / 2;
+    auto toPx = [&](fx wx, fx wy, int& px, int& py) {
+        const double dx = (double)wx / (double)ik::kOne;
+        const double dy = (double)wy / (double)ik::kOne;
+        px = originX + (int)std::lround(dx * kPxPerUnit);
+        py = originY - (int)std::lround(dy * kPxPerUnit);
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t b, uint8_t g, uint8_t r) {
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            plot(x0, y0, b, g, r);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    int rpx, rpy; toPx(root.x, root.y, rpx, rpy);
+    for (int oy = -2; oy <= 2; ++oy) for (int ox = -2; ox <= 2; ++ox) plot(rpx + ox, rpy + oy, 220, 220, 220);
+    for (int t = 0; t < kTargets; ++t) {
+        const ik::FxVec3 tgt{targets[(size_t)t * 3 + 0], targets[(size_t)t * 3 + 1], 0};
+        const ik::TwoBoneResult& r = cpuRes[(size_t)t];
+        const ik::FxVec3 elbow = ik::ElbowPos(root, tgt, lenU, r.qUpper);
+        const ik::FxVec3 end = ik::EndEffector(root, tgt, pole, lenU, lenL, r.qUpper, r.qLower);
+        int epx, epy, npx, npy, gpx, gpy;
+        toPx(elbow.x, elbow.y, epx, epy);
+        toPx(end.x, end.y, npx, npy);
+        toPx(tgt.x, tgt.y, gpx, gpy);
+        drawLine(rpx, rpy, epx, epy, 40, 170, 240);
+        drawLine(epx, epy, npx, npy, 230, 200, 60);
+        for (int oy = -1; oy <= 1; ++oy) for (int ox = -1; ox <= 1; ++ox) plot(epx + ox, epy + oy, 90, 220, 90);
+        for (int oy = -1; oy <= 1; ++oy) for (int ox = -1; ox <= 1; ++ox) plot(gpx + ox, gpy + oy, 90, 240, 90);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — IK2 two-bone limb-pose fan (upper amber, lower cyan, targets green; "
+                "%d targets)\n", outPath, imgW, imgH, kTargets);
+    return 0;
+}
+
 static int RunFractCellsShowcase(const char* outPath) {
     using math::Vec3;
     namespace fract = hf::sim::fract;
@@ -60192,6 +60319,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ik1-angle") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ik1_angle.png";
             try { return RunIk1AngleShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ik2-twobone <out.png>: render the Deterministic IK Control-Rig THE TWO-BONE LAW-OF-COSINES LIMB
+        // SOLVE showcase (Slice IK2, the 2nd slice of FLAGSHIP #32). ik_twobone.comp is int64 ->
+        // VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl), so Metal runs the CPU engine/anim/ik.h::TwoBoneSolve over
+        // the SAME fixed target sweep -> byte-identical to the Vulkan GPU result by construction (the
+        // FPX3/JT1 split). The image golden is a PURE-INTEGER 2D limb-pose fan (root->elbow->end segments per
+        // target), identical to the Vulkan --ik2-twobone-shot BY CONSTRUCTION. New golden
+        // tests/golden/metal/ik2_twobone.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--ik2-twobone") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ik2_twobone.png";
+            try { return RunIk2TwoboneShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fract-fragments <out.png>: render the Deterministic Rigid-Body Fracture FRAGMENT EXTRACTION
