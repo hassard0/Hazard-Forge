@@ -935,5 +935,129 @@ inline VerdictSnapshot RunVerdictRollback(const VerdictSnapshot& world0Snap, con
     return SnapshotWorld(w);   // the corrected authority's snapshot (copyable — the caller restores+renders)
 }
 
+// =================================================================================================
+// Slice VD6 — THE PLAYABLE LIT 3D CAPSTONE — THE MONEY-SHOT (APPEND-ONLY; VD1/VD2/VD3/VD4/VD5 above are
+// BYTE-FROZEN). The 6th and FINAL slice of FLAGSHIP #27 (DETERMINISTIC GAMEPLAY / NETCODE PRODUCT LAYER,
+// hf::game::verdict; the gjk::GJ6 / warmhull::WH6 / ccd::CD6 render-capstone twin at the WHOLE-WORLD level).
+//
+// VD1-VD5 built the deterministic entity world, the gameplay systems, the composed StepWorld tick, the
+// heterogeneous snapshot, and the whole-world lockstep/rollback. VD6 is the artifact the whole flagship was
+// built to produce: it RENDERS the bit-exact deterministic game — a player rolling through a hull-stack arena,
+// collecting pickups, the stack settling — as a LIT 3D scene, whose ENTIRE world (entities + gameplay +
+// physics) is the bit-exact VD1-VD5 deterministic world and is lockstep-replayable.
+//
+// THE RENDER IS THE ONE FLOAT CROSSING (outside the bit-exact integer loop): VerdictToRenderInstances maps the
+// frozen world to FLOAT geometry for display via the FROZEN gjk::HullToRenderInstances (the WH6/CD6/MF6/GJ6
+// delegate — the sim bodies render through it verbatim, MATTE) PLUS gameplay-entity overlays (a small marker
+// mesh per non-body entity at its Transform2D.pos, pickups tinted by type, the player tinted by Score). It is a
+// PURE FUNCTION of `world` (two calls byte-equal via gjk::HullRenderMeshEqual); the integer world is NOT mutated
+// (the provenance + world-unmutated proofs guarantee this). NO new shader, NO new RHI: the soup feeds the
+// EXISTING instanced-lit pipeline (the WH6/GJ6 render path REUSED VERBATIM). gjk.h/warmhull.h + ALL sim headers
+// + ecs.h + ALL shaders BYTE-UNCHANGED; verdict.h is APPEND-ONLY (VD1-VD5 code byte-frozen). This is the FINAL
+// slice -> FLAGSHIP #27 COMPLETE.
+// =================================================================================================
+
+// ----- EntityIsBodyBound(world, id): does `id` carry a BOUND BodyRef (a sim body renders its hull)? ----------
+// A body-bound entity's hull is already drawn by gjk::HullToRenderInstances(world.sim) (the sim-body soup); its
+// gameplay overlay would double-draw at the same place, so VerdictToRenderInstances overlays ONLY the NON-body
+// entities (pickups, the player marker, gameplay-only spawns). A dead/unknown id reports false (skipped).
+inline bool EntityIsBodyBound(const VerdictWorld& world, EntityId id) {
+    auto it = world.handle.find(id);
+    if (it == world.handle.end()) return false;
+    const ecs::Entity e = it->second;
+    if (!world.reg.valid(e)) return false;
+    if (!world.reg.has<BodyRef>(e)) return false;
+    const uint32_t bi = world.reg.get<BodyRef>(e).simBodyIndex;
+    return bi != kNoBody && (size_t)bi < world.sim.bodies.size();
+}
+
+// ----- AppendMarkerCube(out, cx, cy, cz, half, color): emit a small flat-shaded cube into the soup -----------
+// A pure host-float helper (render-only, OUTSIDE the bit-exact loop) that appends a 12-triangle axis-aligned
+// cube (centred at (cx,cy,cz), half-extent `half`) into the gjk::HullRenderMesh soup, each face flat-shaded with
+// an OUTWARD normal + the given matte color — the SAME HullRenderVertex layout gjk::HullToRenderMesh emits, so a
+// marker draws through the EXISTING lit pipeline VERBATIM. The 8 corners (sign sweep ix*4+iy*2+iz) + 6 quad
+// faces with explicit outward normals (no centroid flip needed — axis-aligned). Deterministic: a pure function
+// of its float args (same inputs -> byte-equal verts), so two VerdictToRenderInstances calls are byte-equal.
+inline void AppendMarkerCube(gjk::HullRenderMesh& out, float cx, float cy, float cz, float half,
+                             const float color[3]) {
+    float c[8][3];
+    for (int i = 0; i < 8; ++i) {
+        c[i][0] = cx + ((i & 4) ? half : -half);
+        c[i][1] = cy + ((i & 2) ? half : -half);
+        c[i][2] = cz + ((i & 1) ? half : -half);
+    }
+    // 6 faces: {4 corner indices, outward normal}. Winding is CCW as seen from outside.
+    struct Face { uint32_t a, b, d, e; float n[3]; };
+    const Face faces[6] = {
+        {0, 1, 3, 2, {-1, 0, 0}},   // -x
+        {4, 6, 7, 5, { 1, 0, 0}},   // +x
+        {0, 4, 5, 1, { 0,-1, 0}},   // -y
+        {2, 3, 7, 6, { 0, 1, 0}},   // +y
+        {0, 2, 6, 4, { 0, 0,-1}},   // -z
+        {1, 5, 7, 3, { 0, 0, 1}},   // +z
+    };
+    auto emit = [&](uint32_t idx, const float n[3]) {
+        gjk::HullRenderVertex hv;
+        hv.pos[0] = c[idx][0]; hv.pos[1] = c[idx][1]; hv.pos[2] = c[idx][2];
+        hv.normal[0] = n[0]; hv.normal[1] = n[1]; hv.normal[2] = n[2];
+        hv.color[0] = color[0]; hv.color[1] = color[1]; hv.color[2] = color[2];
+        out.verts.push_back(hv);
+    };
+    for (const Face& f : faces) {
+        // Quad (a,b,d,e) -> two triangles (a,b,d) + (a,d,e).
+        emit(f.a, f.n); emit(f.b, f.n); emit(f.d, f.n);
+        emit(f.a, f.n); emit(f.d, f.n); emit(f.e, f.n);
+    }
+}
+
+// ----- VerdictToRenderInstances(world): the spec-named entry — the render payload for the VD6 game showcase. --
+// The render of the bit-exact deterministic game: the sim bodies via the FROZEN gjk::HullToRenderInstances(
+// world.sim) (the WH6/CD6/MF6/GJ6 delegate, MATTE) PLUS a gameplay-entity overlay — a small marker cube per
+// LIVE NON-body entity (in order[] sequence) at its Transform2D.pos>>kFrac (a Pickup tinted warm by its value;
+// the player — the entity carrying a Score — tinted by its Score; other gameplay entities a cool neutral).
+// Body-bound entities are NOT overlaid (their hull is already in the sim-body soup). A PURE FUNCTION of `world`
+// (two calls byte-equal — gjk::HullRenderMeshEqual; render-only float, OUTSIDE the bit-exact loop). The integer
+// sim/world is UNTOUCHED (a pure read — VerdictStatesEqual(before, after) holds). NO new shader, NO new RHI.
+inline gjk::HullRenderMesh VerdictToRenderInstances(const VerdictWorld& world) {
+    // (1) the sim bodies — the FROZEN render bridge (matte), verbatim.
+    gjk::HullRenderMesh out = gjk::HullToRenderInstances(world.sim);
+
+    // (2) the gameplay-entity overlays — a marker cube per LIVE NON-body entity, IN order[] SEQUENCE (the pinned
+    // deterministic iteration order, so the overlay verts append in a fixed order -> a pure function of `world`).
+    const float kMarkerHalf = 0.35f;   // a small distinct marker (render-only float; smaller than a unit hull)
+    for (size_t i = 0; i < world.order.size(); ++i) {
+        const EntityId id = world.order[i];
+        if (!IsLive(world, id)) continue;
+        if (EntityIsBodyBound(world, id)) continue;   // its hull is already in the sim-body soup
+        auto it = world.handle.find(id);
+        if (it == world.handle.end()) continue;
+        const ecs::Entity e = it->second;
+        if (!world.reg.has<Transform2D>(e)) continue;
+        const Transform2D& xf = world.reg.get<Transform2D>(e);
+        const float px = (float)(xf.pos.x >> kFrac);
+        const float py = (float)(xf.pos.y >> kFrac);
+        const float pz = (float)(xf.pos.z >> kFrac);
+
+        float color[3];
+        if (world.reg.has<Score>(e)) {
+            // The player: tint by Score (more points -> warmer/brighter green-gold; the score-driven highlight).
+            const int32_t s = world.reg.get<Score>(e).points;
+            const float t = (s > 8) ? 1.0f : (s < 0 ? 0.0f : (float)s / 8.0f);   // clamp 0..1
+            color[0] = 0.85f; color[1] = 0.45f + 0.40f * t; color[2] = 0.12f;     // amber -> gold
+        } else if (world.reg.has<Pickup>(e)) {
+            // A pickup: tint warm by its value (a brighter teal-green for the higher-value collectibles).
+            const int32_t v = world.reg.get<Pickup>(e).value;
+            const float t = (v > 5) ? 1.0f : (v < 0 ? 0.0f : (float)v / 5.0f);
+            color[0] = 0.15f; color[1] = 0.55f + 0.30f * t; color[2] = 0.45f;
+        } else {
+            color[0] = 0.45f; color[1] = 0.48f; color[2] = 0.52f;   // a cool neutral gameplay marker
+        }
+        AppendMarkerCube(out, px, py, pz, kMarkerHalf, color);
+    }
+
+    out.triangles = (uint32_t)(out.verts.size() / 3);
+    return out;
+}
+
 }  // namespace verdict
 }  // namespace hf::game

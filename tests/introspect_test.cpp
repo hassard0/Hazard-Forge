@@ -520,6 +520,8 @@ int main() {
             bool sawVerdictSnapshotFeature = false;
             // Slice VD5: the verdict-lockstep capability is advertised.
             bool sawVerdictLockstepFeature = false;
+            // Slice VD6: the verdict-render capability is advertised.
+            bool sawVerdictRenderFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -758,6 +760,7 @@ int main() {
                     if (AsString(el->value) == "verdict-world-step") sawVerdictWorldStepFeature = true;
                     if (AsString(el->value) == "verdict-snapshot") sawVerdictSnapshotFeature = true;
                     if (AsString(el->value) == "verdict-lockstep") sawVerdictLockstepFeature = true;
+                    if (AsString(el->value) == "verdict-render") sawVerdictRenderFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -971,6 +974,7 @@ int main() {
             check(sawVerdictWorldStepFeature, "engine.features includes verdict-world-step");
             check(sawVerdictSnapshotFeature, "engine.features includes verdict-snapshot");
             check(sawVerdictLockstepFeature, "engine.features includes verdict-lockstep");
+            check(sawVerdictRenderFeature, "engine.features includes verdict-render");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1180,6 +1184,8 @@ int main() {
         bool sawVd4SnapShot = false;
         // Slice VD5: the --vd5-net-shot showcase flag is listed in the showcase manifest.
         bool sawVd5NetShot = false;
+        // Slice VD6: the --vd6-game-shot showcase flag is listed in the showcase manifest.
+        bool sawVd6GameShot = false;
         // Slice GR3: the --grain-contact-shot showcase flag is listed in the showcase manifest.
         bool sawGrainContactShot = false;
         // Slice GR4: the --grain-friction-shot showcase flag is listed in the showcase manifest.
@@ -1514,6 +1520,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--vd3-world-shot") sawVd3WorldShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vd4-snap-shot") sawVd4SnapShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vd5-net-shot") sawVd5NetShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--vd6-game-shot") sawVd6GameShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--couple-query-shot") sawCoupleQueryShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--couple-buoyancy-shot") sawCoupleBuoyancyShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--couple-displace-shot") sawCoupleDisplaceShot = true;
@@ -1725,6 +1732,7 @@ int main() {
         check(sawVd3WorldShot, "showcases manifest includes --vd3-world-shot");
         check(sawVd4SnapShot, "showcases manifest includes --vd4-snap-shot");
         check(sawVd5NetShot, "showcases manifest includes --vd5-net-shot");
+        check(sawVd6GameShot, "showcases manifest includes --vd6-game-shot");
         check(sawCoupleQueryShot, "showcases manifest includes --couple-query-shot");
         check(sawCoupleBuoyancyShot, "showcases manifest includes --couple-buoyancy-shot");
         check(sawCoupleDisplaceShot, "showcases manifest includes --couple-displace-shot");

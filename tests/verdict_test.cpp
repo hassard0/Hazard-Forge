@@ -836,6 +836,133 @@ int main() {
                         (uint32_t)authority.simSnap.bodies.size(), kTicks, (uint32_t)kStream.size());
     }
 
+    // =============================================================================================
+    // Slice VD6 — THE PLAYABLE LIT 3D CAPSTONE. Pure CPU. VerdictToRenderInstances maps the bit-exact
+    // deterministic game world to a FLOAT triangle soup (the sim bodies via the FROZEN
+    // gjk::HullToRenderInstances + a marker-cube overlay per gameplay entity). Asserts: provenance (two
+    // calls byte-equal); the body/entity/triangle counts; the render of a played-out world differs from a
+    // fresh world; the integer world is byte-unmutated by the render call (VerdictStatesEqual pre/post);
+    // the rendered scene is RunVerdictLockstep-replayable (the capstone composition).
+    // =============================================================================================
+    {
+        namespace gjk      = hf::sim::gjk;
+        namespace warmhull = hf::sim::warmhull;
+        const warmhull::HullSleepConfig kSleepCfg = [](){
+            const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            convex::ConvexStepConfig c;
+            c.gravity = FxVec3{0, kGravY, 0};
+            c.dt = kOne / 60; c.solveIters = 8; c.restitution = 0; c.slop = kOne / 64;
+            c.beta = (fx)((int64_t)2 * kOne / 10); c.linDamp = (fx)((int64_t)95 * kOne / 100);
+            c.angDamp = kOne; c.posIters = 4;
+            warmhull::HullSleepConfig sc;
+            sc.warm = c; sc.sleepThreshold = kOne; sc.wakeThreshold = (fx)(2 * (int)kOne); sc.sleepTicks = 30;
+            return sc;
+        }();
+        const verdict::HazardRegion kHazard{V(-9,-9,0).x, V(-9,-9,0).y, V(-9,-9,0).x, V(-9,-9,0).y}; // empty
+        const fx kCollectR = (fx)(2 * (int)kOne);
+        const int kStackN = 3;
+        const uint32_t kTicks = 240u;
+        const FxQuat kI{0,0,0,kOne};
+
+        auto buildSimScene = [&]() {
+            gjk::HullWorld sim;
+            { fpx::FxBody b; b.pos={0,0,0}; b.orient={0,0,0,kOne}; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            { fpx::FxBody b; b.pos={0, (fx)((int64_t)2*kOne), 0}; b.orient={0,0,0,kOne}; b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            for (int k = 0; k < kStackN; ++k) {
+                fpx::FxBody b; b.pos={0, (fx)((int64_t)(4 + 2 * k)*kOne), 0}; b.orient={0,0,0,kOne};
+                b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0};
+                sim.bodies.push_back(b);
+                sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            }
+            return sim;
+        };
+        const verdict::EntityId kPlayerId = 2u;
+        const std::vector<verdict::Command> kStream = {
+            verdict::Command{0u, verdict::kCmdImpulse, kPlayerId, V(1,0,0)},
+        };
+        auto buildWorld = [&](verdict::VerdictWorld& w, verdict::EntityId& outPlayer) {
+            w = verdict::VerdictWorld{};
+            w.sim = buildSimScene();
+            const verdict::EntityId support = verdict::SpawnEntity(w, verdict::Transform2D{V(0,0,0), kI});
+            verdict::BindBody(w, support, 0u);
+            const verdict::EntityId player = verdict::SpawnEntity(w, verdict::Transform2D{V(0,2,0), kI});
+            w.reg.add<verdict::Score>(w.handle.at(player), verdict::Score{0});
+            verdict::BindBody(w, player, 1u);
+            const verdict::EntityId pk0 = verdict::SpawnEntity(w, verdict::Transform2D{V(0,2,0), kI});
+            w.reg.add<verdict::Pickup>(w.handle.at(pk0), verdict::Pickup{5});
+            const verdict::EntityId pk1 = verdict::SpawnEntity(w, verdict::Transform2D{V(4,3,0), kI});
+            w.reg.add<verdict::Pickup>(w.handle.at(pk1), verdict::Pickup{3});
+            for (int k = 0; k < kStackN; ++k) {
+                const verdict::EntityId se = verdict::SpawnEntity(w, verdict::Transform2D{V(0, 4 + 2 * k, 0), kI});
+                verdict::BindBody(w, se, (uint32_t)(2 + k));
+            }
+            (void)support; (void)pk0; (void)pk1;
+            outPlayer = player;
+        };
+
+        // Run the deterministic game.
+        verdict::VerdictWorld world; verdict::EntityId player; buildWorld(world, player);
+        verdict::StepWorldN(world, kStream, 0u, kHazard, player, kCollectR, kSleepCfg, kTicks);
+
+        // (1) PROVENANCE: two VerdictToRenderInstances calls on the bit-exact world are BYTE-EQUAL.
+        const gjk::HullRenderMesh soup = verdict::VerdictToRenderInstances(world);
+        const gjk::HullRenderMesh soup2 = verdict::VerdictToRenderInstances(world);
+        check(gjk::HullRenderMeshEqual(soup, soup2),
+              "vd6: VerdictToRenderInstances provenance two-calls BYTE-EQUAL (pure function)");
+
+        // (2) COUNTS: the soup carries the sim-body hulls + a marker per LIVE non-body gameplay entity.
+        check(soup.triangles == (uint32_t)(soup.verts.size() / 3), "vd6: soup triangle count consistent");
+        check(soup.triangles > 0, "vd6: soup has triangles (the rendered game is non-empty)");
+        // The sim-body soup alone (no overlays) has fewer triangles than the full render (markers added).
+        const gjk::HullRenderMesh bodySoup = gjk::HullToRenderInstances(world.sim);
+        check(soup.triangles > bodySoup.triangles,
+              "vd6: the full render adds gameplay-entity overlays (more tris than the bodies alone)");
+
+        // (3) WORLD-UNMUTATED: VerdictStatesEqual of the world before vs after the render call holds.
+        {
+            verdict::VerdictWorld before; verdict::EntityId pb; buildWorld(before, pb);
+            verdict::StepWorldN(before, kStream, 0u, kHazard, pb, kCollectR, kSleepCfg, kTicks);
+            const verdict::VerdictSnapshot pre = verdict::SnapshotWorld(world);
+            (void)verdict::VerdictToRenderInstances(world);   // the render call
+            const verdict::VerdictSnapshot post = verdict::SnapshotWorld(world);
+            check(verdict::VerdictSnapshotsEqual(pre, post),
+                  "vd6: world byte-unmutated by the render call (a pure read)");
+            check(verdict::VerdictStatesEqual(before, world),
+                  "vd6: the played-out world matches an independently-built reference (deterministic)");
+        }
+
+        // (4) A FRESH (un-played) world renders DIFFERENTLY from the played-out world.
+        {
+            verdict::VerdictWorld fresh; verdict::EntityId pf; buildWorld(fresh, pf);
+            const gjk::HullRenderMesh freshSoup = verdict::VerdictToRenderInstances(fresh);
+            check(!gjk::HullRenderMeshEqual(soup, freshSoup),
+                  "vd6: the played-out world renders differently from a fresh world (the game evolved)");
+        }
+
+        // (5) REPLAYABLE: a RunVerdictLockstep replica of the same scene is VerdictStatesEqual to the
+        // rendered world (the rendered game is lockstep-replayable — the capstone composition).
+        {
+            verdict::VerdictWorld w0; verdict::EntityId p0; buildWorld(w0, p0);
+            const verdict::VerdictSnapshot w0Snap = verdict::SnapshotWorld(w0);
+            verdict::VerdictParams params{kHazard, player, kCollectR, kSleepCfg, w0.sim.hulls};
+            const verdict::VerdictSnapshot authority =
+                verdict::RunVerdictLockstep(w0Snap, params, kStream, kTicks);
+            verdict::VerdictWorld replica = verdict::ClonePeer(authority, params);
+            check(verdict::VerdictStatesEqual(world, replica),
+                  "vd6: the rendered world is RunVerdictLockstep-replayable (VerdictStatesEqual)");
+        }
+
+        // (6) the settled headline: the stack fully settled (no awake bodies) after the game.
+        {
+            const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(world.sim, world.sleep);
+            check(sm.awakeCount == 0, "vd6: the hull stack settled (all dynamic bodies asleep)");
+            std::printf("vd6-game: {bodies:%u, entities:%u, tris:%u} provenance two-calls BYTE-EQUAL\n",
+                        (uint32_t)world.sim.bodies.size(), (uint32_t)world.order.size(), soup.triangles);
+        }
+    }
+
     if (g_fail == 0) std::printf("verdict_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

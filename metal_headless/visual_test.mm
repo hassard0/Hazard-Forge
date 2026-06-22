@@ -44880,6 +44880,338 @@ static int RunWh6RenderShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice VD6 — Deterministic Gameplay / Netcode THE PLAYABLE LIT 3D CAPSTONE (--vd6-game) =====
+// The MONEY-SHOT COMPLETING FLAGSHIP #27 (DETERMINISTIC GAMEPLAY / NETCODE PRODUCT LAYER, hf::game::verdict — the
+// gjk::GJ6 / warmhull::WH6 render-capstone twin at the WHOLE-WORLD level). Mirrors the Vulkan --vd6-game-shot
+// path EXACTLY: builds the SAME playable arena (a dynamic hull stack on a static support box + a player entity
+// bound to a dynamic hull body + pickup/marker entities), runs the deterministic game via verdict::StepWorldN
+// (the FIXED pinned schedule — the player is nudged by a kCmdImpulse + collects a pickup, the stack settles; NO
+// GPU step, the render is the point, NO TDR), turns the bit-exact world into a FLOAT world-space TRIANGLE SOUP
+// via verdict::VerdictToRenderInstances (the FROZEN gjk::HullToRenderInstances for the sim bodies + a marker-cube
+// overlay per gameplay entity), and draws it LIT 3D as ONE non-instanced mesh through the EXISTING lit pipeline
+// (lit.vert + lit.frag + shadow.vert — REUSED VERBATIM; NO new shader/RHI), MATTE (roughness 1.0) to dodge the
+// iridescence trap. FLOAT visresolve-bar: Metal-render==Metal-golden DIFF 0.0000 (determinism, two-run) +
+// provenance (two VerdictToRenderInstances calls byte-equal) + the settled+replayable headline + world-unmutated.
+// New golden tests/golden/metal/vd6_game.png. NO new shader. FINAL slice -> FLAGSHIP #27 COMPLETE.
+static int RunVd6GameShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace verdict  = hf::game::verdict;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace warmhull = hf::sim::warmhull;
+    namespace fpx      = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+    auto V  = [&](int x, int y, int z) { return convex::FxVec3{fi(x), fi(y), fi(z)}; };
+    const fpx::FxQuat kIdentity{0, 0, 0, kOne};
+
+    // The deterministic warm+sleep config (== the Vulkan --vd6-game-shot lineage; angDamp OFF).
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    convex::ConvexStepConfig kStepCfg;
+    kStepCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kStepCfg.dt          = kOne / 60;
+    kStepCfg.solveIters  = 8;
+    kStepCfg.restitution = 0;
+    kStepCfg.slop        = kOne / 64;
+    kStepCfg.beta        = (fx)((int64_t)2 * kOne / 10);
+    kStepCfg.linDamp     = (fx)((int64_t)95 * kOne / 100);
+    kStepCfg.angDamp     = kOne;
+    kStepCfg.posIters    = 4;
+    warmhull::HullSleepConfig kCfg;
+    kCfg.warm           = kStepCfg;
+    kCfg.sleepThreshold = kOne;
+    kCfg.wakeThreshold  = (fx)(2 * (int)kOne);
+    kCfg.sleepTicks     = 30;
+
+    const verdict::HazardRegion kHazard{V(-9,-9,0).x, V(-9,-9,0).y, V(-9,-9,0).x, V(-9,-9,0).y}; // empty
+    const fx kCollectR = (fx)(2 * (int)kOne);
+    const int kStackN = 3;
+    const uint32_t kTicks = 240u;
+
+    // THE COMPOSED SIM SCENE (== the Vulkan --vd6-game-shot): body 0 = static support; body 1 = the player's
+    // dynamic hull body; bodies 2..1+kStackN = a small stack of dynamic boxes resting above.
+    auto buildSimScene = [&]() {
+        gjk::HullWorld sim;
+        { fpx::FxBody b; b.pos={0,0,0}; b.orient={0,0,0,kOne}; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+        sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 0 static support
+        { fpx::FxBody b; b.pos={0, fi(2), 0}; b.orient={0,0,0,kOne}; b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+        sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 1 dynamic PLAYER body
+        for (int k = 0; k < kStackN; ++k) {
+            fpx::FxBody b; b.pos={0, fi(4 + 2 * k), 0}; b.orient={0,0,0,kOne};
+            b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0};
+            sim.bodies.push_back(b);
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 2..1+kStackN stacked boxes
+        }
+        return sim;
+    };
+    const verdict::EntityId kPlayerId = 2u;
+    const std::vector<verdict::Command> kStream = {
+        verdict::Command{0u, verdict::kCmdImpulse, kPlayerId, V(1,0,0)},
+    };
+    auto buildWorld = [&](verdict::VerdictWorld& w, verdict::EntityId& outPlayer) {
+        w = verdict::VerdictWorld{};
+        w.sim = buildSimScene();
+        const verdict::EntityId support = verdict::SpawnEntity(w, verdict::Transform2D{V(0,0,0), kIdentity});
+        verdict::BindBody(w, support, 0u);
+        const verdict::EntityId player = verdict::SpawnEntity(w, verdict::Transform2D{V(0,2,0), kIdentity});
+        w.reg.add<verdict::Score>(w.handle.at(player), verdict::Score{0});
+        verdict::BindBody(w, player, 1u);
+        const verdict::EntityId pk0 = verdict::SpawnEntity(w, verdict::Transform2D{V(0,2,0), kIdentity});
+        w.reg.add<verdict::Pickup>(w.handle.at(pk0), verdict::Pickup{5});
+        const verdict::EntityId pk1 = verdict::SpawnEntity(w, verdict::Transform2D{V(4,3,0), kIdentity});
+        w.reg.add<verdict::Pickup>(w.handle.at(pk1), verdict::Pickup{3});
+        for (int k = 0; k < kStackN; ++k) {
+            const verdict::EntityId se = verdict::SpawnEntity(w, verdict::Transform2D{V(0, 4 + 2 * k, 0), kIdentity});
+            verdict::BindBody(w, se, (uint32_t)(2 + k));
+        }
+        (void)support; (void)pk0; (void)pk1;
+        outPlayer = player;
+    };
+
+    verdict::VerdictWorld world; verdict::EntityId player; buildWorld(world, player);
+    verdict::StepWorldN(world, kStream, 0u, kHazard, player, kCollectR, kCfg, kTicks);
+    const int32_t score = world.reg.get<verdict::Score>(world.handle.at(player)).points;
+    const uint32_t kBodies   = (uint32_t)world.sim.bodies.size();
+    const uint32_t kEntities = (uint32_t)world.order.size();
+
+    // The world-space FLOAT triangle soup — the ONE float crossing (sim bodies + gameplay-entity markers).
+    const gjk::HullRenderMesh soup = verdict::VerdictToRenderInstances(world);
+    const uint32_t kTris = soup.triangles;
+
+    std::vector<scene::Vertex> verts;
+    verts.reserve(soup.verts.size());
+    for (const gjk::HullRenderVertex& hv : soup.verts) {
+        scene::Vertex v{};
+        v.pos[0] = hv.pos[0]; v.pos[1] = hv.pos[1]; v.pos[2] = hv.pos[2];
+        v.color[0] = hv.color[0]; v.color[1] = hv.color[1]; v.color[2] = hv.color[2];
+        v.uv[0] = 0.0f; v.uv[1] = 0.0f;
+        v.normal[0] = hv.normal[0]; v.normal[1] = hv.normal[1]; v.normal[2] = hv.normal[2];
+        v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+        verts.push_back(v);
+    }
+    std::vector<uint32_t> indices(verts.size());
+    for (uint32_t k = 0; k < (uint32_t)verts.size(); ++k) indices[k] = k;
+    const uint32_t kIndexCount = (uint32_t)indices.size();
+
+    std::unique_ptr<rhi::IBuffer> soupVb, soupIb;
+    if (!verts.empty()) {
+        rhi::BufferDesc vd; vd.size = (uint64_t)verts.size() * sizeof(scene::Vertex);
+        vd.initialData = verts.data(); vd.usage = rhi::BufferUsage::Vertex;
+        soupVb = device->CreateBuffer(vd);
+        rhi::BufferDesc id; id.size = (uint64_t)indices.size() * sizeof(uint32_t);
+        id.initialData = indices.data(); id.usage = rhi::BufferUsage::Index;
+        soupIb = device->CreateBuffer(id);
+    }
+
+    // === Reuse the EXISTING NON-instanced lit pipeline (the lit.vert + lit.frag + shadow.vert wiring). ===
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;   // model(16) + material(metallic,rough,0,0)
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto staticShadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc stShDesc;
+    stShDesc.vertex = staticShadowVs.get(); stShDesc.fragment = nullptr;
+    stShDesc.vertexLayout = scene::MeshVertexLayout();
+    stShDesc.depthTest = true; stShDesc.depthOnly = true;
+    stShDesc.usesFrameUniforms = true; stShDesc.pushConstantSize = sizeof(float) * 16;   // model
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto whiteTex   = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+    // A fixed 3/4 HERO camera aimed at the arena (== the Vulkan --vd6-game-shot camera/light).
+    const Vec3 eye{11.0f, 7.0f, 15.0f};
+    const Vec3 center{0.0f, 4.0f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = 0.3f; fd.lightDir[1] = -0.8f; fd.lightDir[2] = -0.5f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{0.3f, -0.8f, -0.5f});
+        Vec3 sc{0.0f, 4.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 24.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-14.0f, 14.0f, -14.0f, 14.0f, 1.0f, 56.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    Mat4 identity = Mat4::Identity();
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            if (kIndexCount > 0) {
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(identity.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(*soupVb);
+                cmd.BindIndexBuffer(*soupIb);
+                cmd.DrawIndexed(kIndexCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            if (kIndexCount > 0) {
+                cmd.BindPipeline(*litPipeline);
+                // metallic 0, roughness 1.0 (FULLY matte) -> no iridescence (the WH6/GJ6/CD6/MF6 lesson).
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = identity.m[k];
+                pc[16] = 0.0f; pc[17] = 1.0f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*whiteTex, *flatNormal);
+                cmd.BindVertexBuffer(*soupVb);
+                cmd.BindIndexBuffer(*soupIb);
+                cmd.DrawIndexed(kIndexCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    // === PROOFS (== the Vulkan --vd6-game-shot proofs, same lines) ===
+    // (1) PROVENANCE: two VerdictToRenderInstances calls on the bit-exact world are BYTE-EQUAL.
+    {
+        const gjk::HullRenderMesh rebuild = verdict::VerdictToRenderInstances(world);
+        if (!gjk::HullRenderMeshEqual(soup, rebuild))
+            return fail("vd6-game provenance two-calls NOT byte-equal "
+                        "(render not a pure function of the deterministic game world)");
+    }
+    std::printf("vd6-game: {bodies:%u, entities:%u, tris:%u} provenance two-calls BYTE-EQUAL\n",
+                kBodies, kEntities, kTris);
+
+    // (2) THE HEADLINE: the rendered world is the deterministic game — the stack SETTLED + the score from the
+    // collected pickups + a RunVerdictLockstep replica is VerdictStatesEqual to the rendered world (replayable).
+    const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(world.sim, world.sleep);
+    const bool settled = (sm.awakeCount == 0);
+    bool replayable = false;
+    {
+        verdict::VerdictWorld w0; verdict::EntityId p0; buildWorld(w0, p0);
+        const verdict::VerdictSnapshot w0Snap = verdict::SnapshotWorld(w0);
+        verdict::VerdictParams params{kHazard, player, kCollectR, kCfg, w0.sim.hulls};
+        const verdict::VerdictSnapshot authority =
+            verdict::RunVerdictLockstep(w0Snap, params, kStream, kTicks);
+        verdict::VerdictWorld replica = verdict::ClonePeer(authority, params);
+        replayable = verdict::VerdictStatesEqual(world, replica);
+    }
+    if (!settled || !replayable)
+        return fail("vd6-game NOT the settled+replayable deterministic game");
+    std::printf("vd6-game: {settled:true, score:%d, replayable:true}\n", score);
+
+    // (3) WORLD-UNMUTATED: the render call is a PURE READ — the integer world is byte-identical before vs after.
+    {
+        verdict::VerdictWorld before; verdict::EntityId pb; buildWorld(before, pb);
+        verdict::StepWorldN(before, kStream, 0u, kHazard, pb, kCollectR, kCfg, kTicks);
+        if (!verdict::VerdictStatesEqual(before, world))
+            return fail("vd6-game world MUTATED by render (statesEqual:false)");
+    }
+    std::printf("vd6-game: world byte-unmutated by render (statesEqual:true)\n");
+
+    // (4) DETERMINISM: a SECOND frame is BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd render)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("vd6-game two runs DIFFER (nondeterministic)");
+    std::printf("vd6-game determinism: two runs BYTE-IDENTICAL\n");
+
+    // SHADED: the scene actually rendered (a non-trivial non-black pixel count).
+    uint32_t shaded = 0;
+    for (size_t p = 0; p + 3 < bgra.size(); p += 4)
+        if ((int)bgra[p] + (int)bgra[p + 1] + (int)bgra[p + 2] > 60) ++shaded;
+    std::printf("vd6-game shaded: {nonBlackPixels:%u}\n", shaded);
+    const uint32_t kShadedFloor = 5000u;
+    if (shaded < kShadedFloor) return fail("vd6-game shaded below floor (blank/scrambled frame)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("vd6-game uniform image (no coherent scene)");
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — deterministic playable game lit 3D render "
+                "(%u bodies, %u entities, %u tris, score %d — a player among settling polyhedra)\n",
+                outPath, cw, ch, kBodies, kEntities, kTris, score);
+    return 0;
+}
+
 // ===== Slice MF6 — Hull Narrowphase Hardening THE LIT 3D RENDER CAPSTONE (--mf6-render) =====
 // The money-shot COMPLETING FLAGSHIP #25 (DETERMINISTIC HULL NARROWPHASE HARDENING, hf::sim::manifold — the
 // BP6/GJ6/CD6/CX6/FR6/FC6/PS6 render-capstone twin). Mirrors the Vulkan --mf6-render-shot path EXACTLY: builds a
@@ -58040,6 +58372,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--wh6-render") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_wh6_render.png";
             try { return RunWh6RenderShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vd6-game <out.png>: render the Deterministic Gameplay / Netcode THE PLAYABLE LIT 3D CAPSTONE showcase
+        // (Slice VD6, the MONEY-SHOT COMPLETING FLAGSHIP #27 — the FINAL slice). Builds the SAME playable arena (a
+        // dynamic hull stack on a static support box + a player entity bound to a dynamic hull body + pickup
+        // entities) as the Vulkan --vd6-game-shot, runs the deterministic game (verdict::StepWorldN — the player
+        // is nudged + collects a pickup, the stack settles; the integer world is byte-identical by construction),
+        // turns it into a FLOAT world-space TRIANGLE SOUP via verdict::VerdictToRenderInstances (the frozen
+        // gjk::HullToRenderInstances for the sim bodies + a marker-cube overlay per gameplay entity), and renders
+        // it LIT 3D as ONE non-instanced mesh through the EXISTING lit pipeline (NO new shader/RHI), MATTE
+        // (roughness 1.0) to dodge the iridescence trap. FLOAT visresolve-bar: Metal==Metal-golden DIFF 0.0000
+        // (two-run) + provenance + settled+replayable + world-unmutated. New golden tests/golden/metal/vd6_game.png.
+        if (argc > 1 && std::strcmp(argv[1], "--vd6-game") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vd6_game.png";
+            try { return RunVd6GameShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --mf1-faces <out.png>: render the Hull Narrowphase Hardening HULL FACE TOPOLOGY showcase (Slice MF1,
