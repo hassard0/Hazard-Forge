@@ -588,6 +588,14 @@ hf_gen_msl(warmhull_key.comp        warmhull_key.comp.hlsl        comp warmhull_
 # — the Metal --hf2-warm showcase runs the CPU hullfric::StepHullFrictionSolveOnly (byte-identical to the Vulkan
 # GPU result by construction, the warmhull_warm.comp convention), while the Vulkan --hf2-warm-shot carries the
 # GPU==CPU memcmp proof.
+# Hull Friction + Joints Slice 3 (Slice HF3, the friction-locked WORLD STEP of FLAGSHIP #30): hullfric_step.comp is
+# THE FRICTION-LOCKED HULL WORLD STEP — it runs the full per-tick warmhull 5-pass tick (integrate -> FULL inertia ->
+# all-pairs broadphase building the HF1 friction manifold -> the HF2 warm cone solve -> position de-pen ->
+# orientation) with the friction cache persisted across ticks. The whole chain (GJK/EPA + SH clip + full inertia +
+# the cone solve) is int64, so hullfric_step.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is
+# DELIBERATELY NOT MSL-gen'd here (NO hf_gen_msl line) — the Metal --hf3-step showcase runs the CPU
+# hullfric::StepWarmFrictionHullWorldN (byte-identical to the Vulkan GPU result by construction, the
+# warmhull_sleep.comp convention), while the Vulkan --hf3-step-shot carries the GPU==CPU memcmp proof.
 # Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the BODY->FLUID
 # grid-hash QUERY (the GR2 grain_neighbor twin, per BODY instead of per grain) OVER the reused FL2 fluid cell
 # table (fluid_cell_{count,scan,emit} above build the cellStart/cellParticles the query iterates — no new

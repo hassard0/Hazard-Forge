@@ -1629,6 +1629,21 @@ hf_compile_shaders(
     # CPU reference. NO new RHI; hullfric.h is APPEND-only (HF1 byte-frozen); warmhull.h/gjk.h/fric.h/persist.h/
     # manifold.h + existing shaders + goldens UNTOUCHED.
     "shaders/hullfric_warm.comp.hlsl:cs"
+    # Hull Friction + Joints Slice 3 (Slice HF3): hullfric_step.comp is THE FRICTION-LOCKED HULL WORLD STEP — ONE
+    # THREAD ([numthreads(1,1,1)]) runs the WHOLE hullfric.h::StepWarmFrictionHullWorldN over the small scene: K
+    # ticks of the warmhull 5-pass tick — predict-integrate every dynamic body + damping -> FULL world inverse
+    # inertia per body -> all-pairs i<j broadphase (build the HF1 friction manifold: the keyed hull manifold + the
+    # per-pair tangent basis on the EPA normal + the basis-axis flip field), MatchHullFrictionCache (key + basisAxis)
+    # warm-seed, cfg.solveIters sweeps of SolveHullFrictionWarm (the normal-only solve SWAPPED for the cone solver),
+    # rewrite the persistent FRICTION cache -> position de-penetration along the A->B normal -> orientation (already
+    # in integrate). CHUNKED 1 tick / dispatch (the Windows ~2s TDR rule) over the SAME body + cache buffers. The
+    # whole chain (GJK/EPA + SH clip + full inertia + the cone solve) is int64, so this shader is VULKAN-SPIR-V-ONLY
+    # (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --hf3-step runs the CPU
+    # hullfric::StepWarmFrictionHullWorldN instead (byte-identical by construction, the warmhull_sleep.comp
+    # convention). The GPU final gBodies + gCache memcmp-equals the CPU reference. NO new RHI; hullfric.h is
+    # APPEND-only (HF1+HF2 byte-frozen); warmhull.h/gjk.h/fric.h/persist.h/manifold.h + existing shaders + goldens
+    # UNTOUCHED.
+    "shaders/hullfric_step.comp.hlsl:cs"
     # Warm-Started Hull Contacts Slice 3 (Slice WH3): warmhull_warm.comp is THE ACCUMULATED WARM-STARTED SOLVER
     # — ONE THREAD ([numthreads(1,1,1)]) runs the WHOLE warmhull.h::StepWarmHullWorldN over the small hull set:
     # K ticks of predict-integrate -> FULL inertia -> build-keyed-manifold (the WH1 tagged-clip key derivation

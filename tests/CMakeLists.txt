@@ -897,6 +897,16 @@ hf_add_pure_test(hullfric_test)
 # (hf_core), ASan-eligible.
 hf_add_pure_test(hullfric_warm_test)
 
+# Hull Friction + Joints Slice 3 (Slice HF3, the friction-locked WORLD STEP of FLAGSHIP #30: hf::sim::hullfric): the
+# full per-tick friction-locked hull world step (engine/sim/hullfric.h APPEND) the GPU shaders/hullfric_step.comp
+# copies VERBATIM — the warmhull::StepWarmHullWorld 5-pass tick (integrate -> all-pairs broadphase -> warm cone
+# solve -> position de-pen -> orientation) with the HF2 SolveHullFrictionWarm swapped in + the per-pair tangent basis
+# rebuilt each tick + the friction cache persisted across ticks. Pins StepWarmFrictionHullWorldN two-run determinism,
+# the gripped-on-ramp delta (mu>0 the hull rests, mu=0 it slides off — the falsifiable friction proof), the resting
+# contact's tangent impulse within the cone, the de-pen keeping the hull above the ramp (no sink-through), and the
+# cache persisting/warm-starting. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(hullfric_step_test)
+
 # Deterministic Gameplay / Netcode Slice 1 (Slice VD1, the BEACHHEAD of FLAGSHIP #27: hf::game::verdict): the
 # PURE-CPU integer entity world + the unified tick-ordered input-command bus that layers a determinism contract
 # over the raw ecs::Registry (engine/game/verdict.h, a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h

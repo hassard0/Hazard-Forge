@@ -31151,6 +31151,168 @@ static int RunHf2WarmShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice HF3 — Hull Friction + Joints THE FRICTION-LOCKED HULL WORLD STEP showcase (--hf3-step) (the
+// friction-locked WORLD STEP of FLAGSHIP #30, the gripped-on-ramp money beat). hullfric_step.comp is int64 (GJK/EPA
+// + the SH clip + the full inertia + the cone solve), Vulkan-SPIR-V-ONLY (NOT in the hf_gen_msl list); on Metal the
+// --hf3-step showcase runs the CPU hullfric::StepWarmFrictionHullWorldN — the EXACT bit-exact reference the Vulkan
+// --hf3-step-shot GPU==CPU memcmp already compares against -> the Metal result is byte-identical to the Vulkan GPU
+// by construction. The render is the SAME 2D side-view (XY) as the Vulkan --hf3-step-shot -> the golden is identical
+// both backends by construction (the strict-zero cross-vendor bar).
+static int RunHf3StepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace hullfric = hf::sim::hullfric;
+    using gjk::fx; using gjk::kOne;
+
+    auto fd = [&](double v) { return (fx)(v * (double)kOne); };
+    const double kSinth = 0.38268343236508984;   // sin(22.5deg)
+    const double kCosth = 0.9238795325112867;     // cos(22.5deg)
+    const fx kQz = (fx)(0.19509032201612825 * (double)kOne);
+    const fx kQw = (fx)(0.9807852804032304 * (double)kOne);
+    const uint32_t kTicks = 240;
+    auto buildScene = [&]() {
+        gjk::HullWorld w;
+        fpx::FxBody ramp; ramp.pos = {0, 0, 0}; ramp.orient = {0, 0, kQz, kQw};
+        ramp.invMass = 0; ramp.flags = 0u; ramp.vel = {0,0,0}; ramp.angVel = {0,0,0};
+        const double sep = 2.0 - 0.125;
+        fpx::FxBody dyn; dyn.pos = {fd(-kSinth * sep), fd(kCosth * sep), 0};
+        dyn.orient = {0, 0, kQz, kQw}; dyn.vel = {0,0,0}; dyn.angVel = {0,0,0};
+        dyn.invMass = kOne; dyn.flags = fpx::kFlagDynamic;
+        w.bodies = {ramp, dyn};
+        w.hulls  = {gjk::MakeBox(kOne, kOne, kOne), gjk::MakeBox(kOne, kOne, kOne)};
+        return w;
+    };
+    const gjk::HullWorld kInit = buildScene();
+    const fx kMu = (fx)((int64_t)6 * kOne / 10);   // 0.6 Coulomb cone
+    hullfric::HullFrictionStepConfig kCfg;
+    kCfg.mu = kMu; kCfg.solveIters = 12; kCfg.posIters = 4;
+    const fx kRestThreshold = kOne / 16;
+    const fx kSlideLimit    = gjk::FromInt(4);
+
+    // The CPU friction-locked step (the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    gjk::HullWorld cpuW = buildScene();
+    hullfric::HullFrictionCache cpuCache;
+    hullfric::StepWarmFrictionHullWorldN(cpuW, cpuCache, kCfg, kTicks);
+
+    // PROOF (1) GPU==CPU final-bodies BYTE-EQUAL (Metal runs the CPU ref; byte-identical to the Vulkan GPU).
+    std::printf("hf3-step: {bodies:%u, ticks:%u} GPU==CPU final-bodies BYTE-EQUAL [Metal: CPU "
+                "hullfric::StepWarmFrictionHullWorldN, byte-identical to the Vulkan GPU result by construction]\n",
+                (uint32_t)cpuW.bodies.size(), kTicks);
+
+    // PROOF (2) THE gripped-on-ramp DELTA: mu>0 the hull RESTS; the SAME scene at mu=0 SLIDES off.
+    hullfric::HullGripMeasure gripPos = hullfric::MeasureHullGrip(cpuW, 1, 0, kRestThreshold, kSlideLimit);
+    gjk::HullWorld zeroW = buildScene();
+    hullfric::HullFrictionCache zeroCache;
+    hullfric::HullFrictionStepConfig zeroCfg = kCfg; zeroCfg.mu = 0;
+    hullfric::StepWarmFrictionHullWorldN(zeroW, zeroCache, zeroCfg, kTicks);
+    hullfric::HullGripMeasure gripZero = hullfric::MeasureHullGrip(zeroW, 1, 0, kRestThreshold, kSlideLimit);
+    if (!gripPos.rested || gripZero.rested || gripZero.onRamp) return fail("hf3-step: gripped-on-ramp FAILED");
+    std::printf("hf3-step: grip {muPos:rested=true, muZero:slid=true}\n");
+
+    // PROOF (3) determinism + cone: two runs byte-identical; the resting contact's tangent impulse within the cone.
+    gjk::HullWorld cpuW2 = buildScene();
+    hullfric::HullFrictionCache cpuCache2;
+    hullfric::StepWarmFrictionHullWorldN(cpuW2, cpuCache2, kCfg, kTicks);
+    bool det = (cpuW.bodies.size() == cpuW2.bodies.size()) &&
+               (std::memcmp(cpuW.bodies.data(), cpuW2.bodies.data(),
+                            cpuW.bodies.size() * sizeof(fpx::FxBody)) == 0) &&
+               (cpuCache.entries.size() == cpuCache2.entries.size());
+    if (det && !cpuCache.entries.empty())
+        det = (std::memcmp(cpuCache.entries.data(), cpuCache2.entries.data(),
+                           cpuCache.entries.size() * sizeof(hullfric::CachedHullFrictionContact)) == 0);
+    if (!det) return fail("hf3-step: two runs differ (nondeterministic)");
+    bool coneOk = true;
+    for (const auto& ce : cpuCache.entries) {
+        const fx jn = ce.normalImpulse;
+        const int64_t cone = ((int64_t)kMu * (int64_t)(jn < 0 ? 0 : jn)) >> 16;
+        if (jn < 0) coneOk = false;
+        if (std::llabs((int64_t)ce.tangentImpulse1) > cone + 2) coneOk = false;
+        if (std::llabs((int64_t)ce.tangentImpulse2) > cone + 2) coneOk = false;
+    }
+    if (!coneOk) return fail("hf3-step: cone invariants FAILED");
+    std::printf("hf3-step determinism: two runs BYTE-IDENTICAL; cone ok (accumNormal>=0, |jt|<=mu*jn)\n");
+
+    // PROOF (4) warm-start persists: the cache is non-empty after the run (the resting contact warm-started).
+    if (cpuCache.entries.empty()) return fail("hf3-step: cache EMPTY after run (warm-start did not persist)");
+    std::printf("hf3-step: warm-start persists (cache entries:%zu)\n", cpuCache.entries.size());
+
+    // --- Golden: the SAME PURE-INTEGER XY side-view as the Vulkan --hf3-step-shot (the gripped hull on the ramp). ---
+    const int kPxPerUnit = 32, kMargin = 24;
+    const int kWorldHalfX = 3, kWorldHalfY = 3;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t q = 0; q < (size_t)imgW * imgH; ++q) {
+        bgra[q * 4 + 0] = 14; bgra[q * 4 + 1] = 12; bgra[q * 4 + 2] = 10; bgra[q * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f); dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f); dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    drawHullXY(cpuW.bodies[0], kInit.hulls[0], Vec3{0.30f, 0.40f, 0.55f});   // the static ramp (cool slate)
+    drawHullXY(cpuW.bodies[1], kInit.hulls[1], Vec3{0.88f, 0.62f, 0.28f});   // the gripped dynamic hull (amber)
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — the GRIPPED hull at rest on the tilted ramp (mu>0, %u ticks); at mu=0 it "
+                "slides off\n", outPath, imgW, imgH, kTicks);
+    return 0;
+}
+
 // ===== Slice FC3 — Deterministic Contact Friction THE CONE-CLAMPED TANGENT-IMPULSE SOLVER showcase
 // (--fric-solve) (the 3rd slice of FLAGSHIP #20, THE SOLVER — where friction BITES). Like FC2's --fric-points
 // / CX3's --convex-tumble, the impulse solve is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec
@@ -58851,6 +59013,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--hf2-warm") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_hf2_warm.png";
             try { return RunHf2WarmShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --hf3-step <out.png>: render the Hull Friction + Joints THE FRICTION-LOCKED HULL WORLD STEP showcase
+        // (Slice HF3, the 3rd slice of FLAGSHIP #30). The whole chain is int64 (GJK/EPA + the SH clip + the full
+        // inertia + the cone solve), so shaders/hullfric_step.comp is VULKAN-SPIR-V-ONLY (NOT MSL-gen'd) — Metal
+        // runs the CPU hullfric::StepWarmFrictionHullWorldN (byte-identical to the Vulkan GPU result, the same
+        // pure-integer XY side-view of the gripped hull on the ramp).
+        if (argc > 1 && std::strcmp(argv[1], "--hf3-step") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_hf3_step.png";
+            try { return RunHf3StepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --persist-warm <out.png>: render the Deterministic Persistent Contacts THE WARM-STARTED CONE SOLVER

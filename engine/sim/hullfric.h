@@ -502,5 +502,164 @@ inline std::vector<HullFrictionManifold> StepHullFrictionSolveOnly(
     return solved;
 }
 
+// ============================================================================================================
+// ===== Slice HF3 — THE FRICTION-LOCKED HULL WORLD STEP (APPEND; HF1+HF2 above is BYTE-FROZEN) ================
+// ============================================================================================================
+// HF2 solved a FIXED manifold set in isolation (no integrate / no de-pen). HF3 assembles the FULL per-tick
+// WORLD STEP: the warmhull::StepWarmHullWorld 5-pass tick (predict-integrate -> all-pairs broadphase -> warm
+// solve -> position de-penetration -> orientation) with the normal-only SolveHullManifoldWarm SWAPPED for the
+// HF2 SolveHullFrictionWarm (the cone solver) + the per-pair tangent basis built each tick (HF1
+// BuildHullFrictionManifold) + mu threaded + the friction cache PERSISTED across ticks (MatchHullFrictionCache
+// warm-seeds each tick, UpdateHullFrictionCache rewrites it). The de-pen + integrate passes are the WH3 passes
+// VERBATIM. The money beat: a hull released on a tilted static hull GRIPS and rests at mu>0, but SLIDES off at
+// mu=0 — friction is the thing holding it. STRICT INTEGER, FIXED order -> bit-exact CPU<->Vulkan<->Metal.
+//
+// THE int64 REALITY (the HF1/HF2 lesson): the whole chain is int64 (GJK/EPA + the SH clip + the full inertia +
+// the cone solve + the FxLength). DXC -spirv compiles int64; glslc CANNOT, so shaders/hullfric_step.comp is
+// VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl), single-thread over the small scene copying StepWarmFrictionHullWorldN
+// VERBATIM, chunked 1 tick/dispatch (the Windows ~2s TDR rule). The Metal --hf3-step runs the CPU
+// StepWarmFrictionHullWorldN (byte-identical by construction), while the Vulkan side carries the GPU==CPU memcmp.
+
+// Pull the de-pen helper (REUSE, do NOT redefine).
+using manifold::HullContactMulti;
+
+// ----- HullFrictionStepConfig: the full-step knobs (HF2's HullFrictionConfig is byte-frozen — a NEW struct) ---
+// mu = the Coulomb cone coefficient (0 = frictionless control); gravity = the per-tick acceleration; dt = the
+// tick; solveIters = the warm cone-solver Gauss-Seidel sweeps (== HullFrictionConfig.iters); posIters = the
+// position de-pen sweeps; restitution = the normal bounce; slop/beta = the de-pen knobs; linDamp/angDamp =
+// the per-tick velocity RETAIN factors (kOne == no damping). The WH3 ConvexStepConfig shape + mu, repackaged.
+struct HullFrictionStepConfig {
+    fx       mu          = 0;                              // Q16.16 Coulomb friction coefficient (0 = frictionless)
+    FxVec3   gravity     = FxVec3{0, -(fx)((int64_t)98 * kOne / 10), 0};   // -9.8 host-snapped
+    fx       dt          = kOne / 60;
+    uint32_t solveIters  = 8;                              // warm cone-solver sweeps
+    uint32_t posIters    = 4;                              // position de-pen sweeps
+    fx       restitution = 0;
+    fx       slop        = kOne / 64;                      // allowed penetration before pushing apart
+    fx       beta        = (fx)((int64_t)8 * kOne / 10);   // 0.8 position-correction fraction
+    fx       linDamp     = kOne;                           // kOne == no linear damping
+    fx       angDamp     = kOne;                           // kOne == no angular damping
+};
+
+// ----- StepWarmFrictionHullWorld(world, cache, cfg): ONE deterministic friction-locked WARM-started tick ------
+// The warmhull::StepWarmHullWorld 5-pass tick (warmhull.h:722), with step (3) the warm solve SWAPPED to the HF2
+// cone solver over the HF1 friction manifold + cache. The cache PERSISTS across ticks (carried in/out). Steps
+// (1) predict-integrate + damp, (2) FULL inertia, (4) position de-pen are the WH3 passes VERBATIM. Step (3):
+// per overlapping i<j pair in FIXED order: BuildHullFrictionManifold (re-derived from CURRENT positions, builds
+// the tangent basis this tick) -> MatchHullFrictionCache (warm-seed key+basisAxis) -> SolveHullFrictionWarm
+// (prime once + cfg.solveIters accumulated cone sweeps, IN PLACE) -> capture the converged manifolds, then
+// rewrite `cache` to EXACTLY this tick's contacts (UpdateHullFrictionCache, absent keys/basis-flips evicted).
+// PURE INTEGER, FIXED order -> identical CPU/GPU. The shader copies THIS body VERBATIM.
+inline void StepWarmFrictionHullWorld(HullWorld& world, HullFrictionCache& cache,
+                                      const HullFrictionStepConfig& cfg) {
+    const size_t n = world.bodies.size();
+
+    // (1) predict-integrate dynamic bodies + per-tick damping (== StepWarmHullWorld step 1, VERBATIM).
+    for (size_t i = 0; i < n; ++i) {
+        if (convex::IsDynamic(world.bodies[i])) {
+            fpx::IntegrateBodyFull(world.bodies[i], cfg.gravity, cfg.dt);
+            if (cfg.linDamp != kOne) world.bodies[i].vel = FxScale(world.bodies[i].vel, cfg.linDamp);
+            if (cfg.angDamp != kOne) world.bodies[i].angVel = FxScale(world.bodies[i].angVel, cfg.angDamp);
+        }
+    }
+
+    // (2) world inverse inertias once/tick — the FULL tensor (== StepWarmHullWorld step 2, VERBATIM).
+    std::vector<FxMat3> invIW(n);
+    for (size_t i = 0; i < n; ++i) {
+        const FxHullFaces faces = BuildCanonicalFaces(world.hulls[i]);
+        const FxMat3 invIbody = FxHullInertiaBodyFull(world.hulls[i], faces, world.bodies[i].invMass);
+        invIW[i] = WorldInvInertiaFull(world.bodies[i], invIbody);
+    }
+
+    // (3 — THE SWAP) the warm cone solve over the persistent friction cache, FIXED i<j order, IN PLACE. The HF2
+    // config the cone solver reads (mu/restitution/solveIters) carried from the step config.
+    HullFrictionConfig solveCfg;
+    solveCfg.mu          = cfg.mu;
+    solveCfg.restitution = cfg.restitution;
+    solveCfg.iters       = cfg.solveIters;
+    std::vector<HullFrictionManifold> solved;
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = i + 1; j < n; ++j) {
+            if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;   // static-static
+            HullFrictionManifold m = BuildHullFrictionManifold(
+                (uint32_t)i, world.bodies[i], world.hulls[i],
+                (uint32_t)j, world.bodies[j], world.hulls[j]);
+            if (m.count == 0) continue;
+            MatchHullFrictionCache(cache, m);   // warm-seed the accumulators from last tick (key + basis-axis)
+            SolveHullFrictionWarm(world.bodies[i], world.bodies[j], m, invIW[i], invIW[j], solveCfg);
+            solved.push_back(m);
+        }
+    }
+
+    // (5a) Rewrite the cache to EXACTLY this tick's solved contacts (absent keys/basis-flips evicted) — the
+    // accumulators persist (the warm-start that compounds for a resting contact).
+    cache.entries.clear();
+    for (const HullFrictionManifold& m : solved) UpdateHullFrictionCache(cache, m);
+
+    // (4) position de-penetration (== StepWarmHullWorld step 4, VERBATIM — re-derives HullContactMulti).
+    for (uint32_t pit = 0; pit < cfg.posIters; ++pit) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                const fx invSum = world.bodies[i].invMass + world.bodies[j].invMass;
+                if (invSum == 0) continue;
+                const convex::ContactManifold m = HullContactMulti(world.bodies[i], world.hulls[i],
+                                                                   world.bodies[j], world.hulls[j]);
+                if (m.count == 0) continue;
+                FxVec3 nrm = m.normal;
+                if (FxDot(nrm, FxSub(world.bodies[j].pos, world.bodies[i].pos)) < 0)
+                    nrm = FxVec3{-nrm.x, -nrm.y, -nrm.z};
+                const fx excess = m.depths[0] - cfg.slop;
+                if (excess <= 0) continue;
+                const fx corrected = fxmul(excess, cfg.beta);
+                const fx wi = fxdiv(world.bodies[i].invMass, invSum);
+                const fx wj = kOne - wi;
+                const FxVec3 ci = FxScale(nrm, fxmul(corrected, wi));
+                const FxVec3 cj = FxScale(nrm, fxmul(corrected, wj));
+                world.bodies[i].pos = FxSub(world.bodies[i].pos, ci);
+                world.bodies[j].pos = FxAdd(world.bodies[j].pos, cj);
+            }
+        }
+    }
+    // (5) orientation was already integrated in step (1).
+}
+
+// ----- StepWarmFrictionHullWorldN(world, cache, cfg, ticks): run `ticks` friction-locked steps ----------------
+// The cache carries the accumulated friction impulses ACROSS ticks (the warm-start that locks a resting grip).
+// Mirrors the chunked 1-tick/dispatch the GPU does (TDR-safe) — bit-identical to one big run by construction.
+inline void StepWarmFrictionHullWorldN(HullWorld& world, HullFrictionCache& cache,
+                                       const HullFrictionStepConfig& cfg, uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t) StepWarmFrictionHullWorld(world, cache, cfg);
+}
+
+// ----- HullGripMeasure: is the dynamic hull at REST on the ramp (the gripped-on-ramp proof) ------------------
+// speed   = the dynamic body's max |vel|+|angVel| component magnitude (FxLength of vel + angVel — the rest
+// metric); onRamp = the dynamic body is still ABOVE/ON the ramp (its world position has NOT slid past the ramp
+// extent along the slide axis); rested = (speed below restThreshold AND onRamp) — the body GRIPPED. A SLID hull
+// reads onRamp=false (it left the ramp footprint) and/or a non-zero speed (it kept sliding). Pure integer,
+// fixed order -> deterministic.
+struct HullGripMeasure {
+    fx   speed     = 0;       // FxLength(vel) + FxLength(angVel) of the dynamic body
+    bool onRamp    = false;   // still within the ramp footprint along the slide axis
+    bool rested    = false;   // speed below threshold AND onRamp (the GRIP)
+};
+
+// MeasureHullGrip(world, dynIdx, rampIdx, restThreshold, slideLimit): evaluate the grip of body `dynIdx` resting
+// on the ramp body `rampIdx`. The body is ON the ramp if |dynPos - rampPos| along x AND z stays within
+// slideLimit (a slid body translates far past the ramp footprint along the downhill axis). Read-only, integer.
+inline HullGripMeasure MeasureHullGrip(const HullWorld& world, uint32_t dynIdx, uint32_t rampIdx,
+                                       fx restThreshold, fx slideLimit) {
+    HullGripMeasure g;
+    if (dynIdx >= world.bodies.size() || rampIdx >= world.bodies.size()) return g;
+    const FxBody& dyn  = world.bodies[dynIdx];
+    const FxBody& ramp = world.bodies[rampIdx];
+    g.speed = fpx::FxLength(dyn.vel) + fpx::FxLength(dyn.angVel);
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+    const fx dx = absfx(dyn.pos.x - ramp.pos.x);
+    const fx dz = absfx(dyn.pos.z - ramp.pos.z);
+    g.onRamp = (dx <= slideLimit) && (dz <= slideLimit);
+    g.rested = (g.speed <= restThreshold) && g.onRamp;
+    return g;
+}
+
 }  // namespace hullfric
 }  // namespace hf::sim
