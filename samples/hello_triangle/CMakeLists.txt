@@ -547,6 +547,16 @@ hf_compile_shaders(
     # can't lower to MSL) -> NOT in the Metal hf_gen_msl list; on Metal --rt4-reflect runs the CPU
     # rtrace::RenderSceneReflected (byte-identical by construction). The Vulkan side carries the HW==CPU memcmp.
     "shaders/rt_reflect.comp.hlsl:csrq"
+    # Hardware Ray Tracing Slice 6 (Slice RT6, FLAGSHIP #28, the MONEY-SHOT CAPSTONE): rt_hero.comp is the LIT
+    # HERO kernel — it COPIES the rt_reflect.comp body VERBATIM (primary closest-hit + primary shadow + the
+    # one-bounce reflection + reflected shadow + the integer blend) with the ONE change that every MISS color
+    # (the primary miss AND the reflection-ray miss) is the integer SkyGradient(missDir) (a graded
+    # horizon->zenith sky) instead of the flat background — the EXACT integer lerp of rtrace.h::SkyGradient, so
+    # the HW hero image is bit-identical to the CPU rtrace::RenderSceneHero. The :csrq stage compiles it
+    # cs_6_5 + SPV_KHR_ray_query (HLSL RayQuery -> DXC SPIR-V RayQueryKHR). It is VULKAN-SPIR-V-ONLY (RayQuery +
+    # int64 -> glslc/spirv-cross can't lower to MSL) -> NOT in the Metal hf_gen_msl list; on Metal --rt6-hero
+    # runs the CPU rtrace::RenderSceneHero (byte-identical by construction). The Vulkan side carries HW==CPU.
+    "shaders/rt_hero.comp.hlsl:csrq"
     # Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: deterministic GPU crowds —
     # boids + steering + path-following): boids_steer.comp runs the Q16.16 Reynolds STEERING tick — ONE thread
     # per AGENT reads the FROZEN input buffer (gAgentsIn), computes SteerSeek (proportional pull toward the

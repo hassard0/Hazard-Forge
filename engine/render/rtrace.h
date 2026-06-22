@@ -581,4 +581,117 @@ inline uint32_t RenderSceneReflected(const RtScene& scene, const RtCamera& cam, 
     return reflective;
 }
 
+// ===== Slice RT6 — THE LIT HERO CAPSTONE (APPEND-ONLY; RT1's + RT3's + RT4's code above is BYTE-FROZEN) =
+// The flagship money-shot: the FULL RT feature set (primary + RT3 hard shadows + RT4 mirror reflections +
+// the mirror sphere) under a GRADED SKY, all STRICT INTEGER so the capstone stays byte-identical HW==CPU
+// and strict-zero cross-vendor. RT6 adds ONE piece of visual polish — a vertical sky gradient — as a pure
+// INTEGER function of the ray direction (SkyGradient), and renders a curated higher-res hero scene. The
+// ONLY change vs RT4 is the MISS color: a flat scene.background becomes SkyGradient(missRayDir) for BOTH
+// the primary miss AND the reflection-ray miss. NO float on the bit-exact path. The GPU twin
+// shaders/rt_hero.comp copies the SkyGradient math VERBATIM so the HW readback is bit-identical (memcmp).
+
+// The two PINNED sky endpoint colors (RGBA8 channels), shared by SkyGradient + rt_hero.comp. The horizon is
+// a warm grey-violet; the zenith is the RT2 background deep blue (34,40,56) — so a miss ray pointing UP
+// (n.y -> +kOne) yields the deep-blue zenith and a ray pointing DOWN/level (n.y -> -kOne) yields the warm
+// horizon. Per-channel integer lerp; pure integer, deterministic.
+inline constexpr int kRtSkyHorizonR = 120, kRtSkyHorizonG = 110, kRtSkyHorizonB = 140;  // warm horizon
+inline constexpr int kRtSkyZenithR  =  34, kRtSkyZenithG  =  40, kRtSkyZenithB  =  56;  // cool zenith
+
+// SkyGradient — the integer horizon->zenith background by ray direction. RtNormalize(dir) (pure integer),
+// then t = (n.y + kOne)/2 clamped to [0,kOne] (Q16.16 in [0,1]; t=0 at straight DOWN, t=1 at straight UP).
+// Each channel = horizon + ((zenith - horizon) * t) >> kFrac (the lerp on plain 0..255 ints; t Q16.16).
+// Returns RGBA8 (opaque). Deterministic, NO float. Pinned EXACTLY so rt_hero.comp matches byte-for-byte.
+inline uint32_t SkyGradient(const FxVec3& dir) {
+    FxVec3 n = RtNormalize(dir);
+    fx t = (n.y + kOne) / 2;                 // [-kOne,kOne] -> [0,kOne]
+    if (t < 0) t = 0;
+    if (t > kOne) t = kOne;
+    auto lerp = [&](int horizon, int zenith) -> int32_t {
+        // c = horizon + (zenith - horizon) * t  (horizon/zenith plain 0..255; t Q16.16; >>kFrac requant).
+        int64_t mix = (int64_t)horizon * (int64_t)kOne + (int64_t)(zenith - horizon) * (int64_t)t;
+        return (int32_t)(mix >> kFrac);
+    };
+    return PackRGBA8(lerp(kRtSkyHorizonR, kRtSkyZenithR),
+                     lerp(kRtSkyHorizonG, kRtSkyZenithG),
+                     lerp(kRtSkyHorizonB, kRtSkyZenithB), 255);
+}
+
+// The RT6 render counts (for the proof lines): the number of SHADOWED primary pixels + the number of
+// REFLECTIVE primary pixels.
+struct RtHeroCounts {
+    uint32_t shadowed   = 0;
+    uint32_t reflective = 0;
+};
+
+// RenderSceneHero — IDENTICAL to RenderSceneReflected EXCEPT every miss color (the primary miss AND the
+// reflection-ray miss) is computed as SkyGradient(thatRayDir) instead of scene.background. ShadeHitShadowed
+// is NOT modified (it reads scene.background only on a MISS — and RenderSceneHero substitutes the sky at the
+// call site BEFORE calling it for a real hit, and computes the miss color explicitly when there is no hit).
+// Concretely: if the primary hit is a MISS -> out = SkyGradient(primaryDir); for the reflected color, if the
+// reflection ray MISSES -> cR = SkyGradient(reflDir). All else (the RT3 shadowed shade, the RT4 integer
+// reflectivity blend) is reused VERBATIM. Returns {shadowed, reflective} counts. The GPU twin
+// shaders/rt_hero.comp copies this VERBATIM (one thread per pixel) -> bit-identical HW readback, memcmp.
+// PURE INTEGER, deterministic, cross-backend exact.
+inline RtHeroCounts RenderSceneHero(const RtScene& scene, const RtCamera& cam, uint32_t width,
+                                    uint32_t height, std::span<uint32_t> outRGBA8) {
+    RtHeroCounts counts;
+    for (uint32_t py = 0; py < height; ++py) {
+        for (uint32_t px = 0; px < width; ++px) {
+            RtRay primaryRay = PrimaryRay(cam, px, py, width, height);
+            RtHit hit = TraceClosest(primaryRay, scene);
+
+            // ===== PRIMARY MISS -> the graded sky (SkyGradient of the primary dir) =====
+            if (hit.primIndex == kRtMiss) {
+                outRGBA8[(size_t)py * width + px] = SkyGradient(primaryRay.dir);
+                continue;
+            }
+
+            // The primary RT3 shadowed color cS (the matte+shadowed shade — identical to RenderSceneReflected).
+            RtRay shadowRay;
+            shadowRay.origin = FxAdd(hit.pos, FxScale(hit.normal, kRtShadowEps));
+            shadowRay.dir = scene.lightDir;
+            bool occluded = TraceAnyHit(shadowRay, scene, kRtShadowMinT);
+            if (occluded) ++counts.shadowed;
+            uint32_t cS = ShadeHitShadowed(hit, scene, occluded);
+
+            uint32_t out = cS;
+            fx refl = ReflectivityFor(hit.primIndex);
+            if (refl > 0) {
+                ++counts.reflective;
+                // The reflection ray: origin offset along the normal (anti-acne), dir = the mirror reflect
+                // of the primary ray dir about the surface normal.
+                RtRay reflRay;
+                reflRay.origin = FxAdd(hit.pos, FxScale(hit.normal, kRtReflEps));
+                reflRay.dir = FxReflect(primaryRay.dir, hit.normal);
+                RtHit rHit = TraceClosest(reflRay, scene);
+
+                // The reflected color cR: the GRADED SKY (SkyGradient of the reflection dir) on a MISS, else
+                // the RT3 shadowed shade of the reflected hit (its OWN shadow ray — one bounce).
+                uint32_t cR;
+                if (rHit.primIndex == kRtMiss) {
+                    cR = SkyGradient(reflRay.dir);
+                } else {
+                    RtRay reflShadowRay;
+                    reflShadowRay.origin = FxAdd(rHit.pos, FxScale(rHit.normal, kRtShadowEps));
+                    reflShadowRay.dir = scene.lightDir;
+                    bool rOccluded = TraceAnyHit(reflShadowRay, scene, kRtShadowMinT);
+                    cR = ShadeHitShadowed(rHit, scene, rOccluded);
+                }
+
+                // The per-channel integer blend on the UNPACKED 0..255 RGBA8 channels (VERBATIM RT4).
+                auto chOf = [](uint32_t c, int i) -> int32_t { return (int32_t)((c >> (8 * i)) & 0xFF); };
+                auto blend = [&](int i) -> int32_t {
+                    int32_t s = chOf(cS, i);
+                    int32_t r = chOf(cR, i);
+                    int64_t mix = (int64_t)s * (int64_t)(kOne - refl) + (int64_t)r * (int64_t)refl;
+                    return (int32_t)(mix >> kFrac);
+                };
+                out = PackRGBA8(blend(0), blend(1), blend(2), 255);
+            }
+            outRGBA8[(size_t)py * width + px] = out;
+        }
+    }
+    return counts;
+}
+
 }  // namespace hf::render::rtrace

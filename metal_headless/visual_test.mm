@@ -18373,6 +18373,118 @@ static int RunRt4ReflectShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice RT6 — Hardware Ray Tracing THE LIT HERO CAPSTONE showcase (--rt6-hero) (FLAGSHIP #28, the
+// MONEY-SHOT). The Vulkan --rt6-hero-shot wires REAL HW inline ray query over a curated hero scene at
+// 480x360 (the full RT feature set — primary + hard shadows + mirror reflections + the mirror sphere — under
+// a GRADED SKY) and memcmp's HW==CPU. rt_hero.comp uses HLSL RayQuery + int64 + the integer SkyGradient ->
+// Vulkan-SPIR-V-ONLY (glslc/spirv-cross can't lower to MSL), so on Metal --rt6-hero runs the CPU
+// rtrace::RenderSceneHero reference (the SAME bit-exact reference the Vulkan HW==CPU memcmp compares against)
+// -> the Metal image is byte-identical to the Vulkan HW image BY CONSTRUCTION. Builds the SAME curated hero
+// scene (a reflective ground AABB + an arc of colored spheres + the mirror sphere kRtMirrorSpherePrim + two
+// boxes) the Vulkan --rt6-hero-shot defines, renders the integer hero RGBA8 scene, writes the PNG. Because
+// every channel (sky gradient + shadows + reflection blend) is INTEGER, the rt6_hero golden is STRICT-ZERO
+// cross-vendor. New golden tests/golden/metal/rt6_hero.png (Mac-baked by the CONTROLLER).
+static int RunRt6HeroShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    using rt::fx; using rt::FxVec3; using rt::kOne; using rt::F;
+
+    const uint32_t kRtW = 480, kRtH = 360;
+
+    // The curated hero scene (the SAME primitives + camera the Vulkan --rt6-hero-shot defines; rtrace.h frozen).
+    std::vector<rt::RtSphere> spheresV;
+    std::vector<rt::RtAabb>   aabbsV;
+    uint32_t nextPrim = 0;
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(-20,1), F(-3,1), F(-20,1)},
+                                FxVec3{F(20,1),  F(-1,1), F(20,1)}, nextPrim++});
+    struct SphSpec { int cxN, cxD, czN, czD, rN, rD; };
+    const SphSpec arc[7] = {
+        { -7,2,  5,1,  1,1 },   // primIndex 1
+        { -9,4,  7,2,  3,4 },   // primIndex 2
+        { -3,2,  4,1,  1,1 },   // primIndex 3
+        {  0,1,  9,2,  5,4 },   // primIndex 4
+        {  3,2,  4,1,  1,1 },   // primIndex 5
+        {  9,4,  7,2,  1,1 },   // primIndex 6 : THE MIRROR SPHERE (kRtMirrorSpherePrim)
+        {  7,2,  5,1,  3,4 },   // primIndex 7
+    };
+    for (int i = 0; i < 7; ++i) {
+        fx cx = F(arc[i].cxN, arc[i].cxD);
+        fx cz = F(arc[i].czN, arc[i].czD);
+        fx rad = F(arc[i].rN, arc[i].rD);
+        fx cy = (fx)(F(-1,1) + rad);
+        spheresV.push_back(rt::RtSphere{FxVec3{cx, cy, cz}, rad, nextPrim++});
+    }
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(-11,1), F(-1,1), F(3,1)},
+                                FxVec3{F(-9,1),  F(2,1),  F(5,1)}, nextPrim++});
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(9,1),   F(-1,1), F(3,1)},
+                                FxVec3{F(11,1),  F(2,1),  F(5,1)}, nextPrim++});
+
+    rt::RtScene scene{};
+    scene.spheres = std::span<const rt::RtSphere>(spheresV);
+    scene.aabbs   = std::span<const rt::RtAabb>(aabbsV);
+    scene.lightDir = rt::RtNormalize(FxVec3{F(4,10), F(8,10), F(-3,10)});
+    scene.background = rt::PackRGBA8(34, 40, 56, 255);  // UNUSED in RT6 (misses use the sky gradient)
+
+    rt::RtCamera cam{};
+    cam.eye     = FxVec3{F(0,1), F(3,1), F(-11,1)};
+    cam.right   = FxVec3{kOne, 0, 0};
+    cam.up      = FxVec3{0, kOne, 0};
+    cam.forward = FxVec3{0, 0, kOne};
+    cam.halfW   = F(8, 10);
+    cam.halfH   = F(6, 10);
+
+    const size_t kPixels = (size_t)kRtW * kRtH;
+    const uint32_t kPrimCount = (uint32_t)(spheresV.size() + aabbsV.size());
+
+    // CPU hero reference (the bit-exact image the Vulkan --rt6-hero-shot proves the HW shader equal to).
+    std::vector<uint32_t> image(kPixels, 0);
+    rt::RtHeroCounts counts = rt::RenderSceneHero(scene, cam, kRtW, kRtH, std::span<uint32_t>(image));
+    std::printf("rt6-hero: {rays:%zu, prims:%u, shadowed:%u, reflective:%u} [Metal: CPU rtrace::RenderSceneHero, "
+                "byte-identical to the Vulkan HW result by construction]\n",
+                kPixels, kPrimCount, counts.shadowed, counts.reflective);
+
+    // The full-feature-set proof: shadowed>0 AND reflective>0 AND the sky is graded (>=2 distinct miss colors).
+    bool graded = false;
+    {
+        uint32_t firstSky = 0; bool haveFirst = false;
+        for (uint32_t py = 0; py < kRtH && !graded; ++py) {
+            for (uint32_t px = 0; px < kRtW; ++px) {
+                rt::RtRay pr = rt::PrimaryRay(cam, px, py, kRtW, kRtH);
+                rt::RtHit h = rt::TraceClosest(pr, scene);
+                if (h.primIndex != rt::kRtMiss) continue;
+                uint32_t c = image[(size_t)py * kRtW + px];
+                if (!haveFirst) { firstSky = c; haveFirst = true; }
+                else if (c != firstSky) { graded = true; break; }
+            }
+        }
+    }
+    if (!(counts.shadowed > 0 && counts.reflective > 0 && graded))
+        return fail("rt6-hero: hero NOT ok (need shadowed>0, reflective>0, sky graded)");
+    std::printf("rt6-hero: hero ok (shadowed>0, reflective>0, sky graded)\n");
+
+    // Two-run determinism (the CPU reference is a pure function).
+    {
+        std::vector<uint32_t> image2(kPixels, 0);
+        rt::RenderSceneHero(scene, cam, kRtW, kRtH, std::span<uint32_t>(image2));
+        if (std::memcmp(image.data(), image2.data(), kPixels * sizeof(uint32_t)) != 0)
+            return fail("rt6-hero: two CPU renders differ (nondeterministic)");
+        std::printf("rt6-hero determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // --- Write the image (RGBA8 row-major top-first -> BGRA for WritePNG). ---
+    std::vector<uint8_t> bgra(kPixels * 4, 0);
+    for (size_t p = 0; p < kPixels; ++p) {
+        uint32_t px = image[p];
+        bgra[p * 4 + 0] = (uint8_t)((px >> 16) & 0xFF);
+        bgra[p * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+        bgra[p * 4 + 2] = (uint8_t)(px & 0xFF);
+        bgra[p * 4 + 3] = (uint8_t)((px >> 24) & 0xFF);
+    }
+    if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — the RT lit hero capstone [CPU SW reference] (%u shadowed, %u reflective)\n",
+                outPath, kRtW, kRtH, counts.shadowed, counts.reflective);
+    return 0;
+}
+
 // ===== Slice RT5 — Hardware Ray Tracing DETERMINISM-ENVELOPE + LOCKSTEP TIE-IN showcase (--rt5-simrender)
 // (FLAGSHIP #28). COMPOSES the determinism moat (fpx's deterministic Q16.16 rigid-body sim, lockstep-
 // replayable) with the RT4 render. Runs a fixed sphere-pile sim through fpx::RunLockstep TWICE (authority +
@@ -57908,6 +58020,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--rt4-reflect") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_rt4_reflect.png";
             try { return RunRt4ReflectShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --rt6-hero <out.png>: render the Hardware Ray Tracing THE LIT HERO CAPSTONE showcase (Slice RT6,
+        // FLAGSHIP #28, the money-shot). rt_hero.comp uses HLSL RayQuery + int64 + the integer SkyGradient ->
+        // Vulkan-SPIR-V-ONLY, so Metal runs the CPU rtrace::RenderSceneHero reference (byte-identical to the
+        // Vulkan HW result by construction). New golden tests/golden/metal/rt6_hero.png.
+        if (argc > 1 && std::strcmp(argv[1], "--rt6-hero") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_rt6_hero.png";
+            try { return RunRt6HeroShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --rt5-simrender <out.png>: render the Hardware Ray Tracing DETERMINISM-ENVELOPE + LOCKSTEP TIE-IN

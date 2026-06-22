@@ -705,6 +705,17 @@ hf_add_pure_test(rt_shadow_test)
 # (rtrace.h is APPEND-ONLY/byte-frozen, #included read-only). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(rt_reflect_test)
 
+# Hardware Ray Tracing Slice 6 (Slice RT6, FLAGSHIP #28, the MONEY-SHOT CAPSTONE): the CPU-side invariants the
+# HW lit-hero kernel (shaders/rt_hero.comp) rests on. The HW==CPU memcmp proof lives in the --rt6-hero-shot
+# showcase (needs a GPU); this pure-CPU test pins the deterministic hero contract: SkyGradient is monotonic in
+# dir.y (straight-up == the pinned zenith, straight-down == the pinned horizon, distinct, each channel marches
+# monotonically as dir.y rises); RenderSceneHero is BYTE-IDENTICAL to RenderSceneReflected on an ENCLOSED scene
+# where no ray misses (the sky is never sampled — the ONLY change is the miss color); the curated hero scene
+# has shadowed>0 AND reflective>0 AND the sky is GRADED (>=2 distinct primary-miss colors); RenderSceneHero is
+# two-run byte-identical (image + counts). Defines the hero scene locally with the frozen rtrace:: types
+# (rtrace.h is APPEND-ONLY/byte-frozen, #included read-only). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(rt_hero_test)
+
 # Hardware Ray Tracing Slice 5 (Slice RT5, FLAGSHIP #28): the DETERMINISM-ENVELOPE + LOCKSTEP TIE-IN — the
 # pure-CPU invariants the --rt5-simrender-shot / --rt5-simrender showcases rest on (the HW==CPU memcmp lives
 # in the Vulkan showcase, which needs a GPU). RT5 COMPOSES the determinism moat (fpx's deterministic Q16.16
