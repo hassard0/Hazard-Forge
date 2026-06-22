@@ -737,5 +737,21 @@
     "materialCount": 10,
     "pointLightCount": 3,
     "spotLightCount": 0
+  },
+  "agentApi": {
+    "schemaVersion": 1,
+    "capabilities": ["observe", "mutate", "author", "replay", "hot-reload"],
+    "commands": [
+      { "op": "dump", "capability": "observe", "args": [] },
+      { "op": "list", "capability": "observe", "args": [] },
+      { "op": "set_transform", "capability": "mutate", "args": [{ "name": "entity", "type": "int" }, { "name": "position", "type": "[x,y,z]?" }, { "name": "euler", "type": "[x,y,z]?" }, { "name": "scale", "type": "[x,y,z]?" }] },
+      { "op": "set_material", "capability": "mutate", "args": [{ "name": "entity", "type": "int" }, { "name": "metallic", "type": "float?" }, { "name": "roughness", "type": "float?" }, { "name": "baseColor", "type": "string|null?" }, { "name": "normalMap", "type": "string|null?" }] },
+      { "op": "add", "capability": "mutate", "args": [{ "name": "mesh", "type": "string" }, { "name": "baseColor", "type": "string|null?" }, { "name": "normalMap", "type": "string|null?" }, { "name": "metallic", "type": "float?" }, { "name": "roughness", "type": "float?" }, { "name": "position", "type": "[x,y,z]?" }, { "name": "euler", "type": "[x,y,z]?" }, { "name": "scale", "type": "[x,y,z]?" }] },
+      { "op": "remove", "capability": "mutate", "args": [{ "name": "entity", "type": "int" }] },
+      { "op": "capture", "capability": "observe", "args": [{ "name": "path", "type": "string" }] },
+      { "op": "save_scene", "capability": "observe", "args": [{ "name": "path", "type": "string" }] },
+      { "op": "introspect", "capability": "observe", "args": [{ "name": "path", "type": "string?" }] }
+    ],
+    "contentHash": "99556aa14407ebd3"
   }
 }
