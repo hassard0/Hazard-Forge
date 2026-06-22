@@ -682,6 +682,17 @@ hf_add_pure_test(rt_test)
 # BYTE-FROZEN, #included read-only). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(rt_query_test)
 
+# Hardware Ray Tracing Slice 3 (Slice RT3, FLAGSHIP #28): the CPU-side invariants the HW hard-shadow kernel
+# (shaders/rt_shadow.comp) rests on. The HW==CPU memcmp proof lives in the --rt3-shadow-shot showcase (needs
+# a GPU); this pure-CPU test pins the deterministic shadow contract: TraceAnyHit is analytic (a point under
+# a sphere toward an overhead light is occluded; an open point is not) AND order-independent (shuffling the
+# scene's primitive storage yields the IDENTICAL any-hit boolean — the HW-early-out == SW-full-scan
+# guarantee); ShadeHitShadowed == ShadeHitInt when NOT occluded and strictly darker (ambient-only) when
+# occluded; RenderSceneShadowed is two-run byte-identical; and 0 < shadowed < hits on the RT2 scene (a real
+# occlusion, not all-lit/all-dark). Defines the RT2 scene locally with the frozen rtrace:: types (rtrace.h
+# is APPEND-ONLY/byte-frozen, #included read-only). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(rt_shadow_test)
+
 # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
 # integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
 # copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/

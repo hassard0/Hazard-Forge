@@ -396,4 +396,82 @@ inline RtScene1 BuildRt1Scene() {
     return r;
 }
 
+// ===== Slice RT3 — DETERMINISTIC RT HARD SHADOWS (APPEND-ONLY; RT1's code above is BYTE-FROZEN) ========
+// After the primary TraceClosest finds the surface point, cast a SECOND ray (a SHADOW ray) from
+// hit.pos + normal*kRtShadowEps (the offset kills self-shadow acne) toward scene.lightDir. The point is
+// in shadow iff ANY primitive is intersected with t > kRtShadowMinT (a directional light -> no far
+// bound). "Any hit" is an order-independent boolean OR over OUR fx intersections, so the HW any-hit
+// (drain candidates, OR our fx hits) == the SW brute-force any-hit == the CPU, bit-exact, regardless of
+// BVH traversal order. The shade gates the diffuse term: ambient + (occluded ? 0 : diffuse), so shadowed
+// pixels keep only ambient (visibly darker) -> the integer shadowed image is strict-zero cross-vendor.
+// PURE INTEGER Q16.16 — the same frozen rtrace:: fx helpers, NO float on the bit-exact path.
+
+inline constexpr fx kRtShadowEps  = kOne / 256;   // surface offset along the normal (anti-acne)
+inline constexpr fx kRtShadowMinT = kOne / 1024;  // ignore shadow hits closer than this (self-hit guard)
+
+// TraceAnyHit — the OCCLUSION test. Brute-force EVERY primitive; return true on the FIRST primitive whose
+// IntersectSphere/IntersectAabb yields a hit with t > minT. The result is a boolean OR over the fx hits —
+// ORDER-INDEPENDENT (presence of an occluder, NOT an order-dependent min), so it CAN early-out on the
+// first qualifying hit WITHOUT breaking determinism: the HW any-hit (which may early-out on its first
+// candidate) and the SW brute-force (which may scan all) yield the SAME boolean. NO closest-hit search.
+inline bool TraceAnyHit(const RtRay& ray, const RtScene& scene, fx minT) {
+    for (const RtSphere& s : scene.spheres) {
+        RtHit h;
+        if (IntersectSphere(ray, s, h) && h.t > minT) return true;
+    }
+    for (const RtAabb& b : scene.aabbs) {
+        RtHit h;
+        if (IntersectAabb(ray, b, h) && h.t > minT) return true;
+    }
+    return false;
+}
+
+// ShadeHitShadowed — the ShadeHitInt body with the DIFFUSE term gated by occlusion. A MISS -> background.
+// Else diffuse = ambient + (occluded ? 0 : fxmul(1-ambient, max(dot(n,L),0))) — albedo-tinted + quantized
+// identically to ShadeHitInt. When NOT occluded this is BYTE-IDENTICAL to ShadeHitInt; when occluded the
+// pixel keeps only the ambient floor (strictly darker). PURE INTEGER, deterministic, cross-backend exact.
+inline uint32_t ShadeHitShadowed(const RtHit& hit, const RtScene& scene, bool occluded) {
+    if (hit.primIndex == kRtMiss) return scene.background;
+    fx ndl = FxDot(hit.normal, scene.lightDir);
+    if (ndl < 0) ndl = 0;                          // clamp max(dot,0)
+    const fx ambient = (fx)(kOne * 18 / 100);      // 0.18 ambient floor (== ShadeHitInt)
+    fx lambert = occluded ? 0 : fxmul(kOne - ambient, ndl);  // the GATED diffuse term
+    fx diffuse = ambient + lambert;                // [ambient, 1]; occluded -> exactly ambient
+    FxVec3 alb = AlbedoFor(hit.primIndex);
+    auto q = [&](fx ch) -> int32_t {
+        fx lit = fxmul(ch, diffuse);                       // Q16.16 in [0,1]
+        return (int32_t)(((int64_t)lit * 255) >> kFrac);   // [0,255]
+    };
+    return PackRGBA8(q(alb.x), q(alb.y), q(alb.z), 255);
+}
+
+// RenderSceneShadowed — per pixel: PrimaryRay -> TraceClosest; if it HIT, build the shadow ray
+// {hit.pos + normal*kRtShadowEps, lightDir} and occluded = TraceAnyHit(shadowRay, scene, kRtShadowMinT);
+// out = ShadeHitShadowed(hit, scene, occluded). A MISS shades to background (occluded irrelevant). Pure
+// CPU, deterministic. The GPU twin shaders/rt_shadow.comp copies this math VERBATIM (one thread per pixel)
+// so the HW readback is bit-identical, proven memcmp. Returns the number of SHADOWED pixels (a primary HIT
+// whose surface was occluded — the real-occlusion proof line).
+inline uint32_t RenderSceneShadowed(const RtScene& scene, const RtCamera& cam, uint32_t width,
+                                    uint32_t height, std::span<uint32_t> outRGBA8) {
+    uint32_t shadowed = 0;
+    for (uint32_t py = 0; py < height; ++py) {
+        for (uint32_t px = 0; px < width; ++px) {
+            RtRay ray = PrimaryRay(cam, px, py, width, height);
+            RtHit hit = TraceClosest(ray, scene);
+            bool occluded = false;
+            if (hit.primIndex != kRtMiss) {
+                // Shadow-ray origin = hit.pos offset along the surface normal by kRtShadowEps (anti-acne);
+                // direction = the directional light direction (TOWARD the light).
+                RtRay shadowRay;
+                shadowRay.origin = FxAdd(hit.pos, FxScale(hit.normal, kRtShadowEps));
+                shadowRay.dir = scene.lightDir;
+                occluded = TraceAnyHit(shadowRay, scene, kRtShadowMinT);
+                if (occluded) ++shadowed;
+            }
+            outRGBA8[(size_t)py * width + px] = ShadeHitShadowed(hit, scene, occluded);
+        }
+    }
+    return shadowed;
+}
+
 }  // namespace hf::render::rtrace

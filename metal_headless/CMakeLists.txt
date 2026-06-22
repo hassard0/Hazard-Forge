@@ -305,6 +305,16 @@ hf_gen_msl(fract_reduce.comp     fract_reduce.comp.hlsl     comp fract_reduce_ma
 # Vulkan HW result BY CONSTRUCTION, while the Vulkan side carries the HW-ray-query == SW == CPU proof. So
 # rt_query.comp gets NO hf_gen_msl line. (Metal HARDWARE ray query — rt_query.metal over an
 # MTLAccelerationStructure — is the deliberate follow-on slice RT2b.)
+# Hardware Ray Tracing Slice 3 (Slice RT3, FLAGSHIP #28): rt_shadow.comp is the DETERMINISTIC RT HARD
+# SHADOWS kernel — the rt_query.comp primary RayQuery body VERBATIM, THEN a SECOND RayQuery (the shadow ray)
+# whose any-hit occlusion (an order-independent boolean OR over OUR fx intersections) GATES the diffuse
+# shade. Like rt_query.comp it is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: HLSL inline RayQuery lowers
+# (via DXC) to SPIR-V RayQueryKHR (the SPV_KHR_ray_query extension), which glslc/spirv-cross — the Metal
+# HLSL->SPIR-V->MSL chain — cannot lower; and it also uses the int64 fxmul/fxdiv/FxISqrt math glslc can't
+# parse anyway. Same Vulkan-only convention: on Metal the --rt3-shadow showcase runs the CPU
+# rtrace::RenderSceneShadowed (the SAME bit-exact reference the Vulkan HW==CPU memcmp compares against) ->
+# the Metal result is byte-identical to the Vulkan HW result BY CONSTRUCTION, while the Vulkan side carries
+# the HW-shadow-ray == CPU proof. So rt_shadow.comp gets NO hf_gen_msl line.
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): cloth_integrate.comp runs the
 # Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per particle runs `steps` iterations
 # of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp) on its OWN particle, the fxmul

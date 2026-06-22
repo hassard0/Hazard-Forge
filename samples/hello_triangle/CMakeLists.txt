@@ -521,6 +521,17 @@ hf_compile_shaders(
     # MSL) -> NOT in the Metal hf_gen_msl list; on Metal --rt2-query runs the CPU rtrace::RenderScene
     # (byte-identical by construction). The Vulkan side carries the HW==SW-GPU==CPU memcmp proof.
     "shaders/rt_query.comp.hlsl:csrq"
+    # Hardware Ray Tracing Slice 3 (Slice RT3, FLAGSHIP #28): rt_shadow.comp is the DETERMINISTIC RT HARD
+    # SHADOWS kernel — ONE thread per pixel runs the rt_query.comp PRIMARY RayQuery body VERBATIM (closest
+    # hit), then casts a SECOND RayQuery (the SHADOW ray from hit.pos + normal*kRtShadowEps toward the light)
+    # draining candidates + running OUR fx IntersectSphere/IntersectAabb, setting occluded if ANY yields
+    # t > kRtShadowMinT (an order-independent boolean OR — the shadow query MAY early-out), and writes
+    # ShadeHitShadowed (the integer Lambert with the diffuse GATED by occlusion) — bit-identical to the CPU
+    # rtrace::RenderSceneShadowed. The :csrq stage compiles it cs_6_5 + SPV_KHR_ray_query (HLSL RayQuery ->
+    # DXC SPIR-V RayQueryKHR). It is VULKAN-SPIR-V-ONLY (RayQuery + int64 -> glslc/spirv-cross can't lower to
+    # MSL) -> NOT in the Metal hf_gen_msl list; on Metal --rt3-shadow runs the CPU rtrace::RenderSceneShadowed
+    # (byte-identical by construction). The Vulkan side carries the HW==CPU memcmp proof.
+    "shaders/rt_shadow.comp.hlsl:csrq"
     # Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: deterministic GPU crowds —
     # boids + steering + path-following): boids_steer.comp runs the Q16.16 Reynolds STEERING tick — ONE thread
     # per AGENT reads the FROZEN input buffer (gAgentsIn), computes SteerSeek (proportional pull toward the
