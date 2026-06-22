@@ -315,6 +315,17 @@ hf_gen_msl(fract_reduce.comp     fract_reduce.comp.hlsl     comp fract_reduce_ma
 # rtrace::RenderSceneShadowed (the SAME bit-exact reference the Vulkan HW==CPU memcmp compares against) ->
 # the Metal result is byte-identical to the Vulkan HW result BY CONSTRUCTION, while the Vulkan side carries
 # the HW-shadow-ray == CPU proof. So rt_shadow.comp gets NO hf_gen_msl line.
+# Hardware Ray Tracing Slice 4 (Slice RT4, FLAGSHIP #28): rt_reflect.comp is the DETERMINISTIC RT MIRROR
+# REFLECTIONS kernel — the rt_shadow.comp primary closest-hit + primary shadow body VERBATIM, THEN if the
+# primary hit is reflective a REFLECTION RayQuery (a second closest-hit drain, the view dir mirrored about
+# the fx normal) + the reflected shadow + the integer UNPACKED-channel blend (final = surface*(1-refl) +
+# reflected*refl). Like rt_shadow.comp it is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: HLSL inline
+# RayQuery lowers (via DXC) to SPIR-V RayQueryKHR (the SPV_KHR_ray_query extension), which glslc/spirv-cross
+# cannot lower; and it uses the int64 fxmul/fxdiv/FxISqrt math glslc can't parse anyway. On Metal the
+# --rt4-reflect showcase runs the CPU rtrace::RenderSceneReflected (the SAME bit-exact reference the Vulkan
+# HW==CPU memcmp compares against) -> the Metal result is byte-identical to the Vulkan HW result BY
+# CONSTRUCTION, while the Vulkan side carries the HW-reflection == CPU proof. So rt_reflect.comp gets NO
+# hf_gen_msl line.
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): cloth_integrate.comp runs the
 # Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per particle runs `steps` iterations
 # of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp) on its OWN particle, the fxmul

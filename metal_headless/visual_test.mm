@@ -18286,6 +18286,92 @@ static int RunRt3ShadowShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice RT4 — Hardware Ray Tracing DETERMINISTIC RT MIRROR REFLECTIONS showcase (--rt4-reflect)
+// (FLAGSHIP #28). The Vulkan --rt4-reflect-shot wires REAL HW inline ray query: a PRIMARY RayQuery
+// closest-hit + primary shadow, THEN if the primary surface is REFLECTIVE a REFLECTION RayQuery (the view
+// dir mirrored about the fx normal) + the reflected shadow + the integer UNPACKED-channel blend
+// (final = surface*(1-refl) + reflected*refl) — and memcmp's HW==CPU. rt_reflect.comp uses HLSL RayQuery +
+// int64 -> Vulkan-SPIR-V-ONLY (glslc/spirv-cross can't lower to MSL), so on Metal --rt4-reflect runs the CPU
+// rtrace::RenderSceneReflected reference (the SAME bit-exact reference the Vulkan HW==CPU memcmp compares
+// against) -> the Metal image is byte-identical to the Vulkan HW image BY CONSTRUCTION. Builds the SAME RT2
+// scene (a ground AABB + a 4x4 sphere grid + two boxes) with a reflective ground + a designated mirror
+// sphere (so the floor MIRRORS the spheres + the mirror sphere reflects its neighbours, with the RT3 shadows
+// intact) at 320x240, renders the integer reflected RGBA8 scene, writes the PNG. Because the blend is
+// INTEGER, the rt4_reflect golden is STRICT-ZERO cross-vendor. New golden tests/golden/metal/rt4_reflect.png
+// (Mac-baked by the CONTROLLER).
+static int RunRt4ReflectShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    using rt::fx; using rt::FxVec3; using rt::kOne; using rt::F;
+
+    const uint32_t kRtW = 320, kRtH = 240;
+
+    // The RT2 scene (the SAME primitives + camera the Vulkan --rt4-reflect-shot defines; rtrace.h is frozen).
+    std::vector<rt::RtSphere> spheresV;
+    std::vector<rt::RtAabb>   aabbsV;
+    uint32_t nextPrim = 0;
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(-20,1), F(-3,1), F(-20,1)},
+                                FxVec3{F(20,1),  F(-1,1), F(20,1)}, nextPrim++});
+    for (int gz = 0; gz < 4; ++gz) {
+        for (int gx = 0; gx < 4; ++gx) {
+            fx cx = F(2 * gx - 3, 1);
+            fx cz = F(2 + 2 * gz, 1);
+            fx cy = F(0, 1);
+            fx rad = (gz & 1) ? F(3, 4) : F(1, 1);
+            spheresV.push_back(rt::RtSphere{FxVec3{cx, cy, cz}, rad, nextPrim++});
+        }
+    }
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(-9,2), F(-1,1), F(1,1)},
+                                FxVec3{F(-5,2), F(3,2),  F(5,2)}, nextPrim++});
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(5,2),  F(-1,1), F(2,1)},
+                                FxVec3{F(9,2),  F(2,1),  F(7,2)}, nextPrim++});
+
+    rt::RtScene scene{};
+    scene.spheres = std::span<const rt::RtSphere>(spheresV);
+    scene.aabbs   = std::span<const rt::RtAabb>(aabbsV);
+    scene.lightDir = rt::RtNormalize(FxVec3{F(4,10), F(8,10), F(-3,10)});
+    scene.background = rt::PackRGBA8(34, 40, 56, 255);
+
+    rt::RtCamera cam{};
+    cam.eye     = FxVec3{F(0,1), F(2,1), F(-9,1)};
+    cam.right   = FxVec3{kOne, 0, 0};
+    cam.up      = FxVec3{0, kOne, 0};
+    cam.forward = FxVec3{0, 0, kOne};
+    cam.halfW   = F(7, 10);
+    cam.halfH   = F(7, 10);
+
+    const size_t kPixels = (size_t)kRtW * kRtH;
+    const uint32_t kPrimCount = (uint32_t)(spheresV.size() + aabbsV.size());
+
+    // CPU reflected reference (the bit-exact image the Vulkan --rt4-reflect-shot proves the HW shader equal to).
+    std::vector<uint32_t> image(kPixels, 0);
+    uint32_t reflective = rt::RenderSceneReflected(scene, cam, kRtW, kRtH, std::span<uint32_t>(image));
+    std::printf("rt4-reflect: {rays:%zu, prims:%u, reflective:%u} [Metal: CPU rtrace::RenderSceneReflected, "
+                "byte-identical to the Vulkan HW result by construction]\n", kPixels, kPrimCount, reflective);
+
+    // Two-run determinism (the CPU reference is a pure function).
+    {
+        std::vector<uint32_t> image2(kPixels, 0);
+        rt::RenderSceneReflected(scene, cam, kRtW, kRtH, std::span<uint32_t>(image2));
+        if (std::memcmp(image.data(), image2.data(), kPixels * sizeof(uint32_t)) != 0)
+            return fail("rt4-reflect: two CPU renders differ (nondeterministic)");
+        std::printf("rt4-reflect determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // --- Write the image (RGBA8 row-major top-first -> BGRA for WritePNG). ---
+    std::vector<uint8_t> bgra(kPixels * 4, 0);
+    for (size_t p = 0; p < kPixels; ++p) {
+        uint32_t px = image[p];
+        bgra[p * 4 + 0] = (uint8_t)((px >> 16) & 0xFF);
+        bgra[p * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+        bgra[p * 4 + 2] = (uint8_t)(px & 0xFF);
+        bgra[p * 4 + 3] = (uint8_t)((px >> 24) & 0xFF);
+    }
+    if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — deterministic HW-RT mirror reflections [CPU SW reference] (%u reflective)\n",
+                outPath, kRtW, kRtH, reflective);
+    return 0;
+}
+
 // ===== Slice RT2b — Hardware Ray Tracing METAL HW RAY QUERY showcase (--rt2-query-hw) (cross-platform HW-RT
 // parity, FLAGSHIP #28). The Apple-Metal twin of the Vulkan --rt2-query-shot: a metal::raytracing::
 // intersection_query over an MTLAccelerationStructure of margin-inflated bounding boxes, draining every
@@ -57728,6 +57814,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--rt3-shadow") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_rt3_shadow.png";
             try { return RunRt3ShadowShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --rt4-reflect <out.png>: render the Hardware Ray Tracing DETERMINISTIC RT MIRROR REFLECTIONS
+        // showcase (Slice RT4, FLAGSHIP #28). rt_reflect.comp uses HLSL RayQuery + int64 -> Vulkan-SPIR-V-ONLY,
+        // so Metal runs the CPU rtrace::RenderSceneReflected reference (byte-identical to the Vulkan HW result
+        // by construction). New golden tests/golden/metal/rt4_reflect.png.
+        if (argc > 1 && std::strcmp(argv[1], "--rt4-reflect") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_rt4_reflect.png";
+            try { return RunRt4ReflectShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --rt2-query-hw <out.png>: render the Slice RT2b Metal HARDWARE ray query (intersection_query over an

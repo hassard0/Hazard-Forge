@@ -474,4 +474,111 @@ inline uint32_t RenderSceneShadowed(const RtScene& scene, const RtCamera& cam, u
     return shadowed;
 }
 
+// ===== Slice RT4 — DETERMINISTIC RT MIRROR REFLECTIONS (APPEND-ONLY; RT1's + RT3's code above is
+// BYTE-FROZEN) ========================================================================================
+// After the primary TraceClosest + the RT3 shadowed shade, a REFLECTIVE surface casts a ONE-BOUNCE
+// REFLECTION ray: the view direction MIRRORED about the fx surface normal (r = d - 2*(d·n)*n). The
+// reflected closest hit is shaded with the SAME RT3 integer SHADOWED shade (its own any-hit shadow ray),
+// and the composite final = surface*(kOne-refl) + reflected*refl is a per-channel INTEGER blend on the
+// UNPACKED RGBA8 channels. All integer, so — unlike a float reflection engine — RT4 stays strict-zero
+// cross-vendor (HW==CPU bit-exact). ONE bounce only: the reflected hit's OWN reflectivity is ignored (no
+// recursion); a reflection MISS shades to the background (the reflected sky). PURE INTEGER Q16.16 — the
+// same frozen rtrace:: fx helpers, NO float on the bit-exact path.
+
+inline constexpr fx kRtReflEps = kOne / 256;   // reflection-ray surface offset along the normal (anti-acne)
+
+// The PINNED mirror-sphere primIndex — the ONE sphere (besides the ground) that is reflective. The scene
+// builder + the shader agree on this constant. In the RT2/RT3 scene the spheres are primIndex 1..16 (the
+// 4x4 grid after the ground AABB at primIndex 0); index 6 is a sphere near the middle of the grid.
+inline constexpr uint32_t kRtMirrorSpherePrim = 6u;
+
+// FxReflect — the fx MIRROR reflect r = d - 2*(d·n)*n (n unit; d the incoming ray dir, need not be unit —
+// |r|=|d| so the reflected ray's t units stay consistent). 2*(d·n) is the doubled fx dot; FxScale(n, ...)
+// is the int64 fxmul-per-axis scale; FxSub the per-axis subtract. PURE INTEGER, deterministic.
+inline FxVec3 FxReflect(const FxVec3& d, const FxVec3& n) {
+    fx dn = FxDot(d, n);
+    return FxSub(d, FxScale(n, 2 * dn));
+}
+
+// ReflectivityFor — the fixed per-primIndex integer reflectivity in [0,kOne]. The ground (primIndex 0) is
+// 0.55 reflective; the designated mirror sphere (kRtMirrorSpherePrim) is 0.75; every other primitive is 0
+// (matte -> byte-identical to the RT3 shadowed shade). Deterministic + integer.
+inline fx ReflectivityFor(uint32_t primIndex) {
+    if (primIndex == 0u) return (fx)(kOne * 55 / 100);
+    if (primIndex == kRtMirrorSpherePrim) return (fx)(kOne * 75 / 100);
+    return 0;
+}
+
+// RenderSceneReflected — per pixel: PrimaryRay -> TraceClosest; the RT3 shadowed primary color cS (via the
+// shadow ray + TraceAnyHit + ShadeHitShadowed). If the primary surface is REFLECTIVE (refl > 0): build the
+// reflection ray {hit.pos + normal*kRtReflEps, FxReflect(primaryDir, normal)}, TraceClosest it; the
+// reflected color cR is the background on a MISS, else the RT3 shadowed shade of the reflected hit (its OWN
+// shadow ray). The composite is a per-channel blend on the UNPACKED 0..255 RGBA8 channels:
+//   c = (cS_ch*(kOne-refl) + cR_ch*refl) >> kFrac
+// (cS_ch/cR_ch are plain 0..255 ints, refl is Q16.16 -> the product is Q16.16-scaled, the >>kFrac requantizes
+// to 0..255). The alpha is forced opaque. A non-reflective primary surface -> out = cS (byte-identical to
+// RenderSceneShadowed). Returns the count of REFLECTIVE pixels (a primary hit whose surface is reflective —
+// the reflections-present proof). The GPU twin shaders/rt_reflect.comp copies this VERBATIM (one thread per
+// pixel) so the HW readback is bit-identical, proven memcmp. PURE INTEGER, deterministic, cross-backend exact.
+inline uint32_t RenderSceneReflected(const RtScene& scene, const RtCamera& cam, uint32_t width,
+                                     uint32_t height, std::span<uint32_t> outRGBA8) {
+    uint32_t reflective = 0;
+    for (uint32_t py = 0; py < height; ++py) {
+        for (uint32_t px = 0; px < width; ++px) {
+            RtRay primaryRay = PrimaryRay(cam, px, py, width, height);
+            RtHit hit = TraceClosest(primaryRay, scene);
+
+            // The primary RT3 shadowed color cS (the matte+shadowed shade — identical to RenderSceneShadowed).
+            bool occluded = false;
+            if (hit.primIndex != kRtMiss) {
+                RtRay shadowRay;
+                shadowRay.origin = FxAdd(hit.pos, FxScale(hit.normal, kRtShadowEps));
+                shadowRay.dir = scene.lightDir;
+                occluded = TraceAnyHit(shadowRay, scene, kRtShadowMinT);
+            }
+            uint32_t cS = ShadeHitShadowed(hit, scene, occluded);
+
+            uint32_t out = cS;
+            if (hit.primIndex != kRtMiss) {
+                fx refl = ReflectivityFor(hit.primIndex);
+                if (refl > 0) {
+                    ++reflective;
+                    // The reflection ray: origin offset along the normal (anti-acne), dir = the mirror reflect
+                    // of the primary ray dir about the surface normal.
+                    RtRay reflRay;
+                    reflRay.origin = FxAdd(hit.pos, FxScale(hit.normal, kRtReflEps));
+                    reflRay.dir = FxReflect(primaryRay.dir, hit.normal);
+                    RtHit rHit = TraceClosest(reflRay, scene);
+
+                    // The reflected color cR: background on a miss, else the RT3 shadowed shade (its OWN
+                    // shadow ray — one bounce, the reflected surface is matte+shadowed).
+                    uint32_t cR;
+                    if (rHit.primIndex == kRtMiss) {
+                        cR = scene.background;
+                    } else {
+                        RtRay reflShadowRay;
+                        reflShadowRay.origin = FxAdd(rHit.pos, FxScale(rHit.normal, kRtShadowEps));
+                        reflShadowRay.dir = scene.lightDir;
+                        bool rOccluded = TraceAnyHit(reflShadowRay, scene, kRtShadowMinT);
+                        cR = ShadeHitShadowed(rHit, scene, rOccluded);
+                    }
+
+                    // The per-channel integer blend on the UNPACKED 0..255 RGBA8 channels.
+                    auto chOf = [](uint32_t c, int i) -> int32_t { return (int32_t)((c >> (8 * i)) & 0xFF); };
+                    auto blend = [&](int i) -> int32_t {
+                        int32_t s = chOf(cS, i);
+                        int32_t r = chOf(cR, i);
+                        // c = (s*(kOne-refl) + r*refl) >> kFrac  (s,r are plain 0..255; refl is Q16.16).
+                        int64_t mix = (int64_t)s * (int64_t)(kOne - refl) + (int64_t)r * (int64_t)refl;
+                        return (int32_t)(mix >> kFrac);
+                    };
+                    out = PackRGBA8(blend(0), blend(1), blend(2), 255);
+                }
+            }
+            outRGBA8[(size_t)py * width + px] = out;
+        }
+    }
+    return reflective;
+}
+
 }  // namespace hf::render::rtrace

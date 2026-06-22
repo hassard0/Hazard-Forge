@@ -693,6 +693,18 @@ hf_add_pure_test(rt_query_test)
 # is APPEND-ONLY/byte-frozen, #included read-only). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(rt_shadow_test)
 
+# Hardware Ray Tracing Slice 4 (Slice RT4, FLAGSHIP #28): the CPU-side invariants the HW mirror-reflection
+# kernel (shaders/rt_reflect.comp) rests on. The HW==CPU memcmp proof lives in the --rt4-reflect-shot showcase
+# (needs a GPU); this pure-CPU test pins the deterministic reflection contract: FxReflect is analytic (an
+# axis-plane mirror flips only the normal component; reflecting twice returns the original — the involution)
+# AND the per-channel integer blend is EXACTLY cS at refl=0 (so a non-reflective pixel is byte-identical to
+# the RT3 shadowed shade) and EXACTLY cR at refl=kOne; a no-reflective-prim scene makes RenderSceneReflected
+# byte-identical to RenderSceneShadowed; on the RT2 scene (reflective ground + mirror sphere) the reflected
+# image DIFFERS from the matte shadowed image at >=1 pixel (the reflection contributed) with reflective>0; and
+# RenderSceneReflected is two-run byte-identical. Defines the RT2 scene locally with the frozen rtrace:: types
+# (rtrace.h is APPEND-ONLY/byte-frozen, #included read-only). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(rt_reflect_test)
+
 # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
 # integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
 # copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/

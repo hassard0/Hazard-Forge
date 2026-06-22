@@ -530,6 +530,8 @@ int main() {
             bool sawRt2QueryHwFeature = false;
             // Slice RT3: the rt3-shadow capability is advertised (deterministic RT hard shadows).
             bool sawRt3ShadowFeature = false;
+            // Slice RT4: the rt4-reflect capability is advertised (deterministic RT mirror reflections).
+            bool sawRt4ReflectFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -773,6 +775,7 @@ int main() {
                     if (AsString(el->value) == "rt2-query") sawRt2QueryFeature = true;
                     if (AsString(el->value) == "rt2-query-hw") sawRt2QueryHwFeature = true;
                     if (AsString(el->value) == "rt3-shadow") sawRt3ShadowFeature = true;
+                    if (AsString(el->value) == "rt4-reflect") sawRt4ReflectFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -991,6 +994,7 @@ int main() {
             check(sawRt2QueryFeature, "engine.features includes rt2-query");
             check(sawRt2QueryHwFeature, "engine.features includes rt2-query-hw");
             check(sawRt3ShadowFeature, "engine.features includes rt3-shadow");
+            check(sawRt4ReflectFeature, "engine.features includes rt4-reflect");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1376,6 +1380,8 @@ int main() {
         bool sawRt2QueryShot = false;
         // Slice RT3: the --rt3-shadow-shot showcase flag is listed in the showcase manifest.
         bool sawRt3ShadowShot = false;
+        // Slice RT4: the --rt4-reflect-shot showcase flag is listed in the showcase manifest.
+        bool sawRt4ReflectShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -1623,6 +1629,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--rt1-trace-shot") sawRt1TraceShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--rt2-query-shot") sawRt2QueryShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--rt3-shadow-shot") sawRt3ShadowShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--rt4-reflect-shot") sawRt4ReflectShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-points-shot") sawFricPointsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-solve-shot") sawFricSolveShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-ramp-shot") sawFricRampShot = true;
@@ -1838,6 +1845,7 @@ int main() {
         check(sawRt1TraceShot, "showcases manifest includes --rt1-trace-shot");
         check(sawRt2QueryShot, "showcases manifest includes --rt2-query-shot");
         check(sawRt3ShadowShot, "showcases manifest includes --rt3-shadow-shot");
+        check(sawRt4ReflectShot, "showcases manifest includes --rt4-reflect-shot");
         check(sawFricPointsShot, "showcases manifest includes --fric-points-shot");
         check(sawFricSolveShot, "showcases manifest includes --fric-solve-shot");
         check(sawFricRampShot, "showcases manifest includes --fric-ramp-shot");

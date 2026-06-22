@@ -532,6 +532,17 @@ hf_compile_shaders(
     # MSL) -> NOT in the Metal hf_gen_msl list; on Metal --rt3-shadow runs the CPU rtrace::RenderSceneShadowed
     # (byte-identical by construction). The Vulkan side carries the HW==CPU memcmp proof.
     "shaders/rt_shadow.comp.hlsl:csrq"
+    # Hardware Ray Tracing Slice 4 (Slice RT4, FLAGSHIP #28): rt_reflect.comp is the DETERMINISTIC RT MIRROR
+    # REFLECTIONS kernel — ONE thread per pixel runs the rt_shadow.comp PRIMARY closest-hit + PRIMARY shadow
+    # body VERBATIM (the shadowed color cS), then if the primary hit is REFLECTIVE casts a REFLECTION ray (the
+    # view dir mirrored about the fx normal, a SECOND closest-hit RayQuery drain), shades the reflected hit with
+    # its OWN shadow ray (the RT3 shadowed color cR; a reflection MISS -> background), and BLENDS cS/cR on the
+    # UNPACKED RGBA8 channels by the integer reflectivity (final = surface*(1-refl) + reflected*refl) — bit-
+    # identical to the CPU rtrace::RenderSceneReflected. The :csrq stage compiles it cs_6_5 + SPV_KHR_ray_query
+    # (HLSL RayQuery -> DXC SPIR-V RayQueryKHR). It is VULKAN-SPIR-V-ONLY (RayQuery + int64 -> glslc/spirv-cross
+    # can't lower to MSL) -> NOT in the Metal hf_gen_msl list; on Metal --rt4-reflect runs the CPU
+    # rtrace::RenderSceneReflected (byte-identical by construction). The Vulkan side carries the HW==CPU memcmp.
+    "shaders/rt_reflect.comp.hlsl:csrq"
     # Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: deterministic GPU crowds —
     # boids + steering + path-following): boids_steer.comp runs the Q16.16 Reynolds STEERING tick — ONE thread
     # per AGENT reads the FROZEN input buffer (gAgentsIn), computes SteerSeek (proportional pull toward the
