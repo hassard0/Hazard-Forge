@@ -59508,6 +59508,72 @@ int main(int argc, char** argv) {
             std::printf("hot-reload: wrote reload_trace.json\n");
             return 0;
         }
+        // --replay-record <out.replay> / --replay-verify <in.replay> (Slice DX5, FLAGSHIP #31): the
+        // DETERMINISTIC RECORD->REPLAY->ASSERT-DETERMINISM HARNESS. verdict.h is render-symbol-free
+        // (PURE CPU integer + a 16-hex FNV digest), so NO Metal device is needed and the emitted replay
+        // bytes / digest are IDENTICAL to the Windows/Vulkan --replay-record BY CONSTRUCTION (the
+        // canonical scene + stream + lockstep are the same pure-CPU code). The authoritative byte-golden
+        // compare is Windows-only (verify.ps1); here we emit the artifact + the 4 proofs so the Metal
+        // showcase set mirrors the Vulkan one.
+        if (argc > 2 && std::strcmp(argv[1], "--replay-record") == 0) {
+            namespace verdict = hf::game::verdict;
+            const char* out = argv[2];
+            verdict::VerdictWorld world0;
+            const verdict::CanonicalReplay cr = verdict::BuildCanonicalReplay(world0);
+            const verdict::VerdictSnapshot world0Snap = verdict::SnapshotWorld(world0);
+            bool lockstepIdentical = false;
+            const verdict::VerdictSnapshot finalSnap =
+                verdict::RunVerdictLockstep(world0Snap, cr.params, cr.stream, cr.ticks, &lockstepIdentical);
+            verdict::ReplayFile rf;
+            rf.ticks = cr.ticks; rf.stream = cr.stream;
+            rf.finalDigest = verdict::DigestSnapshot(finalSnap);
+            const std::string text = verdict::SerializeReplay(rf);
+            { std::ofstream f(out, std::ios::binary);
+              if (!f) { std::fprintf(stderr, "FATAL: cannot write %s\n", out); return 1; }
+              f << text; }
+            if (!lockstepIdentical) {
+                std::fprintf(stderr, "FATAL: replay-record authority != replica (whole world)\n"); return 1; }
+            std::printf("dx5-replay lockstep: RunVerdictLockstep(stream) authority==replica (whole world)\n");
+            std::printf("dx5-replay record: {ticks:%u, commands:%u, digest:%s} -> replay file written "
+                        "(byte-golden Windows-only)\n", rf.ticks, (unsigned)rf.stream.size(),
+                        rf.finalDigest.c_str());
+            const verdict::ReplayFile parsed = verdict::ParseReplay(text);
+            if (!verdict::VerifyReplay(parsed) || parsed.finalDigest != rf.finalDigest) {
+                std::fprintf(stderr, "FATAL: replay-record self-verify failed\n"); return 1; }
+            std::printf("dx5-replay verify: replayed world digest == recorded digest BIT-IDENTICAL\n");
+            { verdict::ReplayFile tampered = rf;
+              if (tampered.stream.empty()) { std::fprintf(stderr, "FATAL: empty stream\n"); return 1; }
+              tampered.stream[0].arg.x = -tampered.stream[0].arg.x - verdict::kOne;
+              if (verdict::VerifyReplay(tampered)) {
+                  std::fprintf(stderr, "FATAL: replay-record tamper NOT detected\n"); return 1; } }
+            std::printf("dx5-replay tamper-detect: one flipped command arg -> digest DIFFERS (replay "
+                        "catches drift)\n");
+            std::printf("replay-record: wrote %s\n", out);
+            return 0;
+        }
+        if (argc > 2 && std::strcmp(argv[1], "--replay-verify") == 0) {
+            namespace verdict = hf::game::verdict;
+            const char* in = argv[2];
+            std::ifstream f(in, std::ios::binary);
+            if (!f) { std::fprintf(stderr, "FATAL: cannot read %s\n", in); return 1; }
+            std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            const verdict::ReplayFile rf = verdict::ParseReplay(text);
+            verdict::VerdictWorld world0;
+            const verdict::CanonicalReplay cr = verdict::BuildCanonicalReplay(world0);
+            const verdict::VerdictSnapshot world0Snap = verdict::SnapshotWorld(world0);
+            bool lockstepIdentical = false;
+            const verdict::VerdictSnapshot finalSnap =
+                verdict::RunVerdictLockstep(world0Snap, cr.params, rf.stream, rf.ticks, &lockstepIdentical);
+            if (!lockstepIdentical) {
+                std::fprintf(stderr, "FATAL: replay-verify authority != replica (whole world)\n"); return 1; }
+            std::printf("dx5-replay lockstep: RunVerdictLockstep(stream) authority==replica (whole world)\n");
+            if (!verdict::VerifyReplay(rf) || verdict::DigestSnapshot(finalSnap) != rf.finalDigest) {
+                std::fprintf(stderr, "FATAL: replay-verify FAILED (digest mismatch)\n"); return 1; }
+            std::printf("dx5-replay verify: replayed world digest == recorded digest BIT-IDENTICAL\n");
+            std::printf("replay-verify: {ticks:%u, commands:%u, digest:%s} OK\n", rf.ticks,
+                        (unsigned)rf.stream.size(), rf.finalDigest.c_str());
+            return 0;
+        }
         // --clustered <out.png>: clustered / Forward+ lighting showcase (Slice AG).
         if (argc > 1 && std::strcmp(argv[1], "--clustered") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_clustered.png";

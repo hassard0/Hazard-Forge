@@ -513,6 +513,37 @@ if (-not `$hrOk) {
 }
 Write-Host 'hot-reload trace JSON golden: exact match'
 
+# --- Replay file byte-golden (Slice DX5, FLAGSHIP #31): an EXACT byte-for-byte match of a fresh
+# --replay-record (build the FIXED canonical gameplay+physics world, RunVerdictLockstep over its
+# command stream, DigestSnapshot the converged authority, SerializeReplay {ticks, stream, finalDigest})
+# against the committed tests/golden/agent/canonical.replay. This is the agent REPLAY artifact (the
+# determinism MOAT as a regression guard: a recorded stream replays to a bit-identical final-world
+# digest). Like the --agent-api / --author-scene / --hot-reload goldens it is backend-AGNOSTIC (pure
+# hf_core, verdict.h is render-symbol-free, the bytes + digest are identical on Vulkan and Metal BY
+# CONSTRUCTION), so it is verified once here on the Windows/Vulkan build and is NOT in `$Goldens`/
+# `$vkShots` (the Mac IMAGE set). The --replay-record exe ALSO runs the 4 DX5 proofs internally
+# (record byte-golden / verify digest match / lockstep whole-world / tamper-detect) and fails loudly,
+# and --replay-verify on the committed golden re-asserts the digest. ---
+Write-Host '--- replay file byte-golden ---'
+`$rpExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$rpGolden = 'tests/golden/agent/canonical.replay'
+`$rpLive = Join-Path `$env:TEMP 'hf_canonical_replay_live.replay'
+& `$rpExe --replay-record `$rpLive 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'replay-record run failed (proofs or byte-golden mismatch)'; exit 36 }
+# Compare RAW bytes (the program writes LF-only, no BOM); any difference is a failure.
+`$rpgBytes = [System.IO.File]::ReadAllBytes((Resolve-Path `$rpGolden).Path)
+`$rplBytes = [System.IO.File]::ReadAllBytes(`$rpLive)
+`$rpOk = (`$rpgBytes.Length -eq `$rplBytes.Length)
+if (`$rpOk) { for (`$ri = 0; `$ri -lt `$rpgBytes.Length; `$ri++) { if (`$rpgBytes[`$ri] -ne `$rplBytes[`$ri]) { `$rpOk = `$false; break } } }
+if (-not `$rpOk) {
+    Write-Host 'replay file byte-golden MISMATCH (tests/golden/agent/canonical.replay)'
+    exit 37
+}
+# Re-verify the committed golden replays to its recorded digest (the round-trip guard).
+& `$rpExe --replay-verify `$rpGolden 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'replay-verify of committed golden failed'; exit 38 }
+Write-Host 'replay file byte-golden: exact match'
+
 # --- Audio mixer WAV golden (Slice BB): an EXACT byte-for-byte match of a fresh --audio-render of the
 # fixed deterministic audio scene against the committed tests/golden/audio/scene.wav. The mixer is
 # INTEGER / fixed-point end to end (Q15 gains, int32 accumulate, int16 hard-clamp), so the rendered

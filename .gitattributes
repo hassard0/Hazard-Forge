@@ -12,3 +12,8 @@ tests/golden/material/*.json text eol=lf
 # (scene::RunQueries), which is written LF-only (no BOM). Pin to LF so a CRLF-default Windows checkout
 # does not rewrite it and break the exact-match verify step + the in-exe byte-golden proof.
 tests/golden/agent/*.json text eol=lf
+
+# The agent replay golden (Slice DX5) is compared BYTE-FOR-BYTE against a fresh --replay-record, which
+# is written LF-only (no BOM). Pin to LF so a CRLF-default Windows checkout does not rewrite it and
+# break the exact-match verify step + the in-exe byte-golden proof.
+tests/golden/agent/*.replay text eol=lf

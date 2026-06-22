@@ -42,6 +42,12 @@ hf_add_pure_test(agent_author_test)
 # missing->present, disappearance, re-baseline) + ApplyReload (reload == cold-load, no residue, a
 # failed reload leaves the registry cleared). ASan-eligible like the others.
 hf_add_pure_test(hot_reload_test)
+# DX5: the record->replay->assert-determinism harness (verdict::DigestSnapshot / SerializeReplay /
+# ParseReplay / BuildCanonicalReplay / VerifyReplay). Pure CPU — the FNV-1a snapshot digest
+# determinism + order-independence under ECS handle churn, the SerializeReplay<->ParseReplay JSON
+# round-trip, VerifyReplay true for the recorded replay, tamper-detect (a flipped command arg flips
+# the digest), and the lockstep authority==replica. ASan-eligible like the others.
+hf_add_pure_test(agent_replay_test)
 # Skeletal-animation math + sampling (Quat/Slerp/FromTRS + SampleAnimation). Pure C++ (hf_core),
 # ASan-eligible like the others.
 hf_add_pure_test(anim_test)

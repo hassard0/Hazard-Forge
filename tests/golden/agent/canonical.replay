@@ -1,0 +1,8 @@
+{
+  "ticks": 24,
+  "stream": [
+    { "tick": 0, "kind": 4, "target": 2, "arg": [65536, 0, 0] },
+    { "tick": 2, "kind": 0, "target": 0, "arg": [-196608, 131072, 0] }
+  ],
+  "finalDigest": "76a37a56d256c401"
+}

@@ -30,11 +30,17 @@
 // NO new compute.
 
 #include <cstdint>
+#include <cstdio>              // DX5: std::snprintf (the 16-hex digest)
+#include <cstdlib>             // DX5: std::strtoll / std::free (ParseReplay over json.h)
+#include <cstring>             // DX5: std::strcmp (ParseReplay member lookup)
+#include <string>              // DX5: std::string (DigestSnapshot / Serialize / ParseReplay)
 #include <unordered_map>
 #include <vector>
 
 #include "ecs/ecs.h"           // read-only: ecs::Registry / ecs::Entity / create/get/has/remove (the sparse-set
                                // store VD1 layers the determinism contract over — NOT modified)
+#include "json/json.h"         // DX5 ONLY: the vendored single-header JSON parser (json_weak/inline C TU) for
+                               // ParseReplay — the scene_io.cpp parser, reused; VD1-VD4 do NOT use it
 #include "sim/warmhull.h"      // read-only: warmhull::HullCache / warmhull::HullSleepState (the embedded sim
                                // subsystem fields VD1 carries but does NOT step — VD3 steps them); transitively
                                // gjk::HullWorld + convex::ConvexCommand + the fpx Q16.16 toolbox (FxVec3/FxQuat)
@@ -1057,6 +1063,325 @@ inline gjk::HullRenderMesh VerdictToRenderInstances(const VerdictWorld& world) {
 
     out.triangles = (uint32_t)(out.verts.size() / 3);
     return out;
+}
+
+// =================================================================================================
+// Slice DX5 — THE RECORD->REPLAY->ASSERT-DETERMINISM HARNESS (APPEND-ONLY; VD1-VD6 above are
+// BYTE-FROZEN). The 5th slice of FLAGSHIP #31 (THE AGENT EXPERIENCE / AX PRODUCT, slice-tag DX) —
+// productizing the lockstep MOAT (flagship #27) as a testable agent artifact.
+//
+// VD1-VD6 built the deterministic entity world, the gameplay systems, the composed StepWorld tick,
+// the heterogeneous snapshot, the whole-world lockstep/rollback, and the lit render. DX5 turns that
+// determinism into a PRODUCT GUARANTEE an agent codes against: a command stream is RECORDED against
+// the canonical gameplay world, the engine REPLAYS it (RunVerdictLockstep), and the final world is
+// digested + asserted bit-identical against a committed golden replay file. A float engine cannot
+// ship this: a non-deterministic sim has no reproducible "replay -> bit-identical" guarantee.
+//
+// THE DESIGN: a FIXED canonical scene builder (BuildCanonicalReplay) that record + verify (and the
+// test) ALL call, so the replay file need only carry {stream, ticks, finalDigest} — the initial
+// state is IMPLIED by the canonical builder (serializing arbitrary initial worlds is a future
+// extension, out of scope). The digest is over the FINAL world (the moat's payload: two machines
+// that replay the same stream produce the same final world -> the same digest). DigestSnapshot
+// walks the snapshot in the order[]-KEYED canonical sequence the determinism contract already uses,
+// so it is a pure function of the deterministic final state — stable under ECS handle churn,
+// backend-identical. Tamper-detect (the falsifiable beat): flip one command's arg -> the replayed
+// final digest DIFFERS from finalDigest (VerifyReplay returns false).
+//
+// PURE CPU INTEGER + ONE 16-hex digest. The FNV-1a is a verdict-LOCAL mirror of introspect.cpp's
+// contentHash (same constants) — NO render/introspect include is pulled in. SerializeReplay/
+// ParseReplay are deterministic JSON {ticks, stream:[{tick,kind,target,arg}], finalDigest} over the
+// FROZEN Command wire format (serialized, NEVER changed). NO new RHI, NO new shader, NO Metal
+// golden; verdict.h is APPEND-ONLY (VD1-VD6 byte-frozen).
+// =================================================================================================
+
+// ----- DigestFnv: the verdict-LOCAL FNV-1a 64-bit (the introspect.cpp contentHash constants) -------
+// A pure-integer running mix — NO render/introspect include (the no-cross-dependency contract). The
+// SAME 64-bit FNV-1a offset/prime as engine/editor/introspect.cpp's AgentFnv (1469598103934665603 /
+// 1099511628211), so the digest discipline matches the engine's other deterministic key/hash sites.
+struct DigestFnv {
+    uint64_t h = 1469598103934665603ull;
+    void mix(uint64_t v) {
+        // Fold the 8 bytes of v LSB-first (a fixed byte order -> endianness-independent + stable).
+        for (int b = 0; b < 8; ++b) {
+            h ^= (uint64_t)(uint8_t)(v >> (b * 8));
+            h *= 1099511628211ull;
+        }
+    }
+    void mix32(uint32_t v) { mix((uint64_t)v); }
+    void sep() {                                  // an unambiguous separator (the introspect AgentFnv idiom)
+        h ^= 0x1Full;
+        h *= 1099511628211ull;
+    }
+};
+
+// ----- Fold a Q16.16 FxVec3 / FxQuat / FxBody into a DigestFnv (fixed field order) ------------------
+inline void DigestVec3(DigestFnv& d, const FxVec3& v) {
+    d.mix32((uint32_t)v.x); d.mix32((uint32_t)v.y); d.mix32((uint32_t)v.z);
+}
+inline void DigestQuat(DigestFnv& d, const FxQuat& q) {
+    d.mix32((uint32_t)q.x); d.mix32((uint32_t)q.y); d.mix32((uint32_t)q.z); d.mix32((uint32_t)q.w);
+}
+inline void DigestBody(DigestFnv& d, const fpx::FxBody& b) {
+    DigestVec3(d, b.pos); DigestVec3(d, b.vel);
+    d.mix32((uint32_t)b.invMass); d.mix32(b.flags); d.mix32((uint32_t)b.radius);
+    DigestQuat(d, b.orient); DigestVec3(d, b.angVel);
+}
+
+// ----- DigestSnapshot(s) -> 16-hex FNV-1a over a CANONICAL byte-encoding of the WHOLE snapshot -------
+// A compact, deterministic, backend-agnostic fingerprint of the final world. It walks the snapshot in
+// the order[]-KEYED canonical sequence the determinism contract uses (NOT the ECS dense order): the
+// header (tick, nextId, order[]), THEN every component pool IN order[] sequence (each CompEntry vector
+// is already serialized in order[] sequence by SnapshotWorld, with a separator after each pool so the
+// pools cannot alias), THEN the sim TRIPLE (bodies + cache entries [key + impulse] + per-body sleep
+// state). Two snapshots that are VerdictSnapshotsEqual hash IDENTICALLY (the digest is a pure function
+// of the determinism-relevant state); a restored world (whose ecs handles churn) digests identically
+// because nothing here reads the opaque handle. Returns the 16-hex-digit lowercase string.
+inline std::string DigestSnapshot(const VerdictSnapshot& s) {
+    DigestFnv d;
+    // (1) header.
+    d.mix32(s.tick);
+    d.mix32(s.nextId);
+    d.mix32((uint32_t)s.order.size());
+    for (size_t i = 0; i < s.order.size(); ++i) d.mix32((uint32_t)s.order[i]);
+    d.sep();
+
+    // (2) every component pool, IN order[] sequence (the SnapshotWorld serialization order). Each
+    // entry folds the EntityId key then the component fields; a separator follows each pool.
+    for (const auto& c : s.transforms) { d.mix32((uint32_t)c.id); DigestVec3(d, c.value.pos); DigestQuat(d, c.value.orient); }
+    d.sep();
+    for (const auto& c : s.healths)    { d.mix32((uint32_t)c.id); d.mix32((uint32_t)c.value.hp); }
+    d.sep();
+    for (const auto& c : s.bodyRefs)   { d.mix32((uint32_t)c.id); d.mix32(c.value.simBodyIndex); }
+    d.sep();
+    for (const auto& c : s.velocities) { d.mix32((uint32_t)c.id); DigestVec3(d, c.value.vel); }
+    d.sep();
+    for (const auto& c : s.pickups)    { d.mix32((uint32_t)c.id); d.mix32((uint32_t)c.value.value); }
+    d.sep();
+    for (const auto& c : s.scores)     { d.mix32((uint32_t)c.id); d.mix32((uint32_t)c.value.points); }
+    d.sep();
+
+    // (3) the sim TRIPLE (bodies + cache + sleep), in fixed vector order.
+    d.mix32((uint32_t)s.simSnap.bodies.size());
+    for (const auto& b : s.simSnap.bodies) DigestBody(d, b);
+    d.sep();
+    d.mix32((uint32_t)s.simSnap.cache.entries.size());
+    for (const auto& e : s.simSnap.cache.entries) {
+        d.mix32(e.key.bodyA); d.mix32(e.key.bodyB); d.mix32(e.key.refFaceId); d.mix32(e.key.incVertId);
+        d.mix32((uint32_t)e.normalImpulse);
+    }
+    d.sep();
+    d.mix32((uint32_t)s.simSnap.sleep.size());
+    for (const auto& sl : s.simSnap.sleep) {
+        d.mix32((uint32_t)sl.energy); d.mix32(sl.lowEnergyTicks); d.mix32(sl.asleep ? 1u : 0u);
+    }
+
+    char buf[17];
+    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)d.h);
+    return std::string(buf);
+}
+
+// ----- ReplayFile: the deterministic replay regression artifact --------------------------------------
+// {ticks, stream, finalDigest}. The initial world is IMPLIED by BuildCanonicalReplay (both record +
+// verify build the identical world0 from it), so only the input stream + tick count + the expected
+// final-world digest are serialized. The Command wire format {tick,kind,target,arg} is the FROZEN VD1
+// layout — serialized verbatim, NEVER changed.
+struct ReplayFile {
+    uint32_t             ticks = 0;
+    std::vector<Command> stream;
+    std::string          finalDigest;
+};
+
+// ----- SerializeReplay(rf) -> deterministic JSON text (LF, the house integer style) ------------------
+// {ticks, stream:[{tick,kind,target,arg:[x,y,z]}], finalDigest}. arg is the Q16.16 FxVec3 emitted as
+// INTEGERS (the raw fixed-point words — NO float, so the round-trip is exact). FIXED key order +
+// 2-space indent -> byte-identical run-to-run (the introspect/scene_io house style). NO BOM, LF only.
+inline std::string SerializeReplay(const ReplayFile& rf) {
+    std::string o;
+    o.reserve(256 + rf.stream.size() * 64);
+    o += "{\n";
+    o += "  \"ticks\": " + std::to_string(rf.ticks) + ",\n";
+    o += "  \"stream\": [";
+    for (size_t i = 0; i < rf.stream.size(); ++i) {
+        const Command& c = rf.stream[i];
+        o += (i ? ",\n" : "\n");
+        o += "    { \"tick\": " + std::to_string(c.tick);
+        o += ", \"kind\": " + std::to_string(c.kind);
+        o += ", \"target\": " + std::to_string((uint32_t)c.target);
+        o += ", \"arg\": [" + std::to_string((int64_t)(int32_t)c.arg.x) + ", " +
+             std::to_string((int64_t)(int32_t)c.arg.y) + ", " +
+             std::to_string((int64_t)(int32_t)c.arg.z) + "] }";
+    }
+    o += (rf.stream.empty() ? "],\n" : "\n  ],\n");
+    o += "  \"finalDigest\": \"" + rf.finalDigest + "\"\n";
+    o += "}\n";
+    return o;
+}
+
+// ----- ParseReplay(text) -> ReplayFile: the inverse (the vendored json.h parser) --------------------
+// Tolerant of arbitrary key order / whitespace (the parser handles it); reads ticks, the stream array
+// of {tick,kind,target,arg:[x,y,z]} (arg parsed as INTEGER fixed-point words), and finalDigest. A
+// malformed / missing field yields a default (0 / empty) — VerifyReplay then simply fails the digest
+// compare (the deterministic, non-crashing posture; never a crash). Uses the vendored single-header
+// json.h (a json_weak / inline C TU — safe to include in a header). SerializeReplay -> ParseReplay is
+// a byte-faithful round-trip of {ticks, stream, finalDigest}.
+namespace replay_detail {
+
+inline const json_value_s* Member(const json_object_s* obj, const char* key) {
+    if (!obj) return nullptr;
+    for (const json_object_element_s* el = obj->start; el; el = el->next)
+        if (el->name && std::strcmp(el->name->string, key) == 0) return el->value;
+    return nullptr;
+}
+inline int64_t NumberOf(const json_value_s* v, int64_t fallback) {
+    if (!v || v->type != json_type_number) return fallback;
+    return (int64_t)std::strtoll(static_cast<const json_number_s*>(v->payload)->number, nullptr, 10);
+}
+
+}  // namespace replay_detail
+
+inline ReplayFile ParseReplay(const std::string& text) {
+    ReplayFile rf;
+    json_value_s* root = json_parse(text.data(), text.size());
+    if (!root) return rf;                       // malformed -> empty (VerifyReplay then fails the compare)
+    struct FreeGuard { void* p; ~FreeGuard() { std::free(p); } } guard{root};
+    if (root->type != json_type_object) return rf;
+    const json_object_s* obj = static_cast<const json_object_s*>(root->payload);
+
+    rf.ticks = (uint32_t)replay_detail::NumberOf(replay_detail::Member(obj, "ticks"), 0);
+
+    const json_value_s* fd = replay_detail::Member(obj, "finalDigest");
+    if (fd && fd->type == json_type_string) {
+        const json_string_s* s = static_cast<const json_string_s*>(fd->payload);
+        rf.finalDigest.assign(s->string, s->string_size);
+    }
+
+    const json_value_s* st = replay_detail::Member(obj, "stream");
+    if (st && st->type == json_type_array) {
+        const json_array_s* arr = static_cast<const json_array_s*>(st->payload);
+        for (const json_array_element_s* el = arr->start; el; el = el->next) {
+            if (el->value->type != json_type_object) continue;
+            const json_object_s* co = static_cast<const json_object_s*>(el->value->payload);
+            Command c;
+            c.tick   = (uint32_t)replay_detail::NumberOf(replay_detail::Member(co, "tick"), 0);
+            c.kind   = (uint32_t)replay_detail::NumberOf(replay_detail::Member(co, "kind"), 0);
+            c.target = (EntityId)replay_detail::NumberOf(replay_detail::Member(co, "target"), 0);
+            const json_value_s* ag = replay_detail::Member(co, "arg");
+            if (ag && ag->type == json_type_array) {
+                const json_array_s* aa = static_cast<const json_array_s*>(ag->payload);
+                fx comp[3] = {0, 0, 0};
+                int i = 0;
+                for (const json_array_element_s* ae = aa->start; ae && i < 3; ae = ae->next, ++i)
+                    comp[i] = (fx)(int32_t)replay_detail::NumberOf(ae->value, 0);
+                c.arg = FxVec3{comp[0], comp[1], comp[2]};
+            }
+            rf.stream.push_back(c);
+        }
+    }
+    return rf;
+}
+
+// ----- BuildCanonicalReplay(): the FIXED canonical replay scene ------------------------------------
+// A VD3/VD5-style composed gameplay+physics world0 + VerdictParams + a FIXED command stream + tick
+// count. Record AND verify (AND the test) build the IDENTICAL world0 from this, so the replay file
+// needs only {stream, ticks, finalDigest}. Returns the pieces by out-params (VerdictWorld is
+// non-copyable, so world0 is filled in place). The scene MIRRORS the VD5 --vd5-net showcase: a static
+// support body, a dynamic player body, a small hull stack, plus gameplay entities (player Health+Score,
+// two pickups, a mover) so EVERY component type is exercised by the digest.
+struct CanonicalReplay {
+    VerdictParams        params;
+    std::vector<Command> stream;
+    uint32_t             ticks = 0;
+    EntityId             player = kNoEntity;
+};
+
+inline CanonicalReplay BuildCanonicalReplay(VerdictWorld& world0) {
+    auto fi = [](int v) -> fx { return (fx)((int64_t)v * (int64_t)kOne); };
+    auto V  = [&](int x, int y, int z) { return FxVec3{fi(x), fi(y), fi(z)}; };
+    const FxQuat kIdentity{0, 0, 0, kOne};
+
+    // The deterministic warm+sleep config (== the VD3/VD4/VD5 lineage; angDamp OFF).
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    convex::ConvexStepConfig stepCfg;
+    stepCfg.gravity     = FxVec3{0, kGravY, 0};
+    stepCfg.dt          = kOne / 60;
+    stepCfg.solveIters  = 8;
+    stepCfg.restitution = 0;
+    stepCfg.slop        = kOne / 64;
+    stepCfg.beta        = (fx)((int64_t)2 * kOne / 10);
+    stepCfg.linDamp     = (fx)((int64_t)95 * kOne / 100);
+    stepCfg.angDamp     = kOne;
+    stepCfg.posIters    = 4;
+    warmhull::HullSleepConfig cfg;
+    cfg.warm           = stepCfg;
+    cfg.sleepThreshold = kOne;
+    cfg.wakeThreshold  = (fx)(2 * (int)kOne);
+    cfg.sleepTicks     = 30;
+
+    const HazardRegion hazard{V(-9,-9,0).x, V(-9,-9,0).y, V(-9,-9,0).x, V(-9,-9,0).y};  // empty band
+    const fx collectR = kOne;
+    const int stackN = 2;
+
+    // The composed sim scene: body 0 = static support; body 1 = the player's dynamic hull; bodies
+    // 2..1+stackN = a small stack of dynamic boxes resting above.
+    world0 = VerdictWorld{};
+    {
+        gjk::HullWorld sim;
+        { fpx::FxBody b; b.pos={0,0,0}; b.orient={0,0,0,kOne}; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+        sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 0 static support
+        { fpx::FxBody b; b.pos={0, fi(3), 0}; b.orient={0,0,0,kOne}; b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+        sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 1 dynamic PLAYER body
+        for (int k = 0; k < stackN; ++k) {
+            fpx::FxBody b; b.pos={0, fi(5 + 2 * k), 0}; b.orient={0,0,0,kOne};
+            b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0};
+            sim.bodies.push_back(b);
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 2..1+stackN stacked boxes
+        }
+        world0.sim = sim;
+    }
+
+    // Gameplay entities: support (body 0), player (body 1, Health+Score), a pickup near the player (a
+    // collect fires + despawns it + bumps Score), a second pickup, a mover with a Velocity2D, then the
+    // stacked boxes — so EVERY component type is in the digest.
+    const EntityId support = SpawnEntity(world0, Transform2D{V(0,0,0), kIdentity});
+    BindBody(world0, support, 0u);
+    const EntityId player = SpawnEntity(world0, Transform2D{V(0,3,0), kIdentity}, Health{77}, BodyRef{kNoBody});
+    world0.reg.add<Score>(world0.handle.at(player), Score{0});
+    BindBody(world0, player, 1u);
+    const EntityId pk0 = SpawnEntity(world0, Transform2D{V(0,3,0), kIdentity});
+    world0.reg.add<Pickup>(world0.handle.at(pk0), Pickup{5});
+    const EntityId pk1 = SpawnEntity(world0, Transform2D{V(5,5,0), kIdentity});
+    world0.reg.add<Pickup>(world0.handle.at(pk1), Pickup{3});
+    const EntityId mover = SpawnMover(world0, Transform2D{V(4,4,0), kIdentity}, Health{10}, Velocity2D{V(0,0,0)});
+    for (int k = 0; k < stackN; ++k) {
+        const EntityId se = SpawnEntity(world0, Transform2D{V(0, 5 + 2 * k, 0), kIdentity});
+        BindBody(world0, se, (uint32_t)(2 + k));
+    }
+    (void)support; (void)pk0; (void)pk1; (void)mover;
+
+    CanonicalReplay cr;
+    cr.player = player;
+    cr.ticks  = 24u;
+    cr.params = VerdictParams{hazard, player, collectR, cfg, world0.sim.hulls};
+    // The FIXED command stream: a kCmdImpulse nudges the player body, a kCmdSpawn adds an entity.
+    cr.stream = {
+        Command{0u, kCmdImpulse, player, V(1,0,0)},        // nudge the player body
+        Command{2u, kCmdSpawn,   kNoEntity, V(-3,2,0)},    // a deterministic gameplay spawn
+    };
+    return cr;
+}
+
+// ----- VerifyReplay(rf): rebuild the canonical world0 -> lockstep over rf.stream -> compare digest ---
+// The product guarantee: rebuild the FIXED canonical world0 (BuildCanonicalReplay), RunVerdictLockstep
+// over rf.stream for rf.ticks, DigestSnapshot the converged authority, and return whether it EQUALS
+// rf.finalDigest. A changed input (a tampered command) OR a changed engine BOTH move the digest -> the
+// regression guard. (The lockstep also re-derives a replica from inputs alone; the authority==replica
+// equality is the moat, asserted separately by the driver via RunVerdictLockstep's outIdentical.)
+inline bool VerifyReplay(const ReplayFile& rf) {
+    VerdictWorld world0;
+    const CanonicalReplay cr = BuildCanonicalReplay(world0);
+    const VerdictSnapshot world0Snap = SnapshotWorld(world0);
+    const VerdictSnapshot finalSnap = RunVerdictLockstep(world0Snap, cr.params, rf.stream, rf.ticks);
+    return DigestSnapshot(finalSnap) == rf.finalDigest;
 }
 
 }  // namespace verdict
