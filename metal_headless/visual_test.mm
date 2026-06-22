@@ -59355,6 +59355,41 @@ int main(int argc, char** argv) {
                 return fail(std::string("exception: ") + e.what());
             }
         }
+        // --author-scene <spec.json> <out.json> (Slice DX3, FLAGSHIP #31): the DECLARATIVE SCENE-SPEC
+        // AUTHORING LOOP. CanonicalizeScene = LoadScene(spec) then DumpScene -> the engine's single
+        // canonical scene JSON, written LF-clean. scene_io is render-symbol-free (it maps named opaque
+        // resource pointers <-> names, never dereferences them), so NO Metal device is needed — the
+        // named resources are registered as SENTINEL pointers (the SAME names the Vulkan side uses) and
+        // the canonical bytes are IDENTICAL to the Windows/Vulkan --author-scene by construction. The
+        // authoritative byte-golden compare is Windows-only (verify.ps1); here we just emit the artifact
+        // so the Metal showcase set mirrors the Vulkan one.
+        if (argc > 2 && std::strcmp(argv[1], "--author-scene") == 0) {
+            const char* specPath = argv[2];
+            const char* out = (argc > 3) ? argv[3] : nullptr;
+            if (!out) { std::fprintf(stderr, "FATAL: --author-scene needs <spec.json> <out.json>\n"); return 1; }
+            scene::SceneResources res;
+            res.AddMesh("cube",   reinterpret_cast<scene::Mesh*>(0x1001));
+            res.AddMesh("plane",  reinterpret_cast<scene::Mesh*>(0x1002));
+            res.AddMesh("sphere", reinterpret_cast<scene::Mesh*>(0x1003));
+            res.AddMesh("duck",   reinterpret_cast<scene::Mesh*>(0x1004));
+            res.AddTexture("checker",        reinterpret_cast<rhi::ITexture*>(0x2001));
+            res.AddTexture("normalmap",      reinterpret_cast<rhi::ITexture*>(0x2002));
+            res.AddTexture("duck_basecolor", reinterpret_cast<rhi::ITexture*>(0x2003));
+            res.AddTexture("flat_normal",    reinterpret_cast<rhi::ITexture*>(0x2004));
+            std::string canonical;
+            try {
+                ecs::Registry reg;
+                canonical = scene::CanonicalizeScene(specPath, reg, res);
+            } catch (const std::exception& ex) {
+                std::printf("author-scene: error: %s\n", ex.what());
+                return 1;
+            }
+            std::ofstream f(out, std::ios::binary);  // LF-only, no BOM.
+            if (!f) { std::fprintf(stderr, "FATAL: cannot write author-scene output '%s'\n", out); return 1; }
+            f << canonical;
+            std::printf("author-scene: wrote %s\n", out);
+            return 0;
+        }
         // --clustered <out.png>: clustered / Forward+ lighting showcase (Slice AG).
         if (argc > 1 && std::strcmp(argv[1], "--clustered") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_clustered.png";

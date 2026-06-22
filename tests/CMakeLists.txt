@@ -33,6 +33,10 @@ hf_add_pure_test(commands_test)
 # DX2: the selective scene-query read protocol (scene::RunQueries). Pure CPU JSON over the command
 # bus — determinism, field-selection + canonical order, stats counts, out-of-range error object.
 hf_add_pure_test(agent_query_test)
+# DX3: the declarative scene-spec authoring loop (scene::CanonicalizeScene/Text = LoadScene then
+# DumpScene). Pure CPU JSON — round-trip to the canonical text, idempotence/fixed-point, two-call
+# determinism, and the unknown-mesh std::runtime_error reject. ASan-eligible like the others.
+hf_add_pure_test(agent_author_test)
 # Skeletal-animation math + sampling (Quat/Slerp/FromTRS + SampleAnimation). Pure C++ (hf_core),
 # ASan-eligible like the others.
 hf_add_pure_test(anim_test)

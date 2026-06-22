@@ -1,0 +1,23 @@
+[
+  {
+    "position": [0, -0.5, 0],
+    "scale": [8, 1, 8],
+    "mesh": "plane",
+    "roughness": 0.9,
+    "baseColor": "checker"
+  },
+  {
+    "mesh": "sphere",
+    "metallic": 1,
+    "roughness": 0.2,
+    "position": [1.5, 0.5, 0],
+    "baseColor": "checker",
+    "normalMap": "flat_normal"
+  },
+  {
+    "euler": [0, 0.7853982, 0],
+    "mesh": "duck",
+    "position": [-1.5, 0, 1.2],
+    "baseColor": "duck_basecolor"
+  }
+]

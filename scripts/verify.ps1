@@ -452,6 +452,34 @@ if (-not `$aqOk) {
 }
 Write-Host 'agent query-responses JSON golden: exact match'
 
+# --- Authored-scene canonical JSON golden (Slice DX3, FLAGSHIP #31): an EXACT byte-for-byte match of a
+# fresh --author-scene (scene::CanonicalizeScene = LoadScene then DumpScene over the NON-canonical spec
+# assets/scenes/dx3_spec.json) against the committed canonical golden. This is the agent-AUTHOR artifact
+# (the declarative scene-spec -> canonical-scene round-trip with the fixed-point guarantee — the write
+# half of the agent authoring loop). Like the --agent-api / --agent-query goldens it is backend-AGNOSTIC
+# (pure hf_core, scene_io is render-symbol-free, the bytes are identical on Vulkan and Metal), so it is
+# verified once here on the Windows/Vulkan build and is NOT in `$Goldens`/`$vkShots` (the Mac IMAGE set).
+# CanonicalizeScene is deterministic + side-effect-free, so this rebakes only when the spec or DumpScene
+# changes. The --author-scene exe ALSO runs the 4 DX3 proofs internally (byte-golden / round-trip /
+# idempotence / unknown-mesh reject) and fails loudly. ---
+Write-Host '--- authored-scene canonical JSON golden ---'
+`$asExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$asSpec = 'assets/scenes/dx3_spec.json'
+`$asGolden = 'tests/golden/agent/authored_scene.json'
+`$asLive = Join-Path `$env:TEMP 'hf_author_scene_live.json'
+& `$asExe --author-scene `$asSpec `$asLive 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'author-scene run failed (proofs or byte-golden mismatch)'; exit 32 }
+# Compare RAW bytes (the program writes LF-only, no BOM); any difference is a failure.
+`$asgBytes = [System.IO.File]::ReadAllBytes((Resolve-Path `$asGolden).Path)
+`$aslBytes = [System.IO.File]::ReadAllBytes(`$asLive)
+`$asOk = (`$asgBytes.Length -eq `$aslBytes.Length)
+if (`$asOk) { for (`$si = 0; `$si -lt `$asgBytes.Length; `$si++) { if (`$asgBytes[`$si] -ne `$aslBytes[`$si]) { `$asOk = `$false; break } } }
+if (-not `$asOk) {
+    Write-Host 'authored-scene canonical JSON golden MISMATCH (tests/golden/agent/authored_scene.json)'
+    exit 33
+}
+Write-Host 'authored-scene canonical JSON golden: exact match'
+
 # --- Audio mixer WAV golden (Slice BB): an EXACT byte-for-byte match of a fresh --audio-render of the
 # fixed deterministic audio scene against the committed tests/golden/audio/scene.wav. The mixer is
 # INTEGER / fixed-point end to end (Q15 gains, int32 accumulate, int16 hard-clamp), so the rendered

@@ -1,0 +1,32 @@
+[
+  {
+    "mesh": "plane",
+    "baseColor": "checker",
+    "normalMap": null,
+    "metallic": 0,
+    "roughness": 0.9,
+    "position": [0, -0.5, 0],
+    "euler": [0, 0, 0],
+    "scale": [8, 1, 8]
+  },
+  {
+    "mesh": "sphere",
+    "baseColor": "checker",
+    "normalMap": "flat_normal",
+    "metallic": 1,
+    "roughness": 0.2,
+    "position": [1.5, 0.5, 0],
+    "euler": [0, 0, 0],
+    "scale": [1, 1, 1]
+  },
+  {
+    "mesh": "duck",
+    "baseColor": "duck_basecolor",
+    "normalMap": null,
+    "metallic": 0,
+    "roughness": 0.5,
+    "position": [-1.5, 0, 1.2],
+    "euler": [0, 0.785398, 0],
+    "scale": [1, 1, 1]
+  }
+]

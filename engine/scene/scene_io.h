@@ -82,4 +82,18 @@ std::vector<ecs::Entity> LoadScene(ecs::Registry& reg, const SceneResources& res
 // This is the machine-readable scene state an agent can inspect. Pretty-printed.
 std::string DumpScene(ecs::Registry& reg, const SceneResources& resources);
 
+// Slice DX3 — the declarative scene-spec authoring loop. CanonicalizeScene composes the two frozen
+// halves above: LoadScene(spec) then DumpScene, returning the engine's single CANONICAL scene JSON
+// for the spec. The input spec may be non-canonical (arbitrary key order, whitespace, optional
+// fields omitted to their defaults); the output is the one canonical text. The function is a fixed
+// point under itself: Canonicalize(Canonicalize(spec)) == Canonicalize(spec), byte-for-byte, since
+// DumpScene emits a fixed key order + %g floats. `reg` is used as scratch (pass a fresh Registry).
+// Pure (no render symbols); throws std::runtime_error on a malformed spec / unknown name (the
+// existing LoadScene contract — the spec is rejected, not silently half-built).
+std::string CanonicalizeScene(const char* specPath, ecs::Registry& reg, const SceneResources& res);
+
+// The in-memory overload: `specJson` is the spec as a JSON string (the file-free unit-test entry).
+std::string CanonicalizeSceneText(const char* specJson, ecs::Registry& reg,
+                                  const SceneResources& res);
+
 }  // namespace hf::scene

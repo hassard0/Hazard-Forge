@@ -85,10 +85,11 @@ void AppendVec3(std::ostringstream& os, const math::Vec3& v) {
 
 }  // namespace
 
-std::vector<ecs::Entity> LoadScene(ecs::Registry& reg, const SceneResources& resources,
-                                   const char* path) {
-    std::string text = ReadFile(path);
-
+// Parse a scene JSON STRING (already in memory) and create entities, IN TEXT ORDER. The shared
+// core of LoadScene (file) and the in-memory CanonicalizeSceneText overload. `srcName` only labels
+// parse errors. Throws std::runtime_error on parse error / non-array / unknown mesh name.
+static std::vector<ecs::Entity> LoadSceneText(ecs::Registry& reg, const SceneResources& resources,
+                                              const std::string& text, const char* srcName) {
     json_parse_result_s err{};
     json_value_s* root = json_parse_ex(text.data(), text.size(), json_parse_flags_default,
                                        nullptr, nullptr, &err);
@@ -96,14 +97,14 @@ std::vector<ecs::Entity> LoadScene(ecs::Registry& reg, const SceneResources& res
         char msg[160];
         std::snprintf(msg, sizeof(msg),
                       "LoadScene: JSON parse error %u at line %zu, row %zu in %s",
-                      static_cast<unsigned>(err.error), err.error_line_no, err.error_row_no, path);
+                      static_cast<unsigned>(err.error), err.error_line_no, err.error_row_no, srcName);
         throw std::runtime_error(msg);
     }
     // Own the single allocation json_parse made for the whole DOM.
     struct FreeGuard { void* p; ~FreeGuard() { std::free(p); } } guard{root};
 
     if (root->type != json_type_array)
-        throw std::runtime_error(std::string("LoadScene: top-level JSON must be an array: ") + path);
+        throw std::runtime_error(std::string("LoadScene: top-level JSON must be an array: ") + srcName);
 
     const json_array_s* arr = static_cast<const json_array_s*>(root->payload);
     std::vector<ecs::Entity> created;
@@ -144,6 +145,28 @@ std::vector<ecs::Entity> LoadScene(ecs::Registry& reg, const SceneResources& res
     }
 
     return created;
+}
+
+std::vector<ecs::Entity> LoadScene(ecs::Registry& reg, const SceneResources& resources,
+                                   const char* path) {
+    return LoadSceneText(reg, resources, ReadFile(path), path);
+}
+
+// CanonicalizeScene = DumpScene(LoadScene(spec)) — load the spec FILE into a fresh-state load over
+// `reg`, then re-emit the engine's single canonical form. `reg` is used as scratch (the caller
+// passes a fresh Registry); the returned string is the canonical scene JSON. Pure; throws
+// std::runtime_error on a malformed/unknown-name spec (the LoadScene contract).
+std::string CanonicalizeScene(const char* specPath, ecs::Registry& reg,
+                              const SceneResources& res) {
+    LoadScene(reg, res, specPath);
+    return DumpScene(reg, res);
+}
+
+// The in-memory overload (file-free): canonicalize a spec held as a JSON STRING. Same contract.
+std::string CanonicalizeSceneText(const char* specJson, ecs::Registry& reg,
+                                  const SceneResources& res) {
+    LoadSceneText(reg, res, std::string(specJson), "<text>");
+    return DumpScene(reg, res);
 }
 
 std::string DumpScene(ecs::Registry& reg, const SceneResources& resources) {
