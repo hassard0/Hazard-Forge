@@ -61,6 +61,12 @@ backends, no per-platform drift.
 
 ## Capabilities
 
+> **Looking for a specific feature (ray tracing, GI, Nanite-style geometry, VSM, physics, …) and how to see it?**
+> [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) is the capability map: for each capability it lists *what ships*, the
+> *showcase flag to run it*, the *golden image*, the relevant ARCHITECTURE section, and an honest note on what's not
+> yet built. Every capability is reachable through a headless `--<name>` / `--<name>-shot` flag with a committed
+> reference render.
+
 ### Real-time rendering (Vulkan + Metal, every feature golden-verified)
 
 A full modern renderer — and crucially, *the identical image* on both backends, proven to the byte.
