@@ -548,6 +548,8 @@ int main() {
             bool sawGi5OcclusionFeature = false;
             // Slice GI6: the gi6-hero capability is advertised (the lit GI hero capstone — the FLAGSHIP #29 money-shot).
             bool sawGi6HeroFeature = false;
+            // Slice HF1: the hf1-points capability is advertised (the hull-friction tagged-manifold beachhead, FLAGSHIP #30).
+            bool sawHf1PointsFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -800,6 +802,7 @@ int main() {
                     if (AsString(el->value) == "gi4-bounce") sawGi4BounceFeature = true;
                     if (AsString(el->value) == "gi5-occlusion") sawGi5OcclusionFeature = true;
                     if (AsString(el->value) == "gi6-hero") sawGi6HeroFeature = true;
+                    if (AsString(el->value) == "hf1-points") sawHf1PointsFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -1027,6 +1030,7 @@ int main() {
             check(sawGi4BounceFeature, "engine.features includes gi4-bounce");
             check(sawGi5OcclusionFeature, "engine.features includes gi5-occlusion");
             check(sawGi6HeroFeature, "engine.features includes gi6-hero");
+            check(sawHf1PointsFeature, "engine.features includes hf1-points");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1366,6 +1370,8 @@ int main() {
         bool sawWh1KeysShot = false;
         // Slice WH2: the --wh2-cache-shot showcase flag is listed in the showcase manifest.
         bool sawWh2CacheShot = false;
+        // Slice HF1: the --hf1-points-shot showcase flag is listed in the showcase manifest.
+        bool sawHf1PointsShot = false;
         // Slice WH3: the --wh3-warm-shot showcase flag is listed in the showcase manifest.
         bool sawWh3WarmShot = false;
         // Slice WH4: the --wh4-stack-shot showcase flag is listed in the showcase manifest.
@@ -1654,6 +1660,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--persist-key-shot") sawPersistKeyShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--wh1-keys-shot") sawWh1KeysShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--wh2-cache-shot") sawWh2CacheShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--hf1-points-shot") sawHf1PointsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--wh3-warm-shot") sawWh3WarmShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--wh4-stack-shot") sawWh4StackShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--wh5-lockstep-shot") sawWh5LockstepShot = true;
@@ -1878,6 +1885,7 @@ int main() {
         check(sawPersistKeyShot, "showcases manifest includes --persist-key-shot");
         check(sawWh1KeysShot, "showcases manifest includes --wh1-keys-shot");
         check(sawWh2CacheShot, "showcases manifest includes --wh2-cache-shot");
+        check(sawHf1PointsShot, "showcases manifest includes --hf1-points-shot");
         check(sawWh3WarmShot, "showcases manifest includes --wh3-warm-shot");
         check(sawWh4StackShot, "showcases manifest includes --wh4-stack-shot");
         check(sawWh5LockstepShot, "showcases manifest includes --wh5-lockstep-shot");

@@ -876,6 +876,17 @@ hf_add_pure_test(manifold_test)
 # (hf_core), ASan-eligible.
 hf_add_pure_test(warmhull_test)
 
+# Hull Friction + Joints Slice 1 (Slice HF1, the friction BEACHHEAD of FLAGSHIP #30: hf::sim::hullfric): the
+# integer friction-extended keyed hull manifold (engine/sim/hullfric.h, a NEW additive sibling #including
+# sim/warmhull.h + sim/gjk.h + sim/fric.h + sim/persist.h + sim/manifold.h READ-ONLY/BYTE-FROZEN) the GPU
+# shaders/hullfric_points.comp copies VERBATIM. Pins MakeTangentBasis orthonormal on a spread of EPA normals,
+# BuildHullFrictionManifold's points/depths/keys == the FROZEN warmhull manifold (HF1 is additive over the
+# geometry — it appends the basis + zeroed accumulators), basisAxis == fric::LeastAlignedAxis(normal),
+# MatchHullFrictionCache warm-seeds on a key+basis match AND cold-starts the tangents on a basis-axis FLIP (the
+# crux groundwork), UpdateHullFrictionCache evict/rewrite, and two-run determinism. Pure C++ (hf_core),
+# ASan-eligible.
+hf_add_pure_test(hullfric_test)
+
 # Deterministic Gameplay / Netcode Slice 1 (Slice VD1, the BEACHHEAD of FLAGSHIP #27: hf::game::verdict): the
 # PURE-CPU integer entity world + the unified tick-ordered input-command bus that layers a determinism contract
 # over the raw ecs::Registry (engine/game/verdict.h, a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h

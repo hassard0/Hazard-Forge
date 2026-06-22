@@ -110,6 +110,7 @@
 #include "sim/fric.h"                // Slice FC1: deterministic contact friction THE TANGENT BASIS (TangentBasis/LeastAlignedAxis/MakeTangentBasis/MeasureBasis, the fixed integer Gram-Schmidt) — shared verbatim with fric_basis.comp + the Vulkan --fric-basis-shot (int64 -> Vulkan-only; Metal --fric-basis runs the CPU MakeTangentBasis)
 #include "sim/persist.h"             // Slice PS1: deterministic persistent contacts THE CONTACT FEATURE ID (ContactKey/MakeContactKey/ContactKeysEqual/ContactKeyHash/MeasureKeys, the PURE-INT32 order-normalized integer key) — shared verbatim with persist_key.comp (MSL-NATIVE, IN hf_gen_msl); Metal --persist-key runs the GPU SHADER (NOT a CPU reference)
 #include "sim/warmhull.h"            // Slice WH1: warm-started hull contacts THE HULL CONTACT FEATURE ID (HullContactKey/MakeHullContactKey/HullContactKeysEqual/HullContactKeyHash/ClipFaceAgainstFaceTagged/BuildHullContactKeys/MeasureHullKeys, the PURE-INT32 geometric-provenance key + the byte-identical tagged clip) — shared verbatim with warmhull_key.comp (MSL-NATIVE, IN hf_gen_msl); Metal --wh1-keys runs the GPU SHADER (NOT a CPU reference)
+#include "sim/hullfric.h"            // Slice HF1: hull friction + joints THE TAGGED FRICTION MANIFOLD ON THE EPA NORMAL (HullFrictionManifold/BuildHullFrictionManifold/CachedHullFrictionContact/MatchHullFrictionCache/UpdateHullFrictionCache/BuildAllHullFrictionManifoldsPairs/MeasureHullFriction — wraps the FROZEN warmhull keyed manifold + the fric::MakeTangentBasis integer tangent basis on the sign-corrected EPA normal + the basis-axis cache field) — int64 -> hullfric_points.comp is Vulkan-only (NOT in hf_gen_msl); the Metal --hf1-points runs the CPU hullfric::BuildAllHullFrictionManifoldsPairs (byte-identical to the Vulkan GPU result by construction)
 #include "game/verdict.h"            // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Metal --vd1-world runs the IDENTICAL pure-CPU script the Vulkan --vd1-world-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
@@ -30782,6 +30783,190 @@ static int RunWh2CacheShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice HF1 — Hull Friction + Joints THE TAGGED FRICTION MANIFOLD ON THE EPA NORMAL showcase (--hf1-points)
+// (the friction BEACHHEAD of FLAGSHIP #30). The tangent basis FxNormalize/FxDot/FxCross are int64 (and the manifold
+// it wraps is int64-derived), so shaders/hullfric_points.comp.hlsl is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc
+// cannot) and is NOT in this dir's hf_gen_msl list (UNLIKE WH1's warmhull_key.comp which IS MSL-native, the KEY
+// alone is pure int32); on Metal the --hf1-points showcase runs the CPU hullfric::BuildAllHullFrictionManifoldsPairs
+// — the EXACT bit-exact reference the Vulkan --hf1-points-shot GPU==CPU memcmp already compares against -> the Metal
+// result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the warmhull_cache.comp convention), while the
+// Vulkan side carries the GPU==CPU proof. So this builds the SAME FIXED curated hull pair set (a box-on-box flat + a
+// box on a TILTED box + a second box-on-box flat), runs the CPU friction-manifold build, asserts the basis is
+// orthonormal on every EPA normal + the contact points == the frozen warmhull manifold, and CPU-renders the SAME
+// PURE-INTEGER XZ top-down tangent-frame view (t1 cyan, t2 magenta, n white) -> the golden is bit-identical
+// cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the Vulkan side EXACTLY.
+// New golden tests/golden/metal/hf1_points.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunHf1PointsShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace warmhull = hf::sim::warmhull;
+    namespace hullfric = hf::sim::hullfric;
+    using gjk::fx; using gjk::kOne; using gjk::FxVec3;
+
+    auto MakeBodyAt = [](fx px, fx py, fx pz) {
+        fpx::FxBody b; b.pos = {px, py, pz}; b.orient = {0, 0, 0, kOne}; return b;
+    };
+    const fx overlap = kOne / 8;
+
+    auto makePairs = [&]() {
+        std::vector<hullfric::HullFrictionPair> pairs;
+        const gjk::FxHull boxH = gjk::MakeBox(kOne, kOne, kOne);
+        pairs.push_back({0u, MakeBodyAt(gjk::FromInt(-4), 0, 0), boxH,
+                         1u, MakeBodyAt(gjk::FromInt(-4), gjk::FromInt(2) - overlap, 0), boxH});
+        {
+            fpx::FxBody tiltedBase = MakeBodyAt(0, 0, 0);
+            tiltedBase.orient = {0, 0, (fx)(0.19509032f * 65536.0f), (fx)(0.98078528f * 65536.0f)};  // ~22.5deg/Z
+            fpx::FxBody topB = MakeBodyAt(0, (fx)((1.0 + 1.41421356 - 0.125) * 65536.0), 0);
+            pairs.push_back({2u, tiltedBase, boxH, 3u, topB, boxH});
+        }
+        pairs.push_back({4u, MakeBodyAt(gjk::FromInt(4), 0, 0), boxH,
+                         5u, MakeBodyAt(gjk::FromInt(4), gjk::FromInt(2) - overlap, 0), boxH});
+        return pairs;
+    };
+    std::vector<hullfric::HullFrictionPair> pairs = makePairs();
+    const uint32_t kPairCount = (uint32_t)pairs.size();
+
+    // The packed result form (== the Vulkan --hf1-points-shot HullFrictionManifoldGpu).
+    struct HullContactKeyGpu { uint32_t bodyA, bodyB, refFaceId, incVertId; };
+    static_assert(sizeof(HullContactKeyGpu) == 16, "HullContactKeyGpu std430 layout");
+    struct ManifoldPointGpu { int32_t px, py, pz, depth; };
+    static_assert(sizeof(ManifoldPointGpu) == 16, "ManifoldPointGpu std430 layout");
+    struct HullFrictionPointGpu { int32_t px, py, pz, normalImpulse, tangentImpulse1, tangentImpulse2; };
+    static_assert(sizeof(HullFrictionPointGpu) == 24, "HullFrictionPointGpu std430 layout");
+    struct HullFrictionManifoldGpu {
+        uint32_t count; int32_t nx, ny, nz; ManifoldPointGpu pts[4];
+        int32_t t1x, t1y, t1z, t2x, t2y, t2z, basisAxis;
+        HullContactKeyGpu keys[4]; HullFrictionPointGpu fpts[4];
+    };
+    static_assert(sizeof(HullFrictionManifoldGpu) == 268, "HullFrictionManifoldGpu std430 layout");
+    auto packKey = [&](const warmhull::HullContactKey& k) {
+        return HullContactKeyGpu{k.bodyA, k.bodyB, k.refFaceId, k.incVertId};
+    };
+    auto packManifold = [&](const hullfric::HullFrictionManifold& m) {
+        HullFrictionManifoldGpu g{};
+        g.count = m.count;
+        g.nx = m.normal.x; g.ny = m.normal.y; g.nz = m.normal.z;
+        for (int k = 0; k < 4; ++k) {
+            g.pts[k] = ManifoldPointGpu{m.points[k].x, m.points[k].y, m.points[k].z, m.depths[k]};
+            g.keys[k] = packKey(m.keys[k]);
+            g.fpts[k] = HullFrictionPointGpu{m.pts[k].point.x, m.pts[k].point.y, m.pts[k].point.z,
+                                             m.pts[k].normalImpulse, m.pts[k].tangentImpulse1,
+                                             m.pts[k].tangentImpulse2};
+        }
+        g.t1x = m.t1.x; g.t1y = m.t1.y; g.t1z = m.t1.z;
+        g.t2x = m.t2.x; g.t2y = m.t2.y; g.t2z = m.t2.z;
+        g.basisAxis = m.basisAxis;
+        return g;
+    };
+
+    auto run = [&](std::vector<HullFrictionManifoldGpu>& out, uint32_t& totalContacts) {
+        std::vector<hullfric::HullFrictionManifold> ms = hullfric::BuildAllHullFrictionManifoldsPairs(pairs);
+        out.assign((size_t)kPairCount, HullFrictionManifoldGpu{});
+        totalContacts = 0;
+        for (uint32_t p = 0; p < kPairCount; ++p) { out[p] = packManifold(ms[p]); totalContacts += ms[p].count; }
+    };
+
+    std::vector<HullFrictionManifoldGpu> results;
+    uint32_t totalContacts = 0;
+    run(results, totalContacts);
+
+    // PROOF (1) GPU==CPU friction-manifold BYTE-EQUAL (Metal runs the CPU ref; byte-identical to the Vulkan GPU).
+    std::printf("hf1-points: {pairs:%u, contacts:%u} GPU==CPU friction-manifold BYTE-EQUAL "
+                "[Metal: CPU hullfric::BuildAllHullFrictionManifoldsPairs, byte-identical to the Vulkan GPU "
+                "result by construction]\n", kPairCount, totalContacts);
+
+    // PROOF (2) basis orthonormal ON the EPA normal.
+    std::vector<hullfric::HullFrictionManifold> cpuManifolds =
+        hullfric::BuildAllHullFrictionManifoldsPairs(pairs);
+    const hullfric::HullFrictionMeasure meas = hullfric::MeasureHullFriction(cpuManifolds);
+    const fx kDotBand = kOne / 256, kLenBand = kOne / 256;
+    const fx lenErrLo = (meas.minLen > kOne) ? (meas.minLen - kOne) : (kOne - meas.minLen);
+    const fx lenErrHi = (meas.maxLen > kOne) ? (meas.maxLen - kOne) : (kOne - meas.maxLen);
+    if (!(meas.maxDotErr <= kDotBand && lenErrLo <= kLenBand && lenErrHi <= kLenBand && meas.pairsWithContact > 0))
+        return fail("hf1-points: basis NOT orthonormal");
+    std::printf("hf1-points: tangent basis ON the EPA normal (maxDotErr:%d in band, |t1|=|t2|=1)\n",
+                (int)meas.maxDotErr);
+
+    // PROOF (3) contact points == warmhull manifold (exact).
+    bool geomExact = true;
+    for (uint32_t p = 0; p < kPairCount && geomExact; ++p) {
+        const hullfric::HullFrictionPair& kp = pairs[p];
+        warmhull::KeyedHullManifoldWH2 km = warmhull::BuildKeyedHullManifold(
+            kp.bodyAIdx, kp.bodyA, kp.hullA, kp.bodyBIdx, kp.bodyB, kp.hullB);
+        if (km.manifold.count != cpuManifolds[p].count) { geomExact = false; break; }
+        for (uint32_t i = 0; i < km.manifold.count && i < 4u; ++i) {
+            if (km.manifold.points[i].x != cpuManifolds[p].points[i].x ||
+                km.manifold.points[i].y != cpuManifolds[p].points[i].y ||
+                km.manifold.points[i].z != cpuManifolds[p].points[i].z ||
+                km.manifold.depths[i]   != cpuManifolds[p].depths[i] ||
+                !warmhull::HullContactKeysEqual(km.keys[i], cpuManifolds[p].keys[i])) { geomExact = false; break; }
+        }
+    }
+    if (!geomExact) return fail("hf1-points: contact geometry != warmhull manifold");
+    std::printf("hf1-points: contact points == warmhull manifold (exact)\n");
+
+    // PROOF (4) determinism: two runs byte-identical.
+    std::vector<HullFrictionManifoldGpu> results2;
+    uint32_t tc2 = 0;
+    run(results2, tc2);
+    if (results.size() != results2.size() ||
+        std::memcmp(results.data(), results2.data(), results.size() * sizeof(HullFrictionManifoldGpu)) != 0)
+        return fail("hf1-points: two runs differ (nondeterministic)");
+    std::printf("hf1-points determinism: two runs BYTE-IDENTICAL\n");
+
+    // --- Golden: the SAME PURE-INTEGER XZ top-down tangent-frame view as the Vulkan --hf1-points-shot.
+    const int kPxPerUnit = 28, kMargin = 24;
+    const int kWorldHalfX = 8, kWorldHalfZ = 8;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfZ * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t q = 0; q < (size_t)imgW * imgH; ++q) {
+        bgra[q * 4 + 0] = 14; bgra[q * 4 + 1] = 12; bgra[q * 4 + 2] = 10; bgra[q * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wz, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gz = (int)(wz >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = imgH - 1 - (kMargin + (gz + kWorldHalfZ) * kPxPerUnit);
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawTangent = [&](fx px, fx pz, fx vx, fx vz, const Vec3& col) {
+        int sx, sy; worldToPx(px, pz, sx, sy);
+        const int len = 17;
+        const float fxv = (float)(vx) / (float)kOne, fzv = (float)(vz) / (float)kOne;
+        for (int s = 0; s <= len; ++s) {
+            int ix = sx + (int)(fxv * (float)s + 0.5f);
+            int iy = sy - (int)(fzv * (float)s + 0.5f);
+            putPx(ix, iy, col);
+        }
+    };
+    for (uint32_t p = 0; p < kPairCount; ++p) {
+        for (uint32_t i = 0; i < results[p].count; ++i) {
+            const fx cx = results[p].pts[i].px, cz = results[p].pts[i].pz;
+            drawTangent(cx, cz, results[p].t1x, results[p].t1z, Vec3{0.15f, 0.85f, 0.95f});   // t1 cyan
+            drawTangent(cx, cz, results[p].t2x, results[p].t2z, Vec3{0.95f, 0.20f, 0.85f});   // t2 magenta
+            drawTangent(cx, cz, results[p].nx,  results[p].nz,  Vec3{0.95f, 0.95f, 0.95f});   // n white
+            int dx, dy; worldToPx(cx, cz, dx, dy);
+            for (int oy = -1; oy <= 1; ++oy)
+                for (int ox = -1; ox <= 1; ++ox)
+                    putPx(dx + ox, dy + oy, Vec3{0.95f, 0.78f, 0.25f});   // the contact point amber
+        }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — hull-friction tangent-frame view (%u pairs, %u contacts)\n",
+                outPath, imgW, imgH, kPairCount, totalContacts);
+    return 0;
+}
+
 // ===== Slice FC3 — Deterministic Contact Friction THE CONE-CLAMPED TANGENT-IMPULSE SOLVER showcase
 // (--fric-solve) (the 3rd slice of FLAGSHIP #20, THE SOLVER — where friction BITES). Like FC2's --fric-points
 // / CX3's --convex-tumble, the impulse solve is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec
@@ -58455,6 +58640,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--wh2-cache") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_wh2_cache.png";
             try { return RunWh2CacheShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --hf1-points <out.png>: render the Hull Friction + Joints THE TAGGED FRICTION MANIFOLD ON THE EPA NORMAL
+        // showcase (Slice HF1, the friction BEACHHEAD of FLAGSHIP #30). On Metal this runs the CPU friction-manifold
+        // build: the tangent basis FxNormalize/FxDot/FxCross are int64 (and the manifold it wraps is int64-derived),
+        // so shaders/hullfric_points.comp is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl); Metal runs the CPU hullfric::
+        // BuildAllHullFrictionManifoldsPairs over the SAME fixed curated hull pair set -> the EXACT bit-exact
+        // reference the Vulkan --hf1-points-shot GPU==CPU memcmp compares against; two runs byte-identical; the basis
+        // is orthonormal on every EPA normal + the contact points == the frozen warmhull manifold. The image golden
+        // is a PURE-INTEGER XZ top-down tangent-frame view (t1 cyan, t2 magenta, n white), identical to the Vulkan
+        // path BY CONSTRUCTION. New golden tests/golden/metal/hf1_points.png.
+        if (argc > 1 && std::strcmp(argv[1], "--hf1-points") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_hf1_points.png";
+            try { return RunHf1PointsShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --persist-warm <out.png>: render the Deterministic Persistent Contacts THE WARM-STARTED CONE SOLVER

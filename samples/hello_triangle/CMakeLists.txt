@@ -1599,6 +1599,20 @@ hf_compile_shaders(
     # SSBO compute + ReadBuffer -> bit-exact GPU==CPU inherited-impulse keyed manifold array + cross-backend,
     # proven memcmp. NO new RHI; WH1 + existing shaders + goldens untouched. warmhull.h is APPEND-only.
     "shaders/warmhull_cache.comp.hlsl:cs"
+    # Hull Friction + Joints Slice 1 (Slice HF1): hullfric_points.comp is THE TAGGED FRICTION MANIFOLD ON THE EPA
+    # NORMAL pass — ONE THREAD PER HULL PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics) reads its
+    # HOST-BUILT warmhull keyed manifold (the int64-derived convex::ContactManifold positions/depths/normal + the WH1
+    # HullContactKey per point + the sign-corrected A->B EPA normal, computed host-side by manifold::HullContactMulti
+    # + warmhull::BuildKeyedHullManifold) then APPENDS the friction data: the integer tangent basis (t1,t2) via the
+    # FC1 fixed Gram-Schmidt (fric::MakeTangentBasis copied VERBATIM: project the least-aligned cardinal axis off n +
+    # FxNormalize + n x t1) + the basis-axis index (fric::LeastAlignedAxis) + zeroed per-point accumulators, writing
+    # its OWN gManifolds[pair] HullFrictionManifoldGpu. The basis FxNormalize/FxDot/FxCross are int64 (world-scale
+    # products overflow int32), so this shader is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT
+    # MSL-gen'd — the Metal --hf1-points showcase runs the CPU hullfric::BuildAllHullFrictionManifoldsPairs instead
+    # (byte-identical by construction, the warmhull_cache.comp convention), while the Vulkan side carries the GPU==CPU
+    # memcmp proof. NO new RHI; warmhull.h/gjk.h/fric.h/persist.h + existing shaders + goldens UNTOUCHED. hullfric.h
+    # is a brand-new additive header.
+    "shaders/hullfric_points.comp.hlsl:cs"
     # Warm-Started Hull Contacts Slice 3 (Slice WH3): warmhull_warm.comp is THE ACCUMULATED WARM-STARTED SOLVER
     # — ONE THREAD ([numthreads(1,1,1)]) runs the WHOLE warmhull.h::StepWarmHullWorldN over the small hull set:
     # K ticks of predict-integrate -> FULL inertia -> build-keyed-manifold (the WH1 tagged-clip key derivation

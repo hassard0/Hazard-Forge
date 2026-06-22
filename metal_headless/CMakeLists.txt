@@ -571,6 +571,15 @@ hf_gen_msl(persist_key.comp         persist_key.comp.hlsl         comp persist_k
 # same proof the Vulkan --wh1-keys-shot runs) -> cross-backend strict zero-differing-pixel. Behind --wh1-keys
 # only; every existing shader + golden untouched. NO new RHI; warmhull.h is a NEW additive sibling.
 hf_gen_msl(warmhull_key.comp        warmhull_key.comp.hlsl        comp warmhull_key_main)
+# Hull Friction + Joints Slice 1 (Slice HF1, the friction BEACHHEAD of FLAGSHIP #30): hullfric_points.comp is THE
+# TAGGED FRICTION MANIFOLD ON THE EPA NORMAL — it consumes the host-built warmhull keyed manifold + the
+# sign-corrected A->B EPA normal and builds the integer tangent basis (fric::MakeTangentBasis copied VERBATIM) + the
+# basis-axis index + zeroed accumulators. UNLIKE warmhull_key.comp (the KEY alone is pure int32 -> MSL-native) the
+# tangent basis FxNormalize/FxDot/FxCross are int64 (world-scale products overflow int32) AND the manifold it wraps
+# is int64-derived, so hullfric_points.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is
+# DELIBERATELY NOT MSL-gen'd here (NO hf_gen_msl line) — the Metal --hf1-points showcase runs the CPU
+# hullfric::BuildAllHullFrictionManifoldsPairs (byte-identical to the Vulkan GPU result by construction, the
+# warmhull_cache.comp convention), while the Vulkan --hf1-points-shot carries the GPU==CPU memcmp proof.
 # Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the BODY->FLUID
 # grid-hash QUERY (the GR2 grain_neighbor twin, per BODY instead of per grain) OVER the reused FL2 fluid cell
 # table (fluid_cell_{count,scan,emit} above build the cellStart/cellParticles the query iterates — no new
