@@ -596,6 +596,15 @@ hf_gen_msl(warmhull_key.comp        warmhull_key.comp.hlsl        comp warmhull_
 # DELIBERATELY NOT MSL-gen'd here (NO hf_gen_msl line) — the Metal --hf3-step showcase runs the CPU
 # hullfric::StepWarmFrictionHullWorldN (byte-identical to the Vulkan GPU result by construction, the
 # warmhull_sleep.comp convention), while the Vulkan --hf3-step-shot carries the GPU==CPU memcmp proof.
+# Hull Friction + Joints Slice 4 (Slice HF4, HULL JOINTS COMPOSED of FLAGSHIP #30): hulljoint_step.comp is the HF3
+# friction tick with the joint.h ball/angular-limit constraint passes inserted in the joint::StepArticulatedContacts
+# position (integrate -> jointIters {SolveBallJoint | SolveAngularLimit} sweeps -> FULL inertia -> the cone solve ->
+# de-pen -> orientation), composing a connected hull chain + a hinged door + a friction-resting hull in ONE tick. The
+# whole chain (GJK/EPA + SH clip + full inertia + the cone solve + the joint FxRotate/FxQuatMul/FxQuatNormalize) is
+# int64, so hulljoint_step.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is DELIBERATELY NOT
+# MSL-gen'd here (NO hf_gen_msl line) — the Metal --hf4-joint showcase runs the CPU hulljoint::StepJointedHullWorldN
+# (byte-identical to the Vulkan GPU result by construction, the hullfric_step.comp convention), while the Vulkan
+# --hf4-joint-shot carries the GPU==CPU memcmp proof.
 # Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the BODY->FLUID
 # grid-hash QUERY (the GR2 grain_neighbor twin, per BODY instead of per grain) OVER the reused FL2 fluid cell
 # table (fluid_cell_{count,scan,emit} above build the cellStart/cellParticles the query iterates — no new

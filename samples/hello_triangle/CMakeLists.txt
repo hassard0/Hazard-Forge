@@ -1644,6 +1644,19 @@ hf_compile_shaders(
     # APPEND-only (HF1+HF2 byte-frozen); warmhull.h/gjk.h/fric.h/persist.h/manifold.h + existing shaders + goldens
     # UNTOUCHED.
     "shaders/hullfric_step.comp.hlsl:cs"
+    # Hull Friction + Joints Slice 4 (Slice HF4): hulljoint_step.comp is HULL JOINTS COMPOSED — ONE THREAD
+    # ([numthreads(1,1,1)]) runs the WHOLE hulljoint.h::StepJointedHullWorldN over the small scene: K ticks of the
+    # HF3 friction tick with the joint constraint passes inserted in the joint::StepArticulatedContacts position —
+    # predict-integrate -> jointIters Gauss-Seidel sweeps EACH {all SolveBallJoint, then all SolveAngularLimit} (the
+    # joint.h bodies copied VERBATIM) -> FULL inertia -> the HF1 friction manifold + cache warm-seed + the cone solve
+    # -> position de-pen -> orientation. CHUNKED 1 tick / dispatch (the Windows ~2s TDR rule) over the SAME body +
+    # cache buffers. The whole chain (GJK/EPA + SH clip + full inertia + the cone solve + the joint FxRotate/
+    # FxQuatMul/FxQuatNormalize) is int64, so this shader is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and
+    # is NOT MSL-gen'd — the Metal --hf4-joint runs the CPU hulljoint::StepJointedHullWorldN instead (byte-identical
+    # by construction, the hullfric_step.comp convention). The GPU final gBodies + gCache memcmp-equals the CPU
+    # reference. NO new RHI; hulljoint.h is a NEW additive header; hullfric.h/joint.h/warmhull.h/gjk.h/fpx.h +
+    # existing shaders + goldens UNTOUCHED.
+    "shaders/hulljoint_step.comp.hlsl:cs"
     # Warm-Started Hull Contacts Slice 3 (Slice WH3): warmhull_warm.comp is THE ACCUMULATED WARM-STARTED SOLVER
     # — ONE THREAD ([numthreads(1,1,1)]) runs the WHOLE warmhull.h::StepWarmHullWorldN over the small hull set:
     # K ticks of predict-integrate -> FULL inertia -> build-keyed-manifold (the WH1 tagged-clip key derivation

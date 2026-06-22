@@ -111,6 +111,7 @@
 #include "sim/persist.h"             // Slice PS1: deterministic persistent contacts THE CONTACT FEATURE ID (ContactKey/MakeContactKey/ContactKeysEqual/ContactKeyHash/MeasureKeys, the PURE-INT32 order-normalized integer key) — shared verbatim with persist_key.comp (MSL-NATIVE, IN hf_gen_msl); Metal --persist-key runs the GPU SHADER (NOT a CPU reference)
 #include "sim/warmhull.h"            // Slice WH1: warm-started hull contacts THE HULL CONTACT FEATURE ID (HullContactKey/MakeHullContactKey/HullContactKeysEqual/HullContactKeyHash/ClipFaceAgainstFaceTagged/BuildHullContactKeys/MeasureHullKeys, the PURE-INT32 geometric-provenance key + the byte-identical tagged clip) — shared verbatim with warmhull_key.comp (MSL-NATIVE, IN hf_gen_msl); Metal --wh1-keys runs the GPU SHADER (NOT a CPU reference)
 #include "sim/hullfric.h"            // Slice HF1: hull friction + joints THE TAGGED FRICTION MANIFOLD ON THE EPA NORMAL (HullFrictionManifold/BuildHullFrictionManifold/CachedHullFrictionContact/MatchHullFrictionCache/UpdateHullFrictionCache/BuildAllHullFrictionManifoldsPairs/MeasureHullFriction — wraps the FROZEN warmhull keyed manifold + the fric::MakeTangentBasis integer tangent basis on the sign-corrected EPA normal + the basis-axis cache field) — int64 -> hullfric_points.comp is Vulkan-only (NOT in hf_gen_msl); the Metal --hf1-points runs the CPU hullfric::BuildAllHullFrictionManifoldsPairs (byte-identical to the Vulkan GPU result by construction)
+#include "sim/hulljoint.h"           // Slice HF4: hull friction + joints HULL JOINTS COMPOSED (JointedHullWorld/JointedHullStepConfig/StepJointedHullWorld(N)/MeasureJointedHull — the joint.h ball/angular-limit solvers composed with the HF3 hull friction contacts in ONE deterministic tick) — int64 -> hulljoint_step.comp is Vulkan-only (NOT in hf_gen_msl); the Metal --hf4-joint runs the CPU hulljoint::StepJointedHullWorldN (byte-identical to the Vulkan GPU result by construction)
 #include "game/verdict.h"            // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Metal --vd1-world runs the IDENTICAL pure-CPU script the Vulkan --vd1-world-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
@@ -31313,6 +31314,187 @@ static int RunHf3StepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice HF4 — Hull Friction + Joints HULL JOINTS COMPOSED showcase (--hf4-joint) (the one-deterministic-step
+// headline of FLAGSHIP #30). hulljoint_step.comp is int64 (GJK/EPA + the SH clip + the full inertia + the cone solve
+// + the joint FxRotate/FxQuatMul/FxQuatNormalize), Vulkan-SPIR-V-ONLY (NOT in the hf_gen_msl list); on Metal the
+// --hf4-joint showcase runs the CPU hulljoint::StepJointedHullWorldN — the EXACT bit-exact reference the Vulkan
+// --hf4-joint-shot GPU==CPU memcmp already compares against -> the Metal result is byte-identical to the Vulkan GPU by
+// construction. The render is the SAME PURE-INTEGER 2D side-view (XY) as the Vulkan --hf4-joint-shot -> the golden is
+// identical both backends by construction (the strict-zero cross-vendor bar).
+static int RunHf4JointShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex    = hf::sim::convex;
+    namespace gjk       = hf::sim::gjk;
+    namespace fpx       = hf::sim::fpx;
+    namespace joint     = hf::sim::joint;
+    namespace hulljoint = hf::sim::hulljoint;
+    using gjk::fx; using gjk::kOne;
+
+    auto fd = [&](double v) { return (fx)(v * (double)kOne); };
+    const double kLinkGap = 2.2;
+    const uint32_t kTicks = 240;
+    auto mkStatic = [&](double x, double y, double z) {
+        fpx::FxBody b; b.pos = {fd(x), fd(y), fd(z)}; b.orient = {0, 0, 0, kOne};
+        b.vel = {0,0,0}; b.angVel = {0,0,0}; b.invMass = 0; b.flags = 0u; b.radius = 0; return b;
+    };
+    auto mkDyn = [&](double x, double y, double z) {
+        fpx::FxBody b; b.pos = {fd(x), fd(y), fd(z)}; b.orient = {0, 0, 0, kOne};
+        b.vel = {0,0,0}; b.angVel = {0,0,0}; b.invMass = kOne; b.flags = fpx::kFlagDynamic; b.radius = 0; return b;
+    };
+    auto buildScene = [&]() {
+        hulljoint::JointedHullWorld w;
+        const gjk::FxHull boxH = gjk::MakeBox(kOne, kOne, kOne);
+        const double aY = 6.0;
+        w.hulls.bodies = {
+            mkStatic(-4.0, aY, 0.0), mkDyn(-4.0, aY - kLinkGap, 0.0), mkDyn(-4.0, aY - 2 * kLinkGap, 0.0),
+            mkDyn(-4.0, aY - 3 * kLinkGap, 0.0), mkStatic(2.0, 0.0, 0.0), mkDyn(2.0, 2.0 - 0.0625, 0.0),
+            mkStatic(4.0, aY, 0.0), mkDyn(4.0, aY - kLinkGap, 0.0),
+        };
+        w.hulls.hulls = {boxH, boxH, boxH, boxH, boxH, boxH, boxH, boxH};
+        const gjk::FxVec3 bottomA{0, fd(-kLinkGap / 2.0), 0};
+        const gjk::FxVec3 topA{0, fd(kLinkGap / 2.0), 0};
+        auto mkBall = [&](uint32_t a, uint32_t b) {
+            joint::FxJoint j; j.bodyA = a; j.bodyB = b; j.anchorA = bottomA; j.anchorB = topA;
+            j.kind = joint::kJointBall; j.limit = 0; return j;
+        };
+        w.joints = { mkBall(0, 1), mkBall(1, 2), mkBall(2, 3), mkBall(6, 7) };
+        joint::FxAngularLimit hinge;
+        hinge.bodyA = 6; hinge.bodyB = 7; hinge.axis = {0, 0, kOne};
+        hinge.cosHalfLimit = kOne; hinge.sinHalfLimit = 0; hinge.kind = joint::kAngularHinge;
+        w.limits = { hinge };
+        return w;
+    };
+    const hulljoint::JointedHullWorld kInit = buildScene();
+    const uint32_t kBodyCount  = (uint32_t)kInit.hulls.bodies.size();
+    const uint32_t kJointCount = (uint32_t)kInit.joints.size();
+    const uint32_t kLimitCount = (uint32_t)kInit.limits.size();
+    hulljoint::JointedHullStepConfig kCfg;
+    kCfg.fric.mu = (fx)((int64_t)6 * kOne / 10); kCfg.fric.solveIters = 12; kCfg.fric.posIters = 4;
+    kCfg.jointIters = 8;
+
+    // The CPU jointed-friction step (the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    hulljoint::JointedHullWorld cpuW = buildScene();
+    hulljoint::StepJointedHullWorldN(cpuW, kCfg, kTicks);
+
+    // PROOF (1) GPU==CPU final-bodies BYTE-EQUAL (Metal runs the CPU ref; byte-identical to the Vulkan GPU).
+    std::printf("hf4-joint: {bodies:%u, joints:%u, limits:%u, ticks:%u} GPU==CPU final-bodies BYTE-EQUAL [Metal: CPU "
+                "hulljoint::StepJointedHullWorldN, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kJointCount, kLimitCount, kTicks);
+
+    // PROOF (2) the CHAIN stays CONNECTED + PROOF (3) the HINGE holds its plane.
+    hulljoint::JointMeasure jm = hulljoint::MeasureJointedHull(cpuW);
+    if (jm.maxAnchorGap >= (kOne / 2)) return fail("hf4-joint: chain CAME APART");
+    std::printf("hf4-joint: chain connected (maxAnchorGap:%d small)\n", (int)jm.maxAnchorGap);
+    const fx kLimitCos = kInit.limits[0].cosHalfLimit;
+    if (jm.swingAngleCos < kLimitCos - (kOne / 64)) return fail("hf4-joint: hinge BROKE");
+    std::printf("hf4-joint: hinge holds plane (swingCos>=limitCos)\n");
+
+    // PROOF (4) determinism + composition: two runs byte-identical; the friction cone holds while joints satisfied.
+    hulljoint::JointedHullWorld cpuW2 = buildScene();
+    hulljoint::StepJointedHullWorldN(cpuW2, kCfg, kTicks);
+    bool det = (cpuW.hulls.bodies.size() == cpuW2.hulls.bodies.size()) &&
+               (std::memcmp(cpuW.hulls.bodies.data(), cpuW2.hulls.bodies.data(),
+                            cpuW.hulls.bodies.size() * sizeof(fpx::FxBody)) == 0) &&
+               (cpuW.cache.entries.size() == cpuW2.cache.entries.size());
+    if (det && !cpuW.cache.entries.empty())
+        det = (std::memcmp(cpuW.cache.entries.data(), cpuW2.cache.entries.data(),
+                           cpuW.cache.entries.size() * sizeof(hf::sim::hullfric::CachedHullFrictionContact)) == 0);
+    if (!det) return fail("hf4-joint: two runs differ (nondeterministic)");
+    bool coneOk = !cpuW.cache.entries.empty();
+    for (const auto& ce : cpuW.cache.entries) {
+        const fx jn = ce.normalImpulse;
+        const int64_t cone = ((int64_t)kCfg.fric.mu * (int64_t)(jn < 0 ? 0 : jn)) >> 16;
+        if (jn < 0) coneOk = false;
+        if (std::llabs((int64_t)ce.tangentImpulse1) > cone + 2) coneOk = false;
+        if (std::llabs((int64_t)ce.tangentImpulse2) > cone + 2) coneOk = false;
+    }
+    if (!coneOk) return fail("hf4-joint: friction cone FAILED");
+    std::printf("hf4-joint determinism: two runs BYTE-IDENTICAL; friction cone holds (|jt|<=mu*jn) while joints "
+                "satisfied\n");
+
+    // --- Golden: the SAME PURE-INTEGER XY side-view as the Vulkan --hf4-joint-shot (chain + door + resting hull). ---
+    const int kPxPerUnit = 20, kMargin = 24;
+    const int kWorldHalfX = 7, kWorldHalfY = 7;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t q = 0; q < (size_t)imgW * imgH; ++q) {
+        bgra[q * 4 + 0] = 14; bgra[q * 4 + 1] = 12; bgra[q * 4 + 2] = 10; bgra[q * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f); dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f); dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    const Vec3 kSlate{0.30f, 0.40f, 0.55f}, kAmber{0.88f, 0.62f, 0.28f};
+    const Vec3 kGreen{0.40f, 0.78f, 0.42f}, kCyan{0.32f, 0.72f, 0.84f};
+    drawHullXY(cpuW.hulls.bodies[0], kInit.hulls.hulls[0], kSlate);
+    drawHullXY(cpuW.hulls.bodies[1], kInit.hulls.hulls[1], kAmber);
+    drawHullXY(cpuW.hulls.bodies[2], kInit.hulls.hulls[2], kAmber);
+    drawHullXY(cpuW.hulls.bodies[3], kInit.hulls.hulls[3], kAmber);
+    drawHullXY(cpuW.hulls.bodies[4], kInit.hulls.hulls[4], kSlate);
+    drawHullXY(cpuW.hulls.bodies[5], kInit.hulls.hulls[5], kGreen);
+    drawHullXY(cpuW.hulls.bodies[6], kInit.hulls.hulls[6], kSlate);
+    drawHullXY(cpuW.hulls.bodies[7], kInit.hulls.hulls[7], kCyan);
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — the hanging hull CHAIN + the hinged DOOR + the friction-resting hull "
+                "(%u joints, %u limits, %u ticks)\n", outPath, imgW, imgH, kJointCount, kLimitCount, kTicks);
+    return 0;
+}
+
 // ===== Slice FC3 — Deterministic Contact Friction THE CONE-CLAMPED TANGENT-IMPULSE SOLVER showcase
 // (--fric-solve) (the 3rd slice of FLAGSHIP #20, THE SOLVER — where friction BITES). Like FC2's --fric-points
 // / CX3's --convex-tumble, the impulse solve is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec
@@ -59023,6 +59205,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--hf3-step") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_hf3_step.png";
             try { return RunHf3StepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --hf4-joint <out.png>: render the Hull Friction + Joints HULL JOINTS COMPOSED showcase (Slice HF4, the 4th
+        // slice of FLAGSHIP #30). The whole chain is int64 (GJK/EPA + the SH clip + the full inertia + the cone solve +
+        // the joint FxRotate/FxQuatMul/FxQuatNormalize), so shaders/hulljoint_step.comp is VULKAN-SPIR-V-ONLY (NOT
+        // MSL-gen'd) — Metal runs the CPU hulljoint::StepJointedHullWorldN (byte-identical to the Vulkan GPU result,
+        // the same pure-integer XY side-view of the hanging chain + the hinged door + the resting hull).
+        if (argc > 1 && std::strcmp(argv[1], "--hf4-joint") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_hf4_joint.png";
+            try { return RunHf4JointShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --persist-warm <out.png>: render the Deterministic Persistent Contacts THE WARM-STARTED CONE SOLVER

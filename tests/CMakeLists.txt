@@ -907,6 +907,16 @@ hf_add_pure_test(hullfric_warm_test)
 # cache persisting/warm-starting. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(hullfric_step_test)
 
+# Hull Friction + Joints Slice 4 (Slice HF4, HULL JOINTS COMPOSED of FLAGSHIP #30: hf::sim::hulljoint): the NEW
+# engine/sim/hulljoint.h composes the body-agnostic joint.h solvers (ball / hinge / angular-limit) with the HF3 hull
+# friction contacts in ONE deterministic tick (integrate -> jointIters {SolveBallJoint | SolveAngularLimit} sweeps ->
+# the HF3 FULL-inertia friction-contact warm solve -> de-pen -> orient), the GPU shaders/hulljoint_step.comp copies
+# VERBATIM. Pins StepJointedHullWorldN two-run determinism, a hung ball-joint chain staying connected (MaxAnchorGap
+# small), a hinge holding its angular limit (SwingAngleCos>=cosHalfLimit), joints+friction composing (the cone holds
+# while the chain stays connected), and THE NO-JOINTS CONTROL (empty-joint step == hullfric::StepWarmFrictionHullWorld
+# byte-for-byte — the joints are purely additive). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(hulljoint_test)
+
 # Deterministic Gameplay / Netcode Slice 1 (Slice VD1, the BEACHHEAD of FLAGSHIP #27: hf::game::verdict): the
 # PURE-CPU integer entity world + the unified tick-ordered input-command bus that layers a determinism contract
 # over the raw ecs::Registry (engine/game/verdict.h, a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h
