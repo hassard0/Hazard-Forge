@@ -35,6 +35,7 @@
 #include "scene/renderable.h"
 #include "scene/components.h"
 #include "scene/scene_io.h"
+#include "scene/commands.h"        // Slice DX2: RunQueries (the scene-query read protocol)
 #include "runtime/hot_reload.h"    // Slice DX4: ApplyReload + FileWatcher (the headless scene reload)
 #include "editor/introspect.h"     // Slice DX1: the versioned Agent-SDK contract (DescribeAgentApi)
 #include "scene/streaming.h"        // Slice BD: distance-based scene/asset streaming (pure CPU)

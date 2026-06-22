@@ -1112,6 +1112,12 @@ add_executable(visual_test
     ${HF_ROOT}/engine/scene/mesh.cpp
     # Data-driven scene load/dump (plain C++, vendored single-header JSON parser).
     ${HF_ROOT}/engine/scene/scene_io.cpp
+    # Agent Experience (AX) product, FLAGSHIP #31 — the DX Metal showcases call into these pure-CPU
+    # sources: commands.cpp (DX2 RunQueries), introspect.cpp (DX1 DescribeAgentApi + the --agent-api/
+    # --introspect contract), hot_reload.cpp (DX4 ApplyReload + FileWatcher). Backend-agnostic.
+    ${HF_ROOT}/engine/scene/commands.cpp
+    ${HF_ROOT}/engine/editor/introspect.cpp
+    ${HF_ROOT}/engine/runtime/hot_reload.cpp
     # Distance-based scene/asset streaming (Slice BD, pure C++): the --stream showcase.
     ${HF_ROOT}/engine/scene/streaming.cpp
     # glTF loader (plain C++, header-only cgltf): loads a real model into a scene::Mesh.
