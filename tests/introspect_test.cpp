@@ -546,6 +546,8 @@ int main() {
             bool sawGi4BounceFeature = false;
             // Slice GI5: the gi5-occlusion capability is advertised (the integer Chebyshev occlusion leak-fix — FLAGSHIP #29).
             bool sawGi5OcclusionFeature = false;
+            // Slice GI6: the gi6-hero capability is advertised (the lit GI hero capstone — the FLAGSHIP #29 money-shot).
+            bool sawGi6HeroFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -797,6 +799,7 @@ int main() {
                     if (AsString(el->value) == "gi3-interp") sawGi3InterpFeature = true;
                     if (AsString(el->value) == "gi4-bounce") sawGi4BounceFeature = true;
                     if (AsString(el->value) == "gi5-occlusion") sawGi5OcclusionFeature = true;
+                    if (AsString(el->value) == "gi6-hero") sawGi6HeroFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -1023,6 +1026,7 @@ int main() {
             check(sawGi3InterpFeature, "engine.features includes gi3-interp");
             check(sawGi4BounceFeature, "engine.features includes gi4-bounce");
             check(sawGi5OcclusionFeature, "engine.features includes gi5-occlusion");
+            check(sawGi6HeroFeature, "engine.features includes gi6-hero");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1424,6 +1428,8 @@ int main() {
         bool sawGi4BounceShot = false;
         // Slice GI5: the --gi5-occlusion-shot showcase flag is listed in the showcase manifest.
         bool sawGi5OcclusionShot = false;
+        // Slice GI6: the --gi6-hero-shot showcase flag is listed in the showcase manifest.
+        bool sawGi6HeroShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -1679,6 +1685,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--gi3-interp-shot") sawGi3InterpShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gi4-bounce-shot") sawGi4BounceShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gi5-occlusion-shot") sawGi5OcclusionShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--gi6-hero-shot") sawGi6HeroShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-points-shot") sawFricPointsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-solve-shot") sawFricSolveShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-ramp-shot") sawFricRampShot = true;
@@ -1902,6 +1909,7 @@ int main() {
         check(sawGi3InterpShot, "showcases manifest includes --gi3-interp-shot");
         check(sawGi4BounceShot, "showcases manifest includes --gi4-bounce-shot");
         check(sawGi5OcclusionShot, "showcases manifest includes --gi5-occlusion-shot");
+        check(sawGi6HeroShot, "showcases manifest includes --gi6-hero-shot");
         check(sawFricPointsShot, "showcases manifest includes --fric-points-shot");
         check(sawFricSolveShot, "showcases manifest includes --fric-solve-shot");
         check(sawFricRampShot, "showcases manifest includes --fric-ramp-shot");

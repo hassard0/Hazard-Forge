@@ -18692,6 +18692,104 @@ static int RunGi5OcclusionShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GI6 — Deterministic Lumen-class GI THE LIT GI HERO CAPSTONE showcase (--gi6-hero) (FLAGSHIP
+// #29, the MONEY-SHOT — FLAGSHIP #29 COMPLETE). The Vulkan --gi6-hero-shot dispatches shaders/gi_hero.comp
+// (the RT6 lit hero + the GI indirect lookup, one thread per pixel) and memcmp's the GPU hero image == CPU
+// gi::RenderSceneGI. gi_hero.comp uses HLSL RayQuery + int64 + the int64 SH-blend/Chebyshev ->
+// Vulkan-SPIR-V-ONLY (glslc/spirv-cross can't lower to MSL), so on Metal --gi6-hero runs the CPU
+// gi::RenderSceneGI reference (the SAME bit-exact reference the Vulkan HW==CPU memcmp compares against) ->
+// the Metal image is byte-identical to the Vulkan HW image BY CONSTRUCTION. Builds the SAME gi::BuildGi6Scene
+// Cornell enclosure (a RED + a GREEN wall + a mirror sphere + a box) + 4x4x4 grid the Vulkan --gi6-hero-shot
+// defines, runs the GI1->GI5 bake (BounceProbes(K=3) + FxProbeMoments_All), renders the integer GI-lit hero
+// RGBA8 scene at 480x360, proves the giStrength=0 no-op (== the no-GI hero) + the color bleed + determinism,
+// writes the PNG. Because the whole pipeline is INTEGER, the gi6_hero golden is STRICT-ZERO cross-vendor.
+// New golden tests/golden/metal/gi6_hero.png (Mac-baked by the CONTROLLER).
+static int RunGi6HeroShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    namespace gi = hf::render::gi;
+    using rt::fx; using rt::FxVec3; using rt::kOne;
+
+    const uint32_t kRtW = 480, kRtH = 360;
+    const fx kGiStrength = gi::kGiDefaultStrength;
+    const fx kOccStrength = gi::kGiHeroOccStrength;
+    const int kBounces = 3;
+
+    gi::GiScene6 sc = gi::BuildGi6Scene();
+    gi::GiProbeGrid grid = gi::BuildGi6Grid();
+    const uint32_t kProbes = (uint32_t)gi::ProbeCount(grid);
+
+    // The GI1->GI5 bake (the SAME bit-exact SH + moments the Vulkan GPU==CPU memcmp proves).
+    std::vector<gi::FxProbeSH> sh(kProbes);
+    gi::BounceProbes(sc.scene, grid, kBounces, std::span<gi::FxProbeSH>(sh));
+    std::vector<gi::FxProbeMoments> mom(kProbes);
+    gi::FxProbeMoments_All(grid, sc.scene, std::span<gi::FxProbeMoments>(mom));
+    std::span<const gi::FxProbeSH> shSpan(sh);
+    std::span<const gi::FxProbeMoments> momSpan(mom);
+
+    const size_t kPixels = (size_t)kRtW * kRtH;
+
+    // CPU GI-lit hero reference (the bit-exact image the Vulkan --gi6-hero-shot proves the HW shader equal to).
+    std::vector<uint32_t> image(kPixels, 0);
+    gi::GiHeroCounts counts = gi::RenderSceneGI(sc.scene, grid, shSpan, momSpan, sc.camera, kRtW, kRtH,
+                                                kGiStrength, std::span<uint32_t>(image));
+    std::printf("gi6-hero: {rays:%zu, probes:%u, bounces:%d} [Metal: CPU gi::RenderSceneGI, byte-identical to "
+                "the Vulkan HW result by construction]\n", kPixels, kProbes, kBounces);
+
+    // The hero feature set is present (shadows + indirect light; matte objects -> reflective==0 by design).
+    if (!(counts.shadowed > 0 && counts.indirectLit > 0))
+        return fail("gi6-hero: hero NOT ok (need shadowed>0, indirectLit>0)");
+    std::printf("gi6-hero: hero ok (shadowed:%u reflective:%u indirectLit:%u)\n",
+                counts.shadowed, counts.reflective, counts.indirectLit);
+
+    // The no-op: giStrength=0 == the no-GI hero (== rt::RenderSceneHero) BYTE-IDENTICAL.
+    {
+        std::vector<uint32_t> noGi(kPixels, 0), rt6Hero(kPixels, 0);
+        gi::RenderSceneGI(sc.scene, grid, shSpan, momSpan, sc.camera, kRtW, kRtH, /*giStrength*/ 0,
+                          std::span<uint32_t>(noGi));
+        rt::RenderSceneHero(sc.scene, sc.camera, kRtW, kRtH, std::span<uint32_t>(rt6Hero));
+        if (std::memcmp(noGi.data(), rt6Hero.data(), kPixels * sizeof(uint32_t)) != 0)
+            return fail("gi6-hero: giStrength=0 != no-GI hero (the indirect is not a true +0)");
+        std::printf("gi6-hero: giStrength=0 == no-GI hero BYTE-IDENTICAL\n");
+    }
+
+    // The color bleed (the money-shot): sample the indirect term near the RED + GREEN walls.
+    {
+        const FxVec3 up{0, kOne, 0};
+        FxVec3 redFloor{gi::GiF(-29,10), gi::GiF(1,100), gi::GiF(4,1)};
+        FxVec3 greenFloor{gi::GiF(29,10), gi::GiF(1,100), gi::GiF(4,1)};
+        gi::GiRadiance redIrr = gi::FxInterpolateIrradianceOcc(grid, shSpan, momSpan, redFloor, up, kOccStrength);
+        gi::GiRadiance greenIrr = gi::FxInterpolateIrradianceOcc(grid, shSpan, momSpan, greenFloor, up, kOccStrength);
+        if (!((redIrr.r > redIrr.g && redIrr.r > redIrr.b) &&
+              (greenIrr.g > greenIrr.r && greenIrr.g > greenIrr.b)))
+            return fail("gi6-hero: color bleed absent (the multi-bounce/interp is wrong)");
+        std::printf("gi6-hero: color bleed (red-wall floor: R>G,R>B; green-wall floor: G>R,G>B)\n");
+    }
+
+    // Two-run determinism (the CPU reference is a pure function).
+    {
+        std::vector<uint32_t> image2(kPixels, 0);
+        gi::RenderSceneGI(sc.scene, grid, shSpan, momSpan, sc.camera, kRtW, kRtH, kGiStrength,
+                          std::span<uint32_t>(image2));
+        if (std::memcmp(image.data(), image2.data(), kPixels * sizeof(uint32_t)) != 0)
+            return fail("gi6-hero: two CPU renders differ (nondeterministic)");
+        std::printf("gi6-hero determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // --- Write the image (RGBA8 row-major top-first -> BGRA for WritePNG). ---
+    std::vector<uint8_t> bgra(kPixels * 4, 0);
+    for (size_t p = 0; p < kPixels; ++p) {
+        uint32_t px = image[p];
+        bgra[p * 4 + 0] = (uint8_t)((px >> 16) & 0xFF);
+        bgra[p * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+        bgra[p * 4 + 2] = (uint8_t)(px & 0xFF);
+        bgra[p * 4 + 3] = (uint8_t)((px >> 24) & 0xFF);
+    }
+    if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — the lit GI hero capstone [CPU reference] (%u probes, %d bounces)\n",
+                outPath, kRtW, kRtH, kProbes, kBounces);
+    return 0;
+}
+
 // ===== Slice RT3 — Hardware Ray Tracing DETERMINISTIC RT HARD SHADOWS showcase (--rt3-shadow) (FLAGSHIP
 // #28). The Vulkan --rt3-shadow-shot wires REAL HW inline ray query: a PRIMARY RayQuery closest-hit THEN a
 // SECOND any-hit shadow ray (toward the directional light) whose order-independent occlusion OR GATES the
@@ -58540,6 +58638,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gi5-occlusion") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gi5_occlusion.png";
             try { return RunGi5OcclusionShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gi6-hero <out.png>: render the Deterministic Lumen-class GI THE LIT GI HERO CAPSTONE showcase
+        // (Slice GI6, the FLAGSHIP #29 MONEY-SHOT — FLAGSHIP #29 COMPLETE). gi_hero.comp uses HLSL RayQuery +
+        // int64 + the int64 SH-blend -> Vulkan-SPIR-V-ONLY (glslc can't lower to MSL), so Metal runs the CPU
+        // gi::RenderSceneGI reference (byte-identical to the Vulkan HW result by construction). New golden
+        // tests/golden/metal/gi6_hero.png.
+        if (argc > 1 && std::strcmp(argv[1], "--gi6-hero") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_gi6_hero.png";
+            try { return RunGi6HeroShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --rt3-shadow <out.png>: render the Hardware Ray Tracing DETERMINISTIC RT HARD SHADOWS showcase

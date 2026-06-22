@@ -386,6 +386,15 @@ hf_gen_msl(fract_reduce.comp     fract_reduce.comp.hlsl     comp fract_reduce_ma
 # gi::InterpolateFieldOcc (the SAME bit-exact reference the Vulkan GPU==CPU memcmp compares against) -> the
 # Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries the
 # GPU==CPU irradiance proof. So gi_occ.comp gets NO hf_gen_msl line.
+# Deterministic Lumen-class GI Slice 6 (Slice GI6, THE LIT GI HERO CAPSTONE — the FLAGSHIP #29 MONEY-SHOT):
+# gi_hero.comp is the lit GI hero kernel — ONE thread per pixel copies the RT6 rt_hero.comp body VERBATIM
+# (primary + RT3 shadow + RT4 reflection + the graded SkyGradient miss) and ADDS a GI INDIRECT term at each
+# primary hit (albedo ⊙ FxInterpolateIrradianceOcc × giStrength, the GI3/GI5 SH blend + FxSHEvaluate). Like
+# rt_hero.comp + gi_occ.comp it is VULKAN-SPIR-V-ONLY: HLSL inline RayQuery (DXC -> SPIR-V RayQueryKHR which
+# glslc/spirv-cross can't lower to MSL) PLUS the int64 SH-blend / Chebyshev that glslc cannot parse. On Metal
+# the --gi6-hero showcase runs the CPU gi::RenderSceneGI (the SAME bit-exact reference the Vulkan HW==CPU
+# memcmp compares against) -> the Metal image is byte-identical to the Vulkan HW image BY CONSTRUCTION, while
+# the Vulkan side carries the HW==CPU hero-image proof. So gi_hero.comp gets NO hf_gen_msl line.
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): cloth_integrate.comp runs the
 # Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per particle runs `steps` iterations
 # of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp) on its OWN particle, the fxmul

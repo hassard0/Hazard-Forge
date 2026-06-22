@@ -1072,4 +1072,215 @@ inline void GiOccFieldToImage(const GiProbeGrid& grid, std::span<const FxProbeSH
     }
 }
 
+// =====================================================================================================
+// ===== Slice GI6 — THE LIT GI HERO CAPSTONE (the money-shot) — FLAGSHIP #29 COMPLETE =================
+// =====================================================================================================
+// APPEND-ONLY (everything above this banner is GI1+GI2+GI3+GI4+GI5, BYTE-FROZEN). GI6 is the flagship's
+// FINAL slice — the money-shot: a Cornell-style enclosure rendered with the FULL GI pipeline. It composes
+// the RT6 lit hero (rtrace::RenderSceneHero: primary closest-hit + RT3 hard shadows + RT4 mirror
+// reflections + the RT6 graded SkyGradient on a miss) with a GI INDIRECT term at each primary hit — the
+// GI1→GI5 bake (trace → integer SH → multi-bounce → occlusion moments) sampled per hit via the GI5
+// occlusion-weighted FxInterpolateIrradianceOcc. The indirect = albedo(hit) ⊙ irradiance(hit.pos,
+// hit.normal) × giStrength, added per channel to the RT6 shade. STRICT INTEGER -> byte-identical HW==CPU,
+// strict-zero cross-vendor — the deterministic answer to UE5 Lumen (float / temporal / non-deterministic).
+//
+// THE NO-OP CONTRACT (the make-or-break, falsifiable): RenderSceneGI with giStrength == 0 is a literal
+// integer +0 indirect, so it is BYTE-IDENTICAL to the no-GI hero (the RT6-style direct+reflected+sky
+// render this function reproduces verbatim when the indirect is off). THE COLOR-BLEED HEADLINE (the
+// money-shot): the floor near the RED wall gains its indirect RED channel measurably higher than green/blue
+// (and symmetrically for the GREEN wall) — multi-bounce colored GI a single-bounce direct shade cannot
+// produce. THE BOUNDED RANGE: the indirect irradiance < 2 (the GI2 headroom holds under the K<=3 bake), and
+// giStrength <= kOne keeps the added term within the [0,1] channel range (clamped at quantize).
+//
+// THE INTEGER INDIRECT BLEND (PINNED; the gi_hero.comp shader copies this VERBATIM): per primary hit, after
+// the RT6 shadowed/reflected color cS is formed, add the indirect ON THE UNPACKED 0..255 RGBA8 channels:
+//   irr_ch    = FxInterpolateIrradianceOcc(...).ch                  // Q16.16 indirect irradiance
+//   gain_ch   = fxmul(albedo(hit).ch, fxmul(irr_ch, giStrength))    // albedo ⊙ irr × giStrength (Q16.16)
+//   byte_ch   = (gain_ch * 255) >> kFrac                            // -> 0..255 (clamped in PackRGBA8)
+//   out_ch    = clamp(cS_ch + byte_ch, 0, 255)                      // additive, clamped opaque
+// When giStrength == 0: fxmul(irr, 0) == 0 -> gain == 0 -> byte == 0 -> out == cS (byte-for-byte the RT6
+// hero — the no-op). A reflective primary surface composes the indirect on TOP of the RT4 blend (the
+// indirect lights the matte base color; the mirror term is unchanged). A MISS adds NO indirect (sky only).
+// PURE INTEGER, deterministic, cross-backend exact.
+
+// ----- kGiDefaultStrength / kGiHeroOccStrength — the pinned indirect gain + occlusion weighting. -------
+// kGiDefaultStrength (<= kOne) is the per-channel indirect gain (how much of the baked indirect irradiance
+// is added). kGiHeroOccStrength is the GI5 Chebyshev occlusion strength used INSIDE the indirect lookup
+// (full occlusion weighting -> the leak-fixed field). Both PINNED (the cross-vendor golden rests on them).
+inline constexpr fx kGiDefaultStrength  = (fx)(kOne * 90 / 100);  // 0.90 indirect gain (<= kOne)
+inline constexpr fx kGiHeroOccStrength  = kOne;                   // full Chebyshev occlusion weighting
+
+// ----- GiHeroCounts — the GI6 render counts (for the proof lines). -----------------------------------
+struct GiHeroCounts {
+    uint32_t shadowed    = 0;   // primary hits whose surface was occluded (RT3)
+    uint32_t reflective  = 0;   // primary hits whose surface was reflective (RT4)
+    uint32_t indirectLit = 0;   // primary hits that received a NON-ZERO indirect term (the GI proof)
+};
+
+// ----- RenderSceneGI — the RT6 lit hero + the GI5-occlusion-weighted multi-bounce indirect per hit. ---
+// Per pixel: PrimaryRay -> TraceClosest. A MISS -> SkyGradient(primaryDir) (the RT6 graded sky; NO
+// indirect). A HIT -> the RT6 shadowed color cS (the primary shadow ray + ShadeHitShadowed) + (if
+// reflective) the RT4 one-bounce reflection blend -> the composite cS_or_blend; THEN add the GI indirect
+// = albedo(hit) ⊙ FxInterpolateIrradianceOcc(grid, sh, moments, hit.pos, hit.normal, kGiHeroOccStrength)
+// × giStrength on the unpacked 0..255 channels (clamped). giStrength == 0 -> byte-identical to the no-GI
+// hero (RenderSceneHero). `sh`/`moments` are the GI1→GI5 bake of the SAME scene (BounceProbes +
+// FxProbeMoments_All). Returns {shadowed, reflective, indirectLit}. The GPU twin shaders/gi_hero.comp
+// copies this VERBATIM (one thread per pixel) -> bit-identical HW readback, proven memcmp. PURE INTEGER.
+inline GiHeroCounts RenderSceneGI(const RtScene& scene, const GiProbeGrid& grid,
+                                  std::span<const FxProbeSH> sh, std::span<const FxProbeMoments> moments,
+                                  const rtrace::RtCamera& cam, uint32_t w, uint32_t h, fx giStrength,
+                                  std::span<uint32_t> out) {
+    using rtrace::PrimaryRay;
+    using rtrace::SkyGradient;
+    using rtrace::FxReflect;
+    using rtrace::ReflectivityFor;
+    using rtrace::kRtReflEps;
+    GiHeroCounts counts;
+    for (uint32_t py = 0; py < h; ++py) {
+        for (uint32_t px = 0; px < w; ++px) {
+            RtRay primaryRay = PrimaryRay(cam, px, py, w, h);
+            RtHit hit = TraceClosest(primaryRay, scene);
+
+            // ===== PRIMARY MISS -> the RT6 graded sky (no surface -> no indirect) =====
+            if (hit.primIndex == kRtMiss) {
+                out[(size_t)py * w + px] = SkyGradient(primaryRay.dir);
+                continue;
+            }
+
+            // ===== The RT6 hero shade: primary shadow -> cS, then the RT4 reflection blend. =====
+            RtRay shadowRay;
+            shadowRay.origin = FxAdd(hit.pos, FxScale(hit.normal, kRtShadowEps));
+            shadowRay.dir = scene.lightDir;
+            bool occluded = TraceAnyHit(shadowRay, scene, kRtShadowMinT);
+            if (occluded) ++counts.shadowed;
+            uint32_t cS = ShadeHitShadowed(hit, scene, occluded);
+
+            uint32_t base = cS;
+            fx refl = ReflectivityFor(hit.primIndex);
+            if (refl > 0) {
+                ++counts.reflective;
+                RtRay reflRay;
+                reflRay.origin = FxAdd(hit.pos, FxScale(hit.normal, kRtReflEps));
+                reflRay.dir = FxReflect(primaryRay.dir, hit.normal);
+                RtHit rHit = TraceClosest(reflRay, scene);
+                uint32_t cR;
+                if (rHit.primIndex == kRtMiss) {
+                    cR = SkyGradient(reflRay.dir);
+                } else {
+                    RtRay reflShadowRay;
+                    reflShadowRay.origin = FxAdd(rHit.pos, FxScale(rHit.normal, kRtShadowEps));
+                    reflShadowRay.dir = scene.lightDir;
+                    bool rOccluded = TraceAnyHit(reflShadowRay, scene, kRtShadowMinT);
+                    cR = ShadeHitShadowed(rHit, scene, rOccluded);
+                }
+                auto chOf = [](uint32_t c, int i) -> int32_t { return (int32_t)((c >> (8 * i)) & 0xFF); };
+                auto blend = [&](int i) -> int32_t {
+                    int32_t s = chOf(cS, i);
+                    int32_t r = chOf(cR, i);
+                    int64_t mix = (int64_t)s * (int64_t)(kOne - refl) + (int64_t)r * (int64_t)refl;
+                    return (int32_t)(mix >> kFrac);
+                };
+                base = PackRGBA8(blend(0), blend(1), blend(2), 255);
+            }
+
+            // ===== The GI INDIRECT term: albedo ⊙ irradiance(hit) × giStrength, added per channel. =====
+            // FxInterpolateIrradianceOcc samples the GI1→GI5 baked field (occlusion-weighted) at the hit.
+            // giStrength == 0 -> fxmul(irr, 0) == 0 -> the gain is +0 -> out == base (the no-op contract).
+            GiRadiance irr = FxInterpolateIrradianceOcc(grid, sh, moments, hit.pos, hit.normal,
+                                                        kGiHeroOccStrength);
+            FxVec3 alb = rtrace::AlbedoFor(hit.primIndex);
+            fx albc[3] = {alb.x, alb.y, alb.z};
+            fx irrc[3] = {irr.r, irr.g, irr.b};
+            auto chOf = [](uint32_t c, int i) -> int32_t { return (int32_t)((c >> (8 * i)) & 0xFF); };
+            int32_t gainByte[3];
+            bool anyGain = false;
+            for (int i = 0; i < 3; ++i) {
+                fx gain = fxmul(albc[i], fxmul(irrc[i], giStrength));   // albedo ⊙ irr × giStrength, Q16.16
+                int32_t b = (int32_t)(((int64_t)gain * 255) >> kFrac);  // -> 0..255 (clamped at pack)
+                gainByte[i] = b;
+                if (b > 0) anyGain = true;
+            }
+            if (anyGain) ++counts.indirectLit;
+            uint32_t outColor = PackRGBA8(chOf(base, 0) + gainByte[0], chOf(base, 1) + gainByte[1],
+                                          chOf(base, 2) + gainByte[2], 255);
+            out[(size_t)py * w + px] = outColor;
+        }
+    }
+    return counts;
+}
+
+// ===== The pinned GI6 Cornell enclosure scene + the hero camera =====================================
+// A polished Cornell box: a grey floor + grey ceiling + cool-blue back wall + a RED left wall + a GREEN
+// right wall (the canonical color-bleed pair) + a couple of objects (a reflective sphere + a tall box) +
+// a directional/overhead light angled down into the box. PINNED (the cross-vendor golden rests on it). The
+// owning storage lives in the returned struct (the spans in `scene` point into it — keep the GiScene6
+// alive while rendering). The primIndex palette (mod 6): 0 warm-red, 1 cool-blue, 2 green, 3 amber, 4
+// violet, 5 grey. The objects are MATTE (NO ReflectivityFor surface): a reflection ray in this tight thin-
+// walled Cornell box grazes the slab walls at shallow angles where the driver's float BVH can cull a true
+// fx-math hit (the documented thin-geometry float-BVH tail) — which would diverge HW vs CPU on that one
+// reflected sample. GI6's headline is the deterministic INDIRECT color bleed (RT4 owns reflections); keeping
+// the objects matte holds the strict-zero HW==CPU guarantee end-to-end.
+struct GiScene6 {
+    std::vector<rtrace::RtSphere> spheres;
+    std::vector<rtrace::RtAabb>   aabbs;
+    RtScene                       scene;
+    rtrace::RtCamera              camera;
+};
+
+inline GiScene6 BuildGi6Scene() {
+    GiScene6 r;
+
+    // The enclosure is the box x in [-4,4], y in [-1,7], z in [-4,8] (thin slabs as walls). The camera
+    // looks from -z toward +z into the open front of the box.
+    // Floor (grey, primIndex 5): a thin slab at y in [-1, 0].
+    r.aabbs.push_back(rtrace::RtAabb{FxVec3{GiF(-4,1), GiF(-1,1), GiF(-4,1)},
+                                     FxVec3{GiF(4,1),  GiF(0,1),  GiF(8,1)}, /*primIndex*/ 5});
+    // Ceiling (grey, primIndex 11 -> 11%6==5 grey): a thin slab at y in [6, 7].
+    r.aabbs.push_back(rtrace::RtAabb{FxVec3{GiF(-4,1), GiF(6,1), GiF(-4,1)},
+                                     FxVec3{GiF(4,1),  GiF(7,1), GiF(8,1)}, /*primIndex*/ 11});
+    // Back wall (cool-blue, primIndex 1): a thin slab at z in [7, 8].
+    r.aabbs.push_back(rtrace::RtAabb{FxVec3{GiF(-4,1), GiF(-1,1), GiF(7,1)},
+                                     FxVec3{GiF(4,1),  GiF(7,1),  GiF(8,1)}, /*primIndex*/ 1});
+    // Left wall (warm-RED, primIndex 0): a thin slab at x in [-4,-3] (bleeds RED onto the left floor).
+    r.aabbs.push_back(rtrace::RtAabb{FxVec3{GiF(-4,1), GiF(-1,1), GiF(-4,1)},
+                                     FxVec3{GiF(-3,1), GiF(7,1),  GiF(8,1)}, /*primIndex*/ 0});
+    // Right wall (GREEN, primIndex 2): a thin slab at x in [3,4] (bleeds GREEN onto the right floor).
+    r.aabbs.push_back(rtrace::RtAabb{FxVec3{GiF(3,1),  GiF(-1,1), GiF(-4,1)},
+                                     FxVec3{GiF(4,1),  GiF(7,1),  GiF(8,1)}, /*primIndex*/ 2});
+    // A tall box object on the floor, off to the LEFT-back (amber, primIndex 3; catches the red bleed).
+    r.aabbs.push_back(rtrace::RtAabb{FxVec3{GiF(-5,2), GiF(0,1), GiF(9,2)},
+                                     FxVec3{GiF(-1,2), GiF(7,2), GiF(13,2)}, /*primIndex*/ 3});
+
+    // A matte violet SPHERE resting on the floor near the RIGHT-front (primIndex 4 -> violet, NON-reflective;
+    // rests on the floor top y == 0, radius 1 -> center y == 1). It catches the green wall's bounced light.
+    r.spheres.push_back(rtrace::RtSphere{FxVec3{GiF(3,2), GiF(1,1), GiF(5,1)}, GiF(1,1), /*primIndex*/ 4});
+
+    r.scene.spheres = std::span<const rtrace::RtSphere>(r.spheres);
+    r.scene.aabbs   = std::span<const rtrace::RtAabb>(r.aabbs);
+    // Directional light angled DOWN into the box from the upper-front (TOWARD the light, unit).
+    r.scene.lightDir = rtrace::RtNormalize(FxVec3{GiF(1,10), GiF(9,10), GiF(-2,10)});
+    // Background (UNUSED in GI6 — misses use the RT6 SkyGradient; kept for layout parity).
+    r.scene.background = PackRGBA8(28, 32, 44, 255);
+
+    // The hero camera: eye low + back, looking toward +Z down the open front of the box.
+    r.camera.eye     = FxVec3{GiF(0,1), GiF(3,1), GiF(-7,1)};
+    r.camera.right   = FxVec3{kOne, 0, 0};
+    r.camera.up      = FxVec3{0, kOne, 0};
+    r.camera.forward = FxVec3{0, 0, kOne};
+    r.camera.halfW   = GiF(7, 10);
+    r.camera.halfH   = GiF(525, 1000);   // 0.525 (480:360 == 4:3 aspect)
+    return r;
+}
+
+// ----- The pinned GI6 probe grid over the Cornell enclosure (the bake lattice). ----------------------
+// A 4x4x4 GiProbeGrid spanning the enclosure interior (so the colored walls' bounced light is captured at
+// probes the floor/objects sample). PINNED (the golden rests on it).
+inline GiProbeGrid BuildGi6Grid() {
+    GiProbeGrid grid;
+    grid.origin  = FxVec3{GiF(-3,1), GiF(0,1), GiF(-2,1)};
+    grid.spacing = GiF(2,1);
+    grid.nx = 4; grid.ny = 4; grid.nz = 4;
+    return grid;
+}
+
 }  // namespace hf::render::gi

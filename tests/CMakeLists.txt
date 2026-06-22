@@ -788,6 +788,18 @@ hf_add_pure_test(gi_bounce_test)
 # (hf_core), ASan-eligible.
 hf_add_pure_test(gi_occ_test)
 
+# Deterministic Lumen-class GI Slice 6 (Slice GI6, THE LIT GI HERO CAPSTONE — the FLAGSHIP #29 MONEY-SHOT):
+# the pure-CPU validation of the lit GI hero render (engine/render/gi.h::RenderSceneGI the gi_hero.comp shader
+# runs VERBATIM). Settles the money-shot before any GPU trust over the pinned BuildGi6Scene Cornell enclosure
+# + the GI1->GI5 bake (BounceProbes(K=3) + FxProbeMoments_All): RenderSceneGI(giStrength=0) is BYTE-IDENTICAL
+# to the no-GI hero (the indirect is a true +0, the no-op contract); the indirect is PURELY ADDITIVE
+# (giStrength>0 -> every channel >= the no-GI image, never darkens); the COLOR-BLEED invariant (a red-wall-
+# adjacent floor point's indirect R > G,B + a green-wall floor point's indirect G > R,B — multi-bounce
+# colored GI); two-run determinism; and maxIrr of the baked field stays < 2.0 (the GI2 headroom). The GPU==CPU
+# image memcmp proof lives in --gi6-hero-shot. gi.h #includes render/rtrace.h read-only (byte-frozen),
+# rtrace.h #includes sim/fpx.h read-only. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(gi_hero_test)
+
 # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
 # integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
 # copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/

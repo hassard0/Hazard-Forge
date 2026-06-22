@@ -621,6 +621,19 @@ hf_compile_shaders(
     # hf_gen_msl list; on Metal the --gi5-occlusion showcase runs the CPU gi::InterpolateFieldOcc (byte-identical
     # by construction, the gi_interp.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact.
     "shaders/gi_occ.comp.hlsl:cs"
+    # Deterministic Lumen-class GI Slice 6 (Slice GI6, THE LIT GI HERO CAPSTONE — the FLAGSHIP #29 MONEY-SHOT):
+    # gi_hero.comp is the lit GI hero kernel — ONE thread per pixel copies the RT6 rt_hero.comp body VERBATIM
+    # (primary closest-hit + RT3 hard shadow + RT4 one-bounce reflection + the integer blend + the graded
+    # SkyGradient miss) and ADDS a GI INDIRECT term at each primary hit: albedo(hit) ⊙
+    # FxInterpolateIrradianceOcc(grid, gSH, gMoments, hit.pos, hit.normal, occStrength) × giStrength (the
+    # GI3/GI5 trilinear+Chebyshev SH blend + FxSHEvaluate copied from gi_occ.comp VERBATIM, reading the bound
+    # gSH + gMoments buffers). Bit-identical to the CPU gi::RenderSceneGI (the HW==CPU image memcmp proof;
+    # giStrength==0 -> a literal +0 indirect -> byte-identical to the no-GI RT6 hero, the no-op contract). The
+    # :csrq stage compiles it cs_6_5 + SPV_KHR_ray_query (HLSL RayQuery -> DXC SPIR-V RayQueryKHR). It is
+    # VULKAN-SPIR-V-ONLY (RayQuery + the int64 SH-blend/Chebyshev -> glslc/spirv-cross can't lower to MSL) ->
+    # NOT in the Metal hf_gen_msl list; on Metal --gi6-hero runs the CPU gi::RenderSceneGI (byte-identical by
+    # construction). The Vulkan side carries the HW==CPU hero-image memcmp proof.
+    "shaders/gi_hero.comp.hlsl:csrq"
     # Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: deterministic GPU crowds —
     # boids + steering + path-following): boids_steer.comp runs the Q16.16 Reynolds STEERING tick — ONE thread
     # per AGENT reads the FROZEN input buffer (gAgentsIn), computes SteerSeek (proportional pull toward the
