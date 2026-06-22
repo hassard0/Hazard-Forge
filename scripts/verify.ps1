@@ -544,6 +544,33 @@ if (-not `$rpOk) {
 if (`$LASTEXITCODE -ne 0) { Write-Host 'replay-verify of committed golden failed'; exit 38 }
 Write-Host 'replay file byte-golden: exact match'
 
+# --- Determinism-stress report byte-golden (Slice DX6, FLAGSHIP #31 the CAPSTONE): an EXACT
+# byte-for-byte match of a fresh --determinism-stress (build the FIXED canonical world, sweep rollbackAt
+# over 0..ticks via verdict::RunDeterminismStress, emit the {points, allCorrected, allDiverged, perPoint}
+# PASS matrix) against the committed tests/golden/agent/stress_report.json. This is the agent FUZZER
+# artifact (the determinism MOAT stress-tested + golden-locked: a regression that breaks determinism at
+# ANY rollback boundary flips a `corrected` bit and moves these bytes). Backend-AGNOSTIC (pure hf_core,
+# verdict.h render-symbol-free, integer/bool fields only -> identical on Vulkan and Metal BY
+# CONSTRUCTION), so verified once here on Windows/Vulkan; NOT in `$Goldens`/`$vkShots` (the Mac IMAGE
+# set). The --determinism-stress exe ALSO runs the 4 DX6 proofs internally (every point corrected;
+# byte-golden MATCH; two runs byte-identical; fuzzer-fires real>0/control==0) and fails loudly. ---
+Write-Host '--- determinism-stress report byte-golden ---'
+`$dsExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$dsGolden = 'tests/golden/agent/stress_report.json'
+`$dsLive = Join-Path `$env:TEMP 'hf_stress_report_live.json'
+& `$dsExe --determinism-stress `$dsLive 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'determinism-stress run failed (proofs or byte-golden mismatch)'; exit 39 }
+# Compare RAW bytes (the program writes LF-only, no BOM); any difference is a failure.
+`$dsgBytes = [System.IO.File]::ReadAllBytes((Resolve-Path `$dsGolden).Path)
+`$dslBytes = [System.IO.File]::ReadAllBytes(`$dsLive)
+`$dsOk = (`$dsgBytes.Length -eq `$dslBytes.Length)
+if (`$dsOk) { for (`$di = 0; `$di -lt `$dsgBytes.Length; `$di++) { if (`$dsgBytes[`$di] -ne `$dslBytes[`$di]) { `$dsOk = `$false; break } } }
+if (-not `$dsOk) {
+    Write-Host 'determinism-stress report byte-golden MISMATCH (tests/golden/agent/stress_report.json)'
+    exit 40
+}
+Write-Host 'determinism-stress report byte-golden: exact match'
+
 # --- Audio mixer WAV golden (Slice BB): an EXACT byte-for-byte match of a fresh --audio-render of the
 # fixed deterministic audio scene against the committed tests/golden/audio/scene.wav. The mixer is
 # INTEGER / fixed-point end to end (Q15 gains, int32 accumulate, int16 hard-clamp), so the rendered

@@ -1,0 +1,32 @@
+{
+  "points": 25,
+  "allCorrected": 25,
+  "allDiverged": 1,
+  "perPoint": [
+    { "rollbackAt": 0, "corrected": true, "diverged": true },
+    { "rollbackAt": 1, "corrected": true, "diverged": false },
+    { "rollbackAt": 2, "corrected": true, "diverged": false },
+    { "rollbackAt": 3, "corrected": true, "diverged": false },
+    { "rollbackAt": 4, "corrected": true, "diverged": false },
+    { "rollbackAt": 5, "corrected": true, "diverged": false },
+    { "rollbackAt": 6, "corrected": true, "diverged": false },
+    { "rollbackAt": 7, "corrected": true, "diverged": false },
+    { "rollbackAt": 8, "corrected": true, "diverged": false },
+    { "rollbackAt": 9, "corrected": true, "diverged": false },
+    { "rollbackAt": 10, "corrected": true, "diverged": false },
+    { "rollbackAt": 11, "corrected": true, "diverged": false },
+    { "rollbackAt": 12, "corrected": true, "diverged": false },
+    { "rollbackAt": 13, "corrected": true, "diverged": false },
+    { "rollbackAt": 14, "corrected": true, "diverged": false },
+    { "rollbackAt": 15, "corrected": true, "diverged": false },
+    { "rollbackAt": 16, "corrected": true, "diverged": false },
+    { "rollbackAt": 17, "corrected": true, "diverged": false },
+    { "rollbackAt": 18, "corrected": true, "diverged": false },
+    { "rollbackAt": 19, "corrected": true, "diverged": false },
+    { "rollbackAt": 20, "corrected": true, "diverged": false },
+    { "rollbackAt": 21, "corrected": true, "diverged": false },
+    { "rollbackAt": 22, "corrected": true, "diverged": false },
+    { "rollbackAt": 23, "corrected": true, "diverged": false },
+    { "rollbackAt": 24, "corrected": true, "diverged": false }
+  ]
+}

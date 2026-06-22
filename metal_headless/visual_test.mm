@@ -59574,6 +59574,49 @@ int main(int argc, char** argv) {
                         (unsigned)rf.stream.size(), rf.finalDigest.c_str());
             return 0;
         }
+        // --determinism-stress <out.json> (Slice DX6, FLAGSHIP #31, the CAPSTONE): the determinism-stress
+        // fuzzer. Pure CPU (verdict.h render-symbol-free); the report bytes are IDENTICAL to the
+        // Windows/Vulkan --determinism-stress by construction (only integer/bool fields). Sweep rollbackAt
+        // over 0..ticks via verdict::RunDeterminismStress, assert the 4 proofs, write the matrix LF-clean.
+        // NO Metal golden (backend-agnostic, gated Windows-only).
+        if (argc > 2 && std::strcmp(argv[1], "--determinism-stress") == 0) {
+            namespace verdict = hf::game::verdict;
+            const char* out = argv[2];
+            verdict::VerdictWorld world0;
+            const verdict::CanonicalReplay cr = verdict::BuildCanonicalReplay(world0);
+            const verdict::VerdictSnapshot world0Snap = verdict::SnapshotWorld(world0);
+            const std::vector<verdict::Command> mispredict = verdict::PerturbCanonicalStream(cr.stream);
+            const verdict::StressReport report =
+                verdict::RunDeterminismStress(world0Snap, cr.params, cr.stream, mispredict, cr.ticks);
+            const std::string text = verdict::SerializeStressReport(report);
+            { std::ofstream f(out, std::ios::binary);
+              if (!f) { std::fprintf(stderr, "FATAL: cannot write %s\n", out); return 1; }
+              f << text; }
+            if (report.allCorrected != report.points) {
+                std::fprintf(stderr, "FATAL: dx6-stress allCorrected (%u) != points (%u)\n",
+                             report.allCorrected, report.points); return 1; }
+            std::printf("dx6-stress: {points:%u, allCorrected:%u} every snapshot point -> "
+                        "corrected==authority\n", report.points, report.allCorrected);
+            std::printf("dx6-stress report written (byte-golden Windows-only)\n");
+            { verdict::VerdictWorld w2;
+              const verdict::CanonicalReplay cr2 = verdict::BuildCanonicalReplay(w2);
+              const verdict::VerdictSnapshot snap2 = verdict::SnapshotWorld(w2);
+              const std::vector<verdict::Command> mis2 = verdict::PerturbCanonicalStream(cr2.stream);
+              const verdict::StressReport report2 =
+                  verdict::RunDeterminismStress(snap2, cr2.params, cr2.stream, mis2, cr2.ticks);
+              if (verdict::SerializeStressReport(report2) != text) {
+                  std::fprintf(stderr, "FATAL: dx6-stress two stress runs NOT byte-identical\n"); return 1; } }
+            std::printf("dx6-stress determinism: two stress runs BYTE-IDENTICAL\n");
+            { const verdict::StressReport control =
+                  verdict::RunDeterminismStress(world0Snap, cr.params, cr.stream, cr.stream, cr.ticks);
+              if (report.allDiverged == 0u || control.allDiverged != 0u) {
+                  std::fprintf(stderr, "FATAL: dx6-stress fuzzer-fires FAILED (real %u, control %u)\n",
+                               report.allDiverged, control.allDiverged); return 1; } }
+            std::printf("dx6-stress fuzzer-fires: real mispredict -> diverged at %u points; "
+                        "no-perturbation control -> diverged at 0\n", report.allDiverged);
+            std::printf("determinism-stress: wrote %s\n", out);
+            return 0;
+        }
         // --clustered <out.png>: clustered / Forward+ lighting showcase (Slice AG).
         if (argc > 1 && std::strcmp(argv[1], "--clustered") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_clustered.png";

@@ -1384,5 +1384,116 @@ inline bool VerifyReplay(const ReplayFile& rf) {
     return DigestSnapshot(finalSnap) == rf.finalDigest;
 }
 
+// =================================================================================================
+// Slice DX6 — THE DETERMINISM-STRESS FUZZER — THE CAPSTONE (APPEND-ONLY; VD1-VD6 + the DX5 additions
+// above are BYTE-FROZEN). The 6th and FINAL slice of FLAGSHIP #31 (THE AGENT EXPERIENCE / AX PRODUCT,
+// hf::game::verdict). DX1-DX5 shipped the contract + read + author + reload + replay surfaces. DX6 is
+// the marketable CAPSTONE: a DETERMINISM-STRESS HARNESS that, for the FIXED canonical command stream,
+// asserts that replaying through ANY rollback/snapshot point yields the bit-identical final world as a
+// straight lockstep run — a bounded, seeded, reproducible fuzzer that stress-tests the moat itself and
+// emits a golden "stress report" (every snapshot point -> corrected==authority). It is the
+// deterministic, golden-able equivalent of a fuzzer: a regression that breaks determinism at ANY
+// rollback boundary moves a `corrected` bit and breaks the golden.
+//
+// THE DESIGN: sweep `rollbackAt` over 0..ticks INCLUSIVE (ticks+1 points), each calling the FROZEN
+// RunVerdictRollback (the VD5 per-point oracle: its outCorrectedEqAuthority + outMispredictDiverged
+// out-params). For a deterministic engine EVERY point's `corrected` is true (the moat guarantee:
+// snapshot+mispredict+rollback ANYWHERE recovers the authority bit-exactly). The `diverged` flag makes
+// the fuzzer NON-VACUOUS — it records whether the injected misprediction actually perturbed the world
+// at that point; with a REAL (perturbed) mispredict stream early points diverge, the last point
+// (rollbackAt==ticks, zero speculative ticks) cannot diverge -> allDiverged < points is EXPECTED. The
+// "fuzzer fires" control: mispredict==auth -> diverged false at EVERY point (the flag is meaningful,
+// not always-true), while corrected stays true in BOTH.
+//
+// PURE CPU: NO new render RHI, NO new shader, NO new compute. RunVerdictRollback + the VD4/VD5 machinery
+// are reused VERBATIM. warmhull.h/ecs.h + ALL sim headers + ALL shaders BYTE-UNCHANGED; verdict.h is
+// APPEND-ONLY (VD1-VD6 + DX5 code byte-frozen). This is the FINAL slice -> FLAGSHIP #31 COMPLETE.
+// =================================================================================================
+
+// ----- StressPoint: one rollback/snapshot point's verdict ----------------------------------------
+// `rollbackAt` is the snapshot tick swept; `corrected` is whether RunVerdictRollback recovered the
+// authority bit-exactly from that point (MUST be true at EVERY point); `diverged` is whether the
+// injected misprediction actually perturbed the speculative world at that point (the non-vacuous flag).
+struct StressPoint {
+    uint32_t rollbackAt = 0;
+    bool     corrected  = false;
+    bool     diverged   = false;
+};
+
+// ----- StressReport: the full per-point PASS matrix (the golden artifact) --------------------------
+// `points` == ticks+1 (the inclusive sweep); `allCorrected` == count of points where corrected==true
+// (MUST equal points for a deterministic engine — the headline); `allDiverged` == count where
+// diverged==true (EXPECTED < points: the last point has zero speculative ticks so cannot diverge).
+struct StressReport {
+    uint32_t                 points       = 0;
+    uint32_t                 allCorrected = 0;
+    uint32_t                 allDiverged  = 0;
+    std::vector<StressPoint> perPoint;
+};
+
+// ----- RunDeterminismStress(world0Snap, params, authStream, mispredictStream, ticks) -> StressReport -
+// THE capstone sweep: for rollbackAt in [0, ticks] (ticks+1 points), call the FROZEN VD5
+// RunVerdictRollback(world0Snap, params, authStream, mispredictStream, ticks, rollbackAt, &corrected,
+// &diverged) and record a StressPoint. Tallies allCorrected / allDiverged. Pure CPU, deterministic:
+// the sweep order + the fixed streams -> a byte-identical report run-to-run + cross-backend (verdict.h
+// is render-symbol-free). A determinism regression anywhere in the rollback machinery flips a
+// `corrected` bit -> the report bytes change -> the golden breaks (the fuzzer's regression value).
+inline StressReport RunDeterminismStress(const VerdictSnapshot& world0Snap, const VerdictParams& params,
+                                         const std::vector<Command>& authStream,
+                                         const std::vector<Command>& mispredictStream, uint32_t ticks) {
+    StressReport report;
+    report.points = ticks + 1u;
+    report.perPoint.reserve(report.points);
+    for (uint32_t rollbackAt = 0; rollbackAt <= ticks; ++rollbackAt) {
+        bool corrected = false, diverged = false;
+        (void)RunVerdictRollback(world0Snap, params, authStream, mispredictStream, ticks, rollbackAt,
+                                 &corrected, &diverged);
+        StressPoint p;
+        p.rollbackAt = rollbackAt;
+        p.corrected  = corrected;
+        p.diverged   = diverged;
+        if (corrected) ++report.allCorrected;
+        if (diverged)  ++report.allDiverged;
+        report.perPoint.push_back(p);
+    }
+    return report;
+}
+
+// ----- PerturbCanonicalStream(authStream) -> a REAL deterministic mispredict stream ----------------
+// The mispredict stream = the canonical auth stream with ONE command perturbed at a FIXED index (the
+// player nudge impulse, command 0) — its arg.x is flipped (negated minus kOne, the DX5 tamper convention)
+// AND its kind is left a sim verb so the divergence spans physics. A real, deterministic divergence that
+// the harness's `diverged` flag detects. The empty-stream case returns the input unchanged (no perturb).
+inline std::vector<Command> PerturbCanonicalStream(const std::vector<Command>& authStream) {
+    std::vector<Command> mispredict = authStream;
+    if (!mispredict.empty())
+        mispredict[0].arg.x = -mispredict[0].arg.x - kOne;   // a physics-divergent flip at a fixed index
+    return mispredict;
+}
+
+// ----- SerializeStressReport(r) -> the deterministic stress_report.json (LF-clean, no BOM) ----------
+// The golden PASS matrix: {points, allCorrected, allDiverged, perPoint:[{rollbackAt, corrected,
+// diverged}]} — a pure function of the report (same report -> byte-equal text). NO filesystem paths
+// (invocation-independent). Two-space indent, LF line endings, booleans as true/false. Backend-agnostic
+// (only integer/bool fields) -> byte-identical on Vulkan and Metal.
+inline std::string SerializeStressReport(const StressReport& r) {
+    std::string s;
+    s += "{\n";
+    s += "  \"points\": " + std::to_string(r.points) + ",\n";
+    s += "  \"allCorrected\": " + std::to_string(r.allCorrected) + ",\n";
+    s += "  \"allDiverged\": " + std::to_string(r.allDiverged) + ",\n";
+    s += "  \"perPoint\": [\n";
+    for (size_t i = 0; i < r.perPoint.size(); ++i) {
+        const StressPoint& p = r.perPoint[i];
+        s += "    { \"rollbackAt\": " + std::to_string(p.rollbackAt) +
+             ", \"corrected\": " + (p.corrected ? "true" : "false") +
+             ", \"diverged\": "  + (p.diverged  ? "true" : "false") + " }";
+        s += (i + 1 < r.perPoint.size()) ? ",\n" : "\n";
+    }
+    s += "  ]\n";
+    s += "}\n";
+    return s;
+}
+
 }  // namespace verdict
 }  // namespace hf::game

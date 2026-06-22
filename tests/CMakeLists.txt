@@ -48,6 +48,12 @@ hf_add_pure_test(hot_reload_test)
 # round-trip, VerifyReplay true for the recorded replay, tamper-detect (a flipped command arg flips
 # the digest), and the lockstep authority==replica. ASan-eligible like the others.
 hf_add_pure_test(agent_replay_test)
+# Slice DX6 (FLAGSHIP #31 capstone): the DETERMINISM-STRESS FUZZER — sweep rollbackAt over 0..ticks on
+# the canonical scene, assert allCorrected==points (every snapshot point recovers authority), two stress
+# runs byte-identical, the no-perturbation control (mispredict==auth) -> allDiverged==0 (the flag is
+# meaningful), a real perturbation -> allDiverged>0, and the last point (rollbackAt==ticks) diverged==false.
+# Pure C++ (hf_core), ASan-eligible like the others.
+hf_add_pure_test(agent_stress_test)
 # Skeletal-animation math + sampling (Quat/Slerp/FromTRS + SampleAnimation). Pure C++ (hf_core),
 # ASan-eligible like the others.
 hf_add_pure_test(anim_test)
