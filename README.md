@@ -187,6 +187,9 @@ you need a turnkey AAA content pipeline today, a mature engine is the pragmatic 
 
 ## Building
 
+> **New here?** [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) is the 30-minute on-ramp: clone → build → run a
+> showcase → author your first scene → the per-frame render pattern, with a sample-author cookbook. Start there.
+
 ### Windows — Vulkan (MSVC + Ninja + Conan 2)
 
 Prerequisites: Visual Studio Build Tools 2022 (MSVC x64), CMake ≥ 3.25, Ninja, Conan 2, Vulkan SDK.
