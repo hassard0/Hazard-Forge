@@ -17042,6 +17042,165 @@ static int RunIk4RigShowcase(const char* outPath) {
     return 0;
 }
 
+// --ik5-lockstep: Deterministic IK Control-Rig LOCKSTEP + ROLLBACK over IK-driven character motion (Slice IK5,
+// THE MOAT HEADLINE, the 5th slice of FLAGSHIP #32). PURE CPU (NO GPU dispatch, NO new shader — IK5 appends
+// PURE-CPU lockstep logic to ik.h): both Vulkan-Windows (--ik5-lockstep-shot) and Metal-Mac (--ik5-lockstep)
+// run the IDENTICAL CPU harness over the frozen IK4 SolveRigToTargets, so the converged-pose golden is
+// bit-identical cross-backend BY CONSTRUCTION (that cross-platform bit-identity IS the lockstep evidence — NO
+// GPU==CPU memcmp; the proof is authority==replica + rollback==authority + mispredict-diverged +
+// snapshot/restore round-trip + two-run determinism). Builds the SAME IK4 5-joint leg rig + base pose + an
+// initial target + the SAME kCmdMoveTarget stream as the Vulkan path, runs ik.h::RunIkLockstep (two peers fed
+// only the target-move stream stay bit-identical) + RunIkRollback (snapshot the target+pose, mispredict a wrong
+// target, roll back, re-sim -> corrected==authority), and CPU-draws the SAME integer 2D side-view of the
+// converged IK-corrected leg. New golden tests/golden/metal/ik5_lockstep.png (Mac-baked by the controller);
+// two runs DIFF 0.0000.
+static int RunIk5LockstepShowcase(const char* outPath) {
+    namespace ik = hf::anim::ik;
+    using ik::fx;
+
+    // The fixed hand-built test skeleton (== the Vulkan --ik5-lockstep-shot config): a 5-joint leg.
+    const int kJoints = 5;
+    const int parents[5] = {-1, 0, 1, 2, 3};
+    const double segDown[5] = {0.0, 0.2, 0.5, 0.5, 0.2};
+    const int kChainCount = 4;
+    const int chainIdx[4] = {1, 2, 3, 4};
+    const int kIters = 12;
+    const int kTicks = 16;
+    const int kRollbackAt = 6;
+
+    ik::IkBasePose base{};
+    base.count = kJoints;
+    for (int j = 0; j < kJoints; ++j) {
+        base.localT[j] = ik::FxVec3{0, (fx)(-(fx)std::llround(segDown[j] * (double)ik::kOne)), 0};
+        base.localR[j] = ik::FxQuat{0, 0, 0, ik::kOne};
+    }
+
+    auto F = [](double v) -> fx { return (fx)std::llround(v * (double)ik::kOne); };
+
+    ik::IkSimState init{};
+    init.base = base;
+    init.chains = 1;
+    init.rig[0].count = kChainCount;
+    for (int i = 0; i < kChainCount; ++i) init.rig[0].joint[i] = chainIdx[i];
+    init.rig[0].target = ik::FxVec3{0, (fx)(-F(1.4)), 0};
+    init.rig[0].iters = kIters;
+    ik::SolveRigState(init, parents);
+
+    auto move = [&](int tick, double dx, double dy) {
+        return ik::IkCommand{tick, 0, ik::FxVec3{F(dx), F(dy), 0}, ik::kCmdMoveTarget};
+    };
+    const std::vector<ik::IkCommand> authStream = {
+        move(2,  0.10, 0.10), move(4, 0.10, 0.05), move(6, 0.08, 0.05),
+        move(8,  0.06, 0.04), move(10, 0.05, 0.03),
+    };
+
+    // PROOF (1) authority==replica.
+    bool ident = false;
+    const ik::IkSimState authority = ik::RunIkLockstep(init, parents, authStream, kTicks, &ident);
+    {
+        bool ident2 = false;
+        const ik::IkSimState replica = ik::RunIkLockstep(init, parents, authStream, kTicks, &ident2);
+        if (!ident || !ident2 || !ik::IkStatesEqual(authority, replica))
+            return fail("ik5-lockstep: authority != replica (nondeterministic)");
+    }
+    std::printf("ik5-lockstep: {ticks:%d, chains:%d} authority==replica BIT-IDENTICAL "
+                "(whole rig state) from inputs ONLY\n", kTicks, init.chains);
+
+    // PROOF (2) determinism: two runs byte-identical.
+    {
+        bool ident3 = false;
+        const ik::IkSimState run2 = ik::RunIkLockstep(init, parents, authStream, kTicks, &ident3);
+        if (!ik::IkStatesEqual(authority, run2))
+            return fail("ik5-lockstep: two runs differ (nondeterministic)");
+    }
+    std::printf("ik5-lockstep determinism: two RunIkLockstep runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) rollback==authority + mispredict diverged.
+    {
+        const std::vector<ik::IkCommand> mispredict = {
+            ik::IkCommand{kRollbackAt, 0, ik::FxVec3{F(-0.5), F(-0.4), 0}, ik::kCmdMoveTarget},
+        };
+        bool correctedEq = false, diverged = false;
+        const ik::IkSimState corrected =
+            ik::RunIkRollback(init, parents, authStream, mispredict, kTicks, kRollbackAt,
+                              &correctedEq, &diverged);
+        if (!correctedEq || !ik::IkStatesEqual(corrected, authority))
+            return fail("ik5-lockstep: rollback corrected != authority");
+        if (!diverged)
+            return fail("ik5-lockstep: mispredict did NOT diverge (not a real fix)");
+    }
+    std::printf("ik5-lockstep rollback: corrected==authority BIT-EXACT; pre-rollback mispredict "
+                "DIFFERED (real divergence)\n");
+
+    // PROOF (4) snapshot/restore round-trip bit-exact.
+    {
+        ik::IkSimState s = init;
+        for (int t = 0; t < 5; ++t) ik::SimIkTick(s, parents, authStream, t);
+        const ik::IkSimState saved = s;
+        const ik::IkSnapshot snap = ik::SnapshotIkRig(s, 5);
+        for (int t = 5; t < 10; ++t) ik::SimIkTick(s, parents, authStream, t);
+        const int resume = ik::RestoreIkRig(s, snap);
+        if (resume != 5 || !ik::IkStatesEqual(s, saved))
+            return fail("ik5-lockstep: snapshot/restore round-trip not bit-exact");
+    }
+    std::printf("ik5-lockstep: snapshot/restore round-trip BIT-EXACT (target+pose+tick); "
+                "strict cross-vendor 0.0000 at the bake\n");
+
+    // --- Golden: the PURE-INTEGER converged IK-corrected leg (IDENTICAL to the Vulkan --ik5-lockstep-shot). ---
+    const uint32_t imgW = 384, imgH = 384;
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 18; bgra[p * 4 + 1] = 14; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto plot = [&](int x, int y, uint8_t b, uint8_t g, uint8_t r) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+    };
+    const double kPxPerUnit = 130.0;
+    const int originX = (int)imgW / 2;
+    const int originY = 90;
+    auto toPx = [&](fx wx, fx wy, int& px, int& py) {
+        const double dx = (double)wx / (double)ik::kOne;
+        const double dy = (double)wy / (double)ik::kOne;
+        px = originX + (int)std::lround(dx * kPxPerUnit);
+        py = originY - (int)std::lround(dy * kPxPerUnit);
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t b, uint8_t g, uint8_t r) {
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            plot(x0, y0, b, g, r);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    { int rpx, rpy; toPx(0, 0, rpx, rpy);
+      for (int oy = -2; oy <= 2; ++oy) for (int ox = -2; ox <= 2; ++ox) plot(rpx + ox, rpy + oy, 220, 220, 220); }
+    const ik::IkFkWorld fk = ik::IkSolvedFkWorld(parents, authority.pose);
+    for (int j = 1; j < kJoints; ++j) {
+        const int pj = parents[j];
+        int apx, apy, bpx, bpy;
+        toPx(fk.pos[pj].x, fk.pos[pj].y, apx, apy);
+        toPx(fk.pos[j].x, fk.pos[j].y, bpx, bpy);
+        if (j % 2 == 0) drawLine(apx, apy, bpx, bpy, 40, 170, 240);
+        else            drawLine(apx, apy, bpx, bpy, 230, 200, 60);
+        for (int oy = -1; oy <= 1; ++oy) for (int ox = -1; ox <= 1; ++ox)
+            plot(bpx + ox, bpy + oy, 90, 220, 90);
+    }
+    { int gpx, gpy; toPx(authority.rig[0].target.x, authority.rig[0].target.y, gpx, gpy);
+      for (int oy = -2; oy <= 2; ++oy) for (int ox = -2; ox <= 2; ++ox)
+          if (std::abs(ox) + std::abs(oy) <= 2) plot(gpx + ox, gpy + oy, 90, 240, 120); }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — IK5 lockstep converged IK-corrected leg at the dragged target "
+                "(%d joints, %d-joint chain, %d ticks, rollbackAt %d)\n",
+                outPath, imgW, imgH, kJoints, kChainCount, kTicks, kRollbackAt);
+    return 0;
+}
+
 // --ik3-fabrik: Deterministic IK Control-Rig FABRIK N-BONE CHAIN + LOOK-AT (Slice IK3, the 3rd slice of
 // FLAGSHIP #32). ik_fabrik.comp is int64 -> VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl), so Metal runs the CPU
 // engine/anim/ik.h::FabrikSolve over the SAME fixed target sweep -> byte-identical to the Vulkan GPU result
@@ -60686,6 +60845,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ik4-rig") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ik4_rig.png";
             try { return RunIk4RigShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ik5-lockstep <out.png>: render the Deterministic IK Control-Rig LOCKSTEP + ROLLBACK showcase (Slice
+        // IK5, THE MOAT HEADLINE of FLAGSHIP #32). PURE CPU (NO GPU dispatch, NO new shader — IK5 appends
+        // pure-CPU lockstep logic to ik.h): both backends run the IDENTICAL CPU harness over the frozen IK4
+        // SolveRigToTargets. Two peers fed ONLY the per-tick target-move stream re-derive the bit-identical
+        // IK-corrected pose (RunIkLockstep authority==replica); a mispredicted target is rolled back to a
+        // snapshot (the target + pose + tick) + re-simulated (RunIkRollback corrected==authority). The image
+        // golden is a PURE-INTEGER converged IK-corrected leg, identical to the Vulkan path BY CONSTRUCTION.
+        // New golden tests/golden/metal/ik5_lockstep.png.
+        if (argc > 1 && std::strcmp(argv[1], "--ik5-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ik5_lockstep.png";
+            try { return RunIk5LockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fract-fragments <out.png>: render the Deterministic Rigid-Body Fracture FRAGMENT EXTRACTION

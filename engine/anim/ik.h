@@ -805,4 +805,240 @@ inline void SkeletonParents(const anim::Skeleton& skeleton, int* out, int count)
     for (int j = 0; j < count; ++j) out[j] = skeleton.joints[(size_t)j].parent;
 }
 
+// ===================================================================================================
+// Slice IK5 — DETERMINISTIC IK CONTROL-RIG: LOCKSTEP + ROLLBACK over IK-driven character motion (THE MOAT
+// HEADLINE, the 5th slice of FLAGSHIP #32). APPENDED to ik.h (the IK1 + IK2 + IK3 + IK4 lines above are
+// BYTE-FROZEN — append-only). IK1-IK4 built the deterministic IK SOLVERS + the skeleton bridge; IK5 proves
+// the IK-driven character pose is true cross-platform LOCKSTEP + ROLLBACK-replayable — the headline a FLOAT
+// engine cannot do. Two peers fed ONLY a deterministic INPUT stream (per-tick effector-target moves — "the
+// hand/foot target the player is dragging") re-simulate to a BIT-IDENTICAL IK-corrected pose; a mispredicted
+// target is corrected by rolling back to a snapshot + re-simulating. PURE CPU, 0 backend symbols, NO new
+// shader/RHI (the FPX5/JT5/AC5/VD5 lockstep convention).
+//
+// THE DESIGN CALL (the AC5/VD5 mold over SolveRigToTargets; the target is the state, the pose is the pure
+// function): the lockstep machinery is proven many times (FPX5, JT5, VH5, AC5, VD5). IK5 reuses the SHAPE
+// verbatim, with the IK-specific state minimal + clean:
+//   * The REPLAYABLE STATE = the effector target(s) (each rig's `target`, moved by kCmdMoveTarget each tick).
+//     The base pose + skeleton parents + chain topology are CONST (carried as params, re-supplied at restore,
+//     NOT snapshotted). The IK-corrected pose is a PURE FUNCTION of (base, targets) — re-derived each tick by
+//     SolveRigToTargets (IK4, VERBATIM).
+//   * SimIkTick = apply this tick's target moves (in FIXED command order) -> SolveRigToTargets. Deterministic
+//     by construction (fixed command order, fixed FABRIK iters, integer). Two peers running the same SimIkTick
+//     over the same command stream are byte-identical; rollback restores the exact target(s) + re-sims.
+//   * The SNAPSHOT captures the target(s) + the solved pose (the IkPose localR/localT) + the tick. The pose is
+//     technically re-derivable from the targets, so the snapshot is small; capturing the pose makes
+//     IkStatesEqual a direct byte-compare of the WHOLE rig state (the VD5 whole-state-equality shape).
+//   * DETERMINISM BY CONSTRUCTION: SolveRigToTargets is the frozen IK4 integer solve (GPU==CPU already proven).
+//     The lockstep is a determinism PROPERTY of it — PURE CPU, no GPU dispatch, no shader, no TDR. The
+//     converged pose is bit-identical Vulkan-Windows AND Metal-Mac (both run the same CPU SimIkTick) -> the
+//     cross-backend zero-diff golden IS the lockstep evidence.
+//
+// MULTIPLE CHAINS: IkSimState carries a fixed-capacity array of rigs (chains). Each tick the commands nudge a
+// chain's target (cmd.chain selects the rig); the pose is the result of solving the rigs in FIXED index order,
+// each over the running corrected pose so multiple limbs compose deterministically. A single-chain scene
+// (chains==1) is the common case; the showcase uses one leg chain.
+
+// kIkMaxChains — the fixed chain capacity for the lockstep state (a humanoid has a handful of IK limbs).
+inline constexpr int kIkMaxChains = 4;
+
+// kCmdMoveTarget — the only IK command kind (the per-tick effector-target nudge). A second discriminant slot
+// is reserved for parity with the other lockstep slices; IK5 has exactly one verb.
+inline constexpr int kCmdMoveTarget = 0;
+
+// ----- IkCommand: ONE per-tick effector-target move (the dragged hand/foot target) ----------------------
+// At `tick`, add `delta` to chain `chain`'s end-effector target. The harness applies every command whose
+// cmd.tick == tick in ARRAY ORDER before the SolveRigToTargets of that tick (the AC5 ActiveCommand /
+// VehicleCommand scripted-input-per-tick shape). Pure integer (delta is a Q16.16 FxVec3).
+struct IkCommand {
+    int    tick = 0;          // the tick this target move fires at
+    int    chain = 0;         // which rig/chain's target is nudged (index into IkSimState.rig[])
+    FxVec3 delta;             // the Q16.16 world-space target delta
+    int    kind = kCmdMoveTarget;  // the command discriminant (always kCmdMoveTarget for IK5)
+};
+
+// ----- IkSimState: the mutable IK rig state (the const base + the per-chain rigs whose targets MOVE + the
+// current corrected pose) ----------------------------------------------------------------------------------
+// `base` + the skeleton parents (carried separately as a param) are CONST. `rig[0..chains-1]` carry the per-
+// chain end-effector targets — the ONLY moving state. `pose` is the current solved IkPose (re-derived each
+// tick from the targets; captured so IkStatesEqual byte-compares the whole rig state). The snapshot/equality
+// compares the targets + the pose; base/parents/topology are NOT part of the replayable state.
+struct IkSimState {
+    IkBasePose base;                 // the const base local pose (the bind / sampled pose)
+    IkRig      rig[kIkMaxChains];    // per-chain rigs (their `target` is the moving state)
+    int        chains = 0;           // live chain count (1..kIkMaxChains)
+    IkPose     pose;                 // the current corrected pose (re-derived each tick; snapshotted)
+};
+
+// ----- SolveRigState: re-derive the corrected pose from the base + every chain's target (pure function) ----
+// Solve the chains in FIXED index order. Chain 0 solves over the base pose; each later chain solves over the
+// running corrected pose (so independent limbs compose deterministically — an n-chain generalization of IK4's
+// single SolveRigToTargets). For the common single-chain case this is exactly one SolveRigToTargets over the
+// base. The result is written into state.pose. Pure integer (the IK4 solve, VERBATIM). No GPU, no float.
+inline void SolveRigState(IkSimState& state, const int* parents) {
+    if (state.chains < 1) {
+        // degenerate: no chain -> the pose is exactly the base pose.
+        state.pose.count = state.base.count;
+        for (int j = 0; j < state.base.count; ++j) {
+            state.pose.localT[j] = state.base.localT[j];
+            state.pose.localR[j] = state.base.localR[j];
+        }
+        return;
+    }
+    // Chain 0 over the base pose.
+    state.pose = SolveRigToTargets(parents, state.base, state.rig[0]);
+    // Each later chain solves over the running corrected pose (copy pose -> a base, solve, write back).
+    for (int ch = 1; ch < state.chains; ++ch) {
+        IkBasePose cur{};
+        cur.count = state.pose.count;
+        for (int j = 0; j < state.pose.count; ++j) {
+            cur.localT[j] = state.pose.localT[j];
+            cur.localR[j] = state.pose.localR[j];
+        }
+        state.pose = SolveRigToTargets(parents, cur, state.rig[ch]);
+    }
+}
+
+// ----- SimIkTick: the deterministic per-tick step (apply this tick's target moves + re-solve) -------------
+// (0) APPLY this tick's commands in ARRAY ORDER (every cmd with cmd.tick == tick) — target += delta on the
+//     selected chain — BEFORE the solve so the moved target drives this tick's pose. (1) SolveRigState ->
+//     the corrected pose re-derived from the moved targets. Pure integer (the IK4 solve) + the deterministic
+//     host target nudge -> bit-identical on every peer/platform. The AC5 SimActiveTick / VH5 SimVehicleTick
+//     twin (the input is a TARGET MOVE rather than a hit-impulse).
+inline void SimIkTick(IkSimState& state, const int* parents,
+                      const std::vector<IkCommand>& commands, int tick) {
+    for (size_t c = 0; c < commands.size(); ++c) {
+        if (commands[c].tick == tick) {
+            const int ch = commands[c].chain;
+            if (ch >= 0 && ch < state.chains) {
+                state.rig[ch].target.x += commands[c].delta.x;
+                state.rig[ch].target.y += commands[c].delta.y;
+                state.rig[ch].target.z += commands[c].delta.z;
+            }
+        }
+    }
+    SolveRigState(state, parents);
+}
+
+// ----- IkSnapshot: the captured mutable IK rig state (the targets + the solved pose + the tick) -----------
+// The replayable state is the per-chain targets + the corrected pose + the tick (the rollback restore point).
+// The base/parents/topology are immutable structure (re-supplied at restore) so they are NOT snapshotted —
+// EXACTLY the mutable state is captured. (The pose is technically re-derivable; capturing it makes the equality
+// a whole-state byte-compare — the VD5 shape.)
+struct IkSnapshot {
+    FxVec3 target[kIkMaxChains];   // the per-chain end-effector targets (the moving state)
+    int    chains = 0;             // the live chain count (so restore re-establishes exactly)
+    IkPose pose;                   // the corrected pose at the snapshot tick
+    int    tick = 0;               // the tick this snapshot was taken at
+};
+
+// ----- SnapshotIkRig: capture the mutable state (the rollback restore point) ------------------------------
+// Bit-exact round-trip with RestoreIkRig: RestoreIkRig(state, SnapshotIkRig(state0, t)) leaves state's
+// targets + pose == state0's byte-for-byte AND state resumes at tick t.
+inline IkSnapshot SnapshotIkRig(const IkSimState& state, int tick) {
+    IkSnapshot snap;
+    snap.chains = state.chains;
+    for (int ch = 0; ch < state.chains; ++ch) snap.target[ch] = state.rig[ch].target;
+    snap.pose = state.pose;
+    snap.tick = tick;
+    return snap;
+}
+
+// ----- RestoreIkRig: restore the targets + pose from a snapshot + return the captured tick (the rollback) --
+// Restores each chain's target + the corrected pose and returns snap.tick so the harness resumes from there.
+// Bit-exact round-trip with SnapshotIkRig. The base/parents/topology are untouched (immutable structure).
+inline int RestoreIkRig(IkSimState& state, const IkSnapshot& snap) {
+    for (int ch = 0; ch < snap.chains && ch < state.chains; ++ch)
+        state.rig[ch].target = snap.target[ch];
+    state.pose = snap.pose;
+    return snap.tick;
+}
+
+// ----- IkStatesEqual: whole-rig-state byte-equality (the per-chain targets + the corrected pose) ----------
+// Two states are equal iff every live chain's target is byte-equal AND the corrected pose (localR + localT)
+// is byte-equal. The base/parents are CONST + identical by construction so they are not compared — the
+// equality is over EXACTLY the replayable state (the VD5 whole-world memcmp shape). Pure integer compare.
+inline bool IkStatesEqual(const IkSimState& a, const IkSimState& b) {
+    if (a.chains != b.chains) return false;
+    for (int ch = 0; ch < a.chains; ++ch) {
+        if (a.rig[ch].target.x != b.rig[ch].target.x ||
+            a.rig[ch].target.y != b.rig[ch].target.y ||
+            a.rig[ch].target.z != b.rig[ch].target.z) return false;
+    }
+    if (a.pose.count != b.pose.count) return false;
+    for (int j = 0; j < a.pose.count; ++j) {
+        if (a.pose.localR[j].x != b.pose.localR[j].x || a.pose.localR[j].y != b.pose.localR[j].y ||
+            a.pose.localR[j].z != b.pose.localR[j].z || a.pose.localR[j].w != b.pose.localR[j].w) return false;
+        if (a.pose.localT[j].x != b.pose.localT[j].x || a.pose.localT[j].y != b.pose.localT[j].y ||
+            a.pose.localT[j].z != b.pose.localT[j].z) return false;
+    }
+    return true;
+}
+
+// ----- RunIkLockstep: authority + replica from the SAME inputs, bit-identical every tick ------------------
+// THE peer entry point (the AC5 RunActiveLockstep / VD5 control flow over SimIkTick). Run `ticks` SimIkTicks
+// from a COPY of `initialState`, applying the command stream -> the converged rig. authority = the run;
+// replica = the SAME from the SAME init + stream (INPUTS ONLY — no state shared) -> BIT-IDENTICAL by
+// determinism. This function ASSERTS authority == replica EACH tick (IkStatesEqual) via an internal replica
+// run; the caller also compares two RunIkLockstep returns for the determinism proof. Sets *identical (false
+// if the per-tick lockstep invariant ever broke — unreachable for a deterministic sim) and returns the
+// converged authority state.
+inline IkSimState RunIkLockstep(const IkSimState& initialState, const int* parents,
+                                const std::vector<IkCommand>& commands, int ticks, bool* identical) {
+    IkSimState authority = initialState;   // a fresh copy (base + rigs + pose)
+    IkSimState replica   = initialState;   // the second peer fed the SAME inputs
+    bool ident = true;
+    for (int t = 0; t < ticks; ++t) {
+        SimIkTick(authority, parents, commands, t);
+        SimIkTick(replica,   parents, commands, t);
+        if (!IkStatesEqual(authority, replica)) ident = false;   // the lockstep invariant — must hold each tick
+    }
+    if (identical) *identical = ident;
+    return authority;
+}
+
+// ----- RunIkRollback: snapshot -> mispredict diverges -> rollback -> corrected == authority ----------------
+// The rollback harness (the AC5 RunActiveRollback / VD5 control flow over SimIkTick). (1) advance ticks
+// 0..rollbackAt from `initialState` applying authStream; (2) SAVE an IkSnapshot AT rollbackAt (the targets +
+// pose + tick); (2b) speculatively advance <=3 ticks with the MISPREDICTED stream (a WRONG target move — a
+// different delta that diverges the pose, the client prediction); (3) ROLLBACK — RestoreIkRig to the snapshot
+// + RE-SIMULATE rollbackAt..ticks with the CORRECT authStream -> the corrected final state. Sets *correctedEq
+// (corrected == the straight authority run) AND *diverged (the speculative pre-rollback state DIFFERED from
+// the authority at that tick — a REAL divergence was fixed). Returns the corrected state.
+inline IkSimState RunIkRollback(const IkSimState& initialState, const int* parents,
+                                const std::vector<IkCommand>& authStream,
+                                const std::vector<IkCommand>& mispredictStream, int ticks, int rollbackAt,
+                                bool* correctedEq, bool* diverged) {
+    // The straight authority run (the truth the rollback must reproduce).
+    bool authIdent = true;
+    const IkSimState authority = RunIkLockstep(initialState, parents, authStream, ticks, &authIdent);
+
+    IkSimState state = initialState;
+    // (1) advance 0..rollbackAt with the authoritative stream.
+    for (int t = 0; t < rollbackAt; ++t)
+        SimIkTick(state, parents, authStream, t);
+    // (2) SAVE the snapshot at rollbackAt (the rollback restore point — the targets + pose + tick).
+    const IkSnapshot snap = SnapshotIkRig(state, rollbackAt);
+
+    // (2b) speculatively advance <=3 ticks with the MISPREDICTED stream (the wrong target move that diverges).
+    int specTicks = ticks - rollbackAt;
+    if (specTicks > 3) specTicks = 3;
+    IkSimState spec = state;   // a copy to measure the speculative divergence against the authority
+    for (int s = 0; s < specTicks; ++s)
+        SimIkTick(spec, parents, mispredictStream, rollbackAt + s);
+    // the authority advanced to the SAME tick (with the correct stream) for the divergence comparison.
+    IkSimState authAtSpec = initialState;
+    for (int t = 0; t < rollbackAt + specTicks; ++t)
+        SimIkTick(authAtSpec, parents, authStream, t);
+    const bool didDiverge = !IkStatesEqual(spec, authAtSpec);
+
+    // (3) ROLLBACK: restore the snapshot (targets + pose) + re-sim rollbackAt..ticks with the authStream.
+    const int resumeTick = RestoreIkRig(state, snap);   // == rollbackAt
+    for (int t = resumeTick; t < ticks; ++t)
+        SimIkTick(state, parents, authStream, t);
+
+    if (correctedEq) *correctedEq = IkStatesEqual(state, authority);
+    if (diverged)    *diverged    = didDiverge;
+    return state;
+}
+
 } // namespace hf::anim::ik

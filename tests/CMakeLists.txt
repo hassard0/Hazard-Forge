@@ -667,6 +667,16 @@ hf_add_pure_test(ik_fabrik_test)
 # ASan-eligible. ik.h #includes sim/fpx.h + sim/joint.h read-only.
 hf_add_pure_test(ik_rig_test)
 
+# Deterministic IK Control-Rig Slice 5 (Slice IK5, THE MOAT HEADLINE of FLAGSHIP #32): the LOCKSTEP + ROLLBACK
+# machinery (engine/anim/ik.h::SimIkTick / SnapshotIkRig / RestoreIkRig / IkStatesEqual / RunIkLockstep /
+# RunIkRollback) proving the IK-driven character pose is true cross-platform lockstep + rollback-replayable.
+# Pins: snapshot/restore round-trip bit-exact (targets + pose + tick); lockstep two-peer convergence (whole
+# rig state byte-equal each tick); rollback corrected==authority bit-exact; the mispredict genuinely diverged
+# (a real divergence fixed); a no-op mispredict does NOT diverge (the divergence flag is falsifiable); two
+# runs byte-identical. PURE CPU (SimIkTick is the frozen IK4 SolveRigToTargets after a deterministic integer
+# target nudge -> bit-identical by construction). Pure C++ (hf_core), ASan-eligible. ik.h is APPEND-ONLY.
+hf_add_pure_test(ik_lockstep_test)
+
 # Deterministic Articulated-Body Ragdoll Slice 1 (Slice JT1, the BEACHHEAD of FLAGSHIP #15): the JOINT
 # GRAPH + BALL-JOINT CONSTRAINT integer core (engine/sim/joint.h) the GPU
 # shaders/joint_ball_solve.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
