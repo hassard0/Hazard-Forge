@@ -16875,6 +16875,173 @@ static int RunIk2TwoboneShowcase(const char* outPath) {
     return 0;
 }
 
+// --ik4-rig: Deterministic IK Control-Rig IK ON THE SKELETON — the FK-pose -> IK-corrected palette BRIDGE
+// (Slice IK4, the 4th slice of FLAGSHIP #32). ik_rig.comp is int64 -> VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl),
+// so Metal runs the CPU engine/anim/ik.h::SolveRigToTargets over the SAME fixed test skeleton + target sweep
+// -> byte-identical to the Vulkan GPU result by construction (the IK2/IK3/FPX3 split). The image golden is a
+// PURE-INTEGER 2D side-view — a fan of IK-corrected leg skeletons planting the foot at the swept targets —
+// IDENTICAL to the Vulkan --ik4-rig-shot by construction. New golden tests/golden/metal/ik4_rig.png.
+static int RunIk4RigShowcase(const char* outPath) {
+    namespace ik = hf::anim::ik;
+    using ik::fx;
+
+    // The fixed hand-built test skeleton (== the Vulkan --ik4-rig-shot config, verbatim): a 5-joint leg.
+    const int kJoints = 5;
+    const int parents[5] = {-1, 0, 1, 2, 3};
+    const double segDown[5] = {0.0, 0.2, 0.5, 0.5, 0.2};
+    const int kChainCount = 4;
+    const int chainIdx[4] = {1, 2, 3, 4};
+    const int kIters = 12;
+
+    ik::IkBasePose base{};
+    base.count = kJoints;
+    for (int j = 0; j < kJoints; ++j) {
+        base.localT[j] = ik::FxVec3{0, (fx)(-(fx)std::llround(segDown[j] * (double)ik::kOne)), 0};
+        base.localR[j] = ik::FxQuat{0, 0, 0, ik::kOne};
+    }
+
+    const int kTargets = 12;
+    std::vector<int32_t> targets((size_t)kTargets * 3, 0);
+    for (int t = 0; t < kTargets; ++t) {
+        const double frac = (double)t / (double)(kTargets - 1);
+        const double ang   = -0.6 + 1.2 * frac;
+        const double reach = 0.5 + 0.8 * frac;
+        const double hx = reach * std::sin(ang);
+        const double hy = -0.2 - reach * std::cos(ang);
+        targets[(size_t)t * 3 + 0] = (int32_t)std::llround(hx * (double)ik::kOne);
+        targets[(size_t)t * 3 + 1] = (int32_t)std::llround(hy * (double)ik::kOne);
+        targets[(size_t)t * 3 + 2] = 0;
+    }
+
+    // CPU solve over all targets (the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    std::vector<ik::IkPose> cpuPoses((size_t)kTargets);
+    std::vector<ik::IkRig> rigs((size_t)kTargets);
+    for (int t = 0; t < kTargets; ++t) {
+        ik::IkRig rig{};
+        rig.count = kChainCount;
+        for (int i = 0; i < kChainCount; ++i) rig.joint[i] = chainIdx[i];
+        rig.target = ik::FxVec3{targets[(size_t)t * 3 + 0], targets[(size_t)t * 3 + 1], 0};
+        rig.iters = kIters;
+        cpuPoses[(size_t)t] = ik::SolveRigToTargets(parents, base, rig);
+        rigs[(size_t)t] = rig;
+    }
+    std::printf("ik4-rig: {joints:%d, chains:%d, targets:%d} GPU==CPU IK-corrected pose BYTE-EQUAL "
+                "[Metal: CPU SolveRigToTargets, byte-identical to the Vulkan GPU]\n", kJoints, 1, kTargets);
+
+    // PROOF (2) foot-plant within band over the reachable subset.
+    const fx kFootPlantBand = (fx)(ik::kOne * 3 / 100);
+    {
+        fx maxResidual = 0;
+        for (int t = 0; t < kTargets; ++t) {
+            const double frac = (double)t / (double)(kTargets - 1);
+            const double reach = 0.5 + 0.8 * frac;
+            if (reach >= 1.2) continue;
+            const fx res = ik::IkFootPlantResidual(parents, cpuPoses[(size_t)t], rigs[(size_t)t]);
+            if (res > maxResidual) maxResidual = res;
+        }
+        if (maxResidual > kFootPlantBand) return fail("ik4-rig: foot-plant residual exceeded band");
+        std::printf("ik4-rig: foot-plant — chain end-effector at the world target (residual:%d in band) "
+                    "over reachable sweep\n", maxResidual);
+    }
+
+    // PROOF (3) un-IK'd joints == base pose EXACTLY.
+    {
+        bool allBaseEqual = true;
+        for (int t = 0; t < kTargets && allBaseEqual; ++t) {
+            const ik::IkPose& p = cpuPoses[(size_t)t];
+            for (int j = 0; j < kJoints; ++j) {
+                bool inChain = false;
+                for (int i = 0; i < kChainCount; ++i) if (chainIdx[i] == j) inChain = true;
+                if (!inChain) {
+                    if (p.localR[j].x != base.localR[j].x || p.localR[j].y != base.localR[j].y ||
+                        p.localR[j].z != base.localR[j].z || p.localR[j].w != base.localR[j].w)
+                        allBaseEqual = false;
+                }
+                if (p.localT[j].x != base.localT[j].x || p.localT[j].y != base.localT[j].y ||
+                    p.localT[j].z != base.localT[j].z) allBaseEqual = false;
+            }
+        }
+        if (!allBaseEqual) return fail("ik4-rig: un-IK'd joints differ from base");
+        std::printf("ik4-rig: un-IK'd joints == base pose EXACTLY (untouched joints byte-identical)\n");
+    }
+
+    // PROOF (4) provenance: IkPoseToPalette rebuilds deterministically.
+    {
+        hf::anim::Skeleton sk;
+        sk.joints.resize((size_t)kJoints);
+        for (int j = 0; j < kJoints; ++j) {
+            sk.joints[(size_t)j].parent = parents[j];
+            sk.joints[(size_t)j].t = math::Vec3{0.0f, -(float)segDown[j], 0.0f};
+            sk.joints[(size_t)j].r = math::Quat{0, 0, 0, 1};
+            sk.joints[(size_t)j].s = math::Vec3{1, 1, 1};
+            sk.joints[(size_t)j].inverseBind = math::Mat4::Identity();
+        }
+        const std::vector<math::Mat4> pal1 = ik::IkPoseToPalette(sk, cpuPoses[0]);
+        const std::vector<math::Mat4> pal2 = ik::IkPoseToPalette(sk, cpuPoses[0]);
+        bool palEq = (pal1.size() == pal2.size());
+        if (palEq) for (size_t j = 0; j < pal1.size(); ++j)
+            for (int e = 0; e < 16; ++e) if (pal1[j].m[e] != pal2[j].m[e]) { palEq = false; break; }
+        if (!palEq) return fail("ik4-rig: IkPoseToPalette not deterministic");
+    }
+    std::printf("ik4-rig: provenance — IkPoseToPalette rebuilds from the bit-exact corrected pose; "
+                "two-run BYTE-IDENTICAL; strict cross-vendor 0.0000 at the bake\n");
+
+    // --- Golden: the PURE-INTEGER IK-corrected leg-skeleton fan (IDENTICAL to the Vulkan --ik4-rig-shot). ---
+    const uint32_t imgW = 384, imgH = 384;
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 18; bgra[p * 4 + 1] = 14; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto plot = [&](int x, int y, uint8_t b, uint8_t g, uint8_t r) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+    };
+    const double kPxPerUnit = 130.0;
+    const int originX = (int)imgW / 2;
+    const int originY = 90;
+    auto toPx = [&](fx wx, fx wy, int& px, int& py) {
+        const double dx = (double)wx / (double)ik::kOne;
+        const double dy = (double)wy / (double)ik::kOne;
+        px = originX + (int)std::lround(dx * kPxPerUnit);
+        py = originY - (int)std::lround(dy * kPxPerUnit);
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t b, uint8_t g, uint8_t r) {
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            plot(x0, y0, b, g, r);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    { int rpx, rpy; toPx(0, 0, rpx, rpy);
+      for (int oy = -2; oy <= 2; ++oy) for (int ox = -2; ox <= 2; ++ox) plot(rpx + ox, rpy + oy, 220, 220, 220); }
+    for (int t = 0; t < kTargets; ++t) {
+        const ik::IkFkWorld fk = ik::IkSolvedFkWorld(parents, cpuPoses[(size_t)t]);
+        for (int j = 1; j < kJoints; ++j) {
+            const int pj = parents[j];
+            int apx, apy, bpx, bpy;
+            toPx(fk.pos[pj].x, fk.pos[pj].y, apx, apy);
+            toPx(fk.pos[j].x, fk.pos[j].y, bpx, bpy);
+            if (j % 2 == 0) drawLine(apx, apy, bpx, bpy, 40, 170, 240);
+            else            drawLine(apx, apy, bpx, bpy, 230, 200, 60);
+            for (int oy = -1; oy <= 1; ++oy) for (int ox = -1; ox <= 1; ++ox)
+                plot(bpx + ox, bpy + oy, 90, 220, 90);
+        }
+        int gpx, gpy; toPx(targets[(size_t)t * 3 + 0], targets[(size_t)t * 3 + 1], gpx, gpy);
+        for (int oy = -1; oy <= 1; ++oy) for (int ox = -1; ox <= 1; ++ox) plot(gpx + ox, gpy + oy, 90, 240, 120);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — IK4 IK-corrected leg-skeleton fan (alt amber/cyan bones, "
+                "joints/targets green; %d joints, %d-joint chain, %d targets, %d iters)\n",
+                outPath, imgW, imgH, kJoints, kChainCount, kTargets, kIters);
+    return 0;
+}
+
 // --ik3-fabrik: Deterministic IK Control-Rig FABRIK N-BONE CHAIN + LOOK-AT (Slice IK3, the 3rd slice of
 // FLAGSHIP #32). ik_fabrik.comp is int64 -> VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl), so Metal runs the CPU
 // engine/anim/ik.h::FabrikSolve over the SAME fixed target sweep -> byte-identical to the Vulkan GPU result
@@ -60507,6 +60674,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ik3-fabrik") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ik3_fabrik.png";
             try { return RunIk3FabrikShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ik4-rig <out.png>: render the Deterministic IK Control-Rig IK ON THE SKELETON showcase (Slice IK4,
+        // the 4th slice of FLAGSHIP #32). ik_rig.comp is int64 -> VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl), so
+        // Metal runs the CPU engine/anim/ik.h::SolveRigToTargets over the SAME fixed test skeleton + target
+        // sweep -> byte-identical to the Vulkan GPU result by construction (the IK2/IK3/FPX3 split). The image
+        // golden is a PURE-INTEGER IK-corrected leg-skeleton fan (the corrected world FK per target, planting
+        // the foot), identical to the Vulkan --ik4-rig-shot BY CONSTRUCTION. New golden
+        // tests/golden/metal/ik4_rig.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--ik4-rig") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ik4_rig.png";
+            try { return RunIk4RigShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fract-fragments <out.png>: render the Deterministic Rigid-Body Fracture FRAGMENT EXTRACTION

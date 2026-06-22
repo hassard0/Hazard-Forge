@@ -558,4 +558,251 @@ inline FxQuat LookAtRotation(const FxVec3& fwd, const FxVec3& to) {
     return FxQuatNormalize(QuatFromAxisAngle(axis, angle));
 }
 
+// ===================================================================================================
+// Slice IK4 — DETERMINISTIC IK CONTROL-RIG: IK ON THE SKELETON (the FK-pose -> IK-corrected palette bridge,
+// the 4th slice of FLAGSHIP #32). APPENDED to ik.h (the IK1 + IK2 + IK3 lines above are BYTE-FROZEN —
+// append-only). IK1-IK3 built the deterministic IK SOLVERS (angle LUT, two-bone, FABRIK + look-at); IK4 is
+// the ANIM-PILLAR BRIDGE: wire those solvers into the EXISTING skeleton + skinning-palette pipeline. Take a
+// base local pose (the skeleton bind pose / a sampled animation pose), run the IK solver to correct a limb
+// SUB-CHAIN toward a world target (foot-plant / hand-reach), and emit the corrected joint palette through
+// the same forward-kinematics + palette machinery the animation + ragdoll capstones use.
+//
+// THE BIT-EXACT PIPELINE (Q16.16, GPU==CPU):
+//   (1) FK the base LOCAL pose -> world joint positions (Q16.16), forward-accumulating along the
+//       topologically-sorted joints (the joint::RagdollFromSkeleton / anim::PaletteFromLocalPose single
+//       forward pass, MIRRORED in Q16.16): gquat[j] = FxQuatMul(gquat[parent], localR[j]); gpos[j] =
+//       gpos[parent] + FxRotate(gquat[parent], localT[j]). The world POSITION is the chain input.
+//   (2) IK solve over each rig chain (FABRIK over the world joint positions) toward the world target ->
+//       corrected world positions (the foot-plant). Pure integer; the IK1-IK3 within-band residual carries.
+//   (3) Convert the corrected world positions -> corrected LOCAL rotations. For each chain bone the corrected
+//       LOCAL rotation aims the BIND-POSE bone direction along the corrected world bone direction, expressed
+//       in the joint's PARENT world frame: deltaWorld = LookAtRotation(bindWorldDir, corrWorldDir);
+//       correctedLocalR = QConj(parentWorldRot) * deltaWorld * parentWorldRot * baseLocalR. Write into ONLY
+//       the chain joints.
+//   (4) Un-IK'd joints stay EXACTLY the base pose (byte-identical) — the falsifiable invariant.
+//
+// THE FLOAT CROSSINGS (documented, OUTSIDE the bit-exact loop): (a) the base pose comes from the skeleton
+// bind pose / anim::SampleLocalPose (float) snapped to Q16.16 (the RagdollFromSkeleton bind, FxQuatFromFloat
+// idiom); (b) IkPoseToPalette is the Q16.16->float math::Mat4 read-back for the render (joint::PoseToPalette
+// twin). The IK SOLVE + FK + rotation-convert between them is bit-exact integer.
+//
+// THE int64 REALITY (the IK2/IK3/FPX3 split): the FK (FxRotate/FxQuatMul), the FABRIK solve (FxNormalize/
+// FxLength), and the rotation-convert (LookAtRotation/FxQuatMul) all use int64, so shaders/ik_rig.comp is
+// VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot lower it to MSL) — NOT in the Metal hf_gen_msl list.
+// The Metal --ik4-rig showcase runs THIS CPU SolveRigToTargets (byte-identical to the Vulkan GPU result by
+// construction); the Vulkan side carries the GPU==CPU memcmp proof. The shader copies the bodies VERBATIM.
+//
+// THE WITHIN-BAND CAVEAT (honest): the FK from the corrected LOCAL rotations reaches the world target within
+// a bounded, DETERMINISTIC residual (the FABRIK iterative residual + the FxNormalize / LookAtRotation LSB —
+// NOT zero). The un-IK'd-joints invariant is EXACT (byte-identical). The headline is DETERMINISM + cross-
+// platform bit-identity, NOT analytic reach.
+
+// Pull the float math bridge from joint.h / fpx.h (READ-ONLY) for the base-pose snap + palette read-back.
+using hf::sim::joint::QConj;
+
+// kIkMaxJoints — the fixed skeleton capacity for the GPU SSBO mirror (the rig's hand-built test skeleton is
+// small; the std430 GPU layout reads/writes a flat per-joint array). 16 covers a humanoid limb + spine.
+inline constexpr int kIkMaxJoints = 16;
+
+// IkRig — the IK overlay description for ONE limb sub-chain. `joint[0..count-1]` the skeleton joint INDICES
+// along the chain (joint[0] the chain root, joint[count-1] the end-effector), parent-before-child (a path
+// down the skeleton hierarchy: each joint[i+1]'s skeleton parent IS joint[i]). `target` the chain's
+// end-effector goal in WORLD space (Q16.16). `iters` the FABRIK iteration count. `pole` an optional bend
+// hint (carried for parity with the two-bone solve; FABRIK here is unconstrained). count in [2, kIkMaxBones].
+struct IkRig {
+    int    joint[kIkMaxBones];     // skeleton joint indices along the chain (root..end), <= kIkMaxBones
+    int    count = 0;              // live chain joint count (2..kIkMaxBones)
+    FxVec3 target;                 // the end-effector world-space target (Q16.16)
+    FxVec3 pole{0, kOne, 0};       // optional bend hint (unused by FABRIK; carried for parity)
+    int    iters = 12;             // FABRIK iterations
+};
+
+// IkBasePose — a base LOCAL pose snapped to Q16.16: per-joint local rotation + translation (the bind pose /
+// a sampled animation pose, snapped once OUTSIDE the bit-exact loop). The bit-exact FK + solve + convert
+// read this; SolveRigToTargets returns a corrected COPY of `localR` (translations are untouched by IK).
+struct IkBasePose {
+    FxVec3 localT[kIkMaxJoints];   // per-joint local translation (Q16.16)
+    FxQuat localR[kIkMaxJoints];   // per-joint local rotation (Q16.16)
+    int    count = 0;              // joint count (<= kIkMaxJoints)
+};
+
+// IkFkWorld — the FK result of an IkBasePose: per-joint WORLD rotation + position (Q16.16). The chain input
+// for the IK solve + the parent frame for the rotation-convert.
+struct IkFkWorld {
+    FxVec3 pos[kIkMaxJoints];      // per-joint world position (Q16.16)
+    FxQuat rot[kIkMaxJoints];      // per-joint world rotation (Q16.16)
+    int    count = 0;
+};
+
+// FkWorldPositions(parents, base) -> the Q16.16 forward-accumulate. parents[j] = skeleton parent index (or
+// -1 for a root); base the local pose. gquat[j] = FxQuatMul(gquat[parent], localR[j]); gpos[j] =
+// gpos[parent] + FxRotate(gquat[parent], localT[j]). Topologically-sorted -> single forward pass (parent
+// precedes child). Pure integer (FxQuatMul/FxRotate int64). The shader copies THIS body VERBATIM.
+inline IkFkWorld FkWorldPositions(const int* parents, const IkBasePose& base) {
+    IkFkWorld w{};
+    w.count = base.count;
+    for (int j = 0; j < base.count; ++j) {
+        const int p = parents[j];
+        if (p < 0) {
+            w.rot[j] = base.localR[j];
+            w.pos[j] = base.localT[j];
+        } else {
+            w.rot[j] = FxQuatMul(w.rot[p], base.localR[j]);
+            const FxVec3 tWorld = FxRotate(w.rot[p], base.localT[j]);
+            w.pos[j] = FxVec3{w.pos[p].x + tWorld.x, w.pos[p].y + tWorld.y, w.pos[p].z + tWorld.z};
+        }
+    }
+    return w;
+}
+
+// IkPose — the SolveRigToTargets output: a corrected per-joint LOCAL pose (rotations corrected on the chain,
+// translations + un-IK'd rotations EXACTLY the base). The corrected `localR` IS the bit-exact bridge output
+// (the GPU==CPU memcmp compares THIS); IkPoseToPalette reads it back to a float skinning palette.
+struct IkPose {
+    FxVec3 localT[kIkMaxJoints];
+    FxQuat localR[kIkMaxJoints];
+    int    count = 0;
+};
+
+// SolveRigToTargets(parents, base, rig) -> IkPose. The bit-exact FK + IK + rotation-convert bridge:
+//   (1) FK the base local pose -> world joint rotations + positions.
+//   (2) lay the chain's WORLD positions into an IkChainN, capture its rest segment lengths, FabrikSolve
+//       toward rig.target -> corrected world positions.
+//   (3) for each chain bone i (joint c = rig.joint[i], child cn = rig.joint[i+1]): bindWorldDir =
+//       normalize(fkWorldPos[cn] - fkWorldPos[c]); corrWorldDir = normalize(corrPos[i+1] - corrPos[i]);
+//       deltaWorld = LookAtRotation(bindWorldDir, corrWorldDir); the corrected world rotation of c is
+//       deltaWorld * fkRot[c]; the corrected LOCAL rotation is QConj(parentWorldRot) * (deltaWorld *
+//       fkRot[c]), where parentWorldRot = fkRot[skeletonParent(c)] (identity if c is a root). Write it into
+//       out.localR[c]. The end-effector joint (i==count-1, no child bone) keeps its base local rotation.
+//   (4) every joint NOT on the chain keeps its base localR + localT EXACTLY.
+// Pure integer (int64 in the FK / FABRIK / LookAtRotation). The shader copies THIS body VERBATIM.
+inline IkPose SolveRigToTargets(const int* parents, const IkBasePose& base, const IkRig& rig) {
+    IkPose out{};
+    out.count = base.count;
+    // (4) seed with the EXACT base pose (un-IK'd joints stay byte-identical; the chain joints are overwritten).
+    for (int j = 0; j < base.count; ++j) { out.localT[j] = base.localT[j]; out.localR[j] = base.localR[j]; }
+
+    // (1) FK the base pose to world rotations + positions.
+    const IkFkWorld fk = FkWorldPositions(parents, base);
+
+    if (rig.count < 2) return out;   // a degenerate chain has no bone to correct.
+
+    // (2) lay the chain world positions into an IkChainN, capture rest lengths, FABRIK toward the target.
+    IkChainN chain{};
+    chain.count = rig.count;
+    for (int i = 0; i < rig.count; ++i) chain.pos[i] = fk.pos[rig.joint[i]];
+    CaptureChainLengths(chain);
+    const FxVec3 chainRoot = fk.pos[rig.joint[0]];
+    FabrikSolve(chain, chainRoot, rig.target, rig.iters);
+
+    // (3) corrected world positions -> corrected LOCAL rotations on the chain joints (NOT the end-effector).
+    // CRUX: the local rotation must be expressed in the CORRECTED PARENT world frame, NOT the base FK parent
+    // frame — otherwise the re-FK does not reproduce the corrected bone direction (the chain compounds). We
+    // walk the chain forward, tracking corrWorldRot (the corrected world rotation of the PREVIOUS chain joint,
+    // = the corrected parent frame for the next). For chain joint 0 the parent is NOT in the chain, so its
+    // frame is the (unchanged) base FK rotation of chain[0]'s skeleton parent. For each bone: deltaWorld =
+    // LookAtRotation(baseBoneDir, corrBoneDir); the corrected world rotation of c is deltaWorld * fk.rot[c]
+    // (so FK reproduces |t|*corrBoneDir); the corrected LOCAL rotation is QConj(corrParentWorld) *
+    // (deltaWorld * fk.rot[c]). corrParentWorld == corrWorldRot[c's chain parent] (the corrected one).
+    FxQuat prevCorrWorldRot{0, 0, 0, kOne};   // the corrected world rotation of the previous chain joint
+    for (int i = 0; i + 1 < rig.count; ++i) {
+        const int c  = rig.joint[i];        // the joint whose local rotation drives bone i
+        const int cn = rig.joint[i + 1];    // the chain successor (defines the bone direction)
+        const FxVec3 bindWorldDir = FxNormalize(
+            FxVec3{fk.pos[cn].x - fk.pos[c].x, fk.pos[cn].y - fk.pos[c].y, fk.pos[cn].z - fk.pos[c].z});
+        const FxVec3 corrWorldDir = FxNormalize(
+            FxVec3{chain.pos[i + 1].x - chain.pos[i].x, chain.pos[i + 1].y - chain.pos[i].y,
+                   chain.pos[i + 1].z - chain.pos[i].z});
+        const FxQuat deltaWorld = LookAtRotation(bindWorldDir, corrWorldDir);
+        // the corrected WORLD rotation of joint c (the delta pre-composed onto its base world rotation).
+        const FxQuat corrWorldRot = FxQuatNormalize(FxQuatMul(deltaWorld, fk.rot[c]));
+        // the CORRECTED parent world frame: chain joint 0's parent is outside the chain (base FK rot), every
+        // later chain joint's parent IS the previous chain joint (its corrected world rotation, just computed).
+        FxQuat parentWorldRot;
+        if (i == 0) {
+            const int p = parents[c];
+            parentWorldRot = (p >= 0) ? fk.rot[p] : FxQuat{0, 0, 0, kOne};
+        } else {
+            parentWorldRot = prevCorrWorldRot;
+        }
+        out.localR[c] = FxQuatNormalize(FxQuatMul(QConj(parentWorldRot), corrWorldRot));
+        prevCorrWorldRot = corrWorldRot;
+    }
+    return out;
+}
+
+// IkSolvedFkWorld(parents, pose) -> the FK world positions of an IkPose (the corrected local pose). The
+// foot-plant proof FK's the CORRECTED pose + checks the end-effector reached the world target within band.
+// Pure integer (the FkWorldPositions over the corrected localR). A thin adapter: copy the IkPose into an
+// IkBasePose then FK it.
+inline IkFkWorld IkSolvedFkWorld(const int* parents, const IkPose& pose) {
+    IkBasePose b{};
+    b.count = pose.count;
+    for (int j = 0; j < pose.count; ++j) { b.localT[j] = pose.localT[j]; b.localR[j] = pose.localR[j]; }
+    return FkWorldPositions(parents, b);
+}
+
+// IkFootPlantResidual(parents, pose, rig) -> |FK(corrected pose).endEffector - rig.target| (Q16.16). The
+// bounded within-band foot-plant residual (the FABRIK iterative residual + the rotation-convert LSB — NOT
+// zero). Pure integer.
+inline fx IkFootPlantResidual(const int* parents, const IkPose& pose, const IkRig& rig) {
+    if (rig.count < 1) return 0;
+    const IkFkWorld fk = IkSolvedFkWorld(parents, pose);
+    const int ee = rig.joint[rig.count - 1];
+    return FxLength(FxVec3{fk.pos[ee].x - rig.target.x, fk.pos[ee].y - rig.target.y,
+                           fk.pos[ee].z - rig.target.z});
+}
+
+// IkPoseToPalette(skeleton, pose) -> the Q16.16->float skinning palette read-back (the joint::PoseToPalette
+// twin; render-only, the documented float crossing). FK the corrected LOCAL pose to per-joint world
+// transforms in FLOAT (translate(pos)*quatToMat(normalize(rot)), the fpx::FxBodyTransform float convention),
+// then palette[j] = worldFloat[j] * inverseBind[j]. A pure deterministic function of the bit-exact corrected
+// pose (the provenance proof: two calls byte-identical). One Mat4 per joint, in skeleton order.
+inline std::vector<math::Mat4> IkPoseToPalette(const anim::Skeleton& skeleton, const IkPose& pose) {
+    const size_t n = skeleton.joints.size();
+    std::vector<math::Mat4> palette(n);
+    std::vector<math::Mat4> worldF(n);
+    auto fxToF = [](fx v) -> float { return (float)v / (float)kOne; };
+    for (size_t j = 0; j < n; ++j) {
+        const int idx = (int)j;
+        const math::Vec3 t{fxToF(pose.localT[idx].x), fxToF(pose.localT[idx].y), fxToF(pose.localT[idx].z)};
+        const math::Quat r = math::Normalize(math::Quat{
+            fxToF(pose.localR[idx].x), fxToF(pose.localR[idx].y),
+            fxToF(pose.localR[idx].z), fxToF(pose.localR[idx].w)});
+        const math::Mat4 local = math::FromTRS(t, r, math::Vec3{1, 1, 1});
+        const int parent = skeleton.joints[j].parent;
+        worldF[j] = (parent >= 0) ? (worldF[(size_t)parent] * local) : local;
+        palette[j] = worldF[j] * skeleton.joints[j].inverseBind;
+    }
+    return palette;
+}
+
+// BasePoseFromSkeleton(skeleton) -> the IkBasePose snapped from the skeleton's REST local TRS (the bind
+// pose). The float->Q16.16 snap (the RagdollFromSkeleton bind / FxQuatFromFloat idiom — the documented float
+// crossing OUTSIDE the bit-exact loop). Rotation normalized in float then snapped; translation scaled by
+// kOne. Pure deterministic host float. Joints beyond kIkMaxJoints are ignored (the test skeleton is small).
+inline IkBasePose BasePoseFromSkeleton(const anim::Skeleton& skeleton) {
+    IkBasePose b{};
+    const int n = (int)skeleton.joints.size();
+    b.count = n < kIkMaxJoints ? n : kIkMaxJoints;
+    for (int j = 0; j < b.count; ++j) {
+        const anim::Joint& jt = skeleton.joints[(size_t)j];
+        b.localT[j] = FxVec3{(fx)std::llround((double)jt.t.x * (double)kOne),
+                             (fx)std::llround((double)jt.t.y * (double)kOne),
+                             (fx)std::llround((double)jt.t.z * (double)kOne)};
+        const math::Quat q = math::Normalize(jt.r);
+        b.localR[j] = FxQuatNormalize(FxQuat{(fx)std::llround((double)q.x * (double)kOne),
+                                             (fx)std::llround((double)q.y * (double)kOne),
+                                             (fx)std::llround((double)q.z * (double)kOne),
+                                             (fx)std::llround((double)q.w * (double)kOne)});
+    }
+    return b;
+}
+
+// SkeletonParents(skeleton, out[]) -> fill out[j] = skeleton.joints[j].parent for j in [0, count). A small
+// helper so the solver takes a flat int parent array (the GPU SSBO mirror). Pure copy.
+inline void SkeletonParents(const anim::Skeleton& skeleton, int* out, int count) {
+    for (int j = 0; j < count; ++j) out[j] = skeleton.joints[(size_t)j].parent;
+}
+
 } // namespace hf::anim::ik

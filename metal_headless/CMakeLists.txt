@@ -273,6 +273,15 @@ hf_gen_msl(ik_angle.comp         ik_angle.comp.hlsl         comp ik_angle_main)
 # CPU FabrikSolve over the same targets (byte-identical to the Vulkan GPU result by construction; the Vulkan
 # side carries the GPU==CPU memcmp proof — the IK2/FPX3 split). LookAtRotation (the shortest-arc aim) is
 # CPU-side in both showcases (acos+cross, host-only).
+# Deterministic IK Control-Rig Slice 4 (Slice IK4, the 4th slice of FLAGSHIP #32): ik_rig.comp is the
+# FK-pose -> IK-corrected palette BRIDGE (engine/anim/ik.h::SolveRigToTargets — FK the base local pose, FABRIK
+# the chain, convert corrected world positions back to corrected LOCAL joint rotations). LIKE ik_fabrik.comp
+# (and UNLIKE IK1's MSL-native ik_angle.comp), the FK/FABRIK/quat math (FxRotate/FxQuatMul/FxNormalize/
+# LookAtRotation) is int64, so ik_rig.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot lower it
+# to MSL) -> NO hf_gen_msl line here. The Metal --ik4-rig showcase runs the CPU SolveRigToTargets over the
+# same fixed target sweep (byte-identical to the Vulkan GPU result by construction; the Vulkan side carries
+# the GPU==CPU memcmp proof — the IK2/IK3/FPX3 split). The IkPoseToPalette read-back + the BasePoseFromSkeleton
+# snap are the documented render-only float crossings (CPU-side both showcases).
 # Deterministic Rigid-Body Fracture Slice 2 (Slice FR2): FRAGMENT EXTRACTION — turns each non-empty FR1
 # Voronoi cell into a FRAGMENT RECORD (integer centroid, AABB, boundRadiusSq/boundRadius, volume, cellId,
 # invMass) via the GR2/FL2 count->scan->emit CSR over FR1's cellId[] (cells == seedCount) + a per-fragment

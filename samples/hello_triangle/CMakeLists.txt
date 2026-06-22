@@ -495,6 +495,18 @@ hf_compile_shaders(
     # ReadBuffer reads the positions, PROVEN BIT-EXACT vs the CPU ik.h FabrikSolve (memcmp, no tol). Behind
     # --ik3-fabrik-shot only; existing shaders + goldens untouched.
     "shaders/ik_fabrik.comp.hlsl:cs"
+    # Deterministic IK Control-Rig Slice 4 (Slice IK4, the 4th slice of FLAGSHIP #32): ik_rig.comp is the
+    # FK-pose -> IK-corrected palette BRIDGE — ONE thread per target runs the WHOLE engine/anim/ik.h::
+    # SolveRigToTargets VERBATIM (FK the base local pose to world joint positions, FABRIK the chain's world
+    # positions toward the target, convert the corrected world positions back to corrected LOCAL joint
+    # rotations via LookAtRotation+FxQuatMul+QConj), writing the corrected per-joint LOCAL FxQuats
+    # (kIkMaxJoints*4 ints) per target. LIKE ik_fabrik.comp / ik_twobone.comp (and UNLIKE IK1's MSL-native
+    # ik_angle.comp), the FK/FABRIK/quat math is int64, so ik_rig.comp is VULKAN-SPIR-V-ONLY (DXC compiles
+    # int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal --ik4-rig runs the CPU
+    # SolveRigToTargets (byte-identical by construction). ReadBuffer reads the corrected pose, PROVEN
+    # BIT-EXACT vs the CPU ik.h SolveRigToTargets (memcmp, no tol). Behind --ik4-rig-shot only; existing
+    # shaders + goldens untouched.
+    "shaders/ik_rig.comp.hlsl:cs"
     # Deterministic Rigid-Body Fracture Slice 2 (Slice FR2): FRAGMENT EXTRACTION — the GR2/FL2
     # count->scan->emit CSR over FR1's cellId[] (cells == seedCount) + a per-fragment reduction. PURE
     # INT32 -> MSL-native, a TRUE GPU pass on both backends. fract_emit_count (ONE thread per sample:

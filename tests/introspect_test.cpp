@@ -566,6 +566,8 @@ int main() {
             bool sawIk2TwoboneFeature = false;
             // Slice IK3: the ik3-fabrik capability is advertised (the FABRIK n-bone chain + look-at solve).
             bool sawIk3FabrikFeature = false;
+            // Slice IK4: the ik4-rig capability is advertised (the FK-pose -> IK-corrected palette bridge).
+            bool sawIk4RigFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -827,6 +829,7 @@ int main() {
                     if (AsString(el->value) == "ik1-angle") sawIk1AngleFeature = true;
                     if (AsString(el->value) == "ik2-twobone") sawIk2TwoboneFeature = true;
                     if (AsString(el->value) == "ik3-fabrik") sawIk3FabrikFeature = true;
+                    if (AsString(el->value) == "ik4-rig") sawIk4RigFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -1063,6 +1066,7 @@ int main() {
             check(sawIk1AngleFeature, "engine.features includes ik1-angle");
             check(sawIk2TwoboneFeature, "engine.features includes ik2-twobone");
             check(sawIk3FabrikFeature, "engine.features includes ik3-fabrik");
+            check(sawIk4RigFeature, "engine.features includes ik4-rig");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");

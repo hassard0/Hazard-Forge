@@ -656,6 +656,17 @@ hf_add_pure_test(ik_twobone_test)
 # for fwd~-to. Pure C++ (hf_core), ASan-eligible. ik.h #includes sim/fpx.h read-only.
 hf_add_pure_test(ik_fabrik_test)
 
+# Deterministic IK Control-Rig Slice 4 (Slice IK4, the 4th slice of FLAGSHIP #32): the FK-pose -> IK-corrected
+# palette BRIDGE (engine/anim/ik.h::SolveRigToTargets / FkWorldPositions / IkPoseToPalette) the GPU
+# shaders/ik_rig.comp copies VERBATIM + proves bit-identical. Pins determinism (SolveRigToTargets a pure
+# function, two runs byte-identical); the foot-plant (FK the corrected pose -> the chain end-effector at the
+# world target within a documented band over a reachable sweep — the FABRIK iterative + LookAtRotation LSB
+# residual, NOT zero); the un-IK'd-joints invariant (every joint NOT in the rig chain byte-identical to the
+# base pose — EXACT); IK-did-something (the chain joints' local rotations differ from base when the target !=
+# the rest end-effector); IkPoseToPalette determinism (two calls byte-identical). Pure C++ (hf_core),
+# ASan-eligible. ik.h #includes sim/fpx.h + sim/joint.h read-only.
+hf_add_pure_test(ik_rig_test)
+
 # Deterministic Articulated-Body Ragdoll Slice 1 (Slice JT1, the BEACHHEAD of FLAGSHIP #15): the JOINT
 # GRAPH + BALL-JOINT CONSTRAINT integer core (engine/sim/joint.h) the GPU
 # shaders/joint_ball_solve.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
