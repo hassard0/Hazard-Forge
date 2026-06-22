@@ -926,6 +926,15 @@ hf_add_pure_test(hulljoint_test)
 # include it -> converge — the warm-state-necessary lesson at the friction layer). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(hulljoint_net_test)
 
+# Hull Friction + Joints Slice 6 (Slice HF6, the LIT 3D CAPSTONE of FLAGSHIP #30: hf::sim::hulljoint): the
+# render-only FLOAT delegate JointedHullToRenderInstances(world) APPENDED to engine/sim/hulljoint.h (a one-line
+# delegate to the FROZEN gjk::HullToRenderInstances over the settled jointed hull world — the WH6/CX6/FC6/PS6
+# mold). NO GPU, NO shader, NO RHI. Pins the render-bridge contracts the showcase builds on: PROVENANCE (two
+# calls byte-equal via gjk::HullRenderMeshEqual), the per-body triangle soup (non-empty, tri count a multiple of
+# the body count), THE RENDER IS A PURE READ (the (bodies, friction cache) PAIR JointedHullStatesEqual before vs
+# after), and the settled scene's expected body count. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(hulljoint_render_test)
+
 # Deterministic Gameplay / Netcode Slice 1 (Slice VD1, the BEACHHEAD of FLAGSHIP #27: hf::game::verdict): the
 # PURE-CPU integer entity world + the unified tick-ordered input-command bus that layers a determinism contract
 # over the raw ecs::Registry (engine/game/verdict.h, a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h

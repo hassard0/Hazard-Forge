@@ -412,5 +412,21 @@ inline JointedHullSnapshot RunJointedHullRollback(const JointedHullWorld& scene,
     return corrected;
 }
 
+// =========================================================================================================
+// Slice HF6 — Hull Friction + Joints: LIT 3D CAPSTONE (the money-shot completing FLAGSHIP #30). APPENDED
+// after RunJointedHullRollback (HF1-HF5's lines above are BYTE-FROZEN). A render-only FLOAT delegate over the
+// bit-exact friction+joint settled world — the WH6/CX6/FC6/PS6 capstone mold. NO new shader, NO new RHI.
+//
+// JointedHullToRenderInstances(w): the world-space FLOAT triangle soup for the settled jointed hull world —
+// a ONE-LINE delegate to the FROZEN gjk::HullToRenderInstances(w.hulls). The joints/limits are constraints,
+// NOT geometry — they do NOT render; the hull BODIES (the chain links, the door, the friction-resting hull)
+// render, and their settled poses ARE the joint+friction result. The render is the ONE float crossing
+// (fpx::FxBodyTransform inside the frozen bridge), render-only, OUT of the bit-exact integer loop. A PURE
+// FUNCTION of `w` — two calls byte-equal via gjk::HullRenderMeshEqual (the provenance contract the showcase
+// asserts); the integer world is NOT mutated.
+inline gjk::HullRenderMesh JointedHullToRenderInstances(const JointedHullWorld& w) {
+    return gjk::HullToRenderInstances(w.hulls);
+}
+
 }  // namespace hulljoint
 }  // namespace hf::sim
