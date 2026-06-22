@@ -704,4 +704,153 @@ inline void GiFieldToImage(const GiProbeGrid& grid, std::span<const FxProbeSH> s
     }
 }
 
+// =====================================================================================================
+// ===== Slice GI4 — INTEGER MULTI-BOUNCE FEEDBACK (light that bounces, deterministically) =============
+// =====================================================================================================
+// APPEND-ONLY (everything above this banner is GI1+GI2+GI3, BYTE-FROZEN). GI4 closes the loop: MULTI-BOUNCE.
+// Each probe-ray hit's shade gains an INDIRECT term = the PREVIOUS iteration's GI3-interpolated irradiance
+// at the hit point × the hit's albedo, fed back for a fixed K<=3 iterations — the deterministic integer twin
+// of the float DDGI probe_multibounce.h (ClampBounceCount/BounceIndirect). This is the step that makes light
+// BOUNCE (a red wall tints the floor). STRICT INTEGER -> byte-identical HW==CPU, strict-zero cross-vendor.
+//
+// THE BOUNDED-GAIN ENVELOPE (why the feedback CANNOT overflow the GI2 [-2,2] SH headroom): the bounce energy
+// at iteration k is Σ albedo^k. Because every albedo is < kOne (energy-conserving, AlbedoFor channels are at
+// most 0.82) and K is fixed (<=3), the series is bounded (< radiance/(1-maxAlbedo)). GI2 proved a [0,1]
+// radiance encodes to coeffs in [-0.29,0.29] and reconstructs to irradiance < ~1.02; the bounded feedback
+// keeps the re-injected radiance within [0,~2), so the dynamic-range guarantee carries through (the GI2 crux
+// re-verified under feedback). The ONLY new ingredient is the indirect shade.
+//
+// THE NO-OP CONTRACT (the make-or-break, falsifiable): ShadeHitGI(hit, scene, occluded, indirectIrr) with
+// indirectIrr == {0,0,0} is BYTE-IDENTICAL to UnpackRadiance(ShadeHitShadowed(hit, scene, occluded)) — the
+// indirect term is a literal integer +0. So K==1 BounceProbes (iteration 1 traces with indirectIrr=0) is the
+// GI1+GI2 single-bounce SH EXACTLY. THE MONOTONICITY GUARD: SH_2's reconstructed irradiance >= SH_1's
+// component-wise (the bounce only ADDS non-negative light) AND is measurably greater for >=1 probe (so the
+// integer indirect did NOT truncate to zero — the underflow guard).
+
+// ----- kGiMaxBounces / ClampBounces — the fixed-K clamp (the probemb::ClampBounceCount integer twin). ----
+// K is fixed (the float DDGI posture: a 2nd bounce is the demonstrable leap; N-bounce is a trivial loop
+// extension). bounces<1 clamps to 1 (the single-bounce path); >kGiMaxBounces clamps to kGiMaxBounces.
+inline constexpr int kGiMaxBounces = 3;
+inline int ClampBounces(int bounces) {
+    if (bounces < 1) return 1;
+    if (bounces > kGiMaxBounces) return kGiMaxBounces;
+    return bounces;
+}
+
+// ----- ShadeHitGI — the direct shadowed shade + an indirect (albedo × interpolated irradiance) term. -----
+// = albedo(hit) × (directDiffuse + indirectIrr), per RGB channel, as a GiRadiance (the unpacked RGBA8, the
+// GI1 radiance convention). directDiffuse = ambient + (occluded ? 0 : lambert) is the ShadeHitShadowed body
+// VERBATIM (the SAME ambient/lambert/quantize integer math), and indirectIrr is the GI3-interpolated
+// irradiance of the PREVIOUS SH at the hit (passed in; {0,0,0} on iteration 1). PINNED per-channel integer
+// blend (the shader copies this VERBATIM):
+//   lit_ch  = fxmul(alb.ch, diffuse) + fxmul(alb.ch, indirectIrr.ch)   // Q16.16, direct + indirect
+//   byte_ch = (lit_ch * 255) >> kFrac                                   // [0,255], clamped
+//   rad.ch  = byte_ch * kOne / 255                                      // UnpackRadiance (Q16.16 in [0,1])
+// When indirectIrr == {0,0,0}: lit_ch == fxmul(alb.ch, diffuse) == ShadeHitShadowed's q, so byte_ch is
+// identical and rad == UnpackRadiance(ShadeHitShadowed(...)) BYTE-FOR-BYTE (the no-op contract). A MISS ->
+// UnpackRadiance(scene.background) (indirectIrr irrelevant — no surface to receive indirect light). PURE
+// INTEGER, deterministic, cross-backend exact.
+inline GiRadiance ShadeHitGI(const RtHit& hit, const RtScene& scene, bool occluded,
+                             const GiRadiance& indirectIrr) {
+    if (hit.primIndex == kRtMiss) return UnpackRadiance(scene.background);
+    fx ndl = rtrace::FxDot(hit.normal, scene.lightDir);
+    if (ndl < 0) ndl = 0;                          // clamp max(dot,0)
+    const fx ambient = (fx)(kOne * 18 / 100);      // 0.18 ambient floor (== ShadeHitShadowed)
+    fx lambert = occluded ? 0 : fxmul(kOne - ambient, ndl);  // the GATED diffuse term
+    fx diffuse = ambient + lambert;                // [ambient, 1]; occluded -> exactly ambient
+    FxVec3 alb = rtrace::AlbedoFor(hit.primIndex);
+    fx albc[3] = {alb.x, alb.y, alb.z};
+    fx indc[3] = {indirectIrr.r, indirectIrr.g, indirectIrr.b};
+    auto unpackCh = [](int32_t byteVal) -> fx {
+        if (byteVal < 0) byteVal = 0;
+        if (byteVal > 255) byteVal = 255;
+        return (fx)(((int64_t)byteVal * (int64_t)kOne) / 255);   // == UnpackRadiance per-channel
+    };
+    auto chOut = [&](int i) -> fx {
+        // lit = albedo*diffuse (the ShadeHitShadowed term) + albedo*indirect (the GI4 bounce). Both Q16.16.
+        fx lit = (fx)(fxmul(albc[i], diffuse) + fxmul(albc[i], indc[i]));
+        int32_t byteVal = (int32_t)(((int64_t)lit * 255) >> kFrac);   // [0,255], unclamped (clamped in unpack)
+        return unpackCh(byteVal);
+    };
+    return GiRadiance{chOut(0), chOut(1), chOut(2), 0};
+}
+
+// ----- BounceProbes — the fixed-K multi-bounce iteration (the pure-CPU reference, returns SH_K). ---------
+// SH_0 is undefined-zero. Iteration 1: TraceProbeRays direct (indirectIrr = {0,0,0}) -> EncodeAllProbes ->
+// SH_1 (== the GI1+GI2 single-bounce SH, the no-op contract). Iteration k>1: re-trace each probe-ray, but
+// shade each hit with ShadeHitGI(..., FxInterpolateIrradiance(SH_{k-1}, hit.pos, hit.normal)) -> the previous
+// iteration's interpolated indirect feeds the new radiance -> EncodeAllProbes -> SH_k. Returns SH_K (clamp
+// K<=kGiMaxBounces). The HOST drives the SAME loop on the GPU (dispatch gi_bounce.comp reading SH_{k-1}, then
+// gi_sh_encode.comp to make SH_k). `outSH` must be ProbeCount(grid) long; a 0-probe grid leaves it untouched.
+// PURE INTEGER, deterministic.
+inline void BounceProbes(const RtScene& scene, const GiProbeGrid& grid, int bounces,
+                         std::span<FxProbeSH> outSH) {
+    int K = ClampBounces(bounces);
+    int probes = ProbeCount(grid);
+    if (probes <= 0) return;
+
+    std::vector<GiRadiance> radiance((size_t)probes * kGiRaysPerProbe);
+
+    // ----- Iteration 1: the DIRECT capture (indirectIrr == {0,0,0}) -> SH_1. -----
+    // Byte-identical to TraceProbeRays + EncodeAllProbes (ShadeHitGI with a zero indirect == the unpacked
+    // ShadeHitShadowed) — the no-op contract the K==1 proof rests on.
+    for (int p = 0; p < probes; ++p) {
+        FxVec3 origin = ProbePos(grid, p);
+        for (int d = 0; d < kGiRaysPerProbe; ++d) {
+            RtRay ray{origin, kGiProbeDirs[d]};
+            RtHit hit = TraceClosest(ray, scene);
+            bool occluded = false;
+            if (hit.primIndex != kRtMiss) {
+                RtRay shadowRay;
+                shadowRay.origin = FxAdd(hit.pos, FxScale(hit.normal, kRtShadowEps));
+                shadowRay.dir = scene.lightDir;
+                occluded = TraceAnyHit(shadowRay, scene, kRtShadowMinT);
+            }
+            radiance[(size_t)p * kGiRaysPerProbe + d] = ShadeHitGI(hit, scene, occluded, GiRadiance{});
+        }
+    }
+    EncodeAllProbes(grid, std::span<const GiRadiance>(radiance), outSH);
+
+    // ----- Iterations 2..K: re-trace with the PREVIOUS iteration's GI3 interpolated indirect. -----
+    // outSH holds SH_{k-1}; re-shade each hit with ShadeHitGI(..., FxInterpolateIrradiance(SH_{k-1}, hit)),
+    // re-encode into outSH -> SH_k. The host GPU loop mirrors this exactly (gi_bounce.comp + gi_sh_encode.comp).
+    for (int k = 2; k <= K; ++k) {
+        std::span<const FxProbeSH> prevSH(outSH.data(), (size_t)probes);
+        for (int p = 0; p < probes; ++p) {
+            FxVec3 origin = ProbePos(grid, p);
+            for (int d = 0; d < kGiRaysPerProbe; ++d) {
+                RtRay ray{origin, kGiProbeDirs[d]};
+                RtHit hit = TraceClosest(ray, scene);
+                bool occluded = false;
+                GiRadiance indirect{};
+                if (hit.primIndex != kRtMiss) {
+                    RtRay shadowRay;
+                    shadowRay.origin = FxAdd(hit.pos, FxScale(hit.normal, kRtShadowEps));
+                    shadowRay.dir = scene.lightDir;
+                    occluded = TraceAnyHit(shadowRay, scene, kRtShadowMinT);
+                    // The indirect = the previous SH's interpolated irradiance at the hit point for the hit
+                    // normal (the GI3 continuous field). A MISS receives no indirect (the {} above).
+                    indirect = FxInterpolateIrradiance(grid, prevSH, hit.pos, hit.normal);
+                }
+                radiance[(size_t)p * kGiRaysPerProbe + d] = ShadeHitGI(hit, scene, occluded, indirect);
+            }
+        }
+        EncodeAllProbes(grid, std::span<const GiRadiance>(radiance), outSH);
+    }
+}
+
+// ----- GiMaxIrradiance — the max reconstructed-irradiance magnitude across the SH buffer (the in-range
+// proof helper). For each probe, reconstruct the +Y irradiance and track the largest channel (Q16.16). The
+// GI2 headroom holds under feedback iff this stays < 2*kOne. Pure integer, deterministic.
+inline fx GiMaxIrradiance(std::span<const FxProbeSH> sh, const FxVec3& normal) {
+    fx maxIrr = 0;
+    for (const FxProbeSH& s : sh) {
+        GiRadiance irr = FxSHEvaluate(s, normal);
+        if (irr.r > maxIrr) maxIrr = irr.r;
+        if (irr.g > maxIrr) maxIrr = irr.g;
+        if (irr.b > maxIrr) maxIrr = irr.b;
+    }
+    return maxIrr;
+}
+
 }  // namespace hf::render::gi

@@ -365,6 +365,17 @@ hf_gen_msl(fract_reduce.comp     fract_reduce.comp.hlsl     comp fract_reduce_ma
 # gi_interp.comp gets NO hf_gen_msl line; on Metal the --gi3-interp showcase runs the CPU
 # gi::InterpolateField + GiFieldToImage (byte-identical by construction), while the Vulkan side carries the
 # GPU irradiance == CPU irradiance memcmp proof.
+# Deterministic Lumen-class GI Slice 4 (Slice GI4, INTEGER MULTI-BOUNCE FEEDBACK of FLAGSHIP #29):
+# gi_bounce.comp is the DETERMINISTIC INTEGER MULTI-BOUNCE re-trace kernel — ONE thread per PROBE loops the 16
+# baked Fibonacci-sphere directions, a closest-hit RayQuery (the gi_probe_trace.comp candidate-drain VERBATIM)
+# + a shadow RayQuery + the inline ShadeHitGI, which adds an INDIRECT term = the GI3 FxInterpolateIrradiance
+# of the bound PREVIOUS SH buffer (gPrevSH) at the hit point (the trilinear blend + FxSHEvaluate copied from
+# gi_interp.comp). Like gi_probe_trace.comp + gi_interp.comp it is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd
+# here: HLSL inline RayQuery lowers (via DXC) to SPIR-V RayQueryKHR which glslc/spirv-cross cannot lower, plus
+# the int64 SH-blend glslc can't parse. On Metal the --gi4-bounce showcase runs the CPU gi::BounceProbes (the
+# SAME bit-exact reference the Vulkan HW==CPU memcmp compares against) -> the Metal result is byte-identical to
+# the Vulkan HW result BY CONSTRUCTION, while the Vulkan side carries the HW final-SH == CPU proof. So
+# gi_bounce.comp gets NO hf_gen_msl line.
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): cloth_integrate.comp runs the
 # Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per particle runs `steps` iterations
 # of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp) on its OWN particle, the fxmul

@@ -593,6 +593,20 @@ hf_compile_shaders(
     # --gi3-interp showcase runs the CPU gi::InterpolateField (byte-identical by construction, the
     # gi_sh_encode.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU irradiance.
     "shaders/gi_interp.comp.hlsl:cs"
+    # Deterministic Lumen-class GI Slice 4 (Slice GI4, INTEGER MULTI-BOUNCE FEEDBACK of FLAGSHIP #29):
+    # gi_bounce.comp is the DETERMINISTIC INTEGER MULTI-BOUNCE re-trace kernel — ONE thread per PROBE loops the
+    # 16 baked Fibonacci-sphere directions, a closest-hit RayQuery (the gi_probe_trace.comp candidate-drain
+    # VERBATIM) + a shadow RayQuery, and — the ONE GI4 addition — adds an INDIRECT term to each hit's shade:
+    # the GI3 FxInterpolateIrradiance of the bound PREVIOUS SH buffer (gPrevSH, binding 4) at the hit point
+    # (the trilinear 8-corner blend + FxSHEvaluate copied from gi_interp.comp VERBATIM). The host drives the
+    # K<=3 iteration loop (dispatch gi_bounce.comp reading SH_{k-1}, then gi_sh_encode.comp to make SH_k); a
+    # zeroed gPrevSH at k=1 -> the indirect is a literal +0 -> byte-identical to gi_probe_trace.comp (the no-op
+    # contract). The result is bit-identical to the CPU gi::BounceProbes one-iteration re-trace. The :csrq
+    # stage compiles it cs_6_5 + SPV_KHR_ray_query (HLSL RayQuery -> DXC SPIR-V RayQueryKHR). It is
+    # VULKAN-SPIR-V-ONLY (RayQuery + int64 SH-blend -> glslc/spirv-cross can't lower to MSL) -> NOT in the
+    # Metal hf_gen_msl list; on Metal --gi4-bounce runs the CPU gi::BounceProbes (byte-identical by
+    # construction). The Vulkan side carries the HW==CPU final-SH memcmp proof.
+    "shaders/gi_bounce.comp.hlsl:csrq"
     # Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: deterministic GPU crowds —
     # boids + steering + path-following): boids_steer.comp runs the Q16.16 Reynolds STEERING tick — ONE thread
     # per AGENT reads the FROZEN input buffer (gAgentsIn), computes SteerSeek (proportional pull toward the

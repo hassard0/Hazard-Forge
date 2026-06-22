@@ -18475,6 +18475,104 @@ static int RunGi3InterpShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GI4 — Deterministic Lumen-class GI INTEGER MULTI-BOUNCE FEEDBACK showcase (--gi4-bounce) (light
+// that bounces, FLAGSHIP #29). The Vulkan --gi4-bounce-shot runs the K<=3 bounce loop on the GPU (gi_bounce.comp
+// + gi_sh_encode.comp per iteration, the int64 RayQuery indirect) and memcmp's the HW final SH_K == CPU
+// gi::BounceProbes. gi_bounce.comp uses HLSL RayQuery + an int64 SH-blend -> Vulkan-SPIR-V-ONLY (glslc/spirv-
+// cross can't lower to MSL), so on Metal --gi4-bounce runs the CPU gi::BounceProbes reference (the SAME
+// bit-exact reference the Vulkan HW==CPU memcmp compares against) -> the Metal image is byte-identical to the
+// Vulkan HW result BY CONSTRUCTION. Builds the SAME gi::BuildGi1Scene enclosure (with COLORED walls) + 4x4x4
+// GiProbeGrid, CPU-runs the K-bounce loop, proves the no-op (bounceCount=1 == single-bounce) + 2nd-bounce
+// monotonicity + determinism + in-range, renders gi::GiSHToImage(SH_K) (the multi-bounce SH irradiance grid)
+// at 256x256, writes the PNG. Because the multi-bounce is INTEGER, the gi4_bounce golden is STRICT-ZERO
+// cross-vendor. New golden tests/golden/metal/gi4_bounce.png (Mac-baked by the CONTROLLER).
+static int RunGi4BounceShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    namespace gi = hf::render::gi;
+    using rt::fx; using rt::FxVec3; using rt::kOne;
+
+    const uint32_t kImgW = 256, kImgH = 256;
+    const int kBounces = gi::kGiMaxBounces;   // K = 3 (the full fixed loop)
+
+    gi::GiScene1 sc = gi::BuildGi1Scene();
+    const rt::RtScene& scene = sc.scene;
+    gi::GiProbeGrid grid;
+    grid.origin  = FxVec3{gi::GiF(-2,1), gi::GiF(1,1), gi::GiF(0,1)};
+    grid.spacing = gi::GiF(1,1);
+    grid.nx = 4; grid.ny = 4; grid.nz = 4;
+    const uint32_t kProbes = (uint32_t)gi::ProbeCount(grid);
+
+    // CPU multi-bounce SH (the SAME bit-exact buffers the Vulkan HW==CPU memcmp proves).
+    std::vector<gi::FxProbeSH> shK(kProbes), sh1(kProbes), sh2(kProbes);
+    gi::BounceProbes(scene, grid, kBounces, std::span<gi::FxProbeSH>(shK));
+    gi::BounceProbes(scene, grid, 1, std::span<gi::FxProbeSH>(sh1));
+    gi::BounceProbes(scene, grid, 2, std::span<gi::FxProbeSH>(sh2));
+    std::printf("gi4-bounce: {probes:%u, bounces:%d} [Metal: CPU gi::BounceProbes, byte-identical to the Vulkan "
+                "HW result by construction]\n", kProbes, kBounces);
+
+    // The bounceCount=1 no-op (SH_1 == GI1-trace + GI2-encode single-bounce SH, byte-exact).
+    {
+        std::vector<gi::GiRadiance> singleRad((size_t)kProbes * gi::kGiRaysPerProbe);
+        gi::TraceProbeRays(grid, scene, std::span<gi::GiRadiance>(singleRad));
+        std::vector<gi::FxProbeSH> singleSH(kProbes);
+        gi::EncodeAllProbes(grid, std::span<const gi::GiRadiance>(singleRad),
+                            std::span<gi::FxProbeSH>(singleSH));
+        if (std::memcmp(sh1.data(), singleSH.data(), (size_t)kProbes*sizeof(gi::FxProbeSH)) != 0)
+            return fail("gi4-bounce: bounceCount=1 != single-bounce (indirect not a true +0)");
+        std::printf("gi4-bounce: bounceCount=1 == single-bounce (GI1+GI2) BYTE-IDENTICAL\n");
+    }
+
+    // The 2nd-bounce monotonicity (SH_2 +Y irradiance >= SH_1, strictly greater for >=1 probe).
+    {
+        bool allGe = true; uint32_t brighter = 0;
+        FxVec3 nY{0, kOne, 0};
+        for (uint32_t p = 0; p < kProbes; ++p) {
+            gi::GiRadiance i1 = gi::FxSHEvaluate(sh1[p], nY);
+            gi::GiRadiance i2 = gi::FxSHEvaluate(sh2[p], nY);
+            if (i2.r < i1.r || i2.g < i1.g || i2.b < i1.b) allGe = false;
+            if (i2.r > i1.r || i2.g > i1.g || i2.b > i1.b) ++brighter;
+        }
+        if (!allGe || brighter == 0)
+            return fail("gi4-bounce: 2nd-bounce NOT monotonic (integer indirect truncated to zero)");
+        std::printf("gi4-bounce: bounce adds light (SH2>=SH1 all, brighter:%u probes)\n", brighter);
+    }
+
+    // Determinism (two CPU BounceProbes runs byte-identical) + in-range (maxIrr(SH_K) < 2.0).
+    {
+        std::vector<gi::FxProbeSH> shK2(kProbes);
+        gi::BounceProbes(scene, grid, kBounces, std::span<gi::FxProbeSH>(shK2));
+        if (std::memcmp(shK.data(), shK2.data(), (size_t)kProbes*sizeof(gi::FxProbeSH)) != 0)
+            return fail("gi4-bounce: two CPU runs differ (nondeterministic)");
+        const int64_t kHeadroom = 2 * (int64_t)kOne;
+        int64_t maxIrr = 0;
+        const FxVec3 normals[3] = { FxVec3{0,kOne,0}, FxVec3{kOne,0,0}, FxVec3{0,0,kOne} };
+        for (const FxVec3& n : normals) {
+            fx m = gi::GiMaxIrradiance(std::span<const gi::FxProbeSH>(shK), n);
+            if ((int64_t)m > maxIrr) maxIrr = (int64_t)m;
+        }
+        if (maxIrr >= kHeadroom) return fail("gi4-bounce: maxIrr >= 2.0 (headroom overflow)");
+        std::printf("gi4-bounce determinism: two runs BYTE-IDENTICAL; maxIrr:%.5f < 2.0 (headroom holds)\n",
+                    (double)maxIrr / (double)(int)kOne);
+    }
+
+    // --- Render the multi-bounce SH-irradiance grid + write the image. ---
+    std::vector<uint32_t> img((size_t)kImgW * kImgH, 0);
+    gi::GiSHToImage(grid, std::span<const gi::FxProbeSH>(shK), FxVec3{0, kOne, 0},
+                    std::span<uint32_t>(img), kImgW, kImgH);
+    std::vector<uint8_t> bgra((size_t)kImgW * kImgH * 4, 0);
+    for (size_t p = 0; p < (size_t)kImgW * kImgH; ++p) {
+        uint32_t px = img[p];
+        bgra[p * 4 + 0] = (uint8_t)((px >> 16) & 0xFF);
+        bgra[p * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+        bgra[p * 4 + 2] = (uint8_t)(px & 0xFF);
+        bgra[p * 4 + 3] = (uint8_t)((px >> 24) & 0xFF);
+    }
+    if (!WritePNG(outPath, bgra, kImgW, kImgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — deterministic integer multi-bounce SH irradiance [CPU reference] "
+                "(%u probes, K=%d)\n", outPath, kImgW, kImgH, kProbes, kBounces);
+    return 0;
+}
+
 // ===== Slice RT3 — Hardware Ray Tracing DETERMINISTIC RT HARD SHADOWS showcase (--rt3-shadow) (FLAGSHIP
 // #28). The Vulkan --rt3-shadow-shot wires REAL HW inline ray query: a PRIMARY RayQuery closest-hit THEN a
 // SECOND any-hit shadow ray (toward the directional light) whose order-independent occlusion OR GATES the
@@ -58303,6 +58401,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gi3-interp") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gi3_interp.png";
             try { return RunGi3InterpShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gi4-bounce <out.png>: render the Deterministic Lumen-class GI INTEGER MULTI-BOUNCE FEEDBACK
+        // showcase (Slice GI4, light that bounces, FLAGSHIP #29). gi_bounce.comp uses HLSL RayQuery + an int64
+        // SH-blend -> Vulkan-SPIR-V-ONLY (glslc can't lower to MSL), so Metal runs the CPU gi::BounceProbes +
+        // GiSHToImage reference (byte-identical to the Vulkan HW result by construction). New golden
+        // tests/golden/metal/gi4_bounce.png.
+        if (argc > 1 && std::strcmp(argv[1], "--gi4-bounce") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_gi4_bounce.png";
+            try { return RunGi4BounceShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --rt3-shadow <out.png>: render the Hardware Ray Tracing DETERMINISTIC RT HARD SHADOWS showcase

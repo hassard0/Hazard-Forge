@@ -762,6 +762,19 @@ hf_add_pure_test(gi_sh_test)
 # (hf_core), ASan-eligible.
 hf_add_pure_test(gi_interp_test)
 
+# Deterministic Lumen-class GI Slice 4 (Slice GI4, INTEGER MULTI-BOUNCE FEEDBACK of FLAGSHIP #29): the
+# pure-CPU validation of the INTEGER MULTI-BOUNCE feedback (engine/render/gi.h::ShadeHitGI / BounceProbes the
+# gi_bounce.comp shader runs VERBATIM). It settles the second make-or-break beat (after GI2's crux) before any
+# GPU trust: the NO-OP CONTRACT (ShadeHitGI with a zero indirect == UnpackRadiance(ShadeHitShadowed) BYTE-exact
+# -> K==1 BounceProbes == the GI1+GI2 single-bounce SH EXACTLY); the MONOTONICITY guard (SH_2 +Y irradiance >=
+# SH_1 component-wise AND strictly greater for >=1 probe — the integer indirect did NOT underflow to zero);
+# convergence/in-range (every coeff AND maxIrr across K<=3 stays < 2.0 — the GI2 [-2,2] headroom holds under
+# the bounded feedback); a colored-wall TINT (the per-channel irradiance gain is imbalanced — light bounces
+# off the red wall and tints); two-run determinism; and the ProbeCount==0 no-op. gi.h #includes
+# render/rtrace.h read-only (byte-frozen), rtrace.h #includes sim/fpx.h read-only. Pure C++ (hf_core),
+# ASan-eligible.
+hf_add_pure_test(gi_bounce_test)
+
 # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
 # integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
 # copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/
