@@ -87,6 +87,7 @@
 #include "render/vsm.h"             // Slice VA: virtual shadow map clipmap page table + page-needed marking (VsmClipmap/PageId/SelectClipmapLevel/MarkResidentPages) — shared verbatim with vsm_mark.comp + the Vulkan --vsm-mark-shot
 #include "render/vt.h"              // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp + the Vulkan --vt-feedback-shot
 #include "render/mc.h"              // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp + the Vulkan --mc-classify-shot
+#include "render/rtrace.h"          // Slice RT1: deterministic Q16.16 SW reference ray tracer (RtScene/RtRay/IntersectSphere/IntersectAabb/TraceClosest/ShadeHitInt/RenderScene/BuildRt1Scene) — Metal runs the CPU reference (rt_trace.comp is int64/Vulkan-only) + the Vulkan --rt1-trace-shot
 #include "sim/fpx.h"                // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp + the Vulkan --fpx-shot
 #include "sim/cloth.h"              // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp + the Vulkan --cloth-integrate-shot
 #include "sim/fluid.h"              // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp + the Vulkan --fluid-integrate-shot
@@ -18050,6 +18051,72 @@ static int RunFractLockstepShowcase(const char* outPath) {
 // and Metal runs that same CPU). Same dims + same scene + same coloring as the Vulkan --fpx-shot, so the
 // baked golden matches the Vulkan capture. Determinism + no-op are re-checked on the CPU path. New golden
 // tests/golden/metal/fpx.png; two runs DIFF 0.0000. NO GPU compute, NO collision response (FPX3+), NO new RHI.
+// ===== Slice RT1 — Hardware Ray Tracing THE DETERMINISTIC Q16.16 SW REFERENCE TRACER showcase
+// (--rt1-trace) (the BEACHHEAD of FLAGSHIP #28). Like --fpx (int64 -> CPU on Metal), rt_trace.comp is
+// int64/Vulkan-only (glslc can't parse int64), so Metal runs the CPU rtrace::RenderScene reference (the
+// SAME bit-exact reference the Vulkan --rt1-trace-shot GPU==CPU memcmp compares against) -> the Metal
+// image is byte-identical to the Vulkan GPU image BY CONSTRUCTION. Builds the SAME fixed
+// rtrace::BuildRt1Scene() + 320x240 dims as the Vulkan side, renders the integer Lambert RGBA8 scene, and
+// writes the PNG. Because the shade is INTEGER, the rt1_trace golden is STRICT-ZERO cross-vendor. New
+// golden tests/golden/metal/rt1_trace.png.
+static int RunRt1TraceShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+
+    const uint32_t kRtW = 320, kRtH = 240;
+    rt::RtScene1 sceneHolder = rt::BuildRt1Scene();
+    const size_t kPixels = (size_t)kRtW * kRtH;
+
+    // CPU reference render (the bit-exact image the Vulkan --rt1-trace-shot proves the GPU shader equal to).
+    std::vector<uint32_t> image(kPixels, 0);
+    uint32_t hits = rt::RenderScene(sceneHolder.scene, sceneHolder.camera, kRtW, kRtH,
+                                    std::span<uint32_t>(image));
+    const uint32_t kSphereCount = (uint32_t)sceneHolder.spheres.size();
+    const uint32_t kAabbCount   = (uint32_t)sceneHolder.aabbs.size();
+    std::printf("rt1-trace: {rays:%zu, prims:%u, hits:%u} [Metal: CPU rtrace::RenderScene, byte-identical "
+                "to the Vulkan GPU result by construction]\n", kPixels, kSphereCount + kAabbCount, hits);
+
+    // Two-run determinism (the CPU reference is a pure function).
+    {
+        std::vector<uint32_t> image2(kPixels, 0);
+        rt::RenderScene(sceneHolder.scene, sceneHolder.camera, kRtW, kRtH, std::span<uint32_t>(image2));
+        if (std::memcmp(image.data(), image2.data(), kPixels * sizeof(uint32_t)) != 0)
+            return fail("rt1-trace: two CPU renders differ (nondeterministic)");
+        std::printf("rt1-trace determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // Analytic correctness (the same closed-form checks the Vulkan side prints).
+    {
+        rt::RtRay sRay{rt::FxVec3{0, 0, 0}, rt::FxVec3{0, 0, rt::kOne}};
+        rt::RtSphere sTest{rt::FxVec3{0, 0, (rt::fx)(10 * (int)rt::kOne)}, (rt::fx)(2 * (int)rt::kOne), 0};
+        rt::RtHit sHit; bool sOk = rt::IntersectSphere(sRay, sTest, sHit);
+        rt::RtAabb aTest{rt::FxVec3{-(rt::fx)rt::kOne, -(rt::fx)rt::kOne, (rt::fx)(4 * (int)rt::kOne)},
+                         rt::FxVec3{(rt::fx)rt::kOne, (rt::fx)rt::kOne, (rt::fx)(6 * (int)rt::kOne)}, 1};
+        rt::RtHit aHit; bool aOk = rt::IntersectAabb(sRay, aTest, aHit);
+        rt::RtRay missRay{rt::FxVec3{0, 0, 0}, rt::FxVec3{0, 0, -(rt::fx)rt::kOne}};
+        rt::RtScene one{}; one.spheres = std::span<const rt::RtSphere>(&sTest, 1);
+        rt::RtHit mHit = rt::TraceClosest(missRay, one);
+        if (!(sOk && sHit.t == (rt::fx)(8 * (int)rt::kOne) && aOk && aHit.t == (rt::fx)(4 * (int)rt::kOne) &&
+              mHit.primIndex == rt::kRtMiss))
+            return fail("rt1-trace: analytic closed-form check failed");
+        std::printf("rt1-trace: analytic OK (sphere t=%d, aabb t=%d, miss ok)\n", sHit.t, aHit.t);
+    }
+
+    // --- Write the image (RGBA8 row-major top-first -> BGRA for WritePNG). ---
+    std::vector<uint8_t> bgra(kPixels * 4, 0);
+    for (size_t p = 0; p < kPixels; ++p) {
+        uint32_t px = image[p];
+        uint8_t r = (uint8_t)(px & 0xFF);
+        uint8_t gch = (uint8_t)((px >> 8) & 0xFF);
+        uint8_t b = (uint8_t)((px >> 16) & 0xFF);
+        uint8_t a = (uint8_t)((px >> 24) & 0xFF);
+        bgra[p * 4 + 0] = b; bgra[p * 4 + 1] = gch; bgra[p * 4 + 2] = r; bgra[p * 4 + 3] = a;
+    }
+    if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — deterministic Q16.16 ray-traced scene (%u hits)\n",
+                outPath, kRtW, kRtH, hits);
+    return 0;
+}
+
 static int RunFpxShowcase(const char* outPath) {
     using math::Vec3;
     namespace fpx = hf::sim::fpx;
@@ -57280,6 +57347,16 @@ int main(int argc, char** argv) {
         // integer (pos.x>>kFrac, pos.y>>kFrac) -> a pixel via a fixed integer transform, a
         // hashColor(bodyIndex) dot, the groundY line), identical to the Vulkan path BY CONSTRUCTION.
         // New golden tests/golden/metal/fpx.png; two runs DIFF 0.0000.
+        // --rt1-trace <out.png>: render the Hardware Ray Tracing THE DETERMINISTIC Q16.16 SW REFERENCE
+        // TRACER showcase (Slice RT1, the BEACHHEAD of FLAGSHIP #28). Like --fpx (int64 -> CPU on Metal),
+        // rt_trace.comp is int64/Vulkan-only (glslc can't parse int64), so Metal runs the CPU
+        // rtrace::RenderScene reference (byte-identical to the Vulkan GPU result by construction). New
+        // golden tests/golden/metal/rt1_trace.png.
+        if (argc > 1 && std::strcmp(argv[1], "--rt1-trace") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_rt1_trace.png";
+            try { return RunRt1TraceShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
         if (argc > 1 && std::strcmp(argv[1], "--fpx") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fpx.png";
             try { return RunFpxShowcase(out); }

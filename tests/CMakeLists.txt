@@ -658,6 +658,19 @@ hf_add_pure_test(boids_test)
 # (correct floor, not truncate-toward-zero). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(fpx_test)
 
+# Hardware Ray Tracing Slice 1 (Slice RT1, the BEACHHEAD of FLAGSHIP #28: HARDWARE RAY TRACING): the
+# deterministic Q16.16 SW reference ray tracer (engine/render/rtrace.h) the GPU shaders/rt_trace.comp.hlsl
+# copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/FxVec3/FxISqrt)
+# read-only + a local render-only fxdiv. Pins IntersectSphere (a ray at the sphere center hits at the
+# closed-form t==dist-radius; a ray pointed away misses), IntersectAabb (a ray into a known face hits at
+# the slab-entry t with the correct face normal; a parallel-outside ray misses), miss handling +
+# kRtMiss/kRtNoHit, TraceClosest nearest-by-(t,primIndex) INCLUDING an equal-t tie-break (smaller
+# primIndex wins, storage-order-independent), degenerate dir==0 rejection, RenderScene two-run
+# byte-identical determinism (+ a visible scene), and ShadeHitInt integer-exactness (a fixed normal under
+# a fixed light -> a PINNED RGBA8; a miss -> the background). Pure C++ (hf_core), ASan-eligible.
+# rtrace.h #includes sim/fpx.h read-only.
+hf_add_pure_test(rt_test)
+
 # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
 # integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
 # copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/

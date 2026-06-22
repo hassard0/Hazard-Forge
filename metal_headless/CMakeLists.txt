@@ -280,6 +280,20 @@ hf_gen_msl(fract_reduce.comp     fract_reduce.comp.hlsl     comp fract_reduce_ma
 # showcase runs the CPU fpx::IntegrateStep (the SAME bit-exact reference the Vulkan GPU==CPU proof compares
 # against) -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan
 # side carries the GPU==CPU bit-identity proof. So fpx_integrate.comp gets NO hf_gen_msl line.
+# Hardware Ray Tracing Slice 1 (Slice RT1, the BEACHHEAD of FLAGSHIP #28: HARDWARE RAY TRACING):
+# rt_trace.comp is the GPU TWIN of the deterministic Q16.16 SW reference ray tracer — ONE thread per pixel
+# generates the integer primary ray, brute-forces every primitive (NO accel-struct cull), keeps the
+# closest by the total order (t, primIndex), and writes the integer Lambert RGBA8, the
+# TraceClosest/ShadeHitInt/PrimaryRay math copied VERBATIM from engine/render/rtrace.h.
+# It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64 fxmul/fxdiv ((int64)a*b >> 16 and
+# ((int64)a << 16)/b — GENUINELY required so a Q16.16 product/quotient does not overflow int32) plus the
+# int64 FxISqrt digit loop are compiled fine by DXC on the Vulkan path, but glslc (glslang's HLSL frontend
+# used for the Metal HLSL->SPIR-V->MSL chain) cannot parse int64_t in HLSL, so it can't lower this shader.
+# Same Vulkan-only convention as fpx_integrate.comp / swraster.comp / cluster_cull.comp (which glslc
+# likewise can't lower): on Metal the --rt1-trace showcase runs the CPU rtrace::RenderScene (the SAME
+# bit-exact reference the Vulkan GPU==CPU proof compares against) -> the Metal result is byte-identical to
+# the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries the GPU==CPU bit-identity proof. So
+# rt_trace.comp gets NO hf_gen_msl line.
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): cloth_integrate.comp runs the
 # Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per particle runs `steps` iterations
 # of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp) on its OWN particle, the fxmul

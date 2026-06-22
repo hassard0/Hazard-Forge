@@ -498,6 +498,17 @@ hf_compile_shaders(
     # ReadBuffer -> bit-exact GPU==CPU body array + cross-backend, proven memcmp. NO new RHI; existing
     # shaders + goldens untouched.
     "shaders/fpx_integrate.comp.hlsl:cs"
+    # Hardware Ray Tracing Slice 1 (Slice RT1, the BEACHHEAD of FLAGSHIP #28: HARDWARE RAY TRACING): the GPU
+    # TWIN of the deterministic Q16.16 SW reference ray tracer. rt_trace.comp runs ONE thread per pixel —
+    # generates the integer primary ray, brute-forces every primitive (NO accel-struct cull), keeps the
+    # closest by the total order (t, primIndex), and writes the integer Lambert RGBA8, the
+    # TraceClosest/ShadeHitInt/PrimaryRay math (incl. int64 fxmul/fxdiv + the FxISqrt digit loop) copied
+    # VERBATIM from engine/render/rtrace.h. Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU
+    # image + cross-backend, proven memcmp. It is VULKAN-SPIR-V-ONLY (int64 -> DXC compiles it; glslc
+    # cannot) -> NOT in the Metal hf_gen_msl list (see metal_headless/CMakeLists.txt); on Metal the
+    # --rt1-trace showcase runs the CPU rtrace::RenderScene (byte-identical by construction). NO new RHI on
+    # the trace path (the accel-struct RHI seam is additive + INERT in RT1); existing shaders/goldens untouched.
+    "shaders/rt_trace.comp.hlsl:cs"
     # Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: deterministic GPU crowds —
     # boids + steering + path-following): boids_steer.comp runs the Q16.16 Reynolds STEERING tick — ONE thread
     # per AGENT reads the FROZEN input buffer (gAgentsIn), computes SteerSeek (proportional pull toward the

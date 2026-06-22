@@ -522,6 +522,8 @@ int main() {
             bool sawVerdictLockstepFeature = false;
             // Slice VD6: the verdict-render capability is advertised.
             bool sawVerdictRenderFeature = false;
+            // Slice RT1: the rt1-trace capability is advertised (FLAGSHIP #28 beachhead).
+            bool sawRt1TraceFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -761,6 +763,7 @@ int main() {
                     if (AsString(el->value) == "verdict-snapshot") sawVerdictSnapshotFeature = true;
                     if (AsString(el->value) == "verdict-lockstep") sawVerdictLockstepFeature = true;
                     if (AsString(el->value) == "verdict-render") sawVerdictRenderFeature = true;
+                    if (AsString(el->value) == "rt1-trace") sawRt1TraceFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -975,6 +978,7 @@ int main() {
             check(sawVerdictSnapshotFeature, "engine.features includes verdict-snapshot");
             check(sawVerdictLockstepFeature, "engine.features includes verdict-lockstep");
             check(sawVerdictRenderFeature, "engine.features includes verdict-render");
+            check(sawRt1TraceFeature, "engine.features includes rt1-trace");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1354,6 +1358,8 @@ int main() {
         bool sawGjkLockstepShot = false;
         // Slice GJ6: the --gjk-render-shot showcase flag is listed in the showcase manifest.
         bool sawGjkRenderShot = false;
+        // Slice RT1: the --rt1-trace-shot showcase flag is listed in the showcase manifest.
+        bool sawRt1TraceShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -1598,6 +1604,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--gjk-settle-shot") sawGjkSettleShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gjk-lockstep-shot") sawGjkLockstepShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gjk-render-shot") sawGjkRenderShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--rt1-trace-shot") sawRt1TraceShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-points-shot") sawFricPointsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-solve-shot") sawFricSolveShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-ramp-shot") sawFricRampShot = true;
@@ -1810,6 +1817,7 @@ int main() {
         check(sawGjkSettleShot, "showcases manifest includes --gjk-settle-shot");
         check(sawGjkLockstepShot, "showcases manifest includes --gjk-lockstep-shot");
         check(sawGjkRenderShot, "showcases manifest includes --gjk-render-shot");
+        check(sawRt1TraceShot, "showcases manifest includes --rt1-trace-shot");
         check(sawFricPointsShot, "showcases manifest includes --fric-points-shot");
         check(sawFricSolveShot, "showcases manifest includes --fric-solve-shot");
         check(sawFricRampShot, "showcases manifest includes --fric-ramp-shot");

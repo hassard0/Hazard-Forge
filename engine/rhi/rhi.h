@@ -4,6 +4,8 @@
 #include <span>
 #include <vector>
 
+#include "math/math.h"  // Slice RT1: math::Vec3 for the additive accel-struct AccelGeometry (FLAGSHIP #28).
+
 // Forward declarations of HAL + handle types — NO vulkan headers in this file.
 struct VkInstance_T;  using VkInstance = VkInstance_T*;
 struct VkSurfaceKHR_T; using VkSurfaceKHR = VkSurfaceKHR_T*;
@@ -223,6 +225,41 @@ class ITexture         { public: virtual ~ITexture() = default; };
 // backend dirs; the seam exposes only this abstract handle.
 class IBindlessTextureSet { public: virtual ~IBindlessTextureSet() = default; };
 
+// Slice RT1 — the ACCELERATION-STRUCTURE seam (FLAGSHIP #28: HARDWARE RAY TRACING). This flagship is the
+// one place the "rhi.h is frozen" rule is deliberately relaxed: ADDITIVE ONLY — every decl below is
+// defaulted-no-op and INERT in RT1 (NO backend overrides it; the deterministic SW reference tracer + its
+// GPU compute twin use ONLY the existing compute path). RT1 DEFINES the seam (proving the existing goldens
+// are byte-unaffected); RT2 USES it to wire HW inline ray query. The vk*/MTL* accel-struct build details
+// will live ONLY in the backend dirs; the seam exposes only this abstract handle (by IBindlessTextureSet).
+class IAccelStructure { public: virtual ~IAccelStructure() = default; };
+
+// One geometry of a bottom-level accel structure (BLAS). RT1 DEFINES; RT2 USES. An AABB-procedural geom
+// (the SW tracer's analytic sphere/box bound) or a triangle geom (Tier B / RT6).
+struct AccelGeometry {
+    enum class Kind { AabbProcedural, Triangle } kind = Kind::AabbProcedural;
+    // AabbProcedural:
+    math::Vec3 lo;
+    math::Vec3 hi;
+    // Triangle:
+    const float* verts = nullptr;   // tightly-packed float3 positions
+    uint32_t     vertCount = 0;
+    uint32_t     firstPrim = 0;     // the global primitive index of this geom's first primitive
+};
+
+// A bottom-level accel structure description: the geometries it bounds.
+struct BlasDesc { std::span<const AccelGeometry> geoms; };
+
+// One instance of a BLAS inside a top-level accel structure (TLAS): the BLAS + a 3x4 row-major transform
+// + an instance id surfaced to the ray-query shader.
+struct TlasInstance {
+    IAccelStructure* blas = nullptr;
+    float            transform[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};  // row-major 3x4
+    uint32_t         instanceId = 0;
+};
+
+// A top-level accel structure description: the instances it holds.
+struct TlasDesc { std::span<const TlasInstance> instances; };
+
 // A sampleable offscreen color image (+ its own depth) you render into. Inheriting ITexture
 // lets the post pass bind it via the existing ICommandBuffer::BindTexture.
 class IRenderTarget : public ITexture {
@@ -340,6 +377,11 @@ public:
     // passes/backends without bindless are unaffected (Metal no-ops/falls back to the bound path). The
     // vk* descriptor-array bind lives ONLY in the backend dir.
     virtual void BindBindlessTextures(IBindlessTextureSet& /*set*/) {}
+    // Slice RT1 — bind a TOP-LEVEL accel structure (TLAS) at the dedicated ray-query slot `slot`, so a
+    // following inline-ray-query shader (RT2) can RayQuery it. ADDITIVE, defaulted-no-op, INERT in RT1
+    // (NO backend overrides it; the RT1 SW tracer + its GPU compute twin never call it — they brute-force
+    // the analytic primitives with no accel structure). RT2 wires the Vulkan ray-query backend binding.
+    virtual void BindAccelStructure(IAccelStructure& /*tlas*/, uint32_t /*slot*/) {}
     virtual void Draw(uint32_t vertexCount, uint32_t firstVertex = 0) = 0;
     // `vertexOffset` is added to every index before vertex fetch (ImGui draws share one combined
     // vertex+index buffer per cmd-list and offset into it). Defaults to 0 for the existing scene draws.
@@ -489,6 +531,17 @@ public:
     // backends without bindless still link; only the Vulkan backend overrides it.
     virtual std::unique_ptr<IBindlessTextureSet> CreateBindlessTextureSet(
         std::span<ITexture* const> /*textures*/) { return nullptr; }
+
+    // Slice RT1 — the ACCELERATION-STRUCTURE factories (FLAGSHIP #28: HARDWARE RAY TRACING). ADDITIVE,
+    // defaulted-no-op, INERT in RT1: CreateBlas/CreateTlas return nullptr by default (NO backend overrides
+    // them in RT1), and SupportsHardwareRayQuery reports the real capability or the default false. RT1
+    // DEFINES the seam — the deterministic SW reference tracer NEVER calls these (it brute-forces the
+    // analytic primitives via the existing compute path); they exist solely to land the new RHI inert +
+    // prove the existing goldens are unaffected, de-risking RT2 (which wires the real Vulkan ray-query
+    // backend). The vk*/MTL* accel-struct build lives ONLY in the backend dirs.
+    virtual std::unique_ptr<IAccelStructure> CreateBlas(const BlasDesc&) { return nullptr; }
+    virtual std::unique_ptr<IAccelStructure> CreateTlas(const TlasDesc&) { return nullptr; }
+    virtual bool SupportsHardwareRayQuery() const { return false; }
 
     // Offscreen render target: a sampleable color image (swapchain format) + its own depth.
     virtual std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height) = 0;
