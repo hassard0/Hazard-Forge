@@ -211,4 +211,62 @@ inline std::vector<FxVec3> ScatterMasked(const PcgStream& stream, const PcgArea&
     return out;
 }
 
+// ===== Slice PCG4 — Per-instance transform rules (the 4th slice of FLAGSHIP #22) ===========================
+// The "rules" layer: turn the scattered POINTS (PCG2/PCG3 output) into full INSTANCES — each gets a seed-stable
+// random yaw + a random uniform scale within designer ranges. This is what makes a procedural field look natural
+// (rocks at varied angles and sizes) instead of identical clones. Strict int32: the yaw comes from a BAKED
+// integer quaternion table (NO runtime transcendentals, NO <cmath>, NO QFromAxisAngleSnapped — that small-angle
+// Taylor series diverges for the full 0..2pi range). The pattern mirrors particles.h::EmitDir: a host-constant
+// Q16.16 quaternion table, bit-identical cross-vendor BY CONSTRUCTION (stored integer literals). Pure CPU,
+// header-only, APPEND-ONLY (PCG1/PCG2/PCG3 + fpx.h + particles.h read-only).
+
+// ----- kPcgYaw16: 16 baked yaw quaternions about +Y (a full turn in 22.5-degree steps) ---------------------
+// A yaw quaternion about +Y for theta = k*22.5deg is {x=0, y=sin(theta/2), z=0, w=cos(theta/2)}. These are
+// PRE-SNAPPED host-constant Q16.16 literals (each y^2+w^2 ~= kOne^2 to ~0.0002% — unit to tolerance). Index with
+// the hash (& 15 selects an entry). kPcgYaw16[0] is identity {0,0,0,kOne}. NO runtime trig — stored integers.
+inline const hf::sim::fpx::FxQuat kPcgYaw16[16] = {
+    {0,     0, 0, 65536},  {0, 12785, 0, 64277},  {0, 25080, 0, 60547},  {0, 36410, 0, 54491},
+    {0, 46341, 0, 46341},  {0, 54491, 0, 36410},  {0, 60547, 0, 25080},  {0, 64277, 0, 12785},
+    {0, 65536, 0,     0},  {0, 64277, 0,-12785},  {0, 60547, 0,-25080},  {0, 54491, 0,-36410},
+    {0, 46341, 0,-46341},  {0, 36410, 0,-54491},  {0, 25080, 0,-60547},  {0, 12785, 0,-64277},
+};
+
+// ----- PcgInstance: a placed instance = a scattered point annotated with a seed-stable orient + scale --------
+struct PcgInstance {
+    FxVec3                pos;     // the scattered point (UNCHANGED — the transform only annotates, never moves)
+    hf::sim::fpx::FxQuat  orient;  // a baked yaw quaternion (or identity when randomYaw == false)
+    fx                    scale;   // a Q16.16 uniform scale in [scaleLo, scaleHi] (== scaleLo when scaleLo == scaleHi)
+};
+
+// ----- PcgTransform: the designer's per-instance rule (random yaw on/off + a uniform scale range) ------------
+// randomYaw == false -> identity orientation; scaleLo == scaleHi -> a fixed scale. Together (randomYaw=false,
+// scaleLo=scaleHi=kOne) they are the NO-OP control: every instance is identity orient + unit scale at its point.
+struct PcgTransform {
+    bool randomYaw = true;
+    fx   scaleLo   = kOne;
+    fx   scaleHi   = kOne;
+};
+
+// ----- BuildInstances: annotate each scattered point with a yaw + scale drawn from the stream -----------------
+// For each point i (FIXED order): orient = rule.randomYaw ? kPcgYaw16[PcgHash(yawStream,i)&15] : identity;
+// scale = PcgRandRange(scaleStream, i, scaleLo, scaleHi). yawStream/scaleStream are `stream` with DISTINCT salts
+// (stream.salt ^ 0x4A09 for yaw, stream.salt ^ 0x5CA1E for scale) so the yaw and scale draws are independent of
+// each other AND of the PCG2 jitter / PCG3 keep draws. Emit PcgInstance{point, orient, scale}. Pure int32 (the
+// table is integer literals; PcgRandRange's only mul is fxmul). NO float, NO trig. The transform only ANNOTATES
+// the points (pos is copied verbatim) — it never moves them, so the no-op rule returns the input points exactly.
+inline std::vector<PcgInstance> BuildInstances(const std::vector<FxVec3>& points, const PcgStream& stream,
+                                               const PcgTransform& rule) {
+    std::vector<PcgInstance> out;
+    out.reserve(points.size());
+    const PcgStream yawStream{   stream.seed, stream.salt ^ 0x4A09u };    // independent yaw-draw stream
+    const PcgStream scaleStream{ stream.seed, stream.salt ^ 0x5CA1Eu };   // independent scale-draw stream
+    for (uint32_t i = 0; i < (uint32_t)points.size(); ++i) {
+        const hf::sim::fpx::FxQuat orient = rule.randomYaw ? kPcgYaw16[PcgHash(yawStream, i) & 15u]
+                                                           : hf::sim::fpx::FxQuat{0, 0, 0, kOne};
+        const fx scale = PcgRandRange(scaleStream, i, rule.scaleLo, rule.scaleHi);
+        out.push_back(PcgInstance{ points[(size_t)i], orient, scale });
+    }
+    return out;
+}
+
 }  // namespace hf::pcg

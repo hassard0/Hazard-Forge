@@ -254,6 +254,81 @@ int main() {
         check(contained, "PCG3 containment: every survivor is one of the ScatterGrid candidates (mask removes only)");
     }
 
+    // ================= PCG4: per-instance transform rules (count / unit-orient / scale-range / no-op /
+    // replay / seed-sensitive) ===========================================================================
+    {
+        // The same fixed square XZ patch as PCG2/PCG3's checks; a small grid so the sweep is cheap.
+        const pcg::PcgArea area{ pcg::FxVec3{0, kOne * 2, 0}, pcg::FxVec3{kOne * 16, kOne * 2, kOne * 16} };
+        const int cellsX = 8, cellsZ = 6;                  // 48 points
+        const pcg::PcgStream stA{ 2024u, 0x5CA77E20u };
+        const pcg::PcgStream stB{ 9173u, 0x5CA77E20u };    // DIFFERENT seed, same salt
+
+        const std::vector<pcg::FxVec3> pts = pcg::ScatterGrid(stA, area, cellsX, cellsZ);
+        const pcg::fx scaleLo = kOne / 2, scaleHi = kOne * 3 / 2;     // [0.5, 1.5]
+        pcg::PcgTransform rule;                            // randomYaw == true by default
+        rule.scaleLo = scaleLo; rule.scaleHi = scaleHi;
+
+        const std::vector<pcg::PcgInstance> insA = pcg::BuildInstances(pts, stA, rule);
+
+        // (1) count — exactly points.size() instances.
+        check(insA.size() == pts.size(), "PCG4 count: BuildInstances returns one instance per input point");
+
+        // (2) unit orient — every orient satisfies |y^2 + w^2 - kOne^2| within a loose integer tolerance, and
+        // x == z == 0 exactly (the table is a pure +Y yaw). Tolerance ~ kOne*kOne/1000.
+        const int64_t kOne2 = (int64_t)kOne * (int64_t)kOne;
+        const int64_t tol = kOne2 / 1000;
+        bool unit = (insA.size() == pts.size());
+        for (size_t i = 0; i < insA.size() && unit; ++i) {
+            const pcg::PcgInstance& in = insA[i];
+            if (in.orient.x != 0 || in.orient.z != 0) unit = false;
+            const int64_t mag2 = (int64_t)in.orient.y * (int64_t)in.orient.y +
+                                 (int64_t)in.orient.w * (int64_t)in.orient.w;
+            int64_t diff = mag2 - kOne2; if (diff < 0) diff = -diff;
+            if (diff > tol) unit = false;
+        }
+        check(unit, "PCG4 unit orient: every orient is unit-within-tol (y^2+w^2 ~= kOne^2; x==z==0 exactly)");
+
+        // (3) scale in range — every scale in [scaleLo, scaleHi].
+        bool inRange = (insA.size() == pts.size());
+        for (size_t i = 0; i < insA.size() && inRange; ++i)
+            if (insA[i].scale < scaleLo || insA[i].scale > scaleHi) inRange = false;
+        check(inRange, "PCG4 scale range: every scale in [scaleLo, scaleHi]");
+
+        // (4) no-op — rule{randomYaw=false, scaleLo=kOne, scaleHi=kOne} -> identity orient + scale==kOne +
+        // pos == the input points (the transform only annotates, never moves).
+        pcg::PcgTransform noop;
+        noop.randomYaw = false; noop.scaleLo = kOne; noop.scaleHi = kOne;
+        const std::vector<pcg::PcgInstance> insN = pcg::BuildInstances(pts, stA, noop);
+        bool isNoop = (insN.size() == pts.size());
+        for (size_t i = 0; i < insN.size() && isNoop; ++i) {
+            const pcg::PcgInstance& in = insN[i];
+            if (in.orient.x != 0 || in.orient.y != 0 || in.orient.z != 0 || in.orient.w != kOne) isNoop = false;
+            if (in.scale != kOne) isNoop = false;
+            if (in.pos.x != pts[i].x || in.pos.y != pts[i].y || in.pos.z != pts[i].z) isNoop = false;
+        }
+        check(isNoop, "PCG4 no-op: identity yaw + fixed scale -> identity orient + scale==kOne + pos==input");
+
+        // (5) replay-stable — two calls byte-equal (element-by-element).
+        const std::vector<pcg::PcgInstance> insA2 = pcg::BuildInstances(pts, stA, rule);
+        bool replay = (insA.size() == insA2.size());
+        for (size_t i = 0; i < insA.size() && replay; ++i) {
+            const pcg::PcgInstance& a = insA[i]; const pcg::PcgInstance& b = insA2[i];
+            if (a.pos.x != b.pos.x || a.pos.y != b.pos.y || a.pos.z != b.pos.z) replay = false;
+            if (a.orient.x != b.orient.x || a.orient.y != b.orient.y ||
+                a.orient.z != b.orient.z || a.orient.w != b.orient.w) replay = false;
+            if (a.scale != b.scale) replay = false;
+        }
+        check(replay, "PCG4 replay-stable: two BuildInstances calls with the same args are byte-equal");
+
+        // (6) seed-sensitive — a different seed -> a different yaw/scale sequence (same count).
+        const std::vector<pcg::PcgInstance> insB = pcg::BuildInstances(pts, stB, rule);
+        check(insB.size() == insA.size(), "PCG4 seed-sensitive: a different seed keeps the same count");
+        bool differ = false;
+        for (size_t i = 0; i < insA.size() && !differ; ++i)
+            if (insA[i].scale != insB[i].scale || insA[i].orient.y != insB[i].orient.y) differ = true;
+        check(differ, "PCG4 seed-sensitive: a different seed yields a different yaw/scale sequence");
+    }
+
     if (g_fail == 0) std::printf("pcg_test: ALL CHECKS PASSED\n");
     else std::printf("pcg_test: %d CHECK(S) FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

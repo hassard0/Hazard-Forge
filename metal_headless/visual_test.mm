@@ -40682,6 +40682,138 @@ static int RunPcg3MaskShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PCG4 — Deterministic PCG PER-INSTANCE TRANSFORM RULES showcase (--pcg4-rules) (the 4th slice of
+// FLAGSHIP #22, hf::pcg). PURE CPU — NO GPU compute, NO new shader, NO new RHI; pcg.h is header-only integer math,
+// so on Metal it runs the IDENTICAL deterministic yaw/scale-annotated radial-disc scatter (BuildInstances over the
+// PCG3 ScatterMasked points + the BAKED kPcgYaw16 table) the Vulkan --pcg4-rules-shot runs on Windows -> the 2D
+// oriented-marker golden is bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). Each marker
+// is an oriented cross whose scaled arm offsets are rotated by fpx::FxRotate (pure-integer quaternion rotation) and
+// mapped to INTEGER pixel coords by pure integer math (NO float pixel rounding); the proof lines match the Vulkan
+// side EXACTLY. The fixed SEED/SALT/AREA/CELLS/MASK/DENSITY/RULE/IMG MUST be IDENTICAL to the Vulkan
+// --pcg4-rules-shot. New golden tests/golden/metal/pcg4_rules.png (baked on the Mac by the controller); two runs
+// DIFF 0.0000.
+static int RunPcg4RulesShowcase(const char* outPath) {
+    namespace pcg = hf::pcg;
+    namespace fpx = hf::sim::fpx;
+    // THE FIXED SHOWCASE PARAMS — IDENTICAL to the Vulkan --pcg4-rules-shot (main.cpp).
+    const uint32_t kSeed   = 1337u;
+    const uint32_t kSalt   = 0x5CA77E20u;
+    const int      kCellsX = 48;
+    const int      kCellsZ = 48;
+    const uint32_t kImg    = 256u;
+    const pcg::PcgArea kArea{ pcg::FxVec3{0, 0, 0}, pcg::FxVec3{pcg::kOne * 32, 0, pcg::kOne * 32} };
+    const pcg::fx kRadius = pcg::kOne * 32 / 3;
+    pcg::PcgMask kMask;
+    kMask.type   = pcg::PcgMaskType::Radial;
+    kMask.center = pcg::FxVec3{ pcg::kOne * 16, 0, pcg::kOne * 16 };
+    kMask.radius = kRadius;
+    const pcg::fx kDensity = pcg::kOne;
+    const pcg::fx kScaleLo = pcg::kOne / 2;          // 32768
+    const pcg::fx kScaleHi = pcg::kOne * 3 / 2;      // 98304
+    pcg::PcgTransform kRule; kRule.randomYaw = true; kRule.scaleLo = kScaleLo; kRule.scaleHi = kScaleHi;
+    const int kArmLen = pcg::kOne / 4;
+
+    const pcg::fx extX = kArea.max.x - kArea.min.x;
+    const pcg::fx extZ = kArea.max.z - kArea.min.z;
+    const pcg::PcgStream st{kSeed, kSalt};
+
+    auto renderInstances = [&](const std::vector<pcg::PcgInstance>& insts, std::vector<uint8_t>& out) {
+        out.assign((size_t)kImg * kImg * 4, 0);
+        for (size_t pp = 0; pp < (size_t)kImg * kImg; ++pp) {
+            out[pp * 4 + 0] = 12; out[pp * 4 + 1] = 10; out[pp * 4 + 2] = 8; out[pp * 4 + 3] = 255;
+        }
+        auto putPx = [&](int ix, int iy, uint8_t b, uint8_t g, uint8_t r) {
+            if (ix < 0 || ix >= (int)kImg || iy < 0 || iy >= (int)kImg) return;
+            uint8_t* d = &out[((size_t)iy * kImg + ix) * 4];
+            d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+        };
+        auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t b, uint8_t g, uint8_t r) {
+            int dx = x1 - x0, dy = y1 - y0;
+            int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+            int sx = dx < 0 ? -1 : 1, sy = dy < 0 ? -1 : 1;
+            int err = adx - ady;
+            for (;;) {
+                putPx(x0, y0, b, g, r);
+                if (x0 == x1 && y0 == y1) break;
+                int e2 = 2 * err;
+                if (e2 > -ady) { err -= ady; x0 += sx; }
+                if (e2 <  adx) { err += adx; y0 += sy; }
+            }
+        };
+        for (size_t i = 0; i < insts.size(); ++i) {
+            const pcg::PcgInstance& in = insts[i];
+            const int cx = (int)(((int64_t)(in.pos.x - kArea.min.x) * (int64_t)kImg) / (int64_t)extX);
+            const int cy = (int)(((int64_t)(in.pos.z - kArea.min.z) * (int64_t)kImg) / (int64_t)extZ);
+            const pcg::fx armW = fpx::fxmul((pcg::fx)kArmLen, in.scale);
+            const pcg::FxVec3 arms[4] = {
+                { armW, 0, 0}, {-armW, 0, 0}, {0, 0, armW}, {0, 0,-armW},
+            };
+            for (int a = 0; a < 4; ++a) {
+                const pcg::FxVec3 rv = fpx::FxRotate(in.orient, arms[a]);
+                const int ex = cx + (int)(((int64_t)rv.x * (int64_t)kImg) / (int64_t)extX);
+                const int ey = cy + (int)(((int64_t)rv.z * (int64_t)kImg) / (int64_t)extZ);
+                drawLine(cx, cy, ex, ey, 120, 150, 200);
+            }
+            putPx(cx, cy, 220, 230, 240);
+        }
+    };
+
+    const std::vector<pcg::FxVec3> pts = pcg::ScatterMasked(st, kArea, kCellsX, kCellsZ, kMask, kDensity);
+    const std::vector<pcg::PcgInstance> insA1 = pcg::BuildInstances(pts, st, kRule);
+    const std::vector<pcg::PcgInstance> insA2 = pcg::BuildInstances(pts, st, kRule);
+    std::vector<uint8_t> imgA1, imgA2;
+    renderInstances(insA1, imgA1);
+    renderInstances(insA2, imgA2);
+    const uint32_t kInst = (uint32_t)insA1.size();
+    const bool twoRunIdentical = (imgA1.size() == imgA2.size()) &&
+                                 (std::memcmp(imgA1.data(), imgA2.data(), imgA1.size()) == 0) &&
+                                 (insA1.size() == insA2.size());
+
+    const int64_t kOne2 = (int64_t)pcg::kOne * (int64_t)pcg::kOne;
+    const int64_t tol = kOne2 / 1000;
+    uint32_t unitCount = 0, inRangeCount = 0;
+    for (size_t i = 0; i < insA1.size(); ++i) {
+        const pcg::PcgInstance& in = insA1[i];
+        const int64_t mag2 = (int64_t)in.orient.y * (int64_t)in.orient.y +
+                             (int64_t)in.orient.w * (int64_t)in.orient.w;
+        int64_t diff = mag2 - kOne2; if (diff < 0) diff = -diff;
+        if (in.orient.x == 0 && in.orient.z == 0 && diff <= tol) ++unitCount;
+        if (in.scale >= kScaleLo && in.scale <= kScaleHi) ++inRangeCount;
+    }
+
+    pcg::PcgTransform kNoop; kNoop.randomYaw = false; kNoop.scaleLo = pcg::kOne; kNoop.scaleHi = pcg::kOne;
+    const std::vector<pcg::PcgInstance> insNoop = pcg::BuildInstances(pts, st, kNoop);
+    uint32_t posMatch = 0;
+    bool noopOk = (insNoop.size() == pts.size());
+    for (size_t i = 0; i < insNoop.size(); ++i) {
+        const pcg::PcgInstance& in = insNoop[i];
+        if (in.orient.x != 0 || in.orient.y != 0 || in.orient.z != 0 || in.orient.w != pcg::kOne) noopOk = false;
+        if (in.scale != pcg::kOne) noopOk = false;
+        if (in.pos.x == pts[i].x && in.pos.y == pts[i].y && in.pos.z == pts[i].z) ++posMatch;
+        else noopOk = false;
+    }
+
+    const bool provenanceOk = (kScaleLo == 32768) && (kScaleHi == 98304) && (kInst > 0);
+    const bool allUnitInRange = (unitCount == kInst) && (inRangeCount == kInst);
+
+    if (!twoRunIdentical || !allUnitInRange || !noopOk || !provenanceOk)
+        return fail("pcg4-rules: determinism/unit/range/no-op/provenance check failed");
+
+    std::printf("pcg4-rules: per-instance transform rules (instances=%u, yaw:16-table, scale:[0.5,1.5], seed=%u)\n",
+                kInst, kSeed);
+    std::printf("pcg4-rules: two-run BYTE-IDENTICAL\n");
+    std::printf("pcg4-rules: every orient unit AND every scale in range {instances:%u, unit:%u, inRange:%u}\n",
+                kInst, unitCount, inRangeCount);
+    std::printf("pcg4-rules: no-op rule (identity yaw + fixed scale) == input points unchanged {posMatch:%u}\n",
+                posMatch);
+    std::printf("pcg4-rules: provenance {yawTable:16, scaleLo:32768, scaleHi:98304, instances:%u}\n", kInst);
+
+    if (!WritePNG(outPath, imgA1, kImg, kImg)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — pcg4 per-instance transform rules (%u instances, seed=%u)\n",
+                outPath, kImg, kImg, kInst, kSeed);
+    return 0;
+}
+
 // ===== Slice VD1 — Deterministic Gameplay / Netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS showcase
 // (--vd1-world) (the BEACHHEAD of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO
 // new RHI; the verdict.h entity world + command bus is header-only integer math, so on Metal it runs the IDENTICAL
@@ -69980,6 +70112,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pcg3-mask") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pcg3_mask.png";
             try { return RunPcg3MaskShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pcg4-rules <out.png>: render the Deterministic PCG PER-INSTANCE TRANSFORM RULES showcase (Slice PCG4,
+        // the 4th slice of FLAGSHIP #22). PURE CPU — runs the IDENTICAL pcg.h BuildInstances over the PCG3
+        // ScatterMasked points the Vulkan --pcg4-rules-shot runs (the 2D top-down plot of oriented, scaled markers
+        // — each arm rotated by fpx::FxRotate, pure-integer pixel map) -> bit-identical cross-backend BY
+        // CONSTRUCTION; the proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--pcg4-rules") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pcg4_rules.png";
+            try { return RunPcg4RulesShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vd1-world <out.png>: render the Deterministic Gameplay / Netcode ENTITY WORLD + INPUT-COMMAND BUS
