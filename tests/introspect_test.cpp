@@ -572,6 +572,8 @@ int main() {
             bool sawIk5LockstepFeature = false;
             // Slice IK6: the ik6-render capability is advertised (the IK-corrected lit_skinned render capstone).
             bool sawIk6RenderFeature = false;
+            // Slice AI1: the ai1-tree capability is advertised (the deterministic blackboard + decision-tree tick).
+            bool sawAi1TreeFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -836,6 +838,7 @@ int main() {
                     if (AsString(el->value) == "ik4-rig") sawIk4RigFeature = true;
                     if (AsString(el->value) == "ik5-lockstep") sawIk5LockstepFeature = true;
                     if (AsString(el->value) == "ik6-render") sawIk6RenderFeature = true;
+                    if (AsString(el->value) == "ai1-tree") sawAi1TreeFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -1075,6 +1078,7 @@ int main() {
             check(sawIk4RigFeature, "engine.features includes ik4-rig");
             check(sawIk5LockstepFeature, "engine.features includes ik5-lockstep");
             check(sawIk6RenderFeature, "engine.features includes ik6-render");
+            check(sawAi1TreeFeature, "engine.features includes ai1-tree");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1360,6 +1364,8 @@ int main() {
         bool sawMf4StackShot = false;
         // Slice MF5: the --mf5-lockstep-shot showcase flag is listed in the showcase manifest.
         bool sawMf5LockstepShot = false;
+        // Slice AI1: the --ai1-tree-shot showcase flag is listed in the showcase manifest.
+        bool sawAi1TreeShot = false;
         // Slice VD1: the --vd1-world-shot showcase flag is listed in the showcase manifest.
         bool sawVd1WorldShot = false;
         // Slice VD2: the --vd2-tick-shot showcase flag is listed in the showcase manifest.
@@ -1747,6 +1753,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--mf3-manifold-shot") sawMf3ManifoldShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mf4-stack-shot") sawMf4StackShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mf5-lockstep-shot") sawMf5LockstepShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--ai1-tree-shot") sawAi1TreeShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vd1-world-shot") sawVd1WorldShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vd2-tick-shot") sawVd2TickShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vd3-world-shot") sawVd3WorldShot = true;
@@ -1982,6 +1989,7 @@ int main() {
         check(sawMf3ManifoldShot, "showcases manifest includes --mf3-manifold-shot");
         check(sawMf4StackShot, "showcases manifest includes --mf4-stack-shot");
         check(sawMf5LockstepShot, "showcases manifest includes --mf5-lockstep-shot");
+        check(sawAi1TreeShot, "showcases manifest includes --ai1-tree-shot");
         check(sawVd1WorldShot, "showcases manifest includes --vd1-world-shot");
         check(sawVd2TickShot, "showcases manifest includes --vd2-tick-shot");
         check(sawVd3WorldShot, "showcases manifest includes --vd3-world-shot");

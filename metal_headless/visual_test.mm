@@ -117,6 +117,7 @@
 #include "sim/hullfric.h"            // Slice HF1: hull friction + joints THE TAGGED FRICTION MANIFOLD ON THE EPA NORMAL (HullFrictionManifold/BuildHullFrictionManifold/CachedHullFrictionContact/MatchHullFrictionCache/UpdateHullFrictionCache/BuildAllHullFrictionManifoldsPairs/MeasureHullFriction — wraps the FROZEN warmhull keyed manifold + the fric::MakeTangentBasis integer tangent basis on the sign-corrected EPA normal + the basis-axis cache field) — int64 -> hullfric_points.comp is Vulkan-only (NOT in hf_gen_msl); the Metal --hf1-points runs the CPU hullfric::BuildAllHullFrictionManifoldsPairs (byte-identical to the Vulkan GPU result by construction)
 #include "sim/hulljoint.h"           // Slice HF4: hull friction + joints HULL JOINTS COMPOSED (JointedHullWorld/JointedHullStepConfig/StepJointedHullWorld(N)/MeasureJointedHull — the joint.h ball/angular-limit solvers composed with the HF3 hull friction contacts in ONE deterministic tick) — int64 -> hulljoint_step.comp is Vulkan-only (NOT in hf_gen_msl); the Metal --hf4-joint runs the CPU hulljoint::StepJointedHullWorldN (byte-identical to the Vulkan GPU result by construction)
 #include "game/verdict.h"            // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Metal --vd1-world runs the IDENTICAL pure-CPU script the Vulkan --vd1-world-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "ai/ai.h"                   // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Metal --ai1-tree runs the IDENTICAL pure-CPU tick + 2D node-graph viz the Vulkan --ai1-tree-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
@@ -34758,6 +34759,180 @@ static int RunGjkLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice AI1 — Deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK showcase
+// (--ai1-tree) (the BEACHHEAD of the DETERMINISTIC AI flagship #28, hf::ai). PURE CPU — NO GPU compute, NO new
+// shader, NO new RHI; the ai.h decision-tree tick is header-only integer logic, so on Metal it runs the IDENTICAL
+// pure-CPU canonical tree + blackboard script the Vulkan --ai1-tree-shot runs on Windows -> the node-status graph
+// golden is bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). The 4 proof lines match the
+// Vulkan side EXACTLY. New golden tests/golden/metal/ai1_tree.png (baked on the Mac by the controller).
+static int RunAi1TreeShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace ai = hf::ai;
+
+    // THE CANONICAL TREE (== the Vulkan --ai1-tree-shot + the ai_tree_test): selector[ sequence[ cond, chase ], patrol ].
+    const ai::DecisionTree tree = ai::BuildAi1Tree();
+    const int kNodes = (int)tree.size();
+    const int kDepth = ai::TreeDepth(tree);
+
+    // The fixed script (identical to the Vulkan side + the test's runScript): far -> close -> far.
+    auto runScript = [&](ai::Status& outStatus) {
+        ai::Blackboard bb;
+        ai::Status s = ai::TickTree(tree, bb);                       // enemy far  -> PATROL
+        bb.Set(ai::kBbEnemyClose, ai::kEnemyThreshold);
+        s = ai::TickTree(tree, bb);                                  // enemy close -> CHASE
+        bb.Set(ai::kBbEnemyClose, 0);
+        s = ai::TickTree(tree, bb);                                  // enemy far again -> PATROL
+        outStatus = s;
+        return ai::DigestBlackboard(bb);
+    };
+
+    // PROOF (1) the root tick status over the canonical (enemy-close) scenario — the one the viz renders.
+    ai::Blackboard vizBb;
+    vizBb.Set(ai::kBbEnemyClose, ai::kEnemyThreshold);
+    const ai::Status rootStatus = ai::TickTree(tree, vizBb);
+    const char* statusName = rootStatus == ai::kSuccess ? "SUCCESS"
+                           : rootStatus == ai::kFailure ? "FAILURE" : "RUNNING";
+    std::printf("ai1-tree: {nodes:%d, depth:%d} tick status=%s (deterministic DFS order)\n",
+                kNodes, kDepth, statusName);
+
+    // PROOF (2) two-run determinism over the script (status + DigestBlackboard byte-identical).
+    ai::Status s1, s2;
+    const uint64_t d1 = runScript(s1);
+    const uint64_t d2 = runScript(s2);
+    if (s1 != s2 || d1 != d2) return fail("ai1-tree: two runs differ (nondeterministic tick)");
+    std::printf("ai1-tree determinism: two TickTree runs over the script BYTE-IDENTICAL (blackboard digest %016llx)\n",
+                (unsigned long long)d1);
+
+    // PROOF (3) the falsifiable FIXED-CHILD-ORDER proof.
+    {
+        ai::Blackboard closeBb; closeBb.Set(ai::kBbEnemyClose, ai::kEnemyThreshold);
+        ai::TickTree(tree, closeBb);
+        const bool selChild0 = (closeBb.Get(ai::kBbState) == ai::kStateChase);
+        ai::Blackboard farBb; ai::TickTree(tree, farBb);
+        const bool seqFailsChild0 = (farBb.Get(ai::kBbState) == ai::kStatePatrol);
+        if (!selChild0 || !seqFailsChild0) return fail("ai1-tree: fixed-child-order proof failed");
+        std::printf("ai1-tree: selector short-circuits at child 0; sequence fails at child 0 (fixed child order)\n");
+    }
+
+    // PROOF (4) the cross-vendor declaration.
+    std::printf("ai1-tree: strict cross-vendor 0.0000 expected at the bake (pure-integer node graph)\n");
+
+    // --- Per-node last-tick status of the RENDERED scenario (enemy close), re-walked in the SAME fixed DFS order. ---
+    std::vector<int> nodeStatus((size_t)kNodes, 3);   // 3 = unvisited (grey)
+    {
+        ai::Blackboard bb;
+        bb.Set(ai::kBbEnemyClose, ai::kEnemyThreshold);
+        struct Walk {
+            const ai::DecisionTree& tr; ai::Blackboard& b; std::vector<int>& st;
+            int run(int idx, int depth) {
+                if (idx < 0 || (size_t)idx >= tr.size() || depth >= ai::kMaxDepth) return (int)ai::kFailure;
+                const ai::BtNode& n = tr[(size_t)idx];
+                int result = (int)ai::kFailure;
+                switch (n.kind) {
+                    case ai::kSelector: {
+                        result = (int)ai::kFailure;
+                        for (int c = 0; c < n.childCount && c < ai::kMaxChildren; ++c) {
+                            const int s = run(n.child[c], depth + 1);
+                            if (s != (int)ai::kFailure) { result = s; break; }
+                        }
+                        break;
+                    }
+                    case ai::kSequence: {
+                        result = (int)ai::kSuccess;
+                        for (int c = 0; c < n.childCount && c < ai::kMaxChildren; ++c) {
+                            const int s = run(n.child[c], depth + 1);
+                            if (s != (int)ai::kSuccess) { result = s; break; }
+                        }
+                        break;
+                    }
+                    case ai::kInverter: {
+                        if (n.childCount < 1) { result = (int)ai::kFailure; break; }
+                        const int s = run(n.child[0], depth + 1);
+                        result = s == (int)ai::kSuccess ? (int)ai::kFailure
+                               : s == (int)ai::kFailure ? (int)ai::kSuccess : (int)ai::kRunning;
+                        break;
+                    }
+                    case ai::kCondLeaf:
+                        result = (b.Get(n.bbKey) >= n.param) ? (int)ai::kSuccess : (int)ai::kFailure; break;
+                    case ai::kActionLeaf:
+                        b.Set(n.bbKey, n.param); result = (int)ai::kSuccess; break;
+                    default: result = (int)ai::kFailure; break;
+                }
+                st[(size_t)idx] = result;
+                return result;
+            }
+        } walk{tree, bb, nodeStatus};
+        walk.run(0, 0);
+    }
+
+    // --- Node graph layout (IDENTICAL to the Vulkan --ai1-tree-shot): column by DEPTH, row spread within a band. ---
+    const int nodeDepth[5] = {0, 1, 2, 2, 1};
+    const int nodeRow[5]   = {1, 0, 0, 1, 2};
+    const int kColW = 150, kRowH = 90, kMarginX = 40, kMarginY = 40;
+    const int kBoxHalfW = 52, kBoxHalfH = 26;
+    const uint32_t imgW = (uint32_t)(kMarginX * 2 + 3 * kColW);
+    const uint32_t imgH = (uint32_t)(kMarginY * 2 + 3 * kRowH);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 18; bgra[pp * 4 + 1] = 16; bgra[pp * 4 + 2] = 14; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto nodeCenter = [&](int idx, int& cx, int& cy) {
+        cx = kMarginX + nodeDepth[idx] * kColW + kColW / 2;
+        cy = kMarginY + nodeRow[idx] * kRowH + kRowH / 2;
+    };
+    auto statusColor = [&](int st) {
+        if (st == (int)ai::kSuccess) return Vec3{0.20f, 0.80f, 0.30f};
+        if (st == (int)ai::kFailure) return Vec3{0.85f, 0.25f, 0.20f};
+        if (st == (int)ai::kRunning) return Vec3{0.92f, 0.72f, 0.18f};
+        return Vec3{0.42f, 0.42f, 0.46f};
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            putPx(x0, y0, col);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    for (int i = 0; i < kNodes; ++i) {
+        int px, py; nodeCenter(i, px, py);
+        for (int c = 0; c < tree[(size_t)i].childCount && c < ai::kMaxChildren; ++c) {
+            const int ch = tree[(size_t)i].child[c];
+            if (ch < 0 || ch >= kNodes) continue;
+            int cxp, cyp; nodeCenter(ch, cxp, cyp);
+            drawLine(px, py, cxp, cyp, Vec3{0.55f, 0.55f, 0.58f});
+        }
+    }
+    for (int i = 0; i < kNodes; ++i) {
+        int cx, cy; nodeCenter(i, cx, cy);
+        const Vec3 fill = statusColor(nodeStatus[(size_t)i]);
+        const Vec3 border{fill.x * 0.45f, fill.y * 0.45f, fill.z * 0.45f};
+        for (int dy = -kBoxHalfH; dy <= kBoxHalfH; ++dy)
+            for (int dx = -kBoxHalfW; dx <= kBoxHalfW; ++dx) {
+                const bool edge = (dx <= -kBoxHalfW + 2 || dx >= kBoxHalfW - 2 ||
+                                   dy <= -kBoxHalfH + 2 || dy >= kBoxHalfH - 2);
+                putPx(cx + dx, cy + dy, edge ? border : fill);
+            }
+    }
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — ai1 decision-tree node-status graph (%d nodes, depth %d, root %s)\n",
+                outPath, imgW, imgH, kNodes, kDepth, statusName);
+    return 0;
+}
+
 // ===== Slice VD1 — Deterministic Gameplay / Netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS showcase
 // (--vd1-world) (the BEACHHEAD of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO
 // new RHI; the verdict.h entity world + command bus is header-only integer math, so on Metal it runs the IDENTICAL
@@ -62961,6 +63136,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vd1-world") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vd1_world.png";
             try { return RunVd1WorldShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ai1-tree <out.png>: render the Deterministic AI BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK
+        // showcase (Slice AI1, the BEACHHEAD of the DETERMINISTIC AI flagship #28). PURE CPU — runs the IDENTICAL ai.h
+        // canonical tree + blackboard script the Vulkan --ai1-tree-shot runs -> the converged node-status graph is
+        // bit-identical cross-backend BY CONSTRUCTION; the 4 proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--ai1-tree") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ai1_tree.png";
+            try { return RunAi1TreeShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vd2-tick <out.png>: render the Deterministic Gameplay / Netcode SYSTEM SCHEDULE + GAMEPLAY TICK

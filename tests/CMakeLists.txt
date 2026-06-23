@@ -1034,6 +1034,17 @@ hf_add_pure_test(hulljoint_render_test)
 # spawn/despawn/command script (the 4 spec proof lines). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(verdict_test)
 
+# Deterministic AI Slice 1 (Slice AI1, the BEACHHEAD of the DETERMINISTIC AI flagship, issue #28, hf::ai):
+# the integer BLACKBOARD + the FLAT decision-tree node graph + the deterministic TICK. Asserts: TickTree
+# two-run determinism (same tree+blackboard -> same Status + same DigestBlackboard); selector returns the
+# first non-Failure child AND short-circuits (a later child's action side effect NOT applied); sequence
+# returns the first non-Success child (the trailing action NOT reached on a Failure); inverter flips
+# Success<->Failure; a condition leaf reads the blackboard + an action leaf writes it; the canonical
+# BuildAi1Tree scenario -> the expected status + digest; flipping the single enemy-close input
+# deterministically flips the selected branch (CHASE vs PATROL). ai.h is a NEW additive header-only sibling
+# (#includes game/verdict.h + sim/fpx.h read-only). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(ai_tree_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
