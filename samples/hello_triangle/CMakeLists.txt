@@ -362,6 +362,11 @@ hf_compile_shaders(
     # current jittered HDR scene. Reuses post.vert (fullscreen triangle) + the existing RT/RGBA16F path;
     # the only new shader for the slice. Existing post/bloom/ssao/ssr shaders + goldens untouched.
     "shaders/taa_resolve.frag.hlsl:ps"
+    # Temporal super-resolution (Slice US2, issue #20): the resolve pass forked from taa_resolve for a
+    # RESOLUTION MISMATCH — accumulate N jittered HALF-res frames into a FULL-res history (running-average
+    # supersample, sharper than US1's bilinear). Reuses post.vert; the only new shader for the slice.
+    # taa_resolve.frag / existing shaders + goldens untouched.
+    "shaders/tsr_resolve.frag.hlsl:ps"
     # GPU-driven culling + indirect draw (Slice AR): a compute kernel frustum-culls a 1024-instance
     # grid and ORDER-compacts the survivors + writes the indirect draw-args; reuses lit_instanced.vert
     # for the indirect draw. Existing shaders + goldens untouched.

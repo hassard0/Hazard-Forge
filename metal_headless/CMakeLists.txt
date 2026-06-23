@@ -1111,6 +1111,10 @@ hf_gen_msl(planar.frag           planar.frag.hlsl           frag planar_fragment
 # current jittered HDR scene. Reuses post.vert (fullscreen triangle). Same HLSL->SPIR-V->MSL toolchain;
 # existing shaders + goldens untouched.
 hf_gen_msl(taa_resolve.frag      taa_resolve.frag.hlsl      frag taa_resolve_fragment)
+# Temporal super-resolution (Slice US2, issue #20): the resolve pass forked from taa_resolve for a
+# RESOLUTION MISMATCH — accumulate N jittered HALF-res frames into a FULL-res history. float/int32,
+# MSL-native. Same HLSL->SPIR-V->MSL toolchain; existing shaders + goldens untouched.
+hf_gen_msl(tsr_resolve.frag      tsr_resolve.frag.hlsl      frag tsr_resolve_fragment)
 # Screen-space projected decals (Slice BH): reuses the SSAO/SSR g-buffer (view normal + linear depth)
 # + the lit HDR scene. decal.frag reconstructs the world position (view-space recon like SSR, then
 # view->world via invView), projects it into the decal box, and alpha-blends a procedural decal over

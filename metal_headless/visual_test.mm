@@ -7738,6 +7738,430 @@ static int RunUs1UpscaleShowcase(const char* outPath) {
     return 0;
 }
 
+// --- US2 (temporal accumulation, issue #20). Mirrors the Vulkan --us2-tsr-shot exactly: the settled
+// sphere-pyramid scene rendered as N=8 jittered HALF-res (640x360) frames, each folded into a FULL-res
+// (1280x720) ping-pong history via the new tsr_resolve.frag (running-average alpha=1/(f+1) supersample),
+// then post tonemaps the final history. Also renders a native full-res reference + the US1 naive bilinear
+// and proves the accumulation is measurably CLOSER to native than naive bilinear (tsrDiff < naiveDiff).
+// STATIC camera; the new tsr_resolve shader only; SCENE/RESOLUTIONS/JITTER/N IDENTICAL to the Vulkan path;
+// two TSR runs DIFF 0.0000. New golden tests/golden/metal/us2_tsr.png (controller bakes). ----------------
+static int RunUs2TsrShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace taa = render::taa;
+    const uint32_t W = 1280, H = 720;          // full/display (capture, full-res history)
+    const uint32_t hw = 640, hh = 360;          // half/internal (jittered low-res scene render)
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Static scene: the settled 4-layer instanced sphere pyramid (identical recipe to the Vulkan path).
+    physics::World world;
+    {
+        const float R = 0.5f;
+        const int kLayers = 4;
+        const float d = 2.0f * R;
+        const float dy = R * 1.41421356f;
+        for (int k = 0; k < kLayers; ++k) {
+            int m = kLayers - k;
+            float off = 0.5f * (float)(m - 1) * d;
+            float y = R + (float)k * dy;
+            for (int gx = 0; gx < m; ++gx)
+                for (int gz = 0; gz < m; ++gz) {
+                    float x = (float)gx * d - off;
+                    float z = (float)gz * d - off;
+                    world.bodies.push_back(physics::MakeDynamicSphere({x, y + 0.01f, z}, R));
+                }
+        }
+    }
+    for (int s = 0; s < 240; ++s) world.Step(1.0f / 120.0f);
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(world.bodies.size());
+    for (const auto& b : world.bodies) {
+        Mat4 m = b.Transform();
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        instances.push_back(inst);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+    // Lit pipelines (HDR RT) — UNCHANGED lit/instanced shaders.
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = kHdr;
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    // Shadow pipelines (UNCHANGED).
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    // Sky (HDR RT) — UNCHANGED procedural sky.
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    // TSR resolve + final post (fullscreen, fragment push constants).
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto tsrFs  = loadMSL("tsr_resolve.frag.gen.metal", "tsr_resolve_fragment");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    struct TsrParams { float curTexel[2]; float histTexel[2]; float alpha; float firstFrame; };
+
+    rhi::GraphicsPipelineDesc tsrD;
+    tsrD.vertex = postVs.get(); tsrD.fragment = tsrFs.get();
+    tsrD.colorFormat = kHdr;
+    tsrD.depthTest = false; tsrD.usesTexture = true; tsrD.fullscreen = true;
+    tsrD.fragmentPushConstants = true; tsrD.pushConstantSize = sizeof(TsrParams);
+    auto tsrPipe = device->CreateGraphicsPipeline(tsrD);
+
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    // Render targets: a HALF-res HDR scene + a FULL-res HDR scene (native ref) + two FULL-res ping-pong
+    // history RTs + the shadow map.
+    auto sceneLow  = device->CreateRenderTarget(hw, hh, kHdr);  // 640x360 HDR (jittered)
+    auto sceneFull = device->CreateRenderTarget(W,  H,  kHdr);  // 1280x720 HDR (native ref)
+    auto histA = device->CreateRenderTarget(W, H, kHdr);
+    auto histB = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    rhi::BufferDesc instBufDesc;
+    instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+    instBufDesc.initialData = instances.data();
+    instBufDesc.usage = rhi::BufferUsage::Vertex;
+    auto instanceBuffer = device->CreateBuffer(instBufDesc);
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+    const Vec3 eye{6.5f, 4.5f, 7.0f};
+    const Vec3 center{0.0f, 1.0f, 0.0f};
+    const float aspect = (float)hw / (float)hh;   // == W/H
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    Mat4 unjittered = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f)) * viewM;
+
+    FrameData fdBase{};
+    {
+        fdBase.lightDir[0] = -0.5f; fdBase.lightDir[1] = -1.0f; fdBase.lightDir[2] = -0.3f;
+        fdBase.lightColor[0] = 1.0f; fdBase.lightColor[1] = 0.97f; fdBase.lightColor[2] = 0.9f; fdBase.lightColor[3] = 1.0f;
+        fdBase.viewPos[0] = eye.x; fdBase.viewPos[1] = eye.y; fdBase.viewPos[2] = eye.z; fdBase.viewPos[3] = 1.0f;
+        fdBase.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fdBase.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fdBase.camFwd[0]=fwd.x; fdBase.camFwd[1]=fwd.y; fdBase.camFwd[2]=fwd.z;
+        fdBase.camRight[0]=right.x; fdBase.camRight[1]=right.y; fdBase.camRight[2]=right.z;
+        fdBase.camUp[0]=up.x; fdBase.camUp[1]=up.y; fdBase.camUp[2]=up.z;
+        fdBase.skyParams[0] = std::tan(0.5f * kFovY);
+        fdBase.skyParams[1] = aspect;
+        for (int k = 0; k < 16; ++k) fdBase.prevViewProj[k] = unjittered.m[k];
+    }
+
+    auto recordScene = [&](rhi::ICommandBuffer& cmd) {
+        cmd.BindPipeline(*skyPipe);
+        cmd.Draw(3);
+        cmd.BindPipeline(*litPipeline);
+        {
+            float pc[20];
+            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+            pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+            cmd.PushConstants(pc, sizeof(pc));
+            cmd.BindMaterial(*groundTex, *flatNormal);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+        }
+        cmd.BindPipeline(*instPipeline);
+        {
+            float material[4] = {0.1f, 0.5f, 0.0f, 0.0f};
+            cmd.PushConstants(material, sizeof(material));
+            cmd.BindMaterial(*groundTex, *flatNormal);
+            cmd.BindVertexBuffer(sphere.vertices());
+            cmd.BindInstanceBuffer(*instanceBuffer);
+            cmd.BindIndexBuffer(sphere.indices());
+            cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+        }
+    };
+    auto recordShadow = [&](rhi::ICommandBuffer& cmd) {
+        cmd.BindPipeline(*staticShadowPipeline);
+        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+        cmd.BindVertexBuffer(plane.vertices());
+        cmd.BindIndexBuffer(plane.indices());
+        cmd.DrawIndexed(plane.indexCount());
+        cmd.BindPipeline(*instShadowPipeline);
+        cmd.BindVertexBuffer(sphere.vertices());
+        cmd.BindInstanceBuffer(*instanceBuffer);
+        cmd.BindIndexBuffer(sphere.indices());
+        cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+    };
+
+    // Per-frame FrameData with a jittered projection (sub-pixel NDC offset injected into the base
+    // projection's clip-space XY translation per unit W BEFORE FlipProjY, so the Y-flip carries through
+    // consistently). frameIdx<0 => the UNJITTERED native projection.
+    auto makeFd = [&](int frameIdx, int jw, int jh) -> FrameData {
+        Mat4 jProj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+        if (frameIdx >= 0) {
+            taa::Vec2 j = taa::Jitter(frameIdx, jw, jh);
+            jProj.m[2 * 4 + 0] += j.x;
+            jProj.m[2 * 4 + 1] += j.y;
+        }
+        Mat4 jvp = FlipProjY(jProj) * viewM;
+        FrameData fd = fdBase;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = jvp.m[k];
+        return fd;
+    };
+
+    // (A) The TSR accumulation: N=8 jittered HALF-res frames into the FULL-res ping-pong history.
+    auto renderTsr = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        rhi::IRenderTarget* prevHist = histA.get();
+        rhi::IRenderTarget* curHist  = histB.get();
+        for (int frame = 0; frame < taa::kAccumFrames; ++frame) {
+            FrameData fd = makeFd(frame, (int)hw, (int)hh);
+            const bool first = (frame == 0);
+            TsrParams tp{};
+            tp.curTexel[0]  = 1.0f / (float)hw; tp.curTexel[1]  = 1.0f / (float)hh;
+            tp.histTexel[0] = 1.0f / (float)W;  tp.histTexel[1] = 1.0f / (float)H;
+            tp.alpha = 1.0f / (float)(frame + 1);
+            tp.firstFrame = first ? 1.0f : 0.0f;
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *sceneLow);
+            render::RgResource rgPrev = graph.ImportTarget(
+                "history", render::RgResourceKind::SceneColor, *prevHist);
+            render::RgResource rgCur = graph.ImportTarget(
+                "resolved", render::RgResourceKind::SceneColor, *curHist);
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    recordShadow(cmd);
+                    cmd.EndRenderPass();
+                });
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    recordScene(cmd);
+                    cmd.EndRenderPass();
+                });
+            graph.AddPass("tsrResolve", {rgScene, rgPrev}, {rgCur},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*tsrPipe);
+                    cmd.BindTexturePair(*sceneLow, *prevHist);
+                    cmd.PushConstants(&tp, sizeof(tp));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+            graph.Execute(*device);
+            device->WaitIdle();
+            std::swap(prevHist, curHist);
+        }
+        {
+            render::RenderGraph graph;
+            render::RgResource rgResolved = graph.ImportTarget(
+                "resolved", render::RgResourceKind::SceneColor, *prevHist);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+            graph.AddPass("post", {rgResolved}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*prevHist);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+            device->CaptureNextFrame();
+            graph.Execute(*device);
+        }
+        outW = 0; outH = 0;
+        bool got = device->GetCapturedPixels(outPx, outW, outH);
+        device->WaitIdle();
+        return got;
+    };
+
+    // (B) The NATIVE full-res reference (no jitter, single frame, through post).
+    auto renderNative = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        FrameData fd = makeFd(-1, 0, 0);
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *sceneFull);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                recordShadow(cmd);
+                cmd.EndRenderPass();
+            });
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                recordScene(cmd);
+                cmd.EndRenderPass();
+            });
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*sceneFull);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        outW = 0; outH = 0;
+        bool got = device->GetCapturedPixels(outPx, outW, outH);
+        device->WaitIdle();
+        return got;
+    };
+
+    // (C) The US1 NAIVE bilinear (half-res jittered idx 0 -> post bilinear-upscale).
+    auto renderNaive = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        FrameData fd = makeFd(0, (int)hw, (int)hh);
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *sceneLow);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                recordShadow(cmd);
+                cmd.EndRenderPass();
+            });
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                recordScene(cmd);
+                cmd.EndRenderPass();
+            });
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*sceneLow);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        outW = 0; outH = 0;
+        bool got = device->GetCapturedPixels(outPx, outW, outH);
+        device->WaitIdle();
+        return got;
+    };
+
+    auto meanAbsDiff = [](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) -> double {
+        if (a.size() != b.size() || a.empty()) return 1e9;
+        double acc = 0.0; uint64_t n = 0;
+        for (size_t p = 0; p + 3 < a.size(); p += 4) {
+            for (int c = 0; c < 3; ++c) { acc += std::abs((int)a[p + c] - (int)b[p + c]); ++n; }
+        }
+        return (n > 0) ? acc / (double)n : 1e9;
+    };
+
+    std::printf("us2-tsr: internal %ux%u, N=%d accumulate -> display %ux%u\n",
+                hw, hh, taa::kAccumFrames, W, H);
+
+    std::vector<uint8_t> tsr0; uint32_t tw0 = 0, th0 = 0;
+    std::vector<uint8_t> tsr1; uint32_t tw1 = 0, th1 = 0;
+    if (!renderTsr(tsr0, tw0, th0)) return fail("no TSR pixels (run 0)");
+    if (!renderTsr(tsr1, tw1, th1)) return fail("no TSR pixels (run 1)");
+    bool identical = (tsr0.size() == tsr1.size()) && (tw0 == tw1) && (th0 == th1);
+    if (identical) { for (size_t b = 0; b < tsr0.size(); ++b) { if (tsr0[b] != tsr1[b]) { identical = false; break; } } }
+    if (!identical) return fail("us2-tsr two runs DIFFER (non-deterministic)");
+    std::printf("us2-tsr: two-run BYTE-IDENTICAL\n");
+
+    std::vector<uint8_t> nativePx; uint32_t nw = 0, nh = 0;
+    std::vector<uint8_t> naivePx;  uint32_t aw = 0, ah = 0;
+    if (!renderNative(nativePx, nw, nh)) return fail("no native pixels");
+    if (!renderNaive(naivePx, aw, ah))   return fail("no naive pixels");
+
+    const double naiveDiff = meanAbsDiff(naivePx, nativePx);
+    const double tsrDiff   = meanAbsDiff(tsr0,    nativePx);
+
+    double tsrMean = 0.0; { uint64_t n = 0; for (size_t p = 0; p + 3 < tsr0.size(); p += 4) { for (int c = 0; c < 3; ++c) { tsrMean += tsr0[p + c]; ++n; } } if (n) tsrMean /= (double)n; }
+    if (tsrMean <= 0.0) return fail("us2-tsr image is black (incoherent)");
+
+    const bool closer = (tsrDiff < naiveDiff);
+    std::printf("us2-tsr: closer to native than naive {naiveDiff:%.4f, tsrDiff:%.4f} %s (temporal supersampling sharper)\n",
+                naiveDiff, tsrDiff, closer ? "Dt < Dn" : "Dt >= Dn FAIL");
+    std::printf("us2-tsr: provenance {frames:%d, histPingPong:true}\n", taa::kAccumFrames);
+    if (!closer) return fail("us2-tsr NOT closer to native than naive");
+
+    if (!WritePNG(outPath, tsr0, tw0, th0)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — US2 N=%d accumulate supersample, %u bodies\n",
+                outPath, tw0, th0, taa::kAccumFrames, kInstanceCount);
+    return 0;
+}
+
 // --- Screen-space reflections showcase (Slice AH). Mirrors the Vulkan --ssr-shot path: a DARK
 // reflective checkerboard floor with several distinct colored objects (cubes + spheres) sitting on it,
 // lit + shadowed, rendered into an HDR (RGBA16F) target PLUS a view-space normal+linear-depth g-buffer
@@ -69262,6 +69686,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--us1-upscale") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_us1_upscale.png";
             try { return RunUs1UpscaleShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --us2-tsr <out.png>: temporal accumulation (Slice US2, issue #20). N=8 jittered HALF-res frames
+        // accumulate into a FULL-res ping-pong history via the new tsr_resolve.frag (running-average
+        // supersample), proven measurably CLOSER to native than US1's naive bilinear. Mirrors the Vulkan
+        // --us2-tsr-shot exactly; STATIC camera; two TSR runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--us2-tsr") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_us2_tsr.png";
+            try { return RunUs2TsrShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --editor <out.png>: docked editor showcase (Slice BT). Renders the SAME default Slice-F
