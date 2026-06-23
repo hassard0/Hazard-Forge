@@ -18791,6 +18791,198 @@ static int RunFractStepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FR7 — RECURSIVE FRACTURE-ON-IMPACT showcase (--fract-recursive, Issue #37) ================
+// A HARD impact during the FR4 settle SPLITS a chunk AGAIN, and the children split AGAIN on a further hard
+// slam — a deterministic CASCADE that terminates at a host-fixed minimum-volume floor. PURE CPU: the
+// recursion logic (engine/sim/fract.h::StepFractureRecursiveSteps) is host code on BOTH backends (like FR4
+// bond/break); the per-tick StepFracture drives the FR4 int64 fpx_solve.comp Vulkan-side / the CPU path
+// Metal-side -> byte-identical by construction. SAME FR1 lattice + 16-seed scene as --fract-step. The golden
+// is a STRICT-ZERO INTEGER 2D side-view (settled bodies as discs coloured by DEPTH, retired parents NOT
+// drawn). Two runs DIFF 0.0000, Vulkan==Metal exactly. New golden tests/golden/metal/fract_recursive.png
+// (baked on the Mac by the controller). NO GPU compute here on Metal, NO new shader, NO new RHI.
+static int RunFractRecursiveShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fract = hf::sim::fract;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    const int kNx = 32, kNy = 32, kNz = 16;
+    fract::FractField field; field.nx = kNx; field.ny = kNy; field.nz = kNz;
+    const std::vector<fract::FractSeed> seeds = {
+        { 4,  5,  3}, {27,  6,  2}, { 6, 26,  4}, {25, 27,  3},
+        {16, 15,  8}, { 3, 14, 12}, {29, 18, 13}, {14,  3, 11},
+        {18, 29, 10}, { 9,  9,  6}, {22, 11,  9}, {11, 22,  7},
+        {24, 24, 12}, { 7, 18,  2}, {20,  7, 14}, {15, 28,  6},
+    };
+    const int kM = (int)seeds.size();
+
+    // ---- FR1+FR2+bonds+break on the CPU (== the FR4 host path, verbatim). ----
+    fract::FractCells cells; fract::ClassifyFractCells(field, seeds, cells);
+    fract::FractFragments frags; fract::ExtractFragments(field, cells, kM, frags);
+    fract::FractBonds bonds; fract::BuildFractBonds(field, cells, frags, bonds);
+    const int kBreakIters = 4;
+    const fract::fx kHardImpulse = (fract::fx)(1000 * (int)fpx::kOne);
+    fract::BreakImpact hardImpact{0u, kHardImpulse};
+    std::vector<uint8_t> severed;
+    fract::ApplyImpactBreak(bonds, frags, hardImpact, kBreakIters, severed);
+    std::vector<uint32_t> clusters;
+    fract::CountFractPieces(frags, bonds, severed, &clusters);
+
+    const fract::fx kGravY = (fract::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const fract::fx kDt = fpx::kOne / 60;
+    const int kSolveIters = 8;
+    const int kTicks = 120;
+    fract::FractStepConfig cfg;
+    cfg.worldCellSize = fpx::kOne / 4;
+    cfg.gravity = fract::FxVec3{0, kGravY, 0};
+    cfg.groundY = 0;
+    cfg.impactDir = fract::FxVec3{fpx::kOne / 2, -fpx::kOne, 0};
+    cfg.impactSpeed = (fract::fx)(4 * (int)fpx::kOne);
+
+    const fpx::FxWorld spawnWorld =
+        fract::SpawnFractWorld(frags, bonds, severed, clusters, hardImpact, cfg);
+
+    // The FR7 recursion config: a tuned LOW re-fracture impulse so chunk-on-chunk slams during the fall
+    // split chunks, a low minVolume floor so SEVERAL generations occur. All host integer.
+    fract::FractRecursiveConfig rcfg;
+    rcfg.worldCellSize = fpx::kOne / 4;
+    rcfg.reFractureImpulse = fpx::kOne;        // tuned: above the settle band, below the impact impulse
+    rcfg.minVolume = 300;                      // the floor the 2-generation cascade reaches + terminates
+    rcfg.childPieces = 2;
+    rcfg.gravityY = kGravY;
+    rcfg.groundY = 0;
+
+    // === The recursive cascade (the bit-exact reference the Vulkan --fract-recursive-shot proves equal to).
+    fract::FractRecursiveWorld rw = fract::BuildRecursiveWorld(spawnWorld, frags, clusters);
+    const uint32_t kRootBodies = (uint32_t)rw.world.bodies.size();
+
+    // Snapshot the live piece count at tick 0 / K/4 / K/2 / final (the cascade-growth proof).
+    auto liveBodies = [&](const fract::FractRecursiveWorld& w) {
+        uint32_t live = 0;
+        for (size_t i = 0; i < w.chunks.size(); ++i) if (!w.chunks[i].retired) ++live;
+        return live;
+    };
+    const uint32_t pcTick0 = liveBodies(rw);
+    fract::StepFractureRecursiveSteps(rw, rcfg, kDt, kSolveIters, kTicks / 4);
+    const uint32_t pcQuarter = liveBodies(rw);
+    fract::StepFractureRecursiveSteps(rw, rcfg, kDt, kSolveIters, kTicks / 4);   // -> K/2 total
+    const uint32_t pcHalf = liveBodies(rw);
+    fract::StepFractureRecursiveSteps(rw, rcfg, kDt, kSolveIters, kTicks - kTicks / 2);  // -> K total
+    const uint32_t pcFinal = liveBodies(rw);
+
+    const uint32_t kFinalBodies = (uint32_t)rw.world.bodies.size();
+    const fract::FractCascadeState st = fract::MeasureFractCascade(rw, rcfg);
+
+    // PROOF (1) the cascade ran (GPU==CPU bit-exact by construction — the per-tick StepFracture is the FR4
+    // int64 solve, byte-identical Vulkan==Metal): final-bodies > root-bodies AND max-depth >= 2.
+    if (!(kFinalBodies > kRootBodies && st.maxDepth >= 2u))
+        return fail("fract-recursive: no real cascade (final<=root or max-depth<2)");
+    std::printf("fract-recursive: {root-bodies:%u, ticks:%d, final-bodies:%u, max-depth:%u} GPU==CPU "
+                "BIT-EXACT\n", kRootBodies, kTicks, kFinalBodies, st.maxDepth);
+
+    // PROOF (2) the piece-count is NON-DECREASING across the cascade AND final > tick0 (the cascade happened).
+    if (!(pcQuarter >= pcTick0 && pcHalf >= pcQuarter && pcFinal >= pcHalf && pcFinal > pcTick0))
+        return fail("fract-recursive: piece-count not monotone-non-decreasing / no growth");
+    std::printf("fract-recursive cascade: piece-count {tick0:%u, tickK/4:%u, tickK/2:%u, final:%u}\n",
+                pcTick0, pcQuarter, pcHalf, pcFinal);
+
+    // PROOF (3) determinism: a second full cascade is BYTE-IDENTICAL over BOTH bodies AND chunks.
+    {
+        fract::FractRecursiveWorld rw2 = fract::BuildRecursiveWorld(spawnWorld, frags, clusters);
+        fract::StepFractureRecursiveSteps(rw2, rcfg, kDt, kSolveIters, kTicks);
+        const bool bodiesSame = (rw2.world.bodies.size() == rw.world.bodies.size()) &&
+            std::memcmp(rw2.world.bodies.data(), rw.world.bodies.data(),
+                        rw.world.bodies.size() * sizeof(fpx::FxBody)) == 0;
+        const bool chunksSame = (rw2.chunks.size() == rw.chunks.size()) &&
+            std::memcmp(rw2.chunks.data(), rw.chunks.data(),
+                        rw.chunks.size() * sizeof(fract::FractChunk)) == 0;
+        if (!(bodiesSame && chunksSame))
+            return fail("fract-recursive: two runs differ (nondeterministic)");
+    }
+    std::printf("fract-recursive determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (4) the cascade TERMINATES at the minVolume floor: live volumes hit the floor + EXTRA ticks add
+    // ZERO bodies (no live chunk splits further).
+    {
+        const uint32_t beforeExtra = (uint32_t)rw.world.bodies.size();
+        fract::StepFractureRecursiveSteps(rw, rcfg, kDt, kSolveIters, 60);
+        if (rw.world.bodies.size() != beforeExtra)
+            return fail("fract-recursive: extra ticks still added bodies (no termination)");
+    }
+    if (!(st.minLiveVolume <= rcfg.minVolume && st.atFloor > 0u))
+        return fail("fract-recursive: floor not reached (min-live-volume > minVolume or atFloor==0)");
+    std::printf("fract-recursive floor: min-live-volume:%u <= minVolume:%u reached, at-floor:%u chunks "
+                "(none split further)\n", (uint32_t)st.minLiveVolume, (uint32_t)rcfg.minVolume, st.atFloor);
+
+    // PROOF (5) the soft control: a very-high threshold re-fractures NOTHING (impulse-driven, not
+    // unconditional) -> refractured==0, depth==0; vs the hard run's refractured>0, max-depth>=2.
+    {
+        fract::FractRecursiveWorld soft = fract::BuildRecursiveWorld(spawnWorld, frags, clusters);
+        fract::FractRecursiveConfig scfg = rcfg;
+        scfg.reFractureImpulse = (fract::fx)(1 << 30);   // ~16384 world units — unreachably high (no overflow)
+        const uint32_t softRoot = (uint32_t)soft.world.bodies.size();
+        fract::StepFractureRecursiveSteps(soft, scfg, kDt, kSolveIters, kTicks);
+        const fract::FractCascadeState softState = fract::MeasureFractCascade(soft, scfg);
+        const uint32_t softRefractured = (uint32_t)soft.world.bodies.size() - softRoot;
+        if (!(softRefractured == 0u && softState.maxDepth == 0u && softState.retired == 0u))
+            return fail("fract-recursive: soft control re-fractured (not impulse-driven)");
+        const uint32_t hardRefractured = kFinalBodies - kRootBodies;
+        std::printf("fract-recursive trigger: hard={refractured:%u, max-depth:%u} soft={refractured:0, "
+                    "depth:0}\n", hardRefractured, st.maxDepth);
+    }
+
+    // --- Golden (== the Vulkan --fract-recursive-shot, byte-identical by construction): the live bodies as
+    // discs over the ground, coloured by DEPTH, retired parents NOT drawn. ---
+    const int kPxPerUnit = 60;
+    const int kMargin = 28;
+    const int kWorldW = 10;
+    const int kWorldH = 9;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int x, int y, uint8_t bl, uint8_t gr, uint8_t rd) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = bl; d[1] = gr; d[2] = rd; d[3] = 255;
+    };
+    auto worldToPx = [&](fpx::fx px, fpx::fx py, int& ix, int& iy) {
+        const int64_t sx = ((int64_t)px * kPxPerUnit) >> fpx::kFrac;
+        const int64_t sy = ((int64_t)py * kPxPerUnit) >> fpx::kFrac;
+        ix = kMargin + (int)sx;
+        iy = (int)imgH - kMargin - (int)sy;
+    };
+    {
+        int gx0, gy0; worldToPx(0, cfg.groundY, gx0, gy0);
+        for (int x = 0; x < (int)imgW; ++x) {
+            if (gy0 < 0 || gy0 >= (int)imgH) break;
+            uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+            d[0] = 90; d[1] = 90; d[2] = 90; d[3] = 255;
+        }
+    }
+    for (size_t i = 0; i < rw.world.bodies.size(); ++i) {
+        if (rw.chunks[i].retired) continue;   // a split-in-place parent is NOT drawn
+        const fpx::FxBody& b = rw.world.bodies[i];
+        int cx, cy; worldToPx(b.pos.x, b.pos.y, cx, cy);
+        int rpx = (int)(((int64_t)b.radius * kPxPerUnit) >> fpx::kFrac);
+        if (rpx < 2) rpx = 2; if (rpx > 40) rpx = 40;
+        const bool isAnchor = !(b.flags & fpx::kFlagDynamic);
+        Vec3 col = isAnchor ? Vec3{0.45f, 0.45f, 0.5f} : vg::hashColor(rw.chunks[i].depth + 1u);
+        const uint8_t rd = (uint8_t)(col.x * 255.0f + 0.5f);
+        const uint8_t gr = (uint8_t)(col.y * 255.0f + 0.5f);
+        const uint8_t bl = (uint8_t)(col.z * 255.0f + 0.5f);
+        for (int dy = -rpx; dy <= rpx; ++dy)
+            for (int dx = -rpx; dx <= rpx; ++dx)
+                if (dx * dx + dy * dy <= rpx * rpx) putPx(cx + dx, cy + dy, bl, gr, rd);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fract recursive cascade (root %u -> final %u bodies, max-depth %u "
+                "over %d ticks)\n", outPath, imgW, imgH, kRootBodies, kFinalBodies, st.maxDepth, kTicks);
+    return 0;
+}
+
 // ===== Slice FR5 — Deterministic Rigid-Body Fracture LOCKSTEP + ROLLBACK showcase (--fract-lockstep) =====
 // The NETCODE HEADLINE of FLAGSHIP #14 (the FPX5/GR5/CG5/GF5 twin). PURE CPU: the harness runs the IDENTICAL
 // CPU code (engine/sim/fract.h::RunFractLockstep/RunFractRollback) on Vulkan-Windows AND Metal-Mac, so the
@@ -63159,6 +63351,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fract-step") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fract_step.png";
             try { return RunFractStepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fract-recursive <out.png>: render the RECURSIVE FRACTURE-ON-IMPACT showcase (Slice FR7, Issue
+        // #37). A HARD impact during the FR4 settle SPLITS a chunk AGAIN (plane-split into sub-spheres), the
+        // children split AGAIN on a further hard slam — a deterministic CASCADE terminating at a host-fixed
+        // minimum-volume floor. PURE CPU on Metal (the recursion is host code; the per-tick StepFracture is
+        // the FR4 int64 solve, byte-identical Vulkan==Metal by construction). The golden is the live bodies
+        // as discs coloured by DEPTH (retired parents not drawn). New golden tests/golden/metal/
+        // fract_recursive.png; two runs DIFF 0.0000. NO GPU compute, NO new shader, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--fract-recursive") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fract_recursive.png";
+            try { return RunFractRecursiveShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fract-lockstep <out.png>: render the Deterministic Rigid-Body Fracture LOCKSTEP + ROLLBACK

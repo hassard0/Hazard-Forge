@@ -896,6 +896,106 @@ int main() {
         }
     }
 
+    // ================= FR7: recursive fracture-on-impact (cascade + determinism + floor + control) =======
+    // BuildRecursiveWorld wraps the FR4 spawn into a lineage-tracked recursive world; StepFractureRecursive-
+    // Steps runs the FR4 step + the T1 sphere-contact impulse re-fracture each tick. Pins: a hard re-fracture
+    // threshold makes the body count GROW + the max-depth reach >=2 (a real cascade, children split again); a
+    // second run is BYTE-IDENTICAL over BOTH bodies AND chunks; the cascade TERMINATES at the minVolume floor
+    // (extra ticks add zero bodies + live volumes are all <= floor); a very-high threshold is impulse-driven
+    // (zero re-fracture, body count unchanged). Models the FR4 cases. Pure CPU (no device).
+    {
+        // The FR4/FR5 scene shape (deterministic), broken hard so there is dynamic rubble to slam + split.
+        const int M = 16;
+        fract::FractField f; f.nx = 32; f.ny = 32; f.nz = 16;
+        const std::vector<fract::FractSeed> seeds = {
+            { 4,  5,  3}, {27,  6,  2}, { 6, 26,  4}, {25, 27,  3},
+            {16, 15,  8}, { 3, 14, 12}, {29, 18, 13}, {14,  3, 11},
+            {18, 29, 10}, { 9,  9,  6}, {22, 11,  9}, {11, 22,  7},
+            {24, 24, 12}, { 7, 18,  2}, {20,  7, 14}, {15, 28,  6},
+        };
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, M, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+        fract::BreakImpact imp{0u, (fract::fx)(1000 * (int)fpx::kOne)};   // a HARD break
+        std::vector<uint8_t> sev;
+        fract::ApplyImpactBreak(bonds, frags, imp, 4, sev);
+        std::vector<uint32_t> clusters;
+        fract::CountFractPieces(frags, bonds, sev, &clusters);
+        const fract::fx gravY = (fract::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        fract::FractStepConfig cfg;
+        cfg.worldCellSize = fpx::kOne / 4;
+        cfg.gravity = fract::FxVec3{0, gravY, 0};
+        cfg.groundY = 0;
+        cfg.impactDir = fract::FxVec3{fpx::kOne / 2, -fpx::kOne, 0};
+        cfg.impactSpeed = (fract::fx)(4 * (int)fpx::kOne);
+        const fpx::FxWorld spawn = fract::SpawnFractWorld(frags, bonds, sev, clusters, imp, cfg);
+
+        // A tuned re-fracture config: a threshold clear of the settle band (~24) but below the impact
+        // (~5.8e5) so a hard slam re-fractures while a gentle settle does not; a minVolume floor the cascade
+        // reaches in 2 generations (root vols ~600-1400 -> halved twice ~150-350), childPieces 2.
+        fract::FractRecursiveConfig rcfg;
+        rcfg.worldCellSize = fpx::kOne / 4;
+        rcfg.reFractureImpulse = fpx::kOne;        // 1.0: above the settle band, below the impact impulse
+        rcfg.minVolume = 300;                      // the floor the 2-generation cascade reaches + terminates
+        rcfg.childPieces = 2;
+        rcfg.gravityY = gravY;
+        rcfg.groundY = 0;
+
+        const fract::fx dt = fpx::kOne / 60;
+        const int kIters = 8;
+        const int kTicks = 120;
+
+        // --- (1) cascade growth: the body count GROWS + max-depth reaches >= 2 (children split again). ---
+        fract::FractRecursiveWorld rw = fract::BuildRecursiveWorld(spawn, frags, clusters);
+        const uint32_t rootBodies = (uint32_t)rw.world.bodies.size();
+        const fract::FractCascadeState s0 = fract::MeasureFractCascade(rw, rcfg);
+        fract::StepFractureRecursiveSteps(rw, rcfg, dt, kIters, kTicks);
+        const uint32_t finalBodies = (uint32_t)rw.world.bodies.size();
+        const fract::FractCascadeState sF = fract::MeasureFractCascade(rw, rcfg);
+        check(finalBodies > rootBodies, "FR7 cascade: the body count GREW (a real re-fracture happened)");
+        check(sF.maxDepth >= 2u, "FR7 cascade: max-depth reached >= 2 (children split again)");
+        check(sF.retired > 0u, "FR7 cascade: some parents retired in place (never erased)");
+        check(rw.chunks.size() == rw.world.bodies.size(),
+              "FR7 cascade: chunk[] stays index-aligned to bodies[] (retire-in-place, append-only)");
+        check(s0.liveChunks <= sF.liveChunks || sF.liveChunks > 0u, "FR7 cascade: live chunks present");
+
+        // --- (2) determinism: a second run is BYTE-IDENTICAL over BOTH bodies AND chunks. ---
+        fract::FractRecursiveWorld rw2 = fract::BuildRecursiveWorld(spawn, frags, clusters);
+        fract::StepFractureRecursiveSteps(rw2, rcfg, dt, kIters, kTicks);
+        const bool bodiesSame = (rw2.world.bodies.size() == rw.world.bodies.size()) &&
+            std::memcmp(rw2.world.bodies.data(), rw.world.bodies.data(),
+                        rw.world.bodies.size() * sizeof(fpx::FxBody)) == 0;
+        const bool chunksSame = (rw2.chunks.size() == rw.chunks.size()) &&
+            std::memcmp(rw2.chunks.data(), rw.chunks.data(),
+                        rw.chunks.size() * sizeof(fract::FractChunk)) == 0;
+        check(bodiesSame, "FR7 determinism: two runs BYTE-IDENTICAL over bodies");
+        check(chunksSame, "FR7 determinism: two runs BYTE-IDENTICAL over chunks");
+        check(rw2.nextChunkId == rw.nextChunkId, "FR7 determinism: the lineage id allocator is replay-stable");
+
+        // --- (3) the cascade TERMINATES at the minVolume floor: extra ticks add ZERO bodies + all live
+        //         chunks at/below the floor never split further. ---
+        const uint32_t beforeExtra = (uint32_t)rw.world.bodies.size();
+        fract::StepFractureRecursiveSteps(rw, rcfg, dt, kIters, 60);   // 60 more ticks
+        check(rw.world.bodies.size() == beforeExtra,
+              "FR7 floor: extra ticks add ZERO bodies (the cascade terminated)");
+        const fract::FractCascadeState sT = fract::MeasureFractCascade(rw, rcfg);
+        check(sT.atFloor > 0u, "FR7 floor: at least one live chunk reached the minVolume floor");
+        check(sT.minLiveVolume <= rcfg.minVolume,
+              "FR7 floor: the smallest live volume is at/below the floor (the cascade terminator)");
+
+        // --- (4) the soft control: a very-high threshold is impulse-driven -> ZERO re-fracture. ---
+        fract::FractRecursiveWorld soft = fract::BuildRecursiveWorld(spawn, frags, clusters);
+        fract::FractRecursiveConfig scfg = rcfg;
+        scfg.reFractureImpulse = (fract::fx)(1 << 30);   // ~16384 world units — unreachably high (no int overflow)
+        const uint32_t softRoot = (uint32_t)soft.world.bodies.size();
+        fract::StepFractureRecursiveSteps(soft, scfg, dt, kIters, kTicks);
+        const fract::FractCascadeState softState = fract::MeasureFractCascade(soft, scfg);
+        check(soft.world.bodies.size() == softRoot,
+              "FR7 control: a very-high threshold re-fractures NOTHING (impulse-driven, not unconditional)");
+        check(softState.maxDepth == 0u, "FR7 control: no re-fracture -> max-depth stays 0");
+        check(softState.retired == 0u, "FR7 control: no re-fracture -> nothing retired");
+    }
+
     if (g_fail == 0) std::printf("fract_test: ALL PASS\n");
     else std::printf("fract_test: %d FAIL\n", g_fail);
     return g_fail == 0 ? 0 : 1;
