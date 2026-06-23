@@ -1084,6 +1084,16 @@ hf_add_pure_test(ai_agent_test)
 # navmesh/tree/blockers are re-supplied as params (NOT snapshotted). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(ai_lockstep_test)
 
+# Deterministic AI Slice 6 (Slice AI6, the LIT 3D NPC RENDER CAPSTONE COMPLETING FLAGSHIP #28): the pure-CPU
+# render-bridge contract over the bit-exact AI5 world (engine/ai/ai.h: AgentToRenderInstances /
+# AgentStateColor). Pins: two AgentToRenderInstances calls byte-equal (render provenance is a pure function);
+# marker count == (agents+1) cubes of 36 verts (one per agent in FIXED array order + the player); the integer
+# AI world is byte-unmutated by the render (AiStatesEqual before/after — a pure read); the CHASE vs PATROL
+# tint differs (the state->color mapping is REAL -> a flipped decision recolors the agent); zero agents -> the
+# player marker only (a coherent minimal scene). The markers are render-only float (OUTSIDE the bit-exact
+# loop); the bit-exact part is the AI1-AI5 integer world. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(ai_render_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16

@@ -1318,5 +1318,103 @@ inline AiSimState BuildAi5InitialState(const Ai4Scene& scene) {
     return s;
 }
 
+// =====================================================================================================
+// Slice AI6 — DETERMINISTIC AI: LIT 3D NPC RENDER CAPSTONE (the public AI sample, COMPLETING FLAGSHIP #28).
+// =====================================================================================================
+// AI1 (decision tree) + AI2 (environment queries) + AI3 (line-of-sight) + AI4 (the composed NPC tick) +
+// AI5 (lockstep/rollback) above are BYTE-FROZEN — everything below is APPEND-ONLY. AI6 is the MONEY-SHOT
+// and the issue's explicit ask ("no public AI sample"): render the bit-exact deterministic NPC world as a
+// LIT 3D scene — the agents as oriented marker cubes (tinted by their BT state: CHASE warm / PATROL cool),
+// the player as a distinct marker, their A* corridors as bright lines, the navmesh as a translucent
+// overlay, over a lit ground — from the AI5 converged world, through the EXISTING render pipelines.
+//
+// THE VD6/NAV6/IK6 CAPSTONE MOLD — render-only float delegates over the frozen integer AI world:
+//   * AgentToRenderInstances is a DELEGATE, not new math: each agent -> a marker cube via the FROZEN
+//     verdict::AppendMarkerCube (verdict.h), tinted by its AgentState; the player a distinct marker. The
+//     corridor/overlay come from the frozen nav delegates (nav::PathToWorldPolyline / PolyMeshToRenderMesh)
+//     wired in the showcase. The integer AI world is NOT mutated by the render (a pure read — two calls
+//     byte-equal; AiStatesEqual(before, after) holds).
+//   * The bit-exact part = the AI world (integer, AI1-AI5); the marker transforms + the final raster are
+//     FLOAT (render-only, OUTSIDE the bit-exact loop). So the golden is the FLOAT bar: a per-backend
+//     Metal-baked golden, Metal==Metal DIFF 0.0000 (deterministic two-run) + provenance + a DOCUMENTED
+//     in-band cross-vendor mean (the VD6/NAV6/IK6 convention).
+//   * NO new shader, NO new RHI: the marker soup feeds the EXISTING instanced-lit pipeline VERBATIM (the
+//     VD6 verdict::VerdictToRenderInstances render path). All sim/nav headers + ALL shaders BYTE-UNCHANGED.
+
+// The frozen render-soup namespace (under hf::sim::gjk, pulled in transitively via verdict.h/gjk.h) —
+// alias it locally so the AI6 marker bridges read like the VD6/GJ6 render path they reuse.
+namespace gjk = hf::sim::gjk;
+
+// ----- AgentStateColor(state, out[3]): the BT-state -> marker tint (CHASE warm / PATROL cool) -----------
+// A pure render-only float helper (OUTSIDE the bit-exact loop) mapping an AgentState to a matte marker
+// color: kAgentChase -> a warm red-orange (the alerted/hunting NPC), kAgentPatrol -> a cool teal (the
+// idle/patrolling NPC), anything else -> a neutral grey. Deterministic (same state -> byte-equal color),
+// so AgentToRenderInstances is a pure function of its inputs. The state->color mapping is REAL (CHASE and
+// PATROL tints differ), so a flipped BT decision visibly recolors the agent — the perception->decision
+// beat reads off the rendered scene.
+inline void AgentStateColor(int state, float out[3]) {
+    if (state == kAgentChase) {
+        out[0] = 0.90f; out[1] = 0.28f; out[2] = 0.16f;   // warm red-orange (CHASE — alerted)
+    } else if (state == kAgentPatrol) {
+        out[0] = 0.16f; out[1] = 0.62f; out[2] = 0.58f;   // cool teal (PATROL — idle)
+    } else {
+        out[0] = 0.45f; out[1] = 0.48f; out[2] = 0.52f;   // neutral grey (unknown state)
+    }
+}
+
+// ----- The AI6 marker geometry constants (render-only float) --------------------------------------------
+inline constexpr float kAgentMarkerHalf  = 0.30f;   // an agent marker cube half-extent (world units)
+inline constexpr float kPlayerMarkerHalf = 0.40f;   // the player marker is a bit larger (distinct)
+inline constexpr float kAiMarkerY        = 0.45f;   // lift the markers above the ground/navmesh sheet
+// The player marker tint: a bright gold so it reads distinct from the agents (CHASE warm / PATROL cool).
+inline constexpr float kPlayerColor[3]   = {0.92f, 0.78f, 0.18f};
+
+// ----- AiAgentWorld(p, out[3]): the agent/player Q16.16 world pos -> a float world-space point ----------
+// The ONE host float crossing for the markers (render-only): the agent lives in Q16.16 world units (the
+// navmesh's world space, voxel/navScale), so the float world coord is pos>>kFrac (the VerdictToRender-
+// Instances Transform2D.pos>>kFrac convention). y is lifted to kAiMarkerY so the marker sits above the
+// lit ground + translucent navmesh sheet. Pure float; the integer pos is read-only.
+inline void AiAgentWorld(const fpx::FxVec3& p, float out[3]) {
+    out[0] = (float)(p.x >> fpx::kFrac);
+    out[1] = kAiMarkerY;
+    out[2] = (float)(p.z >> fpx::kFrac);
+}
+
+// ----- AgentToRenderInstances(agents, playerPos): the spec-named entry — the AI marker render payload -----
+// The render of the bit-exact deterministic NPC world: a marker cube per agent (in FIXED array index order —
+// the pinned identity, so the soup appends deterministically) tinted by its AgentState (CHASE warm / PATROL
+// cool via AgentStateColor) at its pos>>kFrac, PLUS a distinct player marker (a larger gold cube) at the
+// player's pos>>kFrac. Each cube is emitted via the FROZEN verdict::AppendMarkerCube into the gjk::Hull-
+// RenderMesh soup — the SAME HullRenderVertex layout the VD6/GJ6 lit pipeline draws, so the markers render
+// VERBATIM through the EXISTING instanced-lit pass. A PURE FUNCTION of `agents` + `playerPos` (two calls
+// byte-equal — gjk::HullRenderMeshEqual; render-only float, OUTSIDE the bit-exact loop). The integer AI
+// world is UNTOUCHED (a pure read — AiStatesEqual(before, after) holds). NO new shader, NO new RHI.
+inline gjk::HullRenderMesh AgentToRenderInstances(const std::vector<AiAgent>& agents,
+                                                  const fpx::FxVec3& playerPos) {
+    gjk::HullRenderMesh out;
+    // (1) the agent markers, IN array index order (the pinned deterministic order -> a pure function).
+    for (size_t i = 0; i < agents.size(); ++i) {
+        const AiAgent& a = agents[i];
+        float w[3]; AiAgentWorld(a.pos, w);
+        float color[3]; AgentStateColor(a.state, color);
+        verdict::AppendMarkerCube(out, w[0], w[1], w[2], kAgentMarkerHalf, color);
+    }
+    // (2) the player marker — a distinct larger gold cube (the perception TARGET the agents react to).
+    {
+        float w[3]; AiAgentWorld(playerPos, w);
+        float color[3] = {kPlayerColor[0], kPlayerColor[1], kPlayerColor[2]};
+        verdict::AppendMarkerCube(out, w[0], w[1], w[2], kPlayerMarkerHalf, color);
+    }
+    out.triangles = (uint32_t)(out.verts.size() / 3);
+    return out;
+}
+
+// ----- AgentToRenderInstances(state): the AiSimState overload (the AI5 converged-world convenience) -------
+// The same marker soup from a whole AiSimState (its agents + player). Lets the showcase render the
+// RunAiLockstep converged world directly. Pure function; the state is read-only.
+inline gjk::HullRenderMesh AgentToRenderInstances(const AiSimState& state) {
+    return AgentToRenderInstances(state.agents, state.playerPos);
+}
+
 }  // namespace ai
 }  // namespace hf

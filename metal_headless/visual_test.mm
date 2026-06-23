@@ -51356,6 +51356,432 @@ static int RunNavRenderShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic AI LIT 3D NPC RENDER CAPSTONE showcase (--ai6-render, Slice AI6, the money-shot
+// COMPLETING FLAGSHIP #28 — the public AI sample). Mirrors the Vulkan --ai6-render-shot path EXACTLY:
+// build the canonical AI4 scene (navmesh + agents + player + blockers), run ai::RunAiLockstep over the
+// SAME deterministic player-move stream to the CONVERGED AI world (bit-exact integer decisions +
+// corridors + positions — identical to the Vulkan side by construction), then render that NPC world as a
+// LIT 3D scene: the agents as oriented marker cubes tinted by their BT state (CHASE warm / PATROL cool via
+// ai::AgentToRenderInstances -> the FROZEN verdict::AppendMarkerCube) + the player a distinct gold marker
+// (the EXISTING instanced-lit pipeline), the A* navigation corridor as a bright debug line
+// (nav::PathToWorldPolyline -> the EXISTING debug-line pass), the navmesh as a translucent per-region
+// overlay (nav::PolyMeshToRenderMesh -> the EXISTING transparent pass), over a lit ground + sky + static-
+// shadow + post, from the SAME fixed 3/4 camera + directional light. FLOAT visresolve-bar: the controller
+// bakes the golden on the Mac; the gate is Metal-render==Metal-golden DIFF 0.0000 + provenance, with the
+// Vulkan-vs-Metal cross-vendor delta the documented float baseline. REUSES lit/transparent/debug-line/sky/
+// post — NO new shader, NO new RHI. The 4 proof lines match the Vulkan side EXACTLY.
+static int RunAi6RenderShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace ai  = hf::ai;
+    namespace nav = hf::nav;
+    namespace gjk = hf::sim::gjk;
+    namespace fpx = hf::sim::fpx;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === Build the canonical AI4 scene + run the AI5 lockstep to the converged world (PURE CPU integer —
+    // the SAME the Vulkan --ai6-render-shot + the ai_render_test build; bit-exact cross-backend). ===
+    const ai::Ai4Scene aiScene = ai::BuildAi4Scene();
+    const ai::AiSimState aiInit = ai::BuildAi5InitialState(aiScene);
+    const int kAiTicks = 16;
+    auto Move = [](int tick, int dx, int dz) {
+        return ai::AiCommand{tick, fpx::FxVec3{(fpx::fx)(dx << fpx::kFrac), 0, (fpx::fx)(dz << fpx::kFrac)}};
+    };
+    const std::vector<ai::AiCommand> aiStream = {
+        Move(2, -1, 0), Move(4, -1, 0), Move(6, 0, -1), Move(8, -1, 0), Move(10, 0, -1),
+    };
+    bool aiIdent = false;
+    const ai::AiSimState aiWorld =
+        ai::RunAiLockstep(aiInit, aiScene.nav, aiScene.trees, aiScene.blockers.data(),
+                          (int)aiScene.blockers.size(), aiStream, kAiTicks, &aiIdent);
+    if (!aiIdent) return fail("ai-render lockstep did not converge (nondeterministic)");
+    const uint32_t kAgents    = (uint32_t)aiWorld.agents.size();
+    const uint32_t kPolyCount = (uint32_t)aiScene.nav.polys.size();
+
+    // === The ONE host float crossing (render-only). Same voxel->world scale + framing as the Vulkan path. ===
+    const int32_t kScale = aiScene.nav.navScale;
+    const float kWorldSpan = (float)32 / (float)kScale;   // 8.0
+    const float kHalfSpan = 0.5f * kWorldSpan;
+    const float kSheetY = 0.06f;
+    const float kLineY  = 0.25f;
+
+    // The agent + player markers (the FROZEN ai::AgentToRenderInstances soup).
+    const gjk::HullRenderMesh markerSoup = ai::AgentToRenderInstances(aiWorld);
+    const uint32_t kMarkerTris = markerSoup.triangles;
+    std::vector<scene::Vertex> markerVerts;
+    markerVerts.reserve(markerSoup.verts.size());
+    for (const gjk::HullRenderVertex& hv : markerSoup.verts) {
+        scene::Vertex v{};
+        v.pos[0] = hv.pos[0] - kHalfSpan; v.pos[1] = hv.pos[1]; v.pos[2] = hv.pos[2] - kHalfSpan;
+        v.color[0] = hv.color[0]; v.color[1] = hv.color[1]; v.color[2] = hv.color[2];
+        v.uv[0] = 0.0f; v.uv[1] = 0.0f;
+        v.normal[0] = hv.normal[0]; v.normal[1] = hv.normal[1]; v.normal[2] = hv.normal[2];
+        v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+        markerVerts.push_back(v);
+    }
+    std::vector<uint32_t> markerIdx(markerVerts.size());
+    for (uint32_t k = 0; k < (uint32_t)markerVerts.size(); ++k) markerIdx[k] = k;
+    const uint32_t kMarkerIndexCount = (uint32_t)markerIdx.size();
+
+    // The navmesh translucent overlay.
+    std::vector<nav::NavWorldVertex> navVerts;
+    nav::PolyMeshToRenderMesh(aiScene.nav.polys, aiScene.nav.flatVerts, aiScene.nav.polyVertBase,
+                              kScale, kSheetY, navVerts);
+    std::vector<scene::Vertex> overlayVerts(navVerts.size());
+    for (size_t k = 0; k < navVerts.size(); ++k) {
+        scene::Vertex& v = overlayVerts[k];
+        v.pos[0] = navVerts[k].px - kHalfSpan;
+        v.pos[1] = navVerts[k].py;
+        v.pos[2] = navVerts[k].pz - kHalfSpan;
+        v.color[0] = navVerts[k].r; v.color[1] = navVerts[k].g; v.color[2] = navVerts[k].b;
+        v.uv[0] = 0.5f; v.uv[1] = 0.5f;
+        v.normal[0] = 0.0f; v.normal[1] = 1.0f; v.normal[2] = 0.0f;
+        v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+    }
+    const uint32_t kOverlayVertCount = (uint32_t)overlayVerts.size();
+    struct OverlayRange { uint32_t first; uint32_t count; float r, g, b; };
+    std::vector<OverlayRange> overlayRanges;
+    for (uint32_t pi = 0; pi < kPolyCount; ) {
+        const uint32_t R = aiScene.nav.polys[pi].region;
+        const uint32_t firstVert = pi * 3u;
+        uint32_t pj = pi;
+        while (pj < kPolyCount && aiScene.nav.polys[pj].region == R) ++pj;
+        float rr, gg, bb; nav::NavRegionColor(R, rr, gg, bb);
+        overlayRanges.push_back(OverlayRange{firstVert, (pj - pi) * 3u, rr, gg, bb});
+        pi = pj;
+    }
+
+    // The A* corridors: the bit-exact start->goal navigation route (the deterministic NPC route over the
+    // SAME navmesh the agents path on) + each converged agent's own corridor when it has one.
+    std::vector<std::vector<uint32_t>> corridors;
+    {
+        uint32_t startPoly = 0u, goalPoly = 0u;
+        nav::SelectStartGoal(aiScene.nav.polys, aiScene.nav.cx, aiScene.nav.cz, startPoly, goalPoly);
+        std::vector<uint32_t> route;
+        nav::FindPath(aiScene.nav.polys, aiScene.nav.cx, aiScene.nav.cz, startPoly, goalPoly, route);
+        if (route.size() >= 2) corridors.push_back(route);
+    }
+    for (uint32_t ai_i = 0; ai_i < kAgents; ++ai_i) {
+        const ai::AiAgent& a = aiWorld.agents[ai_i];
+        if (a.corridor.size() >= 2) corridors.push_back(a.corridor);
+    }
+    const uint32_t kCorridorCount = (uint32_t)corridors.size();
+
+    debug::DebugDraw dd;
+    auto worldPt = [&](const nav::NavWorldPoint& p) {
+        return Vec3{p.x - kHalfSpan, p.y, p.z - kHalfSpan};
+    };
+    const Vec3 kCorridorCol{1.00f, 0.85f, 0.00f};   // pure yellow
+    const int   kRibbon = 4;
+    const float kRibStep = 0.05f;
+    for (const auto& corr : corridors) {
+        std::vector<nav::NavWorldPoint> pts;
+        nav::PathToWorldPolyline(corr, aiScene.nav.cx, aiScene.nav.cz, kScale, kLineY, pts);
+        for (size_t k = 0; k + 1 < pts.size(); ++k) {
+            const Vec3 pa = worldPt(pts[k]);
+            const Vec3 pb = worldPt(pts[k + 1]);
+            for (int o = -kRibbon; o <= kRibbon; ++o) {
+                const float dx = (float)o * kRibStep;
+                const float dz = (float)o * kRibStep;
+                dd.Line({pa.x + dx, pa.y, pa.z}, {pb.x + dx, pb.y, pb.z}, kCorridorCol);
+                dd.Line({pa.x, pa.y, pa.z + dz}, {pb.x, pb.y, pb.z + dz}, kCorridorCol);
+            }
+        }
+    }
+    const uint32_t kLineVertCount = (uint32_t)dd.VertexCount();
+
+    // === Reuse the EXISTING lit (ground + markers) + transparent (overlay) + debug-line (corridors) + sky
+    // + static-shadow + post pipelines (the SAME gen-MSL the other showcases load) — NO new shader/RHI. ===
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto tVs = loadMSL("transparent.vert.gen.metal", "transparent_vertex");
+    auto tFs = loadMSL("transparent.frag.gen.metal", "transparent_fragment");
+    rhi::GraphicsPipelineDesc overlayDesc;
+    overlayDesc.vertex = tVs.get(); overlayDesc.fragment = tFs.get();
+    overlayDesc.vertexLayout = scene::MeshVertexLayout();
+    overlayDesc.colorFormat = device->Swapchain().ColorFormat();
+    overlayDesc.depthTest = true; overlayDesc.depthWrite = false;
+    overlayDesc.alphaBlend = true; overlayDesc.cullNone = true;
+    overlayDesc.usesFrameUniforms = true; overlayDesc.usesTexture = false;
+    overlayDesc.pushConstantSize = sizeof(float) * 20;
+    auto overlayPipeline = device->CreateGraphicsPipeline(overlayDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto dbgVs = loadMSL("debug_line.vert.gen.metal", "debug_line_vertex");
+    auto dbgFs = loadMSL("debug_line.frag.gen.metal", "debug_line_fragment");
+    rhi::GraphicsPipelineDesc dbgD;
+    dbgD.vertex = dbgVs.get(); dbgD.fragment = dbgFs.get();
+    dbgD.vertexLayout.stride = sizeof(debug::LineVertex);
+    dbgD.vertexLayout.attributes = {
+        {0, rhi::Format::RGB32_Float, 0},
+        {1, rhi::Format::RGB32_Float, 12},
+    };
+    dbgD.colorFormat = device->Swapchain().ColorFormat();
+    dbgD.lineList = true; dbgD.depthTest = false; dbgD.depthWrite = false;
+    dbgD.usesFrameUniforms = true;
+    auto debugPipeline = device->CreateGraphicsPipeline(dbgD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    auto whiteTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+
+    std::unique_ptr<rhi::IBuffer> markerVb, markerIb;
+    if (kMarkerIndexCount > 0) {
+        rhi::BufferDesc mvb; mvb.size = (uint64_t)markerVerts.size() * sizeof(scene::Vertex);
+        mvb.initialData = markerVerts.data(); mvb.usage = rhi::BufferUsage::Vertex;
+        markerVb = device->CreateBuffer(mvb);
+        rhi::BufferDesc mib; mib.size = (uint64_t)markerIdx.size() * sizeof(uint32_t);
+        mib.initialData = markerIdx.data(); mib.usage = rhi::BufferUsage::Index;
+        markerIb = device->CreateBuffer(mib);
+    }
+    std::unique_ptr<rhi::IBuffer> overlayBuffer;
+    if (kOverlayVertCount > 0) {
+        rhi::BufferDesc ovb;
+        ovb.size = (uint64_t)overlayVerts.size() * sizeof(scene::Vertex);
+        ovb.initialData = overlayVerts.data();
+        ovb.usage = rhi::BufferUsage::Vertex;
+        overlayBuffer = device->CreateBuffer(ovb);
+    }
+    std::unique_ptr<rhi::IBuffer> lineBuffer;
+    if (kLineVertCount > 0) {
+        rhi::BufferDesc lbd;
+        lbd.size = (uint64_t)dd.Vertices().size() * sizeof(debug::LineVertex);
+        lbd.initialData = dd.Vertices().data();
+        lbd.usage = rhi::BufferUsage::Vertex;
+        lineBuffer = device->CreateBuffer(lbd);
+    }
+
+    Mat4 groundModel = Mat4::Scale({kWorldSpan, 1.0f, kWorldSpan});
+
+    const Vec3 eye{6.5f, 6.0f, 6.5f};
+    const Vec3 center{0.0f, 0.0f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 0.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 14.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-7.0f, 7.0f, -7.0f, 7.0f, 1.0f, 32.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    auto renderOnce = [&](std::vector<uint8_t>& outBGRA, uint32_t& outW, uint32_t& outH) -> bool {
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+                if (kMarkerIndexCount > 0) {
+                    Mat4 id = Mat4::Identity();
+                    cmd.PushConstants(id.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(*markerVb);
+                    cmd.BindIndexBuffer(*markerIb);
+                    cmd.DrawIndexed(kMarkerIndexCount);
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                cmd.BindPipeline(*skyPipe);
+                cmd.Draw(3);
+                cmd.BindPipeline(*litPipeline);
+                {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                    pc[16] = 0.0f; pc[17] = 0.9f; pc[18] = 0.0f; pc[19] = 1.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                if (kMarkerIndexCount > 0) {
+                    Mat4 id = Mat4::Identity();
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = id.m[k];
+                    pc[16] = 0.0f; pc[17] = 1.0f; pc[18] = 0.0f; pc[19] = 1.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*whiteTex, *flatNormal);
+                    cmd.BindVertexBuffer(*markerVb);
+                    cmd.BindIndexBuffer(*markerIb);
+                    cmd.DrawIndexed(kMarkerIndexCount);
+                }
+                if (kOverlayVertCount > 0) {
+                    cmd.BindPipeline(*overlayPipeline);
+                    cmd.BindVertexBuffer(*overlayBuffer);
+                    Mat4 id = Mat4::Identity();
+                    for (const auto& rg : overlayRanges) {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = id.m[k];
+                        pc[16] = rg.r; pc[17] = rg.g; pc[18] = rg.b; pc[19] = 0.4f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.Draw(rg.count, rg.first);
+                    }
+                }
+                if (kLineVertCount > 0) {
+                    cmd.BindPipeline(*debugPipeline);
+                    cmd.BindVertexBuffer(*lineBuffer);
+                    cmd.Draw(kLineVertCount);
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*rt);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        return device->GetCapturedPixels(outBGRA, outW, outH);
+    };
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!renderOnce(bgra, cw, ch)) return fail("ai-render no captured pixels");
+
+    auto countShaded = [](const std::vector<uint8_t>& img) -> uint32_t {
+        uint32_t n = 0;
+        for (size_t p = 0; p + 3 < img.size(); p += 4) {
+            const int b = img[p + 0], g = img[p + 1], r = img[p + 2];
+            if (b + g + r > 60) ++n;
+        }
+        return n;
+    };
+    const uint32_t shaded = countShaded(bgra);
+
+    // PROOF (1) provenance/stats.
+    std::printf("ai-render: {agents:%u, corridors:%u, polys:%u, shaded:%u} (integer AI scene -> lit 3D render)\n",
+                kAgents, kCorridorCount, kPolyCount, shaded);
+
+    // PROOF (2) provenance: agents+paths derive from the bit-exact AI5 world; two ToRender calls byte-equal.
+    {
+        const gjk::HullRenderMesh a = ai::AgentToRenderInstances(aiWorld);
+        const gjk::HullRenderMesh b = ai::AgentToRenderInstances(aiWorld);
+        if (!gjk::HullRenderMeshEqual(a, b))
+            return fail("ai-render AgentToRenderInstances NOT a pure function (two calls differ)");
+        std::printf("ai-render provenance: agents+paths derive from the bit-exact AI5 world "
+                    "(integer decisions; two ToRender calls byte-equal)\n");
+    }
+
+    // PROOF (3) determinism: a second render is BYTE-IDENTICAL.
+    {
+        std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+        if (!renderOnce(bgra2, cw2, ch2) || bgra2.size() != bgra.size() ||
+            std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+            return fail("ai-render two renders DIFFER (nondeterministic)");
+        std::printf("ai-render determinism: two renders BYTE-IDENTICAL\n");
+    }
+
+    if (shaded == 0) return fail("ai-render coverage 0 (nothing shaded)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("ai-render uniform image (no coherent scene)");
+
+    // PROOF (4) empty no-op: zero agents -> the player marker only; an empty navmesh -> no overlay/corridor.
+    {
+        std::vector<ai::AiAgent> noAgents;
+        const gjk::HullRenderMesh emptySoup = ai::AgentToRenderInstances(noAgents, fpx::FxVec3{0, 0, 0});
+        std::vector<nav::Poly> noPolys; std::vector<int32_t> noFlat; std::vector<uint32_t> noBase;
+        std::vector<nav::NavWorldVertex> noVerts;
+        nav::PolyMeshToRenderMesh(noPolys, noFlat, noBase, kScale, kSheetY, noVerts);
+        std::vector<uint32_t> noCorridor; std::vector<int32_t> noCx, noCz;
+        std::vector<nav::NavWorldPoint> noPts;
+        nav::PathToWorldPolyline(noCorridor, noCx, noCz, kScale, kLineY, noPts);
+        if (emptySoup.verts.size() != 36u || !noVerts.empty() || !noPts.empty())
+            return fail("ai-render empty no-op produced unexpected geometry");
+    }
+    std::printf("ai-render empty: lit ground only (no-op when zero agents)\n");
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — integer AI scene lit 3D render (%u agents, %u corridors, %u polys, %u marker tris)\n",
+                outPath, cw, ch, kAgents, kCorridorCount, kPolyCount, kMarkerTris);
+    return 0;
+}
+
 // --- GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT showcase (Slice MC2, the 2nd slice
 // of FLAGSHIP #5). The TRUE pass is identical on both backends: the SAME MC1 sphere VoxelField (33³
 // corners -> 32³ cells, radius 12, iso 0) feeds the SAME shaders/mc_count.comp (here
@@ -63895,6 +64321,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ai5-lockstep") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ai5_lockstep.png";
             try { return RunAi5LockstepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ai6-render <out.png>: render the Deterministic AI LIT 3D NPC RENDER CAPSTONE showcase (Slice AI6,
+        // the money-shot COMPLETING FLAGSHIP #28 — the public AI sample). Builds the IDENTICAL ai.h canonical
+        // AI4 scene + player-move stream, runs ai::RunAiLockstep to the converged world (bit-exact integer
+        // decisions/corridors/positions, cross-backend by construction), and renders it LIT 3D — agent markers
+        // (instanced-lit, CHASE warm / PATROL cool via ai::AgentToRenderInstances) + corridors (debug-line) +
+        // navmesh overlay (transparent) + the player marker over a lit ground — the SAME pipelines/camera the
+        // Vulkan --ai6-render-shot uses; the 4 proof lines match the Vulkan side EXACTLY. FLOAT visresolve-bar
+        // (the controller bakes ai_render.png on the Mac). NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--ai6-render") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ai_render.png";
+            try { return RunAi6RenderShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vd2-tick <out.png>: render the Deterministic Gameplay / Netcode SYSTEM SCHEDULE + GAMEPLAY TICK
