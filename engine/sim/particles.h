@@ -578,5 +578,56 @@ inline void StepEmitIntegrateCollide(ParticlePool& pool, const EmitterConfig& cf
     ++pool.tick;                                                 // (5) advance the tick
 }
 
+// ===== Slice PT4 — The composed StepParticles tick (Issue #19, flagship #19, 4th slice) =================
+// APPEND-ONLY: everything above (PT1 + PT2 + PT3) is BYTE-FROZEN. PT4 composes the PT1 emitter + PT2 force
+// fields + PT3 collision into ONE deterministic tick: emit -> forces+integrate -> collide -> recycle -> ++tick.
+// A full VFX effect (a fountain with wind/vortex + ground/sphere collision) in one call. PT4 adds NO new
+// physics math — it ONLY ORDERS the EXISTING PTn functions, each called VERBATIM: Emit (PT1) ->
+// IntegrateParticlesWithForces (PT2, the force accumulate + integrate) -> CollideParticleWorld (PT3, plane +
+// spheres + bounce) -> RecycleDead (PT1, ascending-slot free-list maintenance) -> ++tick. Per-particle
+// independent (the PT2 force-integrate + the PT3 collide both read the SAME read-only field/collider lists and
+// write only their OWN slot) -> race-free, NO atomics, NO grid, NO TDR. v1 is a PURE EMITTER — NO particle-
+// particle interaction (justified: Niagara's default modules are emitter + global fields + world collision;
+// per-particle-independent = stronger determinism). Pure Q16.16/integer (NO float/rand/clock).
+//
+// THE GPU SPLIT (the established PT1/PT2/PT3 convention): the per-particle PT2 force-integrate + PT3 collide is
+// the GPU dispatch (shaders/particles_step.comp — the particles_forces.comp accumulate+integrate body THEN the
+// particles_collide.comp plane+spheres body, in ONE pass, avoiding a double-integrate); it is int64 ->
+// VULKAN-SPIR-V-ONLY (glslc can't parse int64 in HLSL), NOT in the Metal hf_gen_msl list. The host runs Emit +
+// RecycleDead between dispatches (the deterministic single-thread free-list passes). This StepParticles is the
+// bit-exact CPU reference the GPU memcmp's against. Because it is EXACTLY the four PTn sub-stages in order, the
+// composition == applying Emit -> IntegrateParticlesWithForces -> CollideParticleWorld -> RecycleDead by hand
+// (the PT4 composition proof — nothing new in the math).
+
+// ----- StepParticles: one deterministic PT4 world tick, composing PT1-PT3 -------------------------------
+//   (1) Emit(pool, cfg)                                                  — PT1 host single-thread (free-list LIFO)
+//   (2) IntegrateParticlesWithForces(pool, fields, count, g, dragK, dt)  — PT2 (force accumulate + integrate)
+//   (3) CollideParticleWorld(pool, groundY, radius, e, spheres, sc)      — PT3 (plane + spheres + bounce)
+//   (4) RecycleDead(pool)                                                — PT1 (ascending-slot free-list maint.)
+//   (5) ++pool.tick
+// Every sub-stage is the EXISTING PTn function called VERBATIM (PT4 only orders them). Returns the contact
+// count from step (3) (a coverage stat). count==0 reduces (2) to PT1's gravity-only integrate; sphereCount==0
+// + a clear pool reduces (3) to a no-op -> a particle clear of all colliders with no fields == PT1 free-fall.
+inline int StepParticles(ParticlePool& pool, const EmitterConfig& cfg, const ForceField* fields, uint32_t count,
+                         const FxVec3& gravity, fx dragK, fx dt, fx groundY, fx radius, fx e,
+                         const ParticleSphereCollider* spheres, uint32_t sphereCount) {
+    Emit(pool, cfg);                                                     // (1) spawn (single-thread host-ordered)
+    IntegrateParticlesWithForces(pool, fields, count, gravity, dragK, dt);  // (2) accumulate + force-integrate
+    const int contacts = CollideParticleWorld(pool, groundY, radius, e, spheres, sphereCount);  // (3) collide
+    RecycleDead(pool);                                                  // (4) recycle dead slots (ascending)
+    ++pool.tick;                                                        // (5) advance the tick
+    return contacts;
+}
+
+// ----- StepParticlesN: run `steps` StepParticles ticks (a convenience driver) ---------------------------
+// Runs StepParticles `steps` times over the SAME pool (the per-tick contact count is discarded — the caller
+// can re-run StepParticles for the final-tick stat). Pure composition; identical determinism guarantees.
+inline void StepParticlesN(ParticlePool& pool, const EmitterConfig& cfg, const ForceField* fields,
+                           uint32_t count, const FxVec3& gravity, fx dragK, fx dt, fx groundY, fx radius, fx e,
+                           const ParticleSphereCollider* spheres, uint32_t sphereCount, int steps) {
+    for (int s = 0; s < steps; ++s)
+        StepParticles(pool, cfg, fields, count, gravity, dragK, dt, groundY, radius, e, spheres, sphereCount);
+}
+
 }  // namespace particles
 }  // namespace hf::sim

@@ -819,6 +819,23 @@ hf_compile_shaders(
     # identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU particle array +
     # cross-backend, proven memcmp. NO new RHI; PT1/PT2 shaders + goldens untouched.
     "shaders/particles_collide.comp.hlsl:cs"
+    # Deterministic GPU Particles Slice 4 (Slice PT4, the 4th slice of FLAGSHIP #19: the composed StepParticles
+    # tick): particles_step.comp runs the Q16.16 per-particle FORCE-ACCUMULATE + force-INTEGRATE + COLLIDE in
+    # ONE pass — ONE thread per particle slot accumulates the force over the FIXED field list (point/vortex/wind)
+    # in ASCENDING index order (the particles_forces.comp body), integrates with that force ADDED to gravity,
+    # THEN collides its OWN particle with a ground PLANE + a FIXED-ORDER static SPHERE list (the
+    # particles_collide.comp body) — the AccumulateForce + IntegrateParticleWithForce + CollideParticlePlane +
+    # CollideParticleSphere copied VERBATIM from engine/sim/particles.h (each particle reads the SAME read-only
+    # field + collider inputs + writes only its OWN slot -> race-free, NO atomics). It composes BOTH PT2 + PT3 in
+    # one pass (NO double-integrate) — the GPU half of particles.h::StepParticles (Emit -> IntegrateParticles-
+    # WithForces -> CollideParticleWorld -> RecycleDead). Because the falloff fxdiv + FxLength (FxISqrt) +
+    # FxNormalize (fxdiv) + FxDot/FxCross + the gravity*dt + (1+e)*vn fxmul are int64 (the same form as
+    # particles_forces.comp / particles_collide.comp), this shader is VULKAN-SPIR-V-ONLY (DXC compiles int64;
+    # glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal --pt4-step showcase runs the CPU
+    # particles::StepParticles (byte-identical by construction). Pure integer SSBO compute (4 SSBOs) + ReadBuffer
+    # -> bit-exact GPU==CPU particle array + cross-backend, proven memcmp. NO new RHI; PT1/PT2/PT3 shaders +
+    # goldens untouched.
+    "shaders/particles_step.comp.hlsl:cs"
     # Deterministic GPU Granular/Sand Slice 2 (Slice GR2, the 2nd slice of FLAGSHIP #10): the GRID-HASH
     # NEIGHBOR SEARCH meshed by SIX pure-INT32 count->scan->emit passes (the FL2 fluid_cell/fluid_neighbor
     # twin, applied to grains). The CELL TABLE: grain_cell_count.comp (ONE thread per grain: InterlockedAdd

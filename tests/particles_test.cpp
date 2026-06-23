@@ -490,6 +490,101 @@ int main() {
         }
     }
 
+    // ================= Slice PT4: StepParticles — composition, steady-state churn, determinism ============
+    {
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const fx dt = kOne / 60, drag = kOne / 50;
+        const pt::FxVec3 grav{0, kGravY, 0};
+        const fx groundY = -kOne * 2;
+        const fx radius = pt::kParticleRadius;       // 0.25
+        const fx e = pt::kParticleRestitution;       // 0.5
+
+        // The full PT4 scene (== the showcase): a fountain + a vortex field + a plane + two spheres.
+        const uint32_t cap = 240;
+        const int K = 240;
+        pt::EmitterConfig cfg;
+        cfg.origin = pt::FxVec3{0, kOne * 3, 0}; cfg.ratePerTick = (fx)2; cfg.lifetime = kOne * 3;
+        cfg.speed = kOne * 2; cfg.emitterId = 1u;
+
+        std::vector<pt::ForceField> fields(1);
+        fields[0].kind = pt::kFieldVortex;
+        fields[0].center = pt::FxVec3{0, kOne, 0};
+        fields[0].axis = pt::FxVec3{0, kOne, 0};
+        fields[0].strength = kOne * 5;
+        fields[0].radius = kOne * 5;
+        const uint32_t fc = (uint32_t)fields.size();
+
+        std::vector<pt::ParticleSphereCollider> spheres(2);
+        spheres[0].center = pt::FxVec3{-kOne, 0, 0}; spheres[0].radius = kOne;
+        spheres[1].center = pt::FxVec3{kOne * 5 / 4, -kOne / 2, 0}; spheres[1].radius = kOne * 3 / 4;
+        const uint32_t sc = (uint32_t)spheres.size();
+
+        auto runScene = [&](uint32_t& diedOut) {
+            pt::ParticlePool pool = pt::InitParticlePool(cap);
+            uint32_t died = 0;
+            for (int s = 0; s < K; ++s) {
+                pt::Emit(pool, cfg);
+                const uint32_t a = pt::CountAlive(pool);
+                pt::IntegrateParticlesWithForces(pool, fields.data(), fc, grav, drag, dt);
+                pt::CollideParticleWorld(pool, groundY, radius, e, spheres.data(), sc);
+                died += a - pt::CountAlive(pool);
+                pt::RecycleDead(pool);
+                ++pool.tick;
+            }
+            diedOut = died;
+            return pool;
+        };
+
+        // --- composition: ONE StepParticles tick == applying the four PTn stages by hand (after a warm-up) ---
+        {
+            pt::ParticlePool warm = pt::InitParticlePool(cap);
+            for (int s = 0; s < K / 2; ++s)
+                pt::StepParticles(warm, cfg, fields.data(), fc, grav, drag, dt, groundY, radius, e,
+                                  spheres.data(), sc);
+            pt::ParticlePool composed = warm;   // copy
+            pt::ParticlePool byHand = warm;     // copy
+            const int contacts = pt::StepParticles(composed, cfg, fields.data(), fc, grav, drag, dt, groundY,
+                                                   radius, e, spheres.data(), sc);
+            pt::Emit(byHand, cfg);
+            pt::IntegrateParticlesWithForces(byHand, fields.data(), fc, grav, drag, dt);
+            const int handContacts = pt::CollideParticleWorld(byHand, groundY, radius, e, spheres.data(), sc);
+            pt::RecycleDead(byHand);
+            ++byHand.tick;
+            check(contacts == handContacts, "PT4 StepParticles: returned contact count == CollideParticleWorld");
+            check(composed.particles.size() == byHand.particles.size() &&
+                  std::memcmp(composed.particles.data(), byHand.particles.data(),
+                              (size_t)cap * sizeof(pt::FxParticle)) == 0 &&
+                  composed.freeList == byHand.freeList && composed.spawnCursor == byHand.spawnCursor &&
+                  composed.tick == byHand.tick,
+                  "PT4 StepParticles == Emit->IntegrateParticlesWithForces->CollideParticleWorld->RecycleDead");
+        }
+
+        // --- steady-state churn: died>0 AND the free-list invariant (freeList.size()==capacity-alive) ---
+        {
+            uint32_t died = 0;
+            pt::ParticlePool pool = runScene(died);
+            const uint32_t alive = pt::CountAlive(pool);
+            check(died > 0, "PT4 steady-state: died>0 (emit/death churn over K ticks)");
+            check(alive > 0 && alive <= cap, "PT4 steady-state: alive within the band [1, capacity]");
+            check(pool.freeList.size() == (size_t)cap - (size_t)alive,
+                  "PT4 free-list invariant: freeList.size() == capacity - alive");
+        }
+
+        // --- determinism: two StepParticlesN runs byte-identical ---
+        {
+            pt::ParticlePool a = pt::InitParticlePool(cap);
+            pt::StepParticlesN(a, cfg, fields.data(), fc, grav, drag, dt, groundY, radius, e,
+                               spheres.data(), sc, K);
+            pt::ParticlePool b = pt::InitParticlePool(cap);
+            pt::StepParticlesN(b, cfg, fields.data(), fc, grav, drag, dt, groundY, radius, e,
+                               spheres.data(), sc, K);
+            check(a.particles.size() == b.particles.size() &&
+                  std::memcmp(a.particles.data(), b.particles.data(),
+                              (size_t)cap * sizeof(pt::FxParticle)) == 0,
+                  "PT4 StepParticlesN: two runs byte-identical (deterministic)");
+        }
+    }
+
     if (g_fail == 0) std::printf("particles_test: ALL CHECKS PASSED\n");
     else std::printf("particles_test: %d CHECK(S) FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

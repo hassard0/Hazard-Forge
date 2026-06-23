@@ -22769,6 +22769,207 @@ static int RunPt3CollideShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PT4 — The composed StepParticles tick showcase (--pt4-step) (the 4th slice of FLAGSHIP #19).
+// PT4 composes PT1 + PT2 + PT3 into ONE deterministic tick (particles.h::StepParticles = Emit ->
+// IntegrateParticlesWithForces -> CollideParticleWorld -> RecycleDead -> ++tick, each sub-stage the EXISTING
+// PTn function called VERBATIM). The force-integrate + collide is int64 (FxLength/FxNormalize/FxDot + the
+// gravity*dt + (1+e)*vn fxmul over Q16.16), so shaders/particles_step.comp is VULKAN-SPIR-V-ONLY (glslc can't
+// parse int64 in HLSL) and is NOT in this dir's hf_gen_msl list; on Metal the --pt4-step showcase runs the CPU
+// particles::StepParticles — the EXACT bit-exact reference the Vulkan --pt4-step-shot GPU==CPU memcmp compares
+// against -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the PT1/PT2/PT3
+// convention), while the Vulkan side carries the GPU==CPU proof. The EMIT + RECYCLE are host-side single-thread
+// (the deterministic free-list); the whole tick is the SAME StepParticles both backends run. It builds the SAME
+// deterministic fountain raining DOWN with the SAME vortex field deflecting the stream onto the SAME ground
+// plane + the SAME two spheres (K=240) and renders the SAME PURE-INTEGER side-view (each ALIVE particle a
+// hashColor(seed) dot at (pos.x>>kFrac, pos.y>>kFrac) + the ground line + the sphere outlines) as the Vulkan
+// --pt4-step-shot -> the golden is bit-identical cross-backend BY CONSTRUCTION. The 4 proofs (GPU==CPU by
+// construction, two-run determinism, steady-state churn, composition) print; the image golden is
+// tests/golden/metal/pt4_step.png (baked on the Mac by the controller); two runs DIFF 0.0000. NO GPU compute on
+// Metal (the int64 shader is Vulkan-only). THE SCENE/RECIPE/FIELDS/COLLIDERS BELOW ARE BYTE-IDENTICAL to the
+// Vulkan --pt4-step-shot.
+static int RunPt4StepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace pt = hf::sim::particles;
+    namespace vg = render::vg;
+
+    // ===== THE PT4 SCENE — MUST be byte-identical to the Vulkan --pt4-step-shot (main.cpp) =====
+    const pt::fx kGravY = (pt::fx)(-9.8 * (double)pt::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const pt::fx kDt      = pt::kOne / 60;
+    const pt::fx kDragK   = pt::kOne / 50;
+    const pt::fx kSpeed   = pt::kOne * 2;
+    const pt::fx kLife    = pt::kOne * 3;
+    const pt::fx kGroundY = -pt::kOne * 2;
+    const pt::fx kRadius  = pt::kParticleRadius;
+    const pt::fx kRestit  = pt::kParticleRestitution;
+    const uint32_t kCapacity = 240;
+    const int kSteps = 240;
+    const pt::FxVec3 kGravity{0, kGravY, 0};
+
+    pt::EmitterConfig cfg;
+    cfg.origin = pt::FxVec3{0, pt::kOne * 3, 0};
+    cfg.ratePerTick = (pt::fx)2;
+    cfg.lifetime = kLife;
+    cfg.speed = kSpeed;
+    cfg.emitterId = 1u;
+
+    // ONE vortex field deflecting the stream sideways (FIXED array order; == the Vulkan side).
+    std::vector<pt::ForceField> fields(1);
+    fields[0].kind = pt::kFieldVortex;
+    fields[0].center = pt::FxVec3{0, pt::kOne, 0};
+    fields[0].axis = pt::FxVec3{0, pt::kOne, 0};
+    fields[0].strength = pt::kOne * 5;
+    fields[0].radius = pt::kOne * 5;
+    const uint32_t kFieldCount = (uint32_t)fields.size();
+
+    std::vector<pt::ParticleSphereCollider> spheres(2);
+    spheres[0].center = pt::FxVec3{-pt::kOne, 0, 0};
+    spheres[0].radius = pt::kOne;
+    spheres[1].center = pt::FxVec3{pt::kOne * 5 / 4, -pt::kOne / 2, 0};
+    spheres[1].radius = pt::kOne * 3 / 4;
+    const uint32_t kSphereCount = (uint32_t)spheres.size();
+
+    // std430 FxParticle mirror (== the Vulkan --pt4-step-shot FxParticleGpu): 12 x int32 (48).
+    struct FxParticleGpu {
+        int32_t px, py, pz, vx, vy, vz, age, lifetime; uint32_t seed, flags; int32_t rsv0, rsv1;
+    };
+    static_assert(sizeof(FxParticleGpu) == 48, "FxParticleGpu std430 layout");
+    static_assert(sizeof(pt::FxParticle) == 48, "FxParticle std430 layout");
+    auto packParticles = [&](const std::vector<pt::FxParticle>& ps) {
+        std::vector<FxParticleGpu> out(ps.size());
+        for (size_t i = 0; i < ps.size(); ++i) {
+            const pt::FxParticle& p = ps[i];
+            out[i] = FxParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.vel.x, p.vel.y, p.vel.z,
+                                   p.age, p.lifetime, p.seed, p.flags, p.rsv0, p.rsv1};
+        }
+        return out;
+    };
+
+    // CPU StepParticles K ticks over a fresh pool — the bit-exact reference the Vulkan GPU==CPU memcmp compares
+    // against. Track spawned/died for the steady-state proof.
+    auto runTicks = [&](uint32_t& spawnedOut, uint32_t& diedOut, int& lastContactsOut) {
+        pt::ParticlePool pool = pt::InitParticlePool(kCapacity);
+        uint32_t spawned = 0, died = 0; int lastContacts = 0;
+        for (int s = 0; s < kSteps; ++s) {
+            const uint32_t aliveBefore = pt::CountAlive(pool);
+            pt::Emit(pool, cfg);
+            const uint32_t aliveEmitted = pt::CountAlive(pool);
+            spawned += aliveEmitted - aliveBefore;
+            pt::IntegrateParticlesWithForces(pool, fields.data(), kFieldCount, kGravity, kDragK, kDt);
+            lastContacts = pt::CollideParticleWorld(pool, kGroundY, kRadius, kRestit, spheres.data(),
+                                                    kSphereCount);
+            died += aliveEmitted - pt::CountAlive(pool);
+            pt::RecycleDead(pool);
+            ++pool.tick;
+        }
+        spawnedOut = spawned; diedOut = died; lastContactsOut = lastContacts;
+        return pool;
+    };
+
+    uint32_t spawned = 0, died = 0; int lastContacts = 0;
+    pt::ParticlePool pool = runTicks(spawned, died, lastContacts);
+    const std::vector<FxParticleGpu> particles = packParticles(pool.particles);
+    const uint32_t alive = pt::CountAlive(pool);
+
+    // GPU==CPU is N/A on the Metal CPU path: this particle array IS the CPU StepParticles reference the Vulkan
+    // --pt4-step-shot proved the GPU shader bit-identical against -> byte-identical by construction.
+    std::printf("pt4-step: {alive:%u, fields:%u, colliders:%u, contacts:%d, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU particles::StepParticles, byte-identical to the Vulkan GPU result by "
+                "construction]\n", alive, kFieldCount, kSphereCount + 1u, lastContacts, kSteps);
+
+    // two-run determinism.
+    uint32_t spawned2 = 0, died2 = 0; int lastContacts2 = 0;
+    pt::ParticlePool pool2 = runTicks(spawned2, died2, lastContacts2);
+    const std::vector<FxParticleGpu> particles2 = packParticles(pool2.particles);
+    if (particles.size() != particles2.size() ||
+        std::memcmp(particles.data(), particles2.data(), particles.size() * sizeof(FxParticleGpu)) != 0)
+        return fail("pt4-step: two runs differ (nondeterministic forces/collide/free-list)");
+    std::printf("pt4-step determinism: two runs BYTE-IDENTICAL\n");
+
+    // steady-state: emit/death balanced (died>0 churn) AND alive within the band AND the free-list invariant.
+    {
+        if (died == 0) return fail("pt4-step: died==0 (no churn — lifetime/K wrong?)");
+        if (pool.freeList.size() != (size_t)kCapacity - (size_t)alive)
+            return fail("pt4-step: free-list invariant broken (freeList != capacity - alive)");
+        if (alive == 0 || alive > kCapacity)
+            return fail("pt4-step: steady-state alive out of band");
+        std::printf("pt4-step steady-state: alive %u converged (emit/death balanced, died %u>0, "
+                    "freeList==capacity-alive)\n", alive, died);
+    }
+
+    // composition: ONE StepParticles tick == applying Emit -> IntegrateParticlesWithForces ->
+    // CollideParticleWorld -> RecycleDead by HAND (the four PTn stages in order).
+    {
+        pt::ParticlePool warm = pt::InitParticlePool(kCapacity);
+        for (int s = 0; s < kSteps / 2; ++s)
+            pt::StepParticles(warm, cfg, fields.data(), kFieldCount, kGravity, kDragK, kDt, kGroundY,
+                              kRadius, kRestit, spheres.data(), kSphereCount);
+        pt::ParticlePool composed = warm;
+        pt::ParticlePool byHand = warm;
+        pt::StepParticles(composed, cfg, fields.data(), kFieldCount, kGravity, kDragK, kDt, kGroundY,
+                          kRadius, kRestit, spheres.data(), kSphereCount);
+        pt::Emit(byHand, cfg);
+        pt::IntegrateParticlesWithForces(byHand, fields.data(), kFieldCount, kGravity, kDragK, kDt);
+        pt::CollideParticleWorld(byHand, kGroundY, kRadius, kRestit, spheres.data(), kSphereCount);
+        pt::RecycleDead(byHand);
+        ++byHand.tick;
+        if (composed.particles.size() != byHand.particles.size() ||
+            std::memcmp(composed.particles.data(), byHand.particles.data(),
+                        (size_t)kCapacity * sizeof(pt::FxParticle)) != 0 ||
+            composed.freeList != byHand.freeList || composed.spawnCursor != byHand.spawnCursor ||
+            composed.tick != byHand.tick)
+            return fail("pt4-step: composition StepParticles != hand-applied PTn stages");
+        std::printf("pt4-step composition: each sub-stage == its PT1/PT2/PT3 reference in isolation\n");
+    }
+
+    // --- Golden: a PURE-INTEGER side-view debug-viz (IDENTICAL to the Vulkan --pt4-step-shot transform by
+    // construction). Each ALIVE particle a hashColor(seed) dot at (pos.x>>kFrac, pos.y>>kFrac) PLUS the ground
+    // line + each sphere as an integer circle outline. ---
+    const int kPxPerUnit = 40;
+    const uint32_t imgW = 240, imgH = 240;
+    const int originPxX = (int)imgW / 2;
+    const int originPxY = (int)imgH / 3;
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int32_t wpx, int32_t wpy, int& ix, int& iy) {
+        ix = originPxX + (int)(((int64_t)wpx * kPxPerUnit) >> pt::kFrac);
+        iy = originPxY - (int)(((int64_t)wpy * kPxPerUnit) >> pt::kFrac);  // y up
+    };
+    auto putPx = [&](int ix, int iy, uint8_t r, uint8_t gg, uint8_t b) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = b; dst[1] = gg; dst[2] = r; dst[3] = 255;
+    };
+    {
+        int gx0, gy0; worldToPx(0, kGroundY, gx0, gy0);
+        for (int x = 0; x < (int)imgW; ++x) putPx(x, gy0, 90, 80, 60);
+    }
+    for (uint32_t s = 0; s < kSphereCount; ++s) {
+        int cxPx, cyPx; worldToPx(spheres[s].center.x, spheres[s].center.y, cxPx, cyPx);
+        const int rPx = (int)(((int64_t)spheres[s].radius * kPxPerUnit) >> pt::kFrac);
+        const int r2lo = (rPx - 1) * (rPx - 1), r2hi = (rPx + 1) * (rPx + 1);
+        for (int dy = -rPx - 1; dy <= rPx + 1; ++dy)
+            for (int dx = -rPx - 1; dx <= rPx + 1; ++dx) {
+                const int d2 = dx * dx + dy * dy;
+                if (d2 >= r2lo && d2 <= r2hi) putPx(cxPx + dx, cyPx + dy, 70, 110, 130);
+            }
+    }
+    for (uint32_t i = 0; i < kCapacity; ++i) {
+        if (!(particles[(size_t)i].flags & pt::kFlagAlive)) continue;
+        int cx, cy; worldToPx(particles[(size_t)i].px, particles[(size_t)i].py, cx, cy);
+        Vec3 col = vg::hashColor(particles[(size_t)i].seed);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx)
+                putPx(cx + dx, cy + dy, (uint8_t)(col.x * 255.0f + 0.5f),
+                      (uint8_t)(col.y * 255.0f + 0.5f), (uint8_t)(col.z * 255.0f + 0.5f));
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — curved/bouncing/pooling particle stream + collider outlines (%u alive)\n",
+                outPath, imgW, imgH, alive);
+    return 0;
+}
+
 // ===== Slice FL3 — Deterministic GPU Fluid PBF DENSITY + λ showcase (--fluid-density) (the MAKE-OR-BREAK
 // of FLAGSHIP #9). Like FL1's --fluid-integrate / CL3's --cloth-solve (and UNLIKE the int32 FL2 neighbor
 // search), the density r² (dx² over Q16.16) + the λ fxdiv/FxISqrt are int64, so shaders/fluid_density.comp
@@ -64324,6 +64525,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pt3-collide") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pt3_collide.png";
             try { return RunPt3CollideShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pt4-step <out.png>: render the composed StepParticles tick showcase (Slice PT4, the 4th slice of
+        // FLAGSHIP #19). PT4 composes PT1 + PT2 + PT3 (emit -> forces+integrate -> collide -> recycle) into ONE
+        // deterministic tick (particles.h::StepParticles). The force-integrate+collide is int64 so
+        // particles_step.comp is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl) and Metal runs the CPU
+        // particles::StepParticles — the EXACT bit-exact reference the Vulkan --pt4-step-shot GPU==CPU memcmp
+        // compares against (byte-identical by construction). The image golden is the integer curved/bouncing/
+        // pooling side-view + collider outlines, identical to the Vulkan --pt4-step-shot by construction.
+        if (argc > 1 && std::strcmp(argv[1], "--pt4-step") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pt4_step.png";
+            try { return RunPt4StepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --grain-neighbors <out.png>: render the Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH
