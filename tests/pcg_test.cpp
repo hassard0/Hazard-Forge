@@ -137,6 +137,56 @@ int main() {
         check(uniform, "PCG1 uniformity: every bin within a loose integer band of N/K (no float tolerance)");
     }
 
+    // ================= PCG2: jittered-grid scatter (count / in-cell / replay / seed-sensitive / no-op) ====
+    {
+        // The scatter area: a fixed square XZ patch in Q16.16 world units, Y on the ground plane.
+        const pcg::PcgArea area{ pcg::FxVec3{0, kOne * 2, 0}, pcg::FxVec3{kOne * 16, kOne * 2, kOne * 16} };
+        const int cellsX = 8, cellsZ = 6;                  // 48 cells (non-square -> exercises both axes)
+        const pcg::PcgStream stA{ 2024u, 0x5CA77E20u };
+        const pcg::PcgStream stB{ 9173u, 0x5CA77E20u };    // DIFFERENT seed, same salt
+
+        // (1) count — exactly cellsX*cellsZ points.
+        const std::vector<pcg::FxVec3> ptsA = pcg::ScatterGrid(stA, area, cellsX, cellsZ);
+        check(ptsA.size() == (size_t)cellsX * cellsZ, "PCG2 count: ScatterGrid returns cellsX*cellsZ points");
+
+        // (2) in-cell containment — every point inside its OWN cell's integer AABB (pure integer compares).
+        const fx cellW = (area.max.x - area.min.x) / cellsX;
+        const fx cellD = (area.max.z - area.min.z) / cellsZ;
+        bool inCell = (ptsA.size() == (size_t)cellsX * cellsZ);
+        for (int cz = 0; cz < cellsZ && inCell; ++cz)
+            for (int cx = 0; cx < cellsX && inCell; ++cx) {
+                const size_t idx = (size_t)(cz * cellsX + cx);
+                const fx cellMinX = area.min.x + cellW * cx;
+                const fx cellMinZ = area.min.z + cellD * cz;
+                const pcg::FxVec3& p = ptsA[idx];
+                if (!(p.x >= cellMinX && p.x < cellMinX + cellW)) inCell = false;
+                if (!(p.z >= cellMinZ && p.z < cellMinZ + cellD)) inCell = false;
+                if (p.y != area.min.y) inCell = false;
+            }
+        check(inCell, "PCG2 in-cell: every point lies strictly inside its own cell's integer AABB (Y == min.y)");
+
+        // (3) replay-stable — two calls with the same args are byte-equal (element-by-element).
+        const std::vector<pcg::FxVec3> ptsA2 = pcg::ScatterGrid(stA, area, cellsX, cellsZ);
+        bool replay = (ptsA.size() == ptsA2.size());
+        for (size_t i = 0; i < ptsA.size() && replay; ++i)
+            if (ptsA[i].x != ptsA2[i].x || ptsA[i].y != ptsA2[i].y || ptsA[i].z != ptsA2[i].z) replay = false;
+        check(replay, "PCG2 replay-stable: two calls with the same args are byte-equal");
+
+        // (4) seed-sensitive — a different seed -> a DIFFERENT layout but the SAME count.
+        const std::vector<pcg::FxVec3> ptsB = pcg::ScatterGrid(stB, area, cellsX, cellsZ);
+        check(ptsB.size() == ptsA.size(), "PCG2 seed-sensitive: a different seed keeps the same count");
+        bool differ = false;
+        for (size_t i = 0; i < ptsA.size() && !differ; ++i)
+            if (ptsA[i].x != ptsB[i].x || ptsA[i].z != ptsB[i].z) differ = true;
+        check(differ, "PCG2 seed-sensitive: a different seed yields a different layout");
+
+        // (5) no-op — cellsX<=0 or a degenerate area -> empty vector.
+        check(pcg::ScatterGrid(stA, area, 0, cellsZ).empty(), "PCG2 no-op: cellsX<=0 -> empty");
+        check(pcg::ScatterGrid(stA, area, cellsX, -1).empty(), "PCG2 no-op: cellsZ<=0 -> empty");
+        const pcg::PcgArea degenerate{ pcg::FxVec3{kOne, 0, kOne}, pcg::FxVec3{kOne, 0, kOne} };  // zero extent
+        check(pcg::ScatterGrid(stA, degenerate, cellsX, cellsZ).empty(), "PCG2 no-op: degenerate area -> empty");
+    }
+
     if (g_fail == 0) std::printf("pcg_test: ALL CHECKS PASSED\n");
     else std::printf("pcg_test: %d CHECK(S) FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

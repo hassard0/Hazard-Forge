@@ -40479,6 +40479,107 @@ static int RunPcg1HashShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PCG2 — Deterministic PCG JITTERED-GRID POINT SCATTER showcase (--pcg2-scatter) (the 2nd slice of
+// FLAGSHIP #22, hf::pcg). PURE CPU — NO GPU compute, NO new shader, NO new RHI; pcg.h is header-only pure-int32
+// math, so on Metal it runs the IDENTICAL deterministic jittered-grid scatter (ScatterGrid) the Vulkan
+// --pcg2-scatter-shot runs on Windows -> the 2D scatter-plot golden is bit-identical cross-backend BY
+// CONSTRUCTION (strict zero-differing-pixel). Renders the 48x48 = 2304 scattered points mapped to INTEGER pixel
+// coords by pure integer math (point*kImg/extent, int64 intermediate — NO float pixel rounding); the proof lines
+// (incl. count+in-cell and the different-seed-different-field check) match the Vulkan side EXACTLY. The fixed
+// SEED/SALT/AREA/CELLS/IMG MUST be IDENTICAL to the Vulkan --pcg2-scatter-shot. New golden
+// tests/golden/metal/pcg2_scatter.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunPcg2ScatterShowcase(const char* outPath) {
+    namespace pcg = hf::pcg;
+    // THE FIXED SHOWCASE PARAMS — IDENTICAL to the Vulkan --pcg2-scatter-shot (main.cpp).
+    const uint32_t kSeed   = 1337u;
+    const uint32_t kSalt   = 0x5CA77E20u;
+    const int      kCellsX = 48;
+    const int      kCellsZ = 48;
+    const uint32_t kImg    = 256u;
+    const pcg::PcgArea kArea{ pcg::FxVec3{0, 0, 0}, pcg::FxVec3{pcg::kOne * 32, 0, pcg::kOne * 32} };
+
+    const pcg::fx extX  = kArea.max.x - kArea.min.x;
+    const pcg::fx extZ  = kArea.max.z - kArea.min.z;
+    const pcg::fx cellW = extX / kCellsX;
+    const pcg::fx cellD = extZ / kCellsZ;
+
+    auto renderScatter = [&](uint32_t seed, uint32_t salt, std::vector<uint8_t>& out,
+                             uint32_t& count, uint32_t& inCell) {
+        out.assign((size_t)kImg * kImg * 4, 0);
+        for (size_t pp = 0; pp < (size_t)kImg * kImg; ++pp) {
+            out[pp * 4 + 0] = 12; out[pp * 4 + 1] = 10; out[pp * 4 + 2] = 8; out[pp * 4 + 3] = 255;
+        }
+        const pcg::PcgStream st{seed, salt};
+        const std::vector<pcg::FxVec3> pts = pcg::ScatterGrid(st, kArea, kCellsX, kCellsZ);
+        count = (uint32_t)pts.size();
+        inCell = 0;
+        auto putPx = [&](int ix, int iy, uint8_t b, uint8_t g, uint8_t r) {
+            if (ix < 0 || ix >= (int)kImg || iy < 0 || iy >= (int)kImg) return;
+            uint8_t* d = &out[((size_t)iy * kImg + ix) * 4];
+            d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+        };
+        for (int cz = 0; cz < kCellsZ; ++cz) {
+            for (int cx = 0; cx < kCellsX; ++cx) {
+                const size_t idx = (size_t)(cz * kCellsX + cx);
+                const pcg::FxVec3& p = pts[idx];
+                const pcg::fx cellMinX = kArea.min.x + cellW * cx;
+                const pcg::fx cellMinZ = kArea.min.z + cellD * cz;
+                if (p.x >= cellMinX && p.x < cellMinX + cellW &&
+                    p.z >= cellMinZ && p.z < cellMinZ + cellD && p.y == kArea.min.y) ++inCell;
+                const int px = (int)(((int64_t)(p.x - kArea.min.x) * (int64_t)kImg) / (int64_t)extX);
+                const int py = (int)(((int64_t)(p.z - kArea.min.z) * (int64_t)kImg) / (int64_t)extZ);
+                putPx(px,     py,     220, 230, 240);
+                putPx(px - 1, py,     120, 150, 200);
+                putPx(px + 1, py,     120, 150, 200);
+                putPx(px,     py - 1, 120, 150, 200);
+                putPx(px,     py + 1, 120, 150, 200);
+            }
+        }
+    };
+    auto checksum = [](const std::vector<uint8_t>& img) {
+        uint32_t h = 2166136261u;
+        for (uint8_t byte : img) { h ^= byte; h *= 16777619u; }
+        return h;
+    };
+
+    std::vector<uint8_t> imgA1, imgA2;
+    uint32_t countA1 = 0, countA2 = 0, inCellA1 = 0, inCellA2 = 0;
+    renderScatter(kSeed, kSalt, imgA1, countA1, inCellA1);
+    renderScatter(kSeed, kSalt, imgA2, countA2, inCellA2);
+    const uint32_t kCount = (uint32_t)(kCellsX * kCellsZ);
+    const bool twoRunIdentical = (imgA1.size() == imgA2.size()) &&
+                                 (std::memcmp(imgA1.data(), imgA2.data(), imgA1.size()) == 0);
+    if (!twoRunIdentical || countA1 != kCount || inCellA1 != kCount)
+        return fail("pcg2-scatter: two runs differ or count/in-cell mismatch");
+
+    const pcg::PcgStream stCtrl{kSeed, kSalt};
+    const pcg::PcgArea emptyArea{ pcg::FxVec3{0, 0, 0}, pcg::FxVec3{0, 0, 0} };
+    const uint32_t emptyCount = (uint32_t)pcg::ScatterGrid(stCtrl, emptyArea, kCellsX, kCellsZ).size();
+
+    std::vector<uint8_t> imgB;
+    uint32_t countB = 0, inCellB = 0;
+    const uint32_t kSeedB = kSeed ^ 0xA5A5A5A5u;
+    renderScatter(kSeedB, kSalt, imgB, countB, inCellB);
+    const uint32_t hA = checksum(imgA1);
+    const uint32_t hB = checksum(imgB);
+    if (hA == hB || countB != kCount || inCellB != kCount || emptyCount != 0)
+        return fail("pcg2-scatter: different-seed or empty-area control failed");
+
+    std::printf("pcg2-scatter: jittered-grid scatter (cellsX=%d cellsZ=%d -> %u points, seed=%u)\n",
+                kCellsX, kCellsZ, kCount, kSeed);
+    std::printf("pcg2-scatter: two-run BYTE-IDENTICAL\n");
+    std::printf("pcg2-scatter: count == cellsX*cellsZ AND all points in-cell {points:%u, inCell:%u}\n",
+                countA1, inCellA1);
+    std::printf("pcg2-scatter: different seed -> different field {seedA_hash:%u, seedB_hash:%u} "
+                "hA != hB (same %u count)\n", hA, hB, kCount);
+    std::printf("pcg2-scatter: provenance {cells:%u, jittered:true, empty-area:%u}\n", kCount, emptyCount);
+
+    if (!WritePNG(outPath, imgA1, kImg, kImg)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — pcg2 jittered-grid scatter (%u points, seed=%u)\n",
+                outPath, kImg, kImg, kCount, kSeed);
+    return 0;
+}
+
 // ===== Slice VD1 — Deterministic Gameplay / Netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS showcase
 // (--vd1-world) (the BEACHHEAD of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO
 // new RHI; the verdict.h entity world + command bus is header-only integer math, so on Metal it runs the IDENTICAL
@@ -69757,6 +69858,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pcg1-hash") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pcg1_hash.png";
             try { return RunPcg1HashShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pcg2-scatter <out.png>: render the Deterministic PCG JITTERED-GRID POINT SCATTER showcase (Slice PCG2,
+        // the 2nd slice of FLAGSHIP #22). PURE CPU — runs the IDENTICAL pcg.h ScatterGrid the Vulkan
+        // --pcg2-scatter-shot runs (the 2D top-down plot of the 48x48=2304 jittered points, pure-integer pixel map)
+        // -> the scatter-field is bit-identical cross-backend BY CONSTRUCTION; the proof lines match the Vulkan side
+        // EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--pcg2-scatter") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pcg2_scatter.png";
+            try { return RunPcg2ScatterShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vd1-world <out.png>: render the Deterministic Gameplay / Netcode ENTITY WORLD + INPUT-COMMAND BUS

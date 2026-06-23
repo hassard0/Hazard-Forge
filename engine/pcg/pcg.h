@@ -18,6 +18,7 @@
 // PCG point-field byte-identical CPU<->Vulkan<->Metal BY CONSTRUCTION (a strict zero-differing-pixel golden).
 
 #include <cstdint>
+#include <vector>
 
 #include "sim/fpx.h"            // Q16.16 toolbox (read-only): fx / kOne / kFrac / fxmul / FxVec3
 #include "sim/particles.h"     // ParticleHash (the avalanche shape) + EmitDir (the no-trig direction table), read-only
@@ -87,6 +88,52 @@ inline fx PcgRandRange(const PcgStream& s, uint32_t index, fx lo, fx hi) {
 }
 inline FxVec3 PcgUnitDir(const PcgStream& s, uint32_t index) {
     return hf::sim::particles::EmitDir(PcgHash(s, index));
+}
+
+// ===== Slice PCG2 — Jittered-grid point scatter (the 2nd slice of FLAGSHIP #22) =============================
+// The first real generation primitive built on PCG1's hash-PRNG: deterministic JITTERED-GRID SCATTER — one
+// point per grid cell, each offset within its own cell by a seeded PcgRand01 jitter, so the lattice is broken
+// WITHOUT any float/trig (the declarative replacement for the engine's hand-coded for(gx)for(gz) instance
+// grids). Pure int32 — the only multiply is fxmul (int64-intermediate, CPU-side). NO float, NO trig.
+
+// ----- PcgArea: the XZ scatter region in Q16.16 world units (a flat patch, Y = min.y) ----------------------
+// The area is a flat ground patch: scatter happens in the XZ plane, every point is emitted at height Y =
+// min.y. Keep it a plain struct (no behaviour) — ScatterGrid does all the work.
+struct PcgArea {
+    FxVec3 min;
+    FxVec3 max;
+};
+
+// ----- ScatterGrid: one jittered point per cell over the area's XZ extent -----------------------------------
+// Partition the area's XZ extent into cellsX x cellsZ EQUAL cells (cellW/cellD = integer extents
+// (max.x-min.x)/cellsX, (max.z-min.z)/cellsZ). For each cell (cx,cz) in FIXED ascending order (cz OUTER, cx
+// INNER — the order is PINNED so the output vector is deterministic), emit ONE point at the cell's min corner
+// plus a per-axis in-cell jitter fxmul(PcgRand01(stream, idx*2+0), cellW) in X and
+// fxmul(PcgRand01(stream, idx*2+1), cellD) in Z (idx = cz*cellsX+cx). Because PcgRand01 in [0,kOne) and the
+// jitter scales it by the cell extent, every point stays STRICTLY inside its own cell (cellMin <= p <
+// cellMin + cellExtent). Returns empty for cellsX<=0 || cellsZ<=0 or a degenerate area (the no-op control).
+// Int32 only (the one mul is fxmul). idx*2+0 / idx*2+1 draw INDEPENDENT PcgRand01 samples (distinct indices).
+inline std::vector<FxVec3> ScatterGrid(const PcgStream& stream, const PcgArea& area, int cellsX, int cellsZ) {
+    std::vector<FxVec3> out;
+    if (cellsX <= 0 || cellsZ <= 0) return out;            // no-op control
+    const fx extX = area.max.x - area.min.x;
+    const fx extZ = area.max.z - area.min.z;
+    if (extX <= 0 || extZ <= 0) return out;                // degenerate area -> no-op control
+    const fx cellW = extX / cellsX;                        // integer cell extents (positive divisor + numerator)
+    const fx cellD = extZ / cellsZ;
+    if (cellW <= 0 || cellD <= 0) return out;              // cells collapsed to zero width -> no-op control
+    out.reserve((size_t)cellsX * (size_t)cellsZ);
+    for (int cz = 0; cz < cellsZ; ++cz) {                  // cz OUTER (pinned order)
+        for (int cx = 0; cx < cellsX; ++cx) {              // cx INNER (pinned order)
+            const uint32_t idx = (uint32_t)(cz * cellsX + cx);
+            const fx cellMinX = area.min.x + cellW * cx;   // the cell's min corner (X)
+            const fx cellMinZ = area.min.z + cellD * cz;   // the cell's min corner (Z)
+            const fx jitterX = fxmul(PcgRand01(stream, idx * 2u + 0u), cellW);  // in [0, cellW)
+            const fx jitterZ = fxmul(PcgRand01(stream, idx * 2u + 1u), cellD);  // in [0, cellD)
+            out.push_back(FxVec3{cellMinX + jitterX, area.min.y, cellMinZ + jitterZ});
+        }
+    }
+    return out;
 }
 
 }  // namespace hf::pcg
