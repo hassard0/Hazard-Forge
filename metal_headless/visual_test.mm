@@ -2341,6 +2341,256 @@ static int RunSb3IridescenceShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Substrate-lite ANISOTROPY showcase (issue #11, SB4). The SAME IBL helmet scene/camera/light/env as
+// RunSb3IridescenceShowcase, through lit_substrate.frag (lit_pbr_ibl + an additive anisotropic-GGX
+// difference term), but with ONLY fd.substrateParams2[0]=0.8 (anisotropy) — clearcoat/sheen/iridescence
+// (substrateParams[0..3]) AND the other substrateParams2 all 0 — so SB4 shows the stretched brushed-metal
+// highlight ALONE. Prints the 3 proof lines (fail loudly): (1) two-run byte-identical; (2) THE ADDITIVITY
+// CONTROL — anisotropy=0 (ALL substrateParams=0 AND substrateParams2=0) through lit_substrate ==
+// lit_pbr_ibl byte-identical; (3) anisotropy>0 stretches the highlight along the tangent. Writes the
+// anisotropy-on PNG. ----------------------------------------------------------------------------------
+static int RunSb4AnisoShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    hf::asset::EnvironmentMap env = hf::asset::LoadHdrEnvironment(*device, HF_ENV_PATH);
+    const float envMaxLod = (float)(env.mipLevels - 1);
+
+    // Helmet pipelines: lit_substrate (anisotropy) + the frozen lit_pbr_ibl (additivity-control ref).
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto subFs = loadMSL("lit_substrate.frag.gen.metal", "substrate_fragment");
+    auto iblFs = loadMSL("lit_pbr_ibl.frag.gen.metal", "pbr_ibl_fragment");
+    auto mkHelmetPipe = [&](rhi::IShaderModule* fs) {
+        rhi::GraphicsPipelineDesc d;
+        d.vertex = litVs.get(); d.fragment = fs;
+        d.vertexLayout = scene::MeshVertexLayout();
+        d.colorFormat = device->Swapchain().ColorFormat();
+        d.depthTest = true; d.usesFrameUniforms = true;
+        d.usesTexture = true; d.pbrMaterial = true;
+        d.usesEnvironment = true; d.pushConstantSize = sizeof(float) * 20;
+        return device->CreateGraphicsPipeline(d);
+    };
+    auto substratePipeline = mkHelmetPipe(subFs.get());
+    auto iblPipeline       = mkHelmetPipe(iblFs.get());
+
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky_hdr.frag.gen.metal", "sky_hdr_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    skyD.usesEnvironment = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+
+    hf::asset::PbrModel helmet = hf::asset::LoadPbrGltfModel(*device, HF_HELMET_MODEL_PATH);
+
+    const float scaleS = 1.6f;
+    Mat4 helmetModel = Mat4::Translate({0.0f, scaleS * 1.0f, 0.0f})
+                     * Mat4::RotateX(1.5707963f)
+                     * Mat4::Scale({scaleS, scaleS, scaleS});
+    Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+
+    const Vec3 eye{3.0f, 2.4f, 4.0f};
+    const Vec3 center{0.0f, 1.2f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 1.2f, 0.0f};
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 12.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-5.0f, 5.0f, -5.0f, 5.0f, 1.0f, 25.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+        fd.iblParams[0] = envMaxLod; fd.iblParams[1] = 1.0f;
+    }
+
+    // anisotropy=fd.substrateParams2[0]; ALL substrateParams[0..3] + the other substrateParams2[1..3]
+    // left 0 so SB4 shows the stretched brushed-metal highlight alone.
+    auto renderOnce = [&](rhi::IPipeline& helmetPipe, float anisotropy,
+                          std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        FrameData lfd = fd;
+        lfd.substrateParams[0] = 0.0f;   // clearcoat OFF
+        lfd.substrateParams[1] = 0.0f;
+        lfd.substrateParams[2] = 0.0f;   // sheen OFF
+        lfd.substrateParams[3] = 0.0f;   // iridescence OFF
+        lfd.substrateParams2[0] = anisotropy;  // SB4 anisotropy strength
+        lfd.substrateParams2[1] = 0.0f;
+        lfd.substrateParams2[2] = 0.0f;
+        lfd.substrateParams2[3] = 0.0f;
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&lfd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*shadowPipeline);
+                cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+                cmd.PushConstants(helmetModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(helmet.mesh.vertices());
+                cmd.BindIndexBuffer(helmet.mesh.indices());
+                cmd.DrawIndexed(helmet.mesh.indexCount());
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&lfd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                cmd.BindPipeline(*skyPipe);
+                cmd.BindEnvironment(*env.equirect);
+                cmd.Draw(3);
+                cmd.BindPipeline(*litPipeline);
+                {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                    pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                cmd.BindPipeline(helmetPipe);
+                {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = helmetModel.m[k];
+                    pc[16] = helmet.metallicFactor; pc[17] = helmet.roughnessFactor;
+                    pc[18] = 0.0f; pc[19] = 0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterialPBR(*helmet.baseColor, *helmet.metalRough, *helmet.normalMap,
+                                        *helmet.emissive, *helmet.occlusion);
+                    cmd.BindEnvironment(*env.equirect);
+                    cmd.BindVertexBuffer(helmet.mesh.vertices());
+                    cmd.BindIndexBuffer(helmet.mesh.indices());
+                    cmd.DrawIndexed(helmet.mesh.indexCount());
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*rt);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    const float kAniso = 0.8f;
+    std::vector<uint8_t> pxA, pxB, pxZeroSub, pxIbl;
+    uint32_t cw = 0, ch = 0, tw = 0, th = 0;
+    if (!renderOnce(*substratePipeline, kAniso, pxA, cw, ch))     return fail("no captured pixels (run A)");
+    if (!renderOnce(*substratePipeline, kAniso, pxB, tw, th))     return fail("no captured pixels (run B)");
+    if (!renderOnce(*substratePipeline, 0.0f, pxZeroSub, tw, th)) return fail("no captured pixels (substrate anisotropy=0)");
+    if (!renderOnce(*iblPipeline, 0.0f, pxIbl, tw, th))           return fail("no captured pixels (lit_pbr_ibl)");
+
+    bool twoRunSame = (pxA.size() == pxB.size()) && (std::memcmp(pxA.data(), pxB.data(), pxA.size()) == 0);
+    std::printf("sb4-aniso: two-run %s\n", twoRunSame ? "BYTE-IDENTICAL" : "DIFFER (FAIL)");
+    if (!twoRunSame) return fail("sb4 two-run not byte-identical");
+
+    bool additivity = (pxZeroSub.size() == pxIbl.size()) &&
+                      (std::memcmp(pxZeroSub.data(), pxIbl.data(), pxZeroSub.size()) == 0);
+    std::printf("sb4-aniso: anisotropy=0 == lit_pbr_ibl %s (additivity control)\n",
+                additivity ? "BYTE-IDENTICAL" : "DIFFER (FAIL)");
+    if (!additivity) return fail("sb4 additivity control FAILED (anisotropy=0 != lit_pbr_ibl)");
+
+    size_t nonBlack = 0; bool anyDiff = false; int specStretch = 0;
+    size_t nPix = pxA.size() / 4;
+    for (size_t p = 0; p < nPix; ++p) {
+        int b0 = pxA[p*4+0], g0 = pxA[p*4+1], r0 = pxA[p*4+2];
+        int bz = pxZeroSub[p*4+0], gz = pxZeroSub[p*4+1], rz = pxZeroSub[p*4+2];
+        int dr = r0 - rz, dg = g0 - gz, db = b0 - bz;
+        if (dr != 0 || dg != 0 || db != 0) { anyDiff = true; nonBlack++; }
+        int mag = (dr < 0 ? -dr : dr) + (dg < 0 ? -dg : dg) + (db < 0 ? -db : db);
+        if (mag > specStretch) specStretch = mag;
+    }
+    std::printf("sb4-aniso: {nonBlackPixels:%zu, specStretch:%d} anisotropy>0 stretches the highlight along the tangent\n",
+                nonBlack, specStretch);
+    if (!anyDiff || nonBlack == 0 || specStretch == 0) return fail("anisotropy>0 produced no stretched highlight");
+
+    if (!WritePNG(outPath, pxA, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — env %dx%d, %d mips — anisotropy=%.2f\n",
+                outPath, cw, ch, env.width, env.height, env.mipLevels, kAniso);
+    return 0;
+}
+
 // --- Integrated CAPSTONE showcase (Slice Z). Mirrors the Vulkan --capstone-shot path BYTE-FOR-BYTE
 // (same deterministic physics step budget, same Walk+Run fox blend times, same transforms, same
 // camera/light). ONE composed frame: HDR equirect environment (sky_hdr) as background + IBL source;
@@ -67732,6 +67982,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--sb3-iridescence") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_sb3_iridescence.png";
             try { return RunSb3IridescenceShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --sb4-aniso <out.png>: Substrate-lite anisotropy showcase (issue #11, SB4) — the SAME IBL
+        // helmet scene through lit_substrate.frag with ONLY substrateParams2[0]=0.8 (stretched
+        // brushed-metal highlight; clearcoat/sheen/iridescence off). The anisotropic DIFFERENCE term at
+        // anisotropy=0 is an EXACT identity over lit_pbr_ibl.
+        if (argc > 1 && std::strcmp(argv[1], "--sb4-aniso") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_sb4_aniso.png";
+            try { return RunSb4AnisoShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ibl-dim <out.png>: the SAME IBL helmet showcase with the exposure multiplier dialed down

@@ -250,6 +250,37 @@ float4 main(PSInput i) : SV_Target {
         rgb += sheen * sheenLobe * (f.lightColor.rgb * shadow) * ao;
     }
 
+    // --- SUBSTRATE-LITE ANISOTROPY (Issue #11, SB4). An ADDITIVE difference term: compute BOTH the
+    // isotropic (frozen-base) and an anisotropic-GGX directional-light specular and add their DIFFERENCE
+    // scaled by f.substrateParams2.x -> stretched highlights along the surface tangent (brushed metal,
+    // hair, satin). Gated so anisotropy=0 -> the whole += is +0.0 -> EXACT identity over the base
+    // lit_pbr_ibl render. THIS IS THE MAKE-OR-BREAK (the gate, not formula equality, guarantees it). ---
+    {
+        float aniso = f.substrateParams2.x;
+        // Tangent frame (Gram-Schmidt the interpolated world tangent against the shading normal N).
+        float3 Ta = normalize(i.wtangent - N * dot(N, i.wtangent));
+        float3 Ba = cross(N, Ta);
+        float3 La = normalize(-f.lightDir.xyz);
+        float3 Ha = normalize(La + V);
+        float NoLa = max(dot(N, La), 0.0);
+        float NoVa = max(dot(N, V), 1e-4);
+        float NoHa = max(dot(N, Ha), 0.0);
+        float VoHa = max(dot(V, Ha), 0.0);
+        float alpha = roughness * roughness;
+        float at = max(alpha * (1.0 + aniso), 1e-4);
+        float ab = max(alpha * (1.0 - aniso), 1e-4);
+        float ToH = dot(Ta, Ha), BoH = dot(Ba, Ha);
+        float denom = (ToH*ToH)/(at*at) + (BoH*BoH)/(ab*ab) + NoHa*NoHa;
+        float Daniso = 1.0 / (3.14159265 * at * ab * denom * denom);          // anisotropic GGX
+        float Diso   = hfDistributionGGX(NoHa, alpha);                         // the frozen isotropic D (alpha-convention)
+        float Gv = hfGeometrySmith(NoVa, NoLa, roughness);
+        float3 Fv = hfFresnelSchlick(VoHa, F0);                                // F0 = the SB3-iridescent F0 (already lerped)
+        float invDen = 1.0 / max(4.0 * NoVa * NoLa, 1e-4);
+        float3 anisoSpec = (Daniso * Gv) * Fv * (invDen * NoLa);
+        float3 isoSpec   = (Diso   * Gv) * Fv * (invDen * NoLa);
+        rgb += aniso * (anisoSpec - isoSpec) * (f.lightColor.rgb * shadow);    // aniso=0 -> +0 -> identity
+    }
+
     // --- Emissive (sRGB -> linear), ADDED after lighting. ---
     float3 emis = SrgbToLinear(gEmissive.Sample(gEmissiveSmp, i.uv).rgb);
     rgb += emis;
