@@ -355,6 +355,141 @@ int main() {
         }
     }
 
+    // ================= Slice PT3: COLLISIONS — bounce, sphere projection, containment, no-op, determinism ==
+    {
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const fx dt = kOne / 60, drag = kOne / 50;
+        const pt::FxVec3 grav{0, kGravY, 0};
+        const fx groundY = -kOne * 2;
+        const fx radius = pt::kParticleRadius;       // 0.25
+        const fx e = pt::kParticleRestitution;       // 0.5
+
+        // --- CollideParticlePlane: clamps the surface to groundY+radius AND reflects+damps the downward vel ---
+        {
+            pt::FxParticle p{};
+            p.pos = pt::FxVec3{0, groundY - kOne, 0};   // a full unit BELOW the plane
+            p.vel = pt::FxVec3{kOne, -kOne * 2, 0};     // moving down at 2 (+ a tangential x)
+            p.flags = pt::kFlagAlive; p.seed = 1u; p.lifetime = kOne * 100;
+            const fx vxBefore = p.vel.x;
+            pt::CollideParticlePlane(p, groundY, radius, e);
+            check(p.pos.y == groundY + radius, "PT3 plane: surface clamped to groundY+radius");
+            check(p.vel.y == -pt::fxmul(e, -kOne * 2), "PT3 plane: downward vel reflected+damped (vel.y = -e*vy)");
+            check(p.vel.y > 0, "PT3 plane: reflected vel points UP");
+            check(p.vel.x == vxBefore, "PT3 plane: tangential vel unchanged (frictionless)");
+        }
+
+        // --- CollideParticlePlane: an UPWARD-moving particle below the plane is clamped but vel is NOT flipped ---
+        {
+            pt::FxParticle p{};
+            p.pos = pt::FxVec3{0, groundY - kOne / 2, 0};
+            p.vel = pt::FxVec3{0, kOne, 0};             // already moving UP
+            p.flags = pt::kFlagAlive; p.seed = 1u; p.lifetime = kOne * 100;
+            pt::CollideParticlePlane(p, groundY, radius, e);
+            check(p.pos.y == groundY + radius, "PT3 plane: upward particle still clamped");
+            check(p.vel.y == kOne, "PT3 plane: upward vel NOT reflected (vel.y >= 0)");
+        }
+
+        // --- CollideParticleSphere: projects the centre out to sphereR+radius AND reflects the inward vel ---
+        {
+            pt::ParticleSphereCollider s; s.center = pt::FxVec3{0, 0, 0}; s.radius = kOne;
+            pt::FxParticle p{};
+            p.pos = pt::FxVec3{kOne / 2, 0, 0};         // inside: dist 0.5 < surf 1.25
+            p.vel = pt::FxVec3{-kOne, 0, 0};            // moving INTO the sphere (toward center along -x)
+            p.flags = pt::kFlagAlive; p.seed = 1u; p.lifetime = kOne * 100;
+            const bool hit = pt::CollideParticleSphere(p, s, radius, e);
+            check(hit, "PT3 sphere: contact detected (particle inside the expanded sphere)");
+            // Projected out along +x to surf = 1.25 -> pos.x == 1.25.
+            check(p.pos.x == kOne + radius, "PT3 sphere: centre projected to sphereR+radius along the normal");
+            // dist(pos, center) == surf now (on the surface).
+            const fx surf = s.radius + radius;
+            const pt::FxVec3 d{p.pos.x - s.center.x, p.pos.y - s.center.y, p.pos.z - s.center.z};
+            check(pt::FxLength(d) >= surf - pt::kCollideEps, "PT3 sphere: projected particle on/outside the surface");
+            // The inward vel (-x, vn<0) is reflected -> now points OUTWARD (+x).
+            check(p.vel.x > 0, "PT3 sphere: inward vel reflected to point outward");
+        }
+
+        // --- CollideParticleSphere: a particle CLEAR of the sphere is untouched (no contact) ---
+        {
+            pt::ParticleSphereCollider s; s.center = pt::FxVec3{0, 0, 0}; s.radius = kOne;
+            pt::FxParticle p{};
+            p.pos = pt::FxVec3{kOne * 5, 0, 0};         // far outside
+            p.vel = pt::FxVec3{-kOne, 0, 0};
+            p.flags = pt::kFlagAlive; p.seed = 1u; p.lifetime = kOne * 100;
+            const pt::FxParticle before = p;
+            const bool hit = pt::CollideParticleSphere(p, s, radius, e);
+            check(!hit, "PT3 sphere: a clear particle is not a contact");
+            check(std::memcmp(&p, &before, sizeof(pt::FxParticle)) == 0, "PT3 sphere: clear particle byte-stable");
+        }
+
+        // The full PT3 scene (== the showcase): a fountain raining onto a plane + two spheres.
+        const uint32_t cap = 220;
+        const int K = 220;
+        pt::EmitterConfig cfg;
+        cfg.origin = pt::FxVec3{0, kOne * 3, 0}; cfg.ratePerTick = (fx)2; cfg.lifetime = kOne * 3;
+        cfg.speed = kOne * 2; cfg.emitterId = 1u;
+        std::vector<pt::ParticleSphereCollider> spheres(2);
+        spheres[0].center = pt::FxVec3{-kOne, 0, 0}; spheres[0].radius = kOne;
+        spheres[1].center = pt::FxVec3{kOne * 5 / 4, -kOne / 2, 0}; spheres[1].radius = kOne * 3 / 4;
+        const uint32_t sc = (uint32_t)spheres.size();
+
+        auto runScene = [&]() {
+            pt::ParticlePool pool = pt::InitParticlePool(cap);
+            for (int s = 0; s < K; ++s)
+                pt::StepEmitIntegrateCollide(pool, cfg, grav, drag, dt, groundY, radius, e, spheres.data(), sc);
+            return pool;
+        };
+
+        // --- containment: no ALIVE particle below groundY+radius or inside a collider (within kCollideEps) ---
+        {
+            pt::ParticlePool pool = runScene();
+            bool ok = true;
+            const fx restY = groundY + radius;
+            for (const pt::FxParticle& p : pool.particles) {
+                if (!(p.flags & pt::kFlagAlive)) continue;
+                if (p.pos.y < restY - pt::kCollideEps) { ok = false; break; }
+                for (uint32_t s = 0; s < sc; ++s) {
+                    const fx surf = spheres[s].radius + radius;
+                    const pt::FxVec3 d{p.pos.x - spheres[s].center.x, p.pos.y - spheres[s].center.y,
+                                       p.pos.z - spheres[s].center.z};
+                    if (pt::FxLength(d) < surf - pt::kCollideEps) { ok = false; break; }
+                }
+                if (!ok) break;
+            }
+            check(ok, "PT3 containment: no particle below ground or inside a collider (within kCollideEps)");
+            check(Alive(pool) > 0, "PT3 scene: particles are alive + pooled");
+        }
+
+        // --- determinism: two scene runs byte-identical ---
+        {
+            pt::ParticlePool a = runScene();
+            pt::ParticlePool b = runScene();
+            check(std::memcmp(a.particles.data(), b.particles.data(),
+                              (size_t)cap * sizeof(pt::FxParticle)) == 0,
+                  "PT3 StepEmitIntegrateCollide: two runs byte-identical (deterministic)");
+        }
+
+        // --- no-op control: a particle CLEAR of all colliders == PT1 free-fall (collision idle when clear) ---
+        {
+            pt::FxParticle seed{};
+            seed.pos = pt::FxVec3{kOne * 8, kOne * 100, 0};   // drag caps the fall ~y=78 over K, never near ground
+            seed.vel = pt::FxVec3{kOne, kOne, 0};
+            seed.age = 0; seed.lifetime = kOne * 1000; seed.seed = 123u; seed.flags = pt::kFlagAlive;
+            pt::ParticlePool collidePool = pt::InitParticlePool(1);
+            collidePool.particles[0] = seed;
+            pt::ParticlePool freefallPool = pt::InitParticlePool(1);
+            freefallPool.particles[0] = seed;
+            pt::EmitterConfig noEmit; noEmit.ratePerTick = 0; noEmit.lifetime = kOne * 1000;
+            for (int s = 0; s < K; ++s) {
+                pt::StepEmitIntegrateCollide(collidePool, noEmit, grav, drag, dt, groundY, radius, e,
+                                             spheres.data(), sc);
+                pt::StepEmitIntegrate(freefallPool, noEmit, grav, drag, dt);
+            }
+            check(std::memcmp(collidePool.particles.data(), freefallPool.particles.data(),
+                              sizeof(pt::FxParticle)) == 0,
+                  "PT3 no-op: a clear particle == PT1 free-fall (collision idle when clear)");
+        }
+    }
+
     if (g_fail == 0) std::printf("particles_test: ALL CHECKS PASSED\n");
     else std::printf("particles_test: %d CHECK(S) FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -470,5 +470,113 @@ inline void StepEmitForcesIntegrate(ParticlePool& pool, const EmitterConfig& cfg
     ++pool.tick;                                                     // (4) advance the tick
 }
 
+// ===== Slice PT3 — Deterministic particle-vs-world COLLISIONS (Issue #19, flagship #19, 3rd slice) =======
+// APPEND-ONLY: everything above (PT1 + PT2) is BYTE-FROZEN. PT3 adds particle-vs-world collision — a ground
+// plane + a set of static spheres — with a deterministic velocity BOUNCE (restitution). It PORTS the grain
+// collision MATH (engine/sim/grain.h::CollideGrainPlane / CollideGrainSphere, read-only) onto FxParticle (a
+// FIXED particle radius, not a per-particle one) AND adds the velocity reflection grains don't need: grains
+// are position-based (their velocity is implied by pos - prev), but FxParticle carries an EXPLICIT vel, so a
+// bounce must reflect the inward velocity component (vn = vel·nrm; if vn<0, vel -= nrm*(1+e)*vn). Pure
+// Q16.16/integer, per-particle INDEPENDENT (no grid, no neighbours, NO atomics, NO TDR — each particle reads
+// the SAME read-only collider list, writes only its OWN slot). The make-or-break: a particle CLEAR of every
+// collider must equal PT1's IntegrateParticle EXACTLY (the no-op control), and the plane + sphere passes run
+// in a FIXED order (plane, then spheres ascending) so the result is order-pinned -> bit-exact GPU==CPU +
+// cross-backend.
+//
+// int64 (the FxLength/FxNormalize/FxDot snap + the (1+e)*vn reflect) -> the new shader particles_collide.comp
+// is VULKAN-SPIR-V-ONLY (glslc can't parse int64 in HLSL); Metal runs the CPU StepEmitIntegrateCollide byte-
+// identical by construction (the PT1/PT2/GR3 split). Reuses fpx::FxLength/FxNormalize/FxAdd/FxScale + the PT2
+// local FxDot — NO new fixed-point primitive. (The CollideGrainSphere body shape + the explicit-vel bounce.)
+
+// ----- ParticleSphereCollider: a static sphere collider (the GrainSphereCollider shape) ------------------
+// center / radius are Q16.16. std430-packable as plain int32s (center.xyz + radius + pad) on the GPU side.
+struct ParticleSphereCollider { FxVec3 center{}; fx radius = 0; };
+
+// ----- The PT3 collision constants (host Q16.16 literals) ------------------------------------------------
+inline constexpr fx kParticleRadius      = kOne / 4;   // 0.25 world units (the particle's collision radius)
+inline constexpr fx kParticleRestitution = kOne / 2;   // 0.5 bounce (Q16.16); 0 = stick, kOne = elastic
+inline constexpr fx kCollideEps          = kOne / 256; // containment tolerance for the proof scans
+
+// ----- CollideParticlePlane: clamp the particle SURFACE to the ground + reflect the downward velocity -----
+// The particle's SURFACE rests on the plane: pos.y >= groundY + radius (restY). If pos.y < restY, clamp
+// pos.y = restY AND, if the velocity is DOWNWARD (vel.y < 0), reflect+damp it: vel.y = -fxmul(e, vel.y)
+// (e = restitution; e==0 sticks, e==kOne is fully elastic). Frictionless — the tangential vel.x/vel.z are
+// UNCHANGED. Pure integer, no divide, no sqrt. The shader copies THIS body VERBATIM.
+inline void CollideParticlePlane(FxParticle& p, fx groundY, fx radius, fx e) {
+    const fx restY = groundY + radius;
+    if (p.pos.y < restY) {
+        p.pos.y = restY;
+        if (p.vel.y < 0) p.vel.y = -fxmul(e, p.vel.y);   // reflect+damp the downward component
+    }
+}
+
+// ----- CollideParticleSphere: project the particle CENTRE out of a static sphere + reflect inward vel -----
+// The surfaces touch at surf = sphereR + radius. int32 AABB reject (against surf) first; then if the centre
+// distance < surf, snap the CENTRE out along the outward normal AND reflect the inward velocity component:
+//   d = pos - center; dist = FxLength(d); nrm = FxNormalize(d) (d==0 -> +Y fallback);
+//   pos = center + nrm*surf; vn = FxDot(vel, nrm); if (vn < 0) vel -= nrm*fxmul(kOne + e, vn).
+// Returns true iff it was a contact (the CollideGrainSphere body + the explicit-vel bounce). Pure integer
+// except the int64 FxLength/FxNormalize/FxDot. The shader copies THIS body VERBATIM.
+inline bool CollideParticleSphere(FxParticle& p, const ParticleSphereCollider& s, fx radius, fx e) {
+    const fx surf = s.radius + radius;                   // the surfaces-touch distance
+    const fx dx = p.pos.x - s.center.x;
+    const fx dy = p.pos.y - s.center.y;
+    const fx dz = p.pos.z - s.center.z;
+    const fx ax = dx < 0 ? -dx : dx;
+    const fx ay = dy < 0 ? -dy : dy;
+    const fx az = dz < 0 ? -dz : dz;
+    if (ax > surf || ay > surf || az > surf) return false;   // outside the AABB -> no overlap
+    const FxVec3 d = FxVec3{dx, dy, dz};
+    const fx dist = FxLength(d);
+    if (dist >= surf) return false;                          // outside the (expanded) sphere -> untouched
+    const FxVec3 nrm = FxNormalize(d);                       // dist==0 -> {0,kOne,0} fallback
+    p.pos = FxAdd(s.center, FxScale(nrm, surf));             // snap the centre to sphereR + radius
+    const fx vn = FxDot(p.vel, nrm);                         // velocity along the outward normal
+    if (vn < 0) {                                            // moving INTO the sphere -> reflect+damp it
+        const fx j = fxmul(kOne + e, vn);
+        p.vel.x -= fxmul(nrm.x, j);
+        p.vel.y -= fxmul(nrm.y, j);
+        p.vel.z -= fxmul(nrm.z, j);
+    }
+    return true;
+}
+
+// ----- CollideParticleWorld: per ALIVE particle, the plane then each sphere (FIXED order) ----------------
+// For each ALIVE particle (index order), run CollideParticlePlane then, per sphere (ascending index, fixed
+// order), CollideParticleSphere. Dead/empty slots are skipped (their bytes stay byte-identical). Returns the
+// contact count. Per-particle INDEPENDENT (every particle reads the SAME read-only collider list) -> order-
+// independent -> bit-identical regardless of GPU scheduling. The shader runs THIS per particle.
+inline int CollideParticleWorld(ParticlePool& pool, fx groundY, fx radius, fx e,
+                                const ParticleSphereCollider* spheres, uint32_t sphereCount) {
+    int contacts = 0;
+    const size_t n = pool.particles.size();
+    for (size_t i = 0; i < n; ++i) {
+        FxParticle& p = pool.particles[i];
+        if (!(p.flags & kFlagAlive)) continue;
+        CollideParticlePlane(p, groundY, radius, e);
+        for (uint32_t s = 0; s < sphereCount; ++s)
+            if (CollideParticleSphere(p, spheres[s], radius, e)) ++contacts;
+    }
+    return contacts;
+}
+
+// ----- StepEmitIntegrateCollide: one full PT3 tick --------------------------------------------------------
+// (1) Emit (single-thread host-ordered LIFO spawn) -> (2) IntegrateParticles (PT1 gravity+drag, the GPU
+// integrate dispatch) -> (3) CollideParticleWorld (per-particle independent plane+spheres, the GPU collide
+// dispatch / second half of the shader) -> (4) RecycleDead (ascending-slot) -> (5) ++tick. NO force fields
+// here (PT3 is collision; PT4 composes all). A particle clear of every collider is UNTOUCHED by step (3) ->
+// the tick reduces to PT1's StepEmitIntegrate EXACTLY for it (the no-op control). Pure integer, fixed pass
+// order -> two-run bit-identical AND bit-exact GPU==CPU (the GPU runs (2)+(3) in ONE dispatch; the host does
+// (1)+(4) between dispatches).
+inline void StepEmitIntegrateCollide(ParticlePool& pool, const EmitterConfig& cfg, const FxVec3& gravity,
+                                     fx dragK, fx dt, fx groundY, fx radius, fx e,
+                                     const ParticleSphereCollider* spheres, uint32_t sphereCount) {
+    Emit(pool, cfg);                                              // (1) spawn (single-thread host-ordered)
+    IntegrateParticles(pool, gravity, dragK, dt);                // (2) integrate (per-particle independent)
+    CollideParticleWorld(pool, groundY, radius, e, spheres, sphereCount);  // (3) collide (per-particle indep.)
+    RecycleDead(pool);                                           // (4) recycle dead slots (ascending)
+    ++pool.tick;                                                 // (5) advance the tick
+}
+
 }  // namespace particles
 }  // namespace hf::sim

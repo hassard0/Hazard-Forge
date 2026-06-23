@@ -805,6 +805,20 @@ hf_compile_shaders(
     # (byte-identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU particle
     # array + cross-backend, proven memcmp. NO new RHI; PT1's shader + goldens untouched.
     "shaders/particles_forces.comp.hlsl:cs"
+    # Deterministic GPU Particles Slice 3 (Slice PT3, the 3rd slice of FLAGSHIP #19: particle-vs-world
+    # COLLISIONS): particles_collide.comp runs the Q16.16 per-particle INTEGRATE + COLLIDE — ONE thread per
+    # particle slot runs the PT1 integrate (vel += gravity*dt; drag; pos += vel*dt; age + death) then collides
+    # its OWN particle with a ground PLANE (clamp surface to groundY+radius + reflect the downward vel) and a
+    # FIXED-ORDER static SPHERE list (project the centre out to sphereR+radius + reflect the inward vel), the
+    # CollideParticlePlane + CollideParticleSphere bodies copied VERBATIM from engine/sim/particles.h (each
+    # particle reads the SAME read-only collider input + writes only its OWN slot -> race-free, NO atomics).
+    # collideEnabled=0 -> integrate-only (the PT1 control path). Because the FxLength (FxISqrt) + FxNormalize
+    # (fxdiv) + FxDot + the gravity*dt + (1+e)*vn fxmul are int64 (the same form as particles_forces.comp /
+    # particles_integrate.comp), this shader is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in
+    # the Metal hf_gen_msl list; the Metal --pt3-collide showcase runs the CPU StepEmitIntegrateCollide (byte-
+    # identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU particle array +
+    # cross-backend, proven memcmp. NO new RHI; PT1/PT2 shaders + goldens untouched.
+    "shaders/particles_collide.comp.hlsl:cs"
     # Deterministic GPU Granular/Sand Slice 2 (Slice GR2, the 2nd slice of FLAGSHIP #10): the GRID-HASH
     # NEIGHBOR SEARCH meshed by SIX pure-INT32 count->scan->emit passes (the FL2 fluid_cell/fluid_neighbor
     # twin, applied to grains). The CELL TABLE: grain_cell_count.comp (ONE thread per grain: InterlockedAdd
