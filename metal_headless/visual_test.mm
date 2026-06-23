@@ -176,6 +176,11 @@ struct FrameData {
     float iblParams[4];        // x = env maxLod for the IBL pass (issue #33: dedicated, was skyParams.z)
 };
 
+// Issue #39: per-pipeline IBL exposure multiplier written into FrameData.iblParams.y. 1.0 = stock
+// (every showcase renders unchanged); the --ibl-dim flag lowers it to demonstrate the over-exposure
+// control without engine-shader edits. Set in main() before the IBL showcase runs.
+static float gIblIntensity = 1.0f;
+
 static std::string LoadText(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("Cannot open: " + path);
@@ -1517,7 +1522,7 @@ static int RunIblShowcase(const char* outPath) {
         fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
         fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
         fd.skyParams[1] = aspect;
-        fd.iblParams[0] = envMaxLod;   // env maxLod for the IBL fragment shader (Slice R)
+        fd.iblParams[0] = envMaxLod; fd.iblParams[1] = gIblIntensity;   // env maxLod for the IBL fragment shader (Slice R)
     }
 
     render::RenderGraph graph;
@@ -1951,7 +1956,7 @@ static int RunCapstoneShowcase(const char* outPath, ScriptedCamera scripted = {}
         fd.camUp[0]=camUp.x; fd.camUp[1]=camUp.y; fd.camUp[2]=camUp.z;
         fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
         fd.skyParams[1] = aspect;
-        fd.iblParams[0] = envMaxLod;
+        fd.iblParams[0] = envMaxLod; fd.iblParams[1] = gIblIntensity;
     }
 
     std::sort(glass.begin(), glass.end(), [&](const Glass& a, const Glass& b) {
@@ -2319,7 +2324,7 @@ static int RunBloomShowcase(const char* outPath) {
         fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
         fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
         fd.skyParams[1] = aspect;
-        fd.iblParams[0] = envMaxLod;
+        fd.iblParams[0] = envMaxLod; fd.iblParams[1] = gIblIntensity;
     }
 
     const float kExposure = 1.7f;
@@ -65107,6 +65112,14 @@ int main(int argc, char** argv) {
         // --ibl <out.png>: render the HDR-environment-IBL showcase (Slice R).
         if (argc > 1 && std::strcmp(argv[1], "--ibl") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ibl.png";
+            try { return RunIblShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ibl-dim <out.png>: the SAME IBL helmet showcase with the exposure multiplier dialed down
+        // (issue #39) — a dimmer reflected environment, demonstrating per-pipeline over-exposure control.
+        if (argc > 1 && std::strcmp(argv[1], "--ibl-dim") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ibl_dim.png";
+            gIblIntensity = 0.4f;
             try { return RunIblShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }

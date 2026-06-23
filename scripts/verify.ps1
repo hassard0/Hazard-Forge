@@ -77,6 +77,7 @@ $Goldens = @(
     @{ Name = 'mat_normal';    Flag = '--material-normal' }      # Slice BE (NormalMap node: tangent-space normal map)
     @{ Name = 'instanced';     Flag = '--instanced' }            # Slice Q
     @{ Name = 'ibl_helmet';    Flag = '--ibl' }                  # Slice R
+    @{ Name = 'ibl_dim';       Flag = '--ibl-dim' }              # Issue #39 (per-pipeline IBL exposure multiplier — the SAME helmet scene with FrameData.iblParams.y dialed to 0.4 so the reflected env is dimmer; demonstrates over-exposure control without engine-shader edits. FLOAT visresolve-bar golden like ibl_helmet)
     @{ Name = 'physics';       Flag = '--physics' }              # Slice S
     @{ Name = 'transparency';  Flag = '--transparency' }         # Slice T
     @{ Name = 'bloom';         Flag = '--bloom' }                # Slice U

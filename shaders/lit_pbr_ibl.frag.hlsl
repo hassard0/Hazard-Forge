@@ -162,16 +162,20 @@ float4 main(PSInput i) : SV_Target {
     // the env in the surface-normal direction. Replaces the procedural SkyColor() IBL. ---
     {
         float maxLod = f.iblParams.x;   // = mipLevels - 1 (issue #33: dedicated slot, was skyParams.z)
+        // Per-pipeline IBL exposure multiplier (issue #39): scales the env's specular + diffuse
+        // contribution so a sample can dim an over-bright HDR probe without engine-shader edits.
+        // 1.0 = stock (every existing showcase sets it, so the IBL goldens are unchanged).
+        float iblIntensity = f.iblParams.y;
         float3 R = reflect(-V, N);
         float  NoV = max(dot(N, V), 0.0);
         float3 F   = F0 + (max((1.0 - roughness).xxx, F0) - F0) * pow(1.0 - NoV, 5.0);
         // Specular: sharp mirror at roughness 0, blurrier (higher mip) as roughness rises.
         float3 prefiltered = gEnv.SampleLevel(gEnvSmp, EquirectUV(R), roughness * maxLod).rgb;
-        float3 iblSpecular = prefiltered * F * ao;
+        float3 iblSpecular = prefiltered * F * ao * iblIntensity;
         rgb += iblSpecular;
         // Diffuse irradiance: a very blurred mip (maxLod - 1) of the env in the normal direction.
         float3 irradiance = gEnv.SampleLevel(gEnvSmp, EquirectUV(N), max(maxLod - 1.0, 0.0)).rgb;
-        rgb += (1.0 - metallic) * albedo * irradiance * ao;
+        rgb += (1.0 - metallic) * albedo * irradiance * ao * iblIntensity;
     }
 
     // --- Emissive (sRGB -> linear), ADDED after lighting. ---
