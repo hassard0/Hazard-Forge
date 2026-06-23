@@ -367,6 +367,16 @@ hf_compile_shaders(
     # supersample, sharper than US1's bilinear). Reuses post.vert; the only new shader for the slice.
     # taa_resolve.frag / existing shaders + goldens untouched.
     "shaders/tsr_resolve.frag.hlsl:ps"
+    # Moving-camera history reprojection + disocclusion (Slice US3, issue #20): a fork of tsr_resolve.frag
+    # that reprojects the FULL-res history through the camera motion (motion_blur.frag's analytic
+    # prevViewProj*inverse(curView) reprojection copied verbatim) so an ORBITING camera doesn't ghost, with
+    # an off-screen-history disocclusion fallback. Reuses post.vert; the only new shader for the slice.
+    # tsr_resolve.frag / motion_blur.frag / existing shaders + goldens untouched.
+    "shaders/tsr_resolve_reproject.frag.hlsl:ps"
+    # US3 history+depth PACK pass: folds the full-res history color + the full-res current linear depth into
+    # ONE RGBA16F (rgb=history, a=linDepth) so the reproject resolve fits the RHI's 2-sampled-image material
+    # set (NO RHI change). Reuses post.vert. Existing shaders + goldens untouched.
+    "shaders/tsr_pack_histdepth.frag.hlsl:ps"
     # GPU-driven culling + indirect draw (Slice AR): a compute kernel frustum-culls a 1024-instance
     # grid and ORDER-compacts the survivors + writes the indirect draw-args; reuses lit_instanced.vert
     # for the indirect draw. Existing shaders + goldens untouched.

@@ -1115,6 +1115,15 @@ hf_gen_msl(taa_resolve.frag      taa_resolve.frag.hlsl      frag taa_resolve_fra
 # RESOLUTION MISMATCH — accumulate N jittered HALF-res frames into a FULL-res history. float/int32,
 # MSL-native. Same HLSL->SPIR-V->MSL toolchain; existing shaders + goldens untouched.
 hf_gen_msl(tsr_resolve.frag      tsr_resolve.frag.hlsl      frag tsr_resolve_fragment)
+# Moving-camera history reprojection + disocclusion (Slice US3, issue #20): a fork of tsr_resolve.frag
+# that reprojects the FULL-res history through the camera motion (motion_blur.frag's analytic
+# prevViewProj*inverse(curView) reprojection copied verbatim) so an ORBITING camera doesn't ghost, with an
+# off-screen-history disocclusion fallback. float/int32, MSL-native; existing shaders + goldens untouched.
+hf_gen_msl(tsr_resolve_reproject.frag  tsr_resolve_reproject.frag.hlsl  frag tsr_resolve_reproject_fragment)
+# US3 history+depth PACK pass: folds the full-res history color + the full-res current linear depth into
+# ONE RGBA16F (rgb=history, a=linDepth) so the reproject resolve fits the RHI's 2-sampled-image material
+# set (NO RHI change). MSL-native; existing shaders + goldens untouched.
+hf_gen_msl(tsr_pack_histdepth.frag  tsr_pack_histdepth.frag.hlsl  frag tsr_pack_histdepth_fragment)
 # Screen-space projected decals (Slice BH): reuses the SSAO/SSR g-buffer (view normal + linear depth)
 # + the lit HDR scene. decal.frag reconstructs the world position (view-space recon like SSR, then
 # view->world via invView), projects it into the decal box, and alpha-blends a procedural decal over

@@ -8162,6 +8162,488 @@ static int RunUs2TsrShowcase(const char* outPath) {
     return 0;
 }
 
+// --- US3 (moving-camera history reprojection + disocclusion, issue #20). Mirrors the Vulkan
+// --us3-disocclusion-shot EXACTLY: the same settled sphere-pyramid scene, but the camera ORBITS
+// deterministically over N=8 frames (angle(f)=base+f*delta, NO time). Each frame: render the jittered
+// HALF-res scene + a FULL-res linear-depth G-buffer; the history+depth PACK pass folds prevHist.rgb +
+// the depth into one RGBA16F (so the reproject resolve fits the 2-sampled-image material set, NO RHI
+// change); tsr_resolve_reproject folds the half-res current into the FULL-res ping-pong history WITH the
+// history REPROJECTED through the camera motion (prevClip = prevViewProj*inverse(curView), the
+// motion_blur reprojection copied verbatim — HF_YS Y-flip, prevNdc->prevUV convention), disocclusion
+// fallback for off-screen history. Also accumulates the SAME orbit WITHOUT reprojection (identity UV) +
+// a native full-res render at the FINAL pose, and proves the reprojection accumulation is measurably
+// CLOSER to native than the identity accumulation (reprojDiff < identityDiff). SCENE/ORBIT/JITTER/N
+// IDENTICAL to the Vulkan path; two reproject runs DIFF 0.0000. New golden tests/golden/metal/
+// us3_disocclusion.png (controller bakes). ----------------------------------------------------------
+static int RunUs3DisocclusionShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace taa = render::taa;
+    const uint32_t W = 1280, H = 720;
+    const uint32_t hw = 640, hh = 360;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Static scene: the settled 4-layer instanced sphere pyramid (identical recipe to the Vulkan path).
+    physics::World world;
+    {
+        const float R = 0.5f;
+        const int kLayers = 4;
+        const float dd = 2.0f * R;
+        const float dy = R * 1.41421356f;
+        for (int k = 0; k < kLayers; ++k) {
+            int m = kLayers - k;
+            float off = 0.5f * (float)(m - 1) * dd;
+            float y = R + (float)k * dy;
+            for (int gx = 0; gx < m; ++gx)
+                for (int gz = 0; gz < m; ++gz) {
+                    float x = (float)gx * dd - off;
+                    float z = (float)gz * dd - off;
+                    world.bodies.push_back(physics::MakeDynamicSphere({x, y + 0.01f, z}, R));
+                }
+        }
+    }
+    for (int s = 0; s < 240; ++s) world.Step(1.0f / 120.0f);
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(world.bodies.size());
+    for (const auto& b : world.bodies) {
+        Mat4 m = b.Transform();
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        instances.push_back(inst);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+    // Lit pipelines (HDR RT) — UNCHANGED lit/instanced shaders.
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = kHdr;
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    // Shadow pipelines (UNCHANGED).
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    // Sky (HDR RT) — UNCHANGED procedural sky.
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    // G-buffer (view normal + LINEAR DEPTH in .w) — UNCHANGED gbuffer shaders, static path (the 30 spheres
+    // are drawn individually since no instanced gbuffer vertex shader exists).
+    auto gbVs = loadMSL("gbuffer.vert.gen.metal", "gbuffer_vertex");
+    auto gbFs = loadMSL("gbuffer.frag.gen.metal", "gbuffer_fragment");
+    rhi::GraphicsPipelineDesc gbDesc;
+    gbDesc.vertex = gbVs.get(); gbDesc.fragment = gbFs.get();
+    gbDesc.vertexLayout = scene::MeshVertexLayout();
+    gbDesc.colorFormat = kHdr;
+    gbDesc.depthTest = true; gbDesc.usesFrameUniforms = true;
+    gbDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+    auto gbStaticPipeline = device->CreateGraphicsPipeline(gbDesc);
+
+    // TSR reproject resolve + history+depth pack + final post (fullscreen, fragment push constants).
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto tsrFs  = loadMSL("tsr_resolve_reproject.frag.gen.metal", "tsr_resolve_reproject_fragment");
+    auto packFs = loadMSL("tsr_pack_histdepth.frag.gen.metal", "tsr_pack_histdepth_fragment");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    struct TsrParams {
+        float curTexel[2]; float histTexel[2]; float alpha; float firstFrame;
+        float tanHalfFovY; float aspect;
+        float prevClip0[4]; float prevClip1[4]; float prevClip2[4]; float prevClip3[4];
+    };
+
+    rhi::GraphicsPipelineDesc tsrD;
+    tsrD.vertex = postVs.get(); tsrD.fragment = tsrFs.get();
+    tsrD.colorFormat = kHdr;
+    tsrD.depthTest = false; tsrD.usesTexture = true; tsrD.fullscreen = true;
+    tsrD.fragmentPushConstants = true; tsrD.pushConstantSize = sizeof(TsrParams);
+    auto tsrPipe = device->CreateGraphicsPipeline(tsrD);
+
+    rhi::GraphicsPipelineDesc packD;
+    packD.vertex = postVs.get(); packD.fragment = packFs.get();
+    packD.colorFormat = kHdr;
+    packD.depthTest = false; packD.usesTexture = true; packD.fullscreen = true;
+    auto packPipe = device->CreateGraphicsPipeline(packD);
+
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto sceneLow  = device->CreateRenderTarget(hw, hh, kHdr);
+    auto sceneFull = device->CreateRenderTarget(W,  H,  kHdr);
+    auto gbufFull  = device->CreateRenderTarget(W,  H,  kHdr);
+    auto packedRT  = device->CreateRenderTarget(W,  H,  kHdr);
+    auto histA = device->CreateRenderTarget(W, H, kHdr);
+    auto histB = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    rhi::BufferDesc instBufDesc;
+    instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+    instBufDesc.initialData = instances.data();
+    instBufDesc.usage = rhi::BufferUsage::Vertex;
+    auto instanceBuffer = device->CreateBuffer(instBufDesc);
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+    const Vec3 center{0.0f, 1.0f, 0.0f};
+    const Vec3 baseEye{6.5f, 4.5f, 7.0f};
+    const float aspect = (float)hw / (float)hh;
+    const float orbitRadXZ = std::sqrt((baseEye.x - center.x) * (baseEye.x - center.x) +
+                                       (baseEye.z - center.z) * (baseEye.z - center.z));
+    const float baseAngle = std::atan2(baseEye.x - center.x, baseEye.z - center.z);
+    const float deltaAngle = 0.040f;   // IDENTICAL to the Vulkan path
+    auto orbitEye = [&](int f) -> Vec3 {
+        float a = baseAngle + (float)f * deltaAngle;
+        return Vec3{center.x + orbitRadXZ * std::sin(a), baseEye.y, center.z + orbitRadXZ * std::cos(a)};
+    };
+    auto orbitView = [&](int f) -> Mat4 { return Mat4::LookAt(orbitEye(f), center, {0, 1, 0}); };
+    const float kTanHalfFovY = std::tan(0.5f * kFovY);
+
+    // Per-frame FrameData around the orbit eye for frame f. frameIdx<0 => UNJITTERED. The jitter is the
+    // sub-pixel NDC offset injected BEFORE FlipProjY (US2 Metal convention).
+    auto makeFd = [&](int frameIdx, int jw, int jh, const Mat4& viewM, const Vec3& eye) -> FrameData {
+        Mat4 jProj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+        if (frameIdx >= 0) {
+            taa::Vec2 j = taa::Jitter(frameIdx, jw, jh);
+            jProj.m[2 * 4 + 0] += j.x;
+            jProj.m[2 * 4 + 1] += j.y;
+        }
+        Mat4 jvp = FlipProjY(jProj) * viewM;
+        FrameData fd{};
+        for (int k = 0; k < 16; ++k) fd.vp[k] = jvp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = kTanHalfFovY;
+        fd.skyParams[1] = aspect;
+        Mat4 unj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f)) * viewM;
+        for (int k = 0; k < 16; ++k) fd.prevViewProj[k] = unj.m[k];
+        return fd;
+    };
+
+    auto recordScene = [&](rhi::ICommandBuffer& cmd) {
+        cmd.BindPipeline(*skyPipe);
+        cmd.Draw(3);
+        cmd.BindPipeline(*litPipeline);
+        {
+            float pc[20];
+            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+            pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+            cmd.PushConstants(pc, sizeof(pc));
+            cmd.BindMaterial(*groundTex, *flatNormal);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+        }
+        cmd.BindPipeline(*instPipeline);
+        {
+            float material[4] = {0.1f, 0.5f, 0.0f, 0.0f};
+            cmd.PushConstants(material, sizeof(material));
+            cmd.BindMaterial(*groundTex, *flatNormal);
+            cmd.BindVertexBuffer(sphere.vertices());
+            cmd.BindInstanceBuffer(*instanceBuffer);
+            cmd.BindIndexBuffer(sphere.indices());
+            cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+        }
+    };
+    auto recordShadow = [&](rhi::ICommandBuffer& cmd) {
+        cmd.BindPipeline(*staticShadowPipeline);
+        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+        cmd.BindVertexBuffer(plane.vertices());
+        cmd.BindIndexBuffer(plane.indices());
+        cmd.DrawIndexed(plane.indexCount());
+        cmd.BindPipeline(*instShadowPipeline);
+        cmd.BindVertexBuffer(sphere.vertices());
+        cmd.BindInstanceBuffer(*instanceBuffer);
+        cmd.BindIndexBuffer(sphere.indices());
+        cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+    };
+    auto recordGbuffer = [&](rhi::ICommandBuffer& cmd, const Mat4& viewM) {
+        cmd.BindPipeline(*gbStaticPipeline);
+        {
+            float pc[32];
+            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+            cmd.PushConstants(pc, sizeof(pc));
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+        }
+        cmd.BindVertexBuffer(sphere.vertices());
+        cmd.BindIndexBuffer(sphere.indices());
+        for (uint32_t s = 0; s < kInstanceCount; ++s) {
+            float pc[32];
+            for (int k = 0; k < 16; ++k) pc[k] = instances[s].model[k];
+            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+            cmd.PushConstants(pc, sizeof(pc));
+            cmd.DrawIndexed(sphere.indexCount());
+        }
+    };
+
+    auto fillTsr = [&](TsrParams& tp, int frame, bool reproject) {
+        tp.curTexel[0]  = 1.0f / (float)hw; tp.curTexel[1]  = 1.0f / (float)hh;
+        tp.histTexel[0] = 1.0f / (float)W;  tp.histTexel[1] = 1.0f / (float)H;
+        tp.alpha = 1.0f / (float)(frame + 1);
+        tp.firstFrame = (frame == 0) ? 1.0f : 0.0f;
+        tp.tanHalfFovY = kTanHalfFovY; tp.aspect = aspect;
+        Mat4 curView  = orbitView(frame);
+        Mat4 curVP    = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f)) * curView;
+        Mat4 invCur   = curView.Inverse();
+        Mat4 prevVP   = reproject
+                          ? (FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f)) * orbitView(frame - 1))
+                          : curVP;
+        Mat4 prevClip = prevVP * invCur;
+        for (int k = 0; k < 4; ++k) {
+            tp.prevClip0[k] = prevClip.m[0 * 4 + k];
+            tp.prevClip1[k] = prevClip.m[1 * 4 + k];
+            tp.prevClip2[k] = prevClip.m[2 * 4 + k];
+            tp.prevClip3[k] = prevClip.m[3 * 4 + k];
+        }
+    };
+
+    // (A) The TSR accumulation over the ORBIT. reproject toggles the history reprojection.
+    auto renderTsr = [&](bool reproject, std::vector<uint8_t>& outPx,
+                         uint32_t& outW, uint32_t& outH) -> bool {
+        rhi::IRenderTarget* prevHist = histA.get();
+        rhi::IRenderTarget* curHist  = histB.get();
+        for (int frame = 0; frame < taa::kAccumFrames; ++frame) {
+            Mat4 curView = orbitView(frame);
+            Vec3 eye = orbitEye(frame);
+            FrameData fd     = makeFd(frame, (int)hw, (int)hh, curView, eye);
+            FrameData fdGbuf = makeFd(-1,    0,       0,       curView, eye);
+            TsrParams tp{};
+            fillTsr(tp, frame, reproject);
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *sceneLow);
+            render::RgResource rgGbuf = graph.ImportTarget(
+                "gbuffer", render::RgResourceKind::SceneColor, *gbufFull);
+            render::RgResource rgPrev = graph.ImportTarget(
+                "history", render::RgResourceKind::SceneColor, *prevHist);
+            render::RgResource rgPacked = graph.ImportTarget(
+                "packed", render::RgResourceKind::SceneColor, *packedRT);
+            render::RgResource rgCur = graph.ImportTarget(
+                "resolved", render::RgResourceKind::SceneColor, *curHist);
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    recordShadow(cmd);
+                    cmd.EndRenderPass();
+                });
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    recordScene(cmd);
+                    cmd.EndRenderPass();
+                });
+            graph.AddPass("gbuffer", {}, {rgGbuf},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fdGbuf, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                    recordGbuffer(cmd, curView);
+                    cmd.EndRenderPass();
+                });
+            graph.AddPass("packHistDepth", {rgPrev, rgGbuf}, {rgPacked},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                    cmd.BindPipeline(*packPipe);
+                    cmd.BindTexturePair(*prevHist, *gbufFull);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+            graph.AddPass("tsrReproject", {rgScene, rgPacked}, {rgCur},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*tsrPipe);
+                    cmd.BindTexturePair(*sceneLow, *packedRT);
+                    cmd.PushConstants(&tp, sizeof(tp));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+            graph.Execute(*device);
+            device->WaitIdle();
+            std::swap(prevHist, curHist);
+        }
+        {
+            render::RenderGraph graph;
+            render::RgResource rgResolved = graph.ImportTarget(
+                "resolved", render::RgResourceKind::SceneColor, *prevHist);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+            graph.AddPass("post", {rgResolved}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*prevHist);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+            device->CaptureNextFrame();
+            graph.Execute(*device);
+        }
+        outW = 0; outH = 0;
+        bool got = device->GetCapturedPixels(outPx, outW, outH);
+        device->WaitIdle();
+        return got;
+    };
+
+    // (B) The NATIVE full-res reference at the FINAL camera pose, no jitter.
+    auto renderNative = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        const int fLast = taa::kAccumFrames - 1;
+        Mat4 curView = orbitView(fLast);
+        Vec3 eye = orbitEye(fLast);
+        FrameData fd = makeFd(-1, 0, 0, curView, eye);
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *sceneFull);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                recordShadow(cmd);
+                cmd.EndRenderPass();
+            });
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                recordScene(cmd);
+                cmd.EndRenderPass();
+            });
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*sceneFull);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        outW = 0; outH = 0;
+        bool got = device->GetCapturedPixels(outPx, outW, outH);
+        device->WaitIdle();
+        return got;
+    };
+
+    auto meanAbsDiff = [](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) -> double {
+        if (a.size() != b.size() || a.empty()) return 1e9;
+        double acc = 0.0; uint64_t n = 0;
+        for (size_t p = 0; p + 3 < a.size(); p += 4) {
+            for (int c = 0; c < 3; ++c) { acc += std::abs((int)a[p + c] - (int)b[p + c]); ++n; }
+        }
+        return (n > 0) ? acc / (double)n : 1e9;
+    };
+
+    std::printf("us3-disocclusion: orbiting camera (%d frames), reprojection + disocclusion live\n",
+                taa::kAccumFrames);
+
+    std::vector<uint8_t> rep0; uint32_t rw0 = 0, rh0 = 0;
+    std::vector<uint8_t> rep1; uint32_t rw1 = 0, rh1 = 0;
+    if (!renderTsr(true, rep0, rw0, rh0)) return fail("no reproject pixels (run 0)");
+    if (!renderTsr(true, rep1, rw1, rh1)) return fail("no reproject pixels (run 1)");
+    bool identical = (rep0.size() == rep1.size()) && (rw0 == rw1) && (rh0 == rh1);
+    if (identical) { for (size_t b = 0; b < rep0.size(); ++b) { if (rep0[b] != rep1[b]) { identical = false; break; } } }
+    if (!identical) return fail("us3-disocclusion two runs DIFFER (non-deterministic)");
+    std::printf("us3-disocclusion: two-run BYTE-IDENTICAL\n");
+
+    std::vector<uint8_t> idPx; uint32_t iw = 0, ih = 0;
+    std::vector<uint8_t> nativePx; uint32_t nw = 0, nh = 0;
+    if (!renderTsr(false, idPx, iw, ih)) return fail("no identity pixels");
+    if (!renderNative(nativePx, nw, nh))  return fail("no native pixels");
+
+    const double reprojDiff   = meanAbsDiff(rep0, nativePx);
+    const double identityDiff = meanAbsDiff(idPx, nativePx);
+
+    double repMean = 0.0; { uint64_t n = 0; for (size_t p = 0; p + 3 < rep0.size(); p += 4) { for (int c = 0; c < 3; ++c) { repMean += rep0[p + c]; ++n; } } if (n) repMean /= (double)n; }
+    if (repMean <= 0.0) return fail("us3-disocclusion image is black (incoherent)");
+
+    const bool beats = (reprojDiff < identityDiff);
+    std::printf("us3-disocclusion: reproject beats no-reproject {reprojDiff:%.4f, identityDiff:%.4f} %s (reprojection cuts ghosting under motion)\n",
+                reprojDiff, identityDiff, beats ? "Dr < Di" : "Dr >= Di FAIL");
+    std::printf("us3-disocclusion: provenance {frames:%d, disocclusionFallback:true}\n", taa::kAccumFrames);
+    if (!beats) return fail("us3-disocclusion reprojection NOT closer to native than identity");
+
+    if (!WritePNG(outPath, rep0, rw0, rh0)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — US3 orbiting-camera reprojection, %u bodies\n",
+                outPath, rw0, rh0, kInstanceCount);
+    return 0;
+}
+
 // --- Screen-space reflections showcase (Slice AH). Mirrors the Vulkan --ssr-shot path: a DARK
 // reflective checkerboard floor with several distinct colored objects (cubes + spheres) sitting on it,
 // lit + shadowed, rendered into an HDR (RGBA16F) target PLUS a view-space normal+linear-depth g-buffer
@@ -69695,6 +70177,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--us2-tsr") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_us2_tsr.png";
             try { return RunUs2TsrShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --us3-disocclusion <out.png>: moving-camera history reprojection + disocclusion (Slice US3,
+        // issue #20). The camera ORBITS deterministically over N=8 frames; each frame's FULL-res history is
+        // REPROJECTED through the camera motion via tsr_resolve_reproject.frag (the motion_blur reprojection
+        // copied verbatim), with an off-screen-history disocclusion fallback. Proven measurably CLOSER to a
+        // native final-pose render than the no-reproject (identity) accumulation. Mirrors the Vulkan
+        // --us3-disocclusion-shot exactly; two reproject runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--us3-disocclusion") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_us3_disocclusion.png";
+            try { return RunUs3DisocclusionShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --editor <out.png>: docked editor showcase (Slice BT). Renders the SAME default Slice-F
