@@ -776,6 +776,21 @@ hf_compile_shaders(
     # fluid_integrate.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU grain
     # array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/grain_integrate.comp.hlsl:cs"
+    # Deterministic GPU Particles Slice 1 (Slice PT1, the BEACHHEAD of FLAGSHIP #19: deterministic GPU
+    # particles): particles_integrate.comp runs the Q16.16 semi-implicit-Euler PARTICLE POOL INTEGRATOR — ONE
+    # thread per particle slot runs (vel += gravity*dt; vel -= vel*dragK; pos += vel*dt; age += dt; age >=
+    # lifetime -> clear ALIVE) on its OWN slot, the fxmul ((int64)a*b >> 16, the swraster/fpx int64 pattern) +
+    # integrate + drag + age copied VERBATIM from engine/sim/particles.h::IntegrateParticle, and writes
+    # gParticles[i] back (each particle independent in PT1 -> race-free, NO atomics). The EMIT + RECYCLE are
+    # HOST-side (single-thread, between integrate dispatches — the deterministic free-list); the GPU dispatch is
+    # ONLY the per-particle integrate. The FxParticle packs pos/vel/age/lifetime/seed/flags -> 48-byte std430.
+    # integrateEnabled=0 -> write the input back UNCHANGED. Like grain_integrate.comp / fluid_integrate.comp /
+    # fpx_integrate.comp this is int64 (gravity*dt over Q16.16 overflows int32) -> VULKAN-SPIR-V-ONLY (DXC
+    # compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal --pt1-emit showcase runs the
+    # CPU particles::StepEmitIntegrate (byte-identical by construction, the grain_integrate.comp convention).
+    # Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU particle array + cross-backend, proven
+    # memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/particles_integrate.comp.hlsl:cs"
     # Deterministic GPU Granular/Sand Slice 2 (Slice GR2, the 2nd slice of FLAGSHIP #10): the GRID-HASH
     # NEIGHBOR SEARCH meshed by SIX pure-INT32 count->scan->emit passes (the FL2 fluid_cell/fluid_neighbor
     # twin, applied to grains). The CELL TABLE: grain_cell_count.comp (ONE thread per grain: InterlockedAdd

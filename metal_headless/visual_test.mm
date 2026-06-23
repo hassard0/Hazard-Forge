@@ -98,6 +98,7 @@
 #include "sim/cloth.h"              // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp + the Vulkan --cloth-integrate-shot
 #include "sim/fluid.h"              // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp + the Vulkan --fluid-integrate-shot
 #include "sim/grain.h"              // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp + the Vulkan --grain-integrate-shot
+#include "sim/particles.h"          // Slice PT1: deterministic GPU particles Q16.16 emitter + integrator (FxParticle/ParticlePool/EmitParticle/IntegrateParticles/RecycleDead/StepEmitIntegrate, free-list) — shared verbatim with particles_integrate.comp + the Vulkan --pt1-emit-shot; the Metal --pt1-emit runs the CPU StepEmitIntegrate (int64 integrator -> Vulkan-only shader)
 #include "sim/broad.h"              // Slice BP1: deterministic integer broadphase THE BODY GRID + CSR CELL TABLE (BodyGrid/MakeBodyGrid/BodyCellOf/FlatBodyCellId/BodyCellTable/BuildBodyCellTable/BodyGridMeasure, keyed on fpx::FxBody) — shared verbatim with broad_cell_{count,scan,emit}.comp (MSL-NATIVE) + the Vulkan --broad-cell-shot; Metal --broad-cell DISPATCHES the GPU shaders
 #include "sim/couple.h"             // Slice CP1: deterministic rigid<->fluid coupling unified world + body->fluid grid-hash query (CoupleWorld/GatherBodyParticles/BodyParticleAccept) — shared verbatim with couple_body_{count,scan,emit}.comp + the Vulkan --couple-query-shot
 #include "sim/couple_grain.h"       // Slice CG1: deterministic rigid<->grain coupling unified bodies+grains world + body->grain grid-hash query (CGrainWorld/GatherBodyGrains/BodyGrainAccept) — shared verbatim with cgrain_body_{count,scan,emit}.comp + the Vulkan --cgrain-query-shot
@@ -22245,6 +22246,158 @@ static int RunGrainIntegrateShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
     std::printf("OK wrote %s (%ux%u) — grain pool side-view (%d moved, %d at ground)\n",
                 outPath, imgW, imgH, moved, restingAtGround);
+    return 0;
+}
+
+// ===== Slice PT1 — Deterministic GPU Particles Q16.16 EMITTER + INTEGRATOR showcase (--pt1-emit) (the
+// BEACHHEAD of FLAGSHIP #19). Because the integrate is the SAME int64 fxmul form as GR1's grain_integrate.comp
+// / FL1's fluid_integrate.comp (gravity*dt over Q16.16 overflows int32), shaders/particles_integrate.comp is
+// VULKAN-SPIR-V-ONLY (glslc can't parse int64 in HLSL) and is NOT in this dir's hf_gen_msl list; on Metal the
+// --pt1-emit showcase runs the CPU particles::StepEmitIntegrate — the EXACT bit-exact reference the Vulkan
+// --pt1-emit-shot GPU==CPU memcmp compares against -> the Metal result is byte-identical to the Vulkan GPU
+// result BY CONSTRUCTION (the grain_integrate.comp convention), while the Vulkan side carries the GPU==CPU
+// proof. The EMIT + RECYCLE are host-side single-thread (the deterministic free-list — LIFO spawn, ascending
+// recycle, NO atomic cursor), so this whole tick (Emit -> IntegrateParticles -> RecycleDead) is the SAME
+// StepEmitIntegrate both backends run. It builds the SAME deterministic fountain (capacity 256, rate 8/tick,
+// K=90) and renders the SAME PURE-INTEGER side-view (each ALIVE particle a hashColor(seed) dot at
+// (pos.x>>kFrac, pos.y>>kFrac)) as the Vulkan --pt1-emit-shot -> the golden is bit-identical cross-backend BY
+// CONSTRUCTION. The 4 proofs (GPU==CPU by construction, two-run determinism, no-op control, lifecycle
+// free-list invariant) print; the image golden is tests/golden/metal/pt1_emit.png (baked on the Mac by the
+// controller); two runs DIFF 0.0000. NO GPU compute on Metal (the int64 shader is Vulkan-only).
+static int RunPt1EmitShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace pt = hf::sim::particles;
+    namespace vg = render::vg;
+
+    // The deterministic fountain recipe (== the Vulkan --pt1-emit-shot config). -9.8 snapped.
+    const pt::fx kGravY = (pt::fx)(-9.8 * (double)pt::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const pt::fx kDt    = pt::kOne / 60;
+    const pt::fx kDragK = pt::kOne / 50;
+    const pt::fx kSpeed = pt::kOne * 4;
+    const pt::fx kLife  = pt::kOne * 2;
+    const uint32_t kCapacity = 256;
+    const int kSteps = 90;
+    const pt::FxVec3 kGravity{0, kGravY, 0};
+
+    pt::EmitterConfig cfg;
+    cfg.origin = pt::FxVec3{0, 0, 0};
+    cfg.ratePerTick = (pt::fx)8;
+    cfg.lifetime = kLife;
+    cfg.speed = kSpeed;
+    cfg.emitterId = 1u;
+
+    // std430 FxParticle mirror (== the Vulkan --pt1-emit-shot FxParticleGpu): 12 x int32 (48).
+    struct FxParticleGpu {
+        int32_t px, py, pz, vx, vy, vz, age, lifetime; uint32_t seed, flags; int32_t rsv0, rsv1;
+    };
+    static_assert(sizeof(FxParticleGpu) == 48, "FxParticleGpu std430 layout");
+    static_assert(sizeof(pt::FxParticle) == 48, "FxParticle std430 layout");
+    auto packParticles = [&](const std::vector<pt::FxParticle>& ps) {
+        std::vector<FxParticleGpu> out(ps.size());
+        for (size_t i = 0; i < ps.size(); ++i) {
+            const pt::FxParticle& p = ps[i];
+            out[i] = FxParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.vel.x, p.vel.y, p.vel.z,
+                                   p.age, p.lifetime, p.seed, p.flags, p.rsv0, p.rsv1};
+        }
+        return out;
+    };
+
+    // CPU StepEmitIntegrate K ticks over a fresh pool — the bit-exact reference the Vulkan GPU==CPU memcmp
+    // compares against. Track spawned/died for the lifecycle proof.
+    auto runTicks = [&](uint32_t& spawnedOut, uint32_t& diedOut) {
+        pt::ParticlePool pool = pt::InitParticlePool(kCapacity);
+        uint32_t spawned = 0, died = 0;
+        for (int s = 0; s < kSteps; ++s) {
+            const uint32_t aliveBefore = pt::CountAlive(pool);
+            pt::Emit(pool, cfg);
+            spawned += pt::CountAlive(pool) - aliveBefore;
+            const uint32_t aliveAfterEmit = pt::CountAlive(pool);
+            pt::IntegrateParticles(pool, kGravity, kDragK, kDt);
+            died += aliveAfterEmit - pt::CountAlive(pool);
+            pt::RecycleDead(pool);
+            ++pool.tick;
+        }
+        spawnedOut = spawned; diedOut = died;
+        return pool;
+    };
+
+    uint32_t spawned = 0, died = 0;
+    pt::ParticlePool pool = runTicks(spawned, died);
+    const std::vector<FxParticleGpu> particles = packParticles(pool.particles);
+    const uint32_t alive = pt::CountAlive(pool);
+
+    // GPU==CPU is N/A on the Metal CPU path: this particle array IS the CPU StepEmitIntegrate reference the
+    // Vulkan --pt1-emit-shot proved the GPU shader bit-identical against, so the Metal result is byte-identical
+    // to the Vulkan GPU result BY CONSTRUCTION. Print the same proof line for parity.
+    std::printf("pt1-emit: {capacity:%u, spawned:%u, alive:%u, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU particles::StepEmitIntegrate, byte-identical to the Vulkan GPU result by "
+                "construction]\n", kCapacity, spawned, alive, kSteps);
+
+    // two-run determinism.
+    uint32_t spawned2 = 0, died2 = 0;
+    pt::ParticlePool pool2 = runTicks(spawned2, died2);
+    const std::vector<FxParticleGpu> particles2 = packParticles(pool2.particles);
+    if (particles.size() != particles2.size() ||
+        std::memcmp(particles.data(), particles2.data(), particles.size() * sizeof(FxParticleGpu)) != 0)
+        return fail("pt1-emit: two runs differ (nondeterministic free-list / integrate)");
+    std::printf("pt1-emit determinism: two runs BYTE-IDENTICAL\n");
+
+    // no-op control: NO Emit -> the pool stays all-empty across K integrate steps (0 spawned, 0 alive).
+    {
+        pt::ParticlePool noEmitPool = pt::InitParticlePool(kCapacity);
+        const std::vector<FxParticleGpu> empty0 = packParticles(noEmitPool.particles);
+        for (int s = 0; s < kSteps; ++s) {
+            pt::IntegrateParticles(noEmitPool, kGravity, kDragK, kDt);
+            pt::RecycleDead(noEmitPool);
+            ++noEmitPool.tick;
+        }
+        const std::vector<FxParticleGpu> emptyK = packParticles(noEmitPool.particles);
+        if (pt::CountAlive(noEmitPool) != 0 ||
+            std::memcmp(empty0.data(), emptyK.data(), empty0.size() * sizeof(FxParticleGpu)) != 0)
+            return fail("pt1-emit: emitEnabled=false changed the pool");
+        std::printf("pt1-emit no-op: emitEnabled=false -> pool UNCHANGED (0 spawned, 0 alive)\n");
+    }
+
+    // lifecycle: spawned S, died D, alive A == S-D AND freeList.size() == capacity - alive (the signature check).
+    if (alive != spawned - died)
+        return fail("pt1-emit: lifecycle broken (alive != spawned - died)");
+    if ((uint32_t)pool.freeList.size() != kCapacity - alive)
+        return fail("pt1-emit: free-list invariant broken (freeList != capacity - alive)");
+    std::printf("pt1-emit lifecycle: spawned %u, died %u, alive %u == S-D (free-list churn balanced)\n",
+                spawned, died, alive);
+
+    // --- Golden: a PURE-INTEGER side-view debug-viz (IDENTICAL to the Vulkan --pt1-emit-shot by
+    // construction). Each ALIVE particle a hashColor(seed) dot at (pos.x>>kFrac, pos.y>>kFrac). ---
+    const int kPxPerUnit = 24, kMargin = 24, kWorldHalfW = 4, kWorldH = 8;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + (2 * kWorldHalfW) * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+        ix = kMargin + (worldX + kWorldHalfW) * kPxPerUnit;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    for (uint32_t i = 0; i < kCapacity; ++i) {
+        if (!(particles[(size_t)i].flags & pt::kFlagAlive)) continue;
+        const int wx = particles[(size_t)i].px >> pt::kFrac;
+        const int wy = particles[(size_t)i].py >> pt::kFrac;
+        int cx, cy; worldToPx(wx, wy, cx, cy);
+        Vec3 col = vg::hashColor(particles[(size_t)i].seed);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — particle fountain side-view (%u alive)\n", outPath, imgW, imgH, alive);
     return 0;
 }
 
@@ -63766,6 +63919,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--grain-integrate") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_grain_integrate.png";
             try { return RunGrainIntegrateShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pt1-emit <out.png>: render the Deterministic GPU Particles Q16.16 EMITTER + INTEGRATOR showcase
+        // (Slice PT1, the BEACHHEAD of FLAGSHIP #19). UNLIKE the int32 passes, the integrate is int64
+        // (gravity*dt + drag fxmul over Q16.16 overflows int32) so particles_integrate.comp is VULKAN-SPIR-V-
+        // ONLY (NOT in hf_gen_msl) and Metal runs the CPU particles::StepEmitIntegrate — the EXACT bit-exact
+        // reference the Vulkan --pt1-emit-shot GPU==CPU memcmp compares against (byte-identical by
+        // construction). The deterministic free-list (LIFO spawn + ascending recycle, NO atomic cursor) is
+        // host-side, so the whole tick is the SAME both backends. The image golden is the integer fountain
+        // side-view, identical to the Vulkan --pt1-emit-shot by construction.
+        if (argc > 1 && std::strcmp(argv[1], "--pt1-emit") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pt1_emit.png";
+            try { return RunPt1EmitShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --grain-neighbors <out.png>: render the Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH

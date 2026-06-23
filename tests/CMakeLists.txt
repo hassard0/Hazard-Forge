@@ -1133,6 +1133,20 @@ hf_add_pure_test(fluid_test)
 # later GR slices). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(grain_test)
 
+# Deterministic GPU Particles Slice 1 (Slice PT1, the BEACHHEAD of FLAGSHIP #19): the Q16.16 PARTICLE POOL
+# EMITTER + INTEGRATOR core (engine/sim/particles.h) the GPU shaders/particles_integrate.comp.hlsl copies
+# VERBATIM + proves bit-identical. The GR1 integer-beachhead twin with the EMITTER + FREE-LIST delta: a
+# deterministic free-list (LIFO spawn, ascending recycle, NO atomic cursor) on top of the per-particle
+# semi-implicit-Euler + linear-drag integrate. Pins the 48-byte std430 packing, InitParticlePool (free-list
+# DESCENDING so the first pop yields slot 0), ParticleHash (deterministic + distinct), EmitParticle (LIFO pop,
+# ALIVE write, cursor++, full-pool kNoSlot no-op), IntegrateParticle (one-step + drag closed form, age/death),
+# IntegrateParticles ORDER-INDEPENDENCE (particles independent in PT1), RecycleDead (ascending-slot, dead-only,
+# seed cleared, LIFO re-use), StepEmitIntegrate (two-run determinism + the free-list invariant alive ==
+# spawned-died AND freeList.size() == capacity-alive + the no-emit no-op). PT1 is ONLY the emitter + integrator
+# (NO neighbours/collision PT2+, NO ground clamp PT3, NO lockstep, NO float render). Pure C++ (hf_core),
+# ASan-eligible. particles.h #includes fpx.h + grain.h read-only.
+hf_add_pure_test(particles_test)
+
 # Deterministic Integer Broadphase Slice 1 (Slice BP1, the BEACHHEAD of FLAGSHIP #23): the BODY GRID + CSR CELL
 # TABLE core (engine/sim/broad.h) the GPU shaders/broad_cell_{count,scan,emit}.comp.hlsl copy VERBATIM + prove
 # bit-identical. The grain.h GrainGrid/GrainCellTable count->scan->emit, keyed on fpx::FxBody. broad_test pins
