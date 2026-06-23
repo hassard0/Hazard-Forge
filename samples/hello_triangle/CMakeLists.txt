@@ -791,6 +791,20 @@ hf_compile_shaders(
     # Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU particle array + cross-backend, proven
     # memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/particles_integrate.comp.hlsl:cs"
+    # Deterministic GPU Particles Slice 2 (Slice PT2, the 2nd slice of FLAGSHIP #19: deterministic integer
+    # FORCE FIELDS): particles_forces.comp runs the Q16.16 per-particle FORCE-ACCUMULATE + force-integrate — ONE
+    # thread per particle slot accumulates the force over the FIXED field list (point attractor/repeller, vortex
+    # swirl, uniform wind) in ASCENDING index order then runs the PT1 integrate with that force ADDED to gravity
+    # (vel += (gravity+force)*dt; vel -= vel*dragK; pos += vel*dt; age + death), the AccumulateForce +
+    # IntegrateParticleWithForce copied VERBATIM from engine/sim/particles.h (each particle reads the SAME
+    # read-only field input + writes only its OWN slot -> race-free, NO atomics). forcesEnabled=0 -> force is
+    # (0,0,0) so the integrate equals PT1 EXACTLY (the no-op control). Because the falloff fxdiv + FxLength
+    # (FxISqrt) + FxDot/FxCross + the gravity*dt fxmul are int64 (the same form as particles_integrate.comp /
+    # grain_integrate.comp), this shader is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the
+    # Metal hf_gen_msl list; the Metal --pt2-forces showcase runs the CPU particles::StepEmitForcesIntegrate
+    # (byte-identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU particle
+    # array + cross-backend, proven memcmp. NO new RHI; PT1's shader + goldens untouched.
+    "shaders/particles_forces.comp.hlsl:cs"
     # Deterministic GPU Granular/Sand Slice 2 (Slice GR2, the 2nd slice of FLAGSHIP #10): the GRID-HASH
     # NEIGHBOR SEARCH meshed by SIX pure-INT32 count->scan->emit passes (the FL2 fluid_cell/fluid_neighbor
     # twin, applied to grains). The CELL TABLE: grain_cell_count.comp (ONE thread per grain: InterlockedAdd

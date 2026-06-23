@@ -309,5 +309,166 @@ inline uint32_t CountAlive(const ParticlePool& pool) {
     return n;
 }
 
+// ===== Slice PT2 — Deterministic integer FORCE FIELDS (Issue #19, flagship #19, 2nd slice) ==============
+// APPEND-ONLY: everything above (PT1) is BYTE-FROZEN. PT2 adds deterministic integer FORCE FIELDS — point
+// attractor/repeller, vortex swirl, uniform wind — accumulated PER-PARTICLE in a FIXED array order and folded
+// into the integrate as an extra acceleration alongside gravity. Per-particle INDEPENDENT (no grid, no
+// neighbours, no atomics, NO TDR — each particle reads the SAME read-only field list). Pure Q16.16/integer
+// (NO float/rand/clock). int64 in the falloff/normalize/cross math -> the new shader particles_forces.comp is
+// VULKAN-SPIR-V-ONLY (glslc can't parse int64 in HLSL); Metal runs the CPU StepEmitForcesIntegrate byte-
+// identical by construction (the PT1/GR3/FL4 split). The make-or-break: force==0 must equal PT1's
+// IntegrateParticle EXACTLY (the no-op control), and the fields must accumulate in FIXED array order so the
+// sum is associative-order-pinned -> bit-exact GPU==CPU + cross-backend.
+//
+// fpx.h gives FxLength / FxNormalize / fxdiv (read-only); FxDot / FxCross are NOT in fpx.h (they live in
+// convex.h, which particles.h does NOT include — particles.h stays minimal, fpx.h+grain.h only), so we add
+// the two as small LOCAL inline helpers here, VERBATIM the convex.h int64 form (the FxRotate-internal cross),
+// so the shader copies the SAME ops. NO new fixed-point primitive — just the dot/cross composed of fxmul.
+
+using fpx::fxdiv;          // Q16.16 divide (int64 shift then truncating divide; b==0 -> 0)
+using fpx::FxLength;       // Q16.16 vector length (FxISqrt of the int64 sum-of-squares)
+using fpx::FxNormalize;    // Q16.16 unit vector (len==0 -> (0,kOne,0) fallback)
+
+// ----- FxDot / FxCross (LOCAL, VERBATIM the convex.h int64 form — fpx.h lacks them) ----------------------
+// a·b = (ax*bx + ay*by + az*bz) >> kFrac, the sum kept in int64 then ONE arithmetic right shift -> Q16.16
+// (the FxLength sum-of-squares discipline). Deterministic, identical CPU/HLSL. The shader copies THIS body.
+inline fx FxDot(const FxVec3& a, const FxVec3& b) {
+    int64_t d = (int64_t)a.x * (int64_t)b.x + (int64_t)a.y * (int64_t)b.y + (int64_t)a.z * (int64_t)b.z;
+    return (fx)(d >> kFrac);
+}
+// a×b = (ay*bz - az*by, az*bx - ax*bz, ax*by - ay*bx), each fxmul an int64 product (the FxRotate cross). The
+// vortex tangent is FxCross(axis, rPerp). The shader copies THIS body VERBATIM.
+inline FxVec3 FxCross(const FxVec3& a, const FxVec3& b) {
+    return FxVec3{
+        fxmul(a.y, b.z) - fxmul(a.z, b.y),
+        fxmul(a.z, b.x) - fxmul(a.x, b.z),
+        fxmul(a.x, b.y) - fxmul(a.y, b.x),
+    };
+}
+
+// ----- The force-field kinds (a fixed integer enum) -----------------------------------------------------
+inline constexpr uint32_t kFieldPoint  = 0u;  // attractor (strength>0) / repeller (strength<0), radial falloff
+inline constexpr uint32_t kFieldVortex = 1u;  // swirl about `axis` through `center`, tangential, radial falloff
+inline constexpr uint32_t kFieldWind   = 2u;  // uniform constant force = axis*strength (no falloff, no radius)
+
+// ----- ForceField: a single deterministic Q16.16 force field (the std430 GPU mirror) --------------------
+// std430-packable as plain int32s: kind (uint), center.xyz, axis.xyz, strength, radius (9 x 4-byte = 36
+// bytes; the GPU pack rounds to a std430-friendly stride). center/axis are Q16.16 vectors; strength is a
+// SIGNED Q16.16 magnitude (point: + attract toward center / - repel away); radius is the Q16.16 influence
+// cutoff (point/vortex; ignored for wind). axis is a host-snapped unit-ish direction (vortex spin axis /
+// wind direction). All host-snapped integers -> the GPU consumes them verbatim, ZERO float.
+struct ForceField {
+    uint32_t kind = kFieldPoint;
+    FxVec3   center{};     // Q16.16 field origin (point/vortex)
+    FxVec3   axis{};       // Q16.16 unit-ish: vortex spin axis, OR wind direction (host-snapped unit)
+    fx       strength = 0; // Q16.16 force magnitude (signed for point: + attract, - repel)
+    fx       radius = 0;   // Q16.16 influence radius (point/vortex); ignored for wind
+};
+
+// ----- AccumulateForce: sum the force on a particle over the fields in FIXED ARRAY ORDER ------------------
+// PURE int64 Q16.16, fields summed in ascending index order (the deterministic associative-order contract —
+// the SAME order on CPU + GPU, so the integer sum is bit-identical). Per field kind:
+//   kFieldPoint:  d = center - p.pos; dist = FxLength(d); if (0 < dist < radius) {
+//                   dir = FxNormalize(d); falloff = fxdiv(radius - dist, radius);  // 1 at center -> 0 at edge
+//                   force += FxScale(dir, fxmul(strength, falloff)); }             // strength sign = attract/repel
+//   kFieldVortex: r = p.pos - center; rPerp = r - FxScale(axis, FxDot(r, axis));   // perpendicular to axis
+//                 dist = FxLength(rPerp); if (0 < dist < radius) {
+//                   tan = FxCross(axis, rPerp); if (FxLength(tan) > 0) {
+//                     dir = FxNormalize(tan); falloff = fxdiv(radius - dist, radius);
+//                     force += FxScale(dir, fxmul(strength, falloff)); } }
+//   kFieldWind:   force += FxScale(axis, strength);                                 // constant, no falloff
+// dead/empty particles still evaluate the same (the caller gates on ALIVE), so the result is order-pinned.
+// The shader copies THIS body VERBATIM. (Uses fpx::FxLength/FxNormalize/fxdiv + the local FxDot/FxCross.)
+inline FxVec3 AccumulateForce(const FxParticle& p, const ForceField* fields, uint32_t count) {
+    FxVec3 force{0, 0, 0};
+    for (uint32_t f = 0; f < count; ++f) {
+        const ForceField& fld = fields[f];
+        if (fld.kind == kFieldPoint) {
+            const FxVec3 d = FxSub(fld.center, p.pos);
+            const fx dist = FxLength(d);
+            if (dist > 0 && dist < fld.radius) {
+                const FxVec3 dir = FxNormalize(d);
+                const fx falloff = fxdiv(fld.radius - dist, fld.radius);
+                const fx mag = fxmul(fld.strength, falloff);
+                force.x += fxmul(dir.x, mag);
+                force.y += fxmul(dir.y, mag);
+                force.z += fxmul(dir.z, mag);
+            }
+        } else if (fld.kind == kFieldVortex) {
+            const FxVec3 r = FxSub(p.pos, fld.center);
+            const fx along = FxDot(r, fld.axis);
+            const FxVec3 rPerp = FxSub(r, FxScale(fld.axis, along));
+            const fx dist = FxLength(rPerp);
+            if (dist > 0 && dist < fld.radius) {
+                const FxVec3 tang = FxCross(fld.axis, rPerp);
+                if (FxLength(tang) > 0) {
+                    const FxVec3 dir = FxNormalize(tang);
+                    const fx falloff = fxdiv(fld.radius - dist, fld.radius);
+                    const fx mag = fxmul(fld.strength, falloff);
+                    force.x += fxmul(dir.x, mag);
+                    force.y += fxmul(dir.y, mag);
+                    force.z += fxmul(dir.z, mag);
+                }
+            }
+        } else if (fld.kind == kFieldWind) {
+            force.x += fxmul(fld.axis.x, fld.strength);
+            force.y += fxmul(fld.axis.y, fld.strength);
+            force.z += fxmul(fld.axis.z, fld.strength);
+        }
+    }
+    return force;
+}
+
+// ----- IntegrateParticleWithForce: the PT1 integrate with `force` ADDED to gravity -----------------------
+// EXACTLY IntegrateParticle, but the velocity integrate adds (gravity + force) instead of gravity:
+//   vel += (gravity + force) * dt; vel -= vel*dragK; pos += vel*dt; age += dt; death. When force == (0,0,0)
+//   this is BYTE-IDENTICAL to IntegrateParticle (the no-op control). The shader copies THIS body VERBATIM.
+inline void IntegrateParticleWithForce(FxParticle& p, const FxVec3& force, const FxVec3& gravity,
+                                       fx dragK, fx dt) {
+    if (!(p.flags & kFlagAlive)) return;
+    // (1) integrate velocity: vel += (gravity + force) * dt.
+    p.vel.x += fxmul(gravity.x + force.x, dt);
+    p.vel.y += fxmul(gravity.y + force.y, dt);
+    p.vel.z += fxmul(gravity.z + force.z, dt);
+    // (2) linear drag: vel -= vel * dragK.
+    p.vel.x -= fxmul(p.vel.x, dragK);
+    p.vel.y -= fxmul(p.vel.y, dragK);
+    p.vel.z -= fxmul(p.vel.z, dragK);
+    // (3) integrate position: pos += vel * dt.
+    p.pos.x += fxmul(p.vel.x, dt);
+    p.pos.y += fxmul(p.vel.y, dt);
+    p.pos.z += fxmul(p.vel.z, dt);
+    // (4) age + death (NO ground clamp — PT3).
+    p.age += dt;
+    if (p.age >= p.lifetime) p.flags &= ~kFlagAlive;
+}
+
+// ----- IntegrateParticlesWithForces: per-particle accumulate + force-integrate over the whole pool --------
+// For each slot: force = AccumulateForce(p, fields, count); IntegrateParticleWithForce(p, force, ...). The
+// reference the GPU memcmp's against. Per-particle INDEPENDENT (every particle reads the SAME read-only field
+// list) -> order-independent -> bit-identical regardless of GPU scheduling. count==0 -> force is always
+// (0,0,0) -> EXACTLY IntegrateParticles (the no-op control). The shader runs THIS per particle.
+inline void IntegrateParticlesWithForces(ParticlePool& pool, const ForceField* fields, uint32_t count,
+                                         const FxVec3& gravity, fx dragK, fx dt) {
+    const size_t n = pool.particles.size();
+    for (size_t i = 0; i < n; ++i) {
+        const FxVec3 force = AccumulateForce(pool.particles[i], fields, count);
+        IntegrateParticleWithForce(pool.particles[i], force, gravity, dragK, dt);
+    }
+}
+
+// ----- StepEmitForcesIntegrate: one full PT2 tick ---------------------------------------------------------
+// (1) Emit (single-thread host-ordered LIFO spawn) -> (2) IntegrateParticlesWithForces (per-particle
+// accumulate + force-integrate, the GPU dispatch) -> (3) RecycleDead (ascending-slot) -> (4) ++tick. count==0
+// reduces to PT1's StepEmitIntegrate EXACTLY (the forces-idle control). Pure integer, fixed pass order ->
+// two-run bit-identical AND bit-exact GPU==CPU (the GPU runs (2); the host does (1)+(3) between dispatches).
+inline void StepEmitForcesIntegrate(ParticlePool& pool, const EmitterConfig& cfg, const ForceField* fields,
+                                    uint32_t count, const FxVec3& gravity, fx dragK, fx dt) {
+    Emit(pool, cfg);                                                  // (1) spawn (single-thread host-ordered)
+    IntegrateParticlesWithForces(pool, fields, count, gravity, dragK, dt);  // (2) accumulate + integrate
+    RecycleDead(pool);                                               // (3) recycle dead slots (ascending)
+    ++pool.tick;                                                     // (4) advance the tick
+}
+
 }  // namespace particles
 }  // namespace hf::sim

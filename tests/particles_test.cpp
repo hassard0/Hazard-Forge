@@ -267,6 +267,94 @@ int main() {
               "StepEmitIntegrate: no-emit pool byte-stable (the no-op control)");
     }
 
+    // ================= Slice PT2: FORCE FIELDS — zero-fields==PT1, vortex deflection, determinism =========
+    {
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const fx dt = kOne / 60, drag = kOne / 50;
+        const pt::FxVec3 grav{0, kGravY, 0};
+        const uint32_t cap = 256;
+        const int K = 140;
+        pt::EmitterConfig cfg;
+        cfg.origin = pt::FxVec3{0, 0, 0}; cfg.ratePerTick = (fx)8; cfg.lifetime = kOne * 2;
+        cfg.speed = kOne * 4; cfg.emitterId = 1u;
+
+        // The two PT2 fields (== the showcase): a vortex (axis +Y) + a point attractor off to +x.
+        std::vector<pt::ForceField> fields(2);
+        fields[0].kind = pt::kFieldVortex;
+        fields[0].center = pt::FxVec3{0, kOne * 3 / 2, 0};
+        fields[0].axis = pt::FxVec3{0, kOne, 0};
+        fields[0].strength = kOne * 6;
+        fields[0].radius = kOne * 4;
+        fields[1].kind = pt::kFieldPoint;
+        fields[1].center = pt::FxVec3{kOne * 2, kOne * 2, 0};
+        fields[1].axis = pt::FxVec3{0, 0, 0};
+        fields[1].strength = kOne * 5;
+        fields[1].radius = kOne * 5;
+
+        // --- IntegrateParticleWithForce with force==0 is BYTE-IDENTICAL to PT1's IntegrateParticle ---
+        {
+            pt::FxParticle a;
+            a.pos = pt::FxVec3{FromInt(1), FromInt(3), FromInt(-2)};
+            a.vel = pt::FxVec3{FromInt(2), FromInt(1), 0};
+            a.age = 0; a.lifetime = kOne * 100; a.seed = 7u; a.flags = pt::kFlagAlive;
+            pt::FxParticle b = a;
+            pt::IntegrateParticle(a, grav, drag, dt);
+            pt::IntegrateParticleWithForce(b, pt::FxVec3{0, 0, 0}, grav, drag, dt);
+            check(std::memcmp(&a, &b, sizeof(pt::FxParticle)) == 0,
+                  "PT2 IntegrateParticleWithForce(force=0) == PT1 IntegrateParticle (byte-identical)");
+        }
+
+        // --- AccumulateForce idle when count==0 (no fields -> zero force) ---
+        {
+            pt::FxParticle p;
+            p.pos = pt::FxVec3{kOne, kOne, 0}; p.flags = pt::kFlagAlive; p.seed = 1u;
+            const pt::FxVec3 f = pt::AccumulateForce(p, fields.data(), 0u);
+            check(f.x == 0 && f.y == 0 && f.z == 0, "PT2 AccumulateForce(count=0) is zero (forces idle when absent)");
+        }
+
+        // --- zero fields == PT1 free-fall: StepEmitForcesIntegrate(count=0) == StepEmitIntegrate ---
+        {
+            pt::ParticlePool zeroPool = pt::InitParticlePool(cap);
+            for (int s = 0; s < K; ++s)
+                pt::StepEmitForcesIntegrate(zeroPool, cfg, fields.data(), 0u, grav, drag, dt);
+            pt::ParticlePool pt1Pool = pt::InitParticlePool(cap);
+            for (int s = 0; s < K; ++s)
+                pt::StepEmitIntegrate(pt1Pool, cfg, grav, drag, dt);
+            check(std::memcmp(zeroPool.particles.data(), pt1Pool.particles.data(),
+                              (size_t)cap * sizeof(pt::FxParticle)) == 0,
+                  "PT2 StepEmitForcesIntegrate(count=0) == PT1 StepEmitIntegrate (zero fields == free-fall)");
+        }
+
+        // --- determinism: two fielded runs byte-identical ---
+        auto runFielded = [&]() {
+            pt::ParticlePool pool = pt::InitParticlePool(cap);
+            for (int s = 0; s < K; ++s)
+                pt::StepEmitForcesIntegrate(pool, cfg, fields.data(), (uint32_t)fields.size(), grav, drag, dt);
+            return pool;
+        };
+        pt::ParticlePool f1 = runFielded();
+        pt::ParticlePool f2 = runFielded();
+        check(std::memcmp(f1.particles.data(), f2.particles.data(),
+                          (size_t)cap * sizeof(pt::FxParticle)) == 0,
+              "PT2 StepEmitForcesIntegrate: two runs byte-identical (deterministic)");
+
+        // --- vortex deflection non-trivial: fielded mean |x| clearly exceeds the no-field control ---
+        {
+            pt::ParticlePool ctrl = pt::InitParticlePool(cap);
+            for (int s = 0; s < K; ++s)
+                pt::StepEmitIntegrate(ctrl, cfg, grav, drag, dt);
+            auto meanAbsX = [](const pt::ParticlePool& p) -> double {
+                int64_t sum = 0; uint32_t n = 0;
+                for (const pt::FxParticle& q : p.particles)
+                    if (q.flags & pt::kFlagAlive) { sum += (q.pos.x < 0 ? -(int64_t)q.pos.x : q.pos.x); ++n; }
+                if (n == 0) return 0.0;
+                return (double)sum / (double)n / (double)kOne;
+            };
+            const double deflect = meanAbsX(f1) - meanAbsX(ctrl);
+            check(deflect > 0.10, "PT2 vortex+attractor deflection non-trivial (mean |x| > no-field control + 0.1)");
+        }
+    }
+
     if (g_fail == 0) std::printf("particles_test: ALL CHECKS PASSED\n");
     else std::printf("particles_test: %d CHECK(S) FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
