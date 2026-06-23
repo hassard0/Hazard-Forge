@@ -67,12 +67,23 @@ hint shader. The public path:
 
 - `--rt1-trace` — the deterministic Q16.16 **software reference tracer** (the "ground-truth reference mode" of issue
   #13 — every HW path is validated to agree with it).
-- `--rt2-query` (Vulkan HW inline ray query) / `--rt2-hwquery` (Metal HW intersection query) — real hardware RT on
-  *both* vendors, reconciled to a bit-identical result.
-- `--rt3-shadow`, `--rt4-reflect`, `--rt5-simrender`, `--rt6-hero` — RT shadows, reflections, sim-render, hero scene.
+- `--rt2-query` (Vulkan HW inline ray query, in the RHI) — real Vulkan hardware RT through the engine RHI.
+- `--rt2-query-hw` (Metal HW `intersection_query`, RT2b) — real Apple-Silicon hardware ray query, **demonstrated in
+  the headless Metal test** (`MTLAccelerationStructure` + `intersection_query`, proven byte-equal to the CPU
+  reference). **Honest caveat:** this Metal HW path lives in `metal_headless/visual_test.mm`, NOT in the RHI
+  (`engine/rhi_metal/` has no accel-structure plumbing yet), so a sample author cannot reach Metal HW RT through the
+  engine RHI / `accelStructureBinding`. **On the Metal backend, `--rt3-shadow`/`--rt4-reflect`/`--rt-reflect-graphics`
+  run the deterministic CPU `rtrace::` reference, not the GPU**, because the int64 RayQuery kernels are
+  Vulkan-SPIR-V-only (glslc/spirv-cross cannot lower int64 to MSL). Productizing Metal HW RT through the RHI +
+  graphics pipeline is a **deferred flagship (issue #35)**.
+- `--rt3-shadow`, `--rt4-reflect`, `--rt5-simrender`, `--rt6-hero` — RT shadows, reflections, sim-render, hero scene
+  (Vulkan HW; Metal runs the CPU reference per the caveat above).
 
 The moat: the HW BVH is used only as a candidate generator; our integer intersection owns the closest hit, so the
-result is **bit-identical NVIDIA + Apple** — a deterministic RT reference no float RT engine offers. See ARCHITECTURE
+HW result is **bit-identical to the CPU reference** — a deterministic RT reference no float RT engine offers. NOTE:
+"bit-identical Vulkan/Metal" today means both agree with the same CPU `rtrace::` reference; the Vulkan HW path is
+proven equal to it, and the Metal HW path is proven equal to it for RT2b standalone — it is NOT a claim that Metal
+runs HW RT through the engine in the shadow/reflection showcases (those use the CPU reference on Metal). See ARCHITECTURE
 "Hardware ray tracing, deterministically reconciled". *Genuine remaining work:* a temporal RT **denoiser** for noisy
 1-spp paths (a screen-space denoiser exists for SSGI: `--ssgi-denoise`).
 
