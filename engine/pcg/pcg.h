@@ -17,6 +17,7 @@
 // [0, kOne) strictly (top16 of a uint32 is in [0, 65535] = [0, kOne)). This is what makes a CPU-rendered
 // PCG point-field byte-identical CPU<->Vulkan<->Metal BY CONSTRUCTION (a strict zero-differing-pixel golden).
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -267,6 +268,89 @@ inline std::vector<PcgInstance> BuildInstances(const std::vector<FxVec3>& points
         out.push_back(PcgInstance{ points[(size_t)i], orient, scale });
     }
     return out;
+}
+
+// ===== Slice PCG5 — Declarative layered pipeline + overlap-prune (the 5th slice of FLAGSHIP #22) ============
+// THE DETERMINISM HEADLINE. Composes PCG2/PCG3/PCG4 into one declarative `Generate(graph, stream)` call (the
+// integer-deterministic analog of a PCG graph), and adds the capstone PruneOverlaps stage: reject instances
+// whose footprint spheres interpenetrate, processed in a FIXED CANONICAL ORDER (first-placed-wins, the
+// fpx::SolveContacts Gauss-Seidel order-determinism discipline) so a designer gets a Poisson-like
+// minimum-spacing guarantee deterministically. The headline: `Generate` is a PURE FUNCTION of the seed, so two
+// netcode "peers" produce a byte-identical world from the seed alone. Strict int32 except the prune's FxLength
+// (int64, CPU-both -> still byte-identical). APPEND-ONLY (PCG1-PCG4 + fpx.h + particles.h read-only).
+
+// ----- PcgGraph: the declarative recipe (scatter -> mask -> transform -> prune) ------------------------------
+struct PcgGraph {
+    PcgArea      area;
+    int          cellsX = 1, cellsZ = 1;     // ScatterStage
+    bool         useMask = false;            // MaskStage (optional)
+    PcgMask      mask;
+    fx           density = kOne;
+    PcgTransform transform;                  // TransformStage
+    bool         prune = false;              // PruneStage (optional)
+    fx           pruneRadius = 0;            // footprint sphere radius (scaled per-instance by instance.scale)
+};
+
+// ----- PruneOverlaps: greedy minimum-spacing prune in a CANONICAL order independent of input order -----------
+// (1) Establish a CANONICAL order INDEPENDENT of input order (the load-bearing bit): build an index array
+//     0..n-1 and STABLE-sort it by a position-derived key — primary pos.z, tie-break pos.x, final tie-break the
+//     original index (pure integer compares, NO float). Positions are unique per scatter cell so the key is
+//     effectively total; the explicit origIndex tie-break makes the sort fully deterministic regardless. This
+//     is what makes "shuffle the input -> SAME survivors" hold.
+// (2) Greedily walk the canonical order; KEEP instance i iff it does NOT overlap any ALREADY-KEPT j: overlap
+//     <=> FxLength((pos_i - pos_j) with Y zeroed) < r_i + r_j, where r_i = fxmul(baseRadius, inst_i.scale)
+//     (the per-instance footprint; FxLength is the int64 path, reused from fpx.h). First-placed in canonical
+//     order wins. Return the survivors IN canonical order (deterministic output order).
+// (3) baseRadius <= 0 -> no pair can overlap -> all kept (a clean no-op), returned in canonical order.
+inline std::vector<PcgInstance> PruneOverlaps(const std::vector<PcgInstance>& in, fx baseRadius) {
+    std::vector<PcgInstance> out;
+    const size_t n = in.size();
+    if (n == 0) return out;
+
+    // Canonical order: stable integer sort of indices by (pos.z, pos.x, origIndex).
+    std::vector<uint32_t> order(n);
+    for (uint32_t i = 0; i < (uint32_t)n; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&in](uint32_t a, uint32_t b) {
+        if (in[a].pos.z != in[b].pos.z) return in[a].pos.z < in[b].pos.z;  // primary: pos.z
+        if (in[a].pos.x != in[b].pos.x) return in[a].pos.x < in[b].pos.x;  // tie-break: pos.x
+        return a < b;                                                       // final tie-break: original index
+    });
+
+    out.reserve(n);
+    if (baseRadius <= 0) {                       // no-op: no pair can overlap -> all kept, in canonical order
+        for (size_t k = 0; k < n; ++k) out.push_back(in[order[k]]);
+        return out;
+    }
+
+    // Greedy first-placed-wins walk over the canonical order; keep iff disjoint from every already-kept.
+    std::vector<fx> keptR;                        // the per-instance footprint radius of each kept survivor
+    keptR.reserve(n);
+    for (size_t k = 0; k < n; ++k) {
+        const PcgInstance& ci = in[order[k]];
+        const fx ri = fxmul(baseRadius, ci.scale);
+        bool overlaps = false;
+        for (size_t j = 0; j < out.size() && !overlaps; ++j) {
+            const PcgInstance& cj = out[j];
+            const FxVec3 d{ ci.pos.x - cj.pos.x, 0, ci.pos.z - cj.pos.z };  // Y zeroed (XZ footprint)
+            const fx dist = hf::sim::fpx::FxLength(d);                       // int64 integer sqrt, Q16.16
+            if (dist < ri + keptR[j]) overlaps = true;                       // interpenetration
+        }
+        if (!overlaps) { out.push_back(ci); keptR.push_back(ri); }
+    }
+    return out;
+}
+
+// ----- Generate: compose the stages into one declarative pure-of-the-seed call -------------------------------
+// (1) points = useMask ? ScatterMasked(...) : ScatterGrid(...);  (2) instances = BuildInstances(points,...);
+// (3) if (prune) instances = PruneOverlaps(instances, pruneRadius). cellsX<=0||cellsZ<=0 -> empty (the empty
+// no-op, since ScatterGrid/ScatterMasked already short-circuit). A PURE FUNCTION of (g, stream).
+inline std::vector<PcgInstance> Generate(const PcgGraph& g, const PcgStream& stream) {
+    const std::vector<FxVec3> points =
+        g.useMask ? ScatterMasked(stream, g.area, g.cellsX, g.cellsZ, g.mask, g.density)
+                  : ScatterGrid(stream, g.area, g.cellsX, g.cellsZ);
+    std::vector<PcgInstance> instances = BuildInstances(points, stream, g.transform);
+    if (g.prune) instances = PruneOverlaps(instances, g.pruneRadius);
+    return instances;
 }
 
 }  // namespace hf::pcg

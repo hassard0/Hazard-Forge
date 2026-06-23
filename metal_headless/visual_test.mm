@@ -40814,6 +40814,140 @@ static int RunPcg4RulesShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PCG5 — Deterministic PCG DECLARATIVE LAYERED PIPELINE + OVERLAP-PRUNE showcase (--pcg5-graph) (the
+// 5th slice of FLAGSHIP #22, hf::pcg — THE DETERMINISM HEADLINE). PURE CPU — NO GPU compute, NO new shader, NO new
+// RHI; pcg.h is header-only integer math, so on Metal it runs the IDENTICAL declarative pcg::Generate pipeline
+// (scatter->mask->transform->prune) the Vulkan --pcg5-graph-shot runs on Windows -> the 2D non-overlapping
+// oriented-marker golden is bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). The prune
+// is order-CANONICAL (stable integer sort by (pos.z,pos.x,origIndex)) so shuffling the input gives the SAME
+// survivors. Each marker is PCG4's oriented cross whose scaled arm offsets are rotated by fpx::FxRotate
+// (pure-integer) and mapped to INTEGER pixel coords (NO float pixel rounding); the proof lines match the Vulkan
+// side EXACTLY. The fixed SEED/SALT/AREA/CELLS/MASK/DENSITY/RULE/PRUNE/IMG MUST be IDENTICAL to the Vulkan
+// --pcg5-graph-shot. New golden tests/golden/metal/pcg5_graph.png (baked on the Mac by the controller); two runs
+// DIFF 0.0000.
+static int RunPcg5GraphShowcase(const char* outPath) {
+    namespace pcg = hf::pcg;
+    namespace fpx = hf::sim::fpx;
+    // THE FIXED SHOWCASE PARAMS — IDENTICAL to the Vulkan --pcg5-graph-shot (main.cpp).
+    const uint32_t kSeed   = 1337u;
+    const uint32_t kSalt   = 0x5CA77E20u;
+    const int      kCellsX = 48;
+    const int      kCellsZ = 48;
+    const uint32_t kImg    = 256u;
+    const pcg::PcgArea kArea{ pcg::FxVec3{0, 0, 0}, pcg::FxVec3{pcg::kOne * 32, 0, pcg::kOne * 32} };
+    const pcg::fx kRadius = pcg::kOne * 32 / 3;
+    const pcg::fx kScaleLo = pcg::kOne / 2;          // 32768
+    const pcg::fx kScaleHi = pcg::kOne * 3 / 2;      // 98304
+    const pcg::fx kPruneRadius = pcg::kOne;
+    const int kArmLen = pcg::kOne / 4;
+
+    pcg::PcgGraph kGraph;
+    kGraph.area = kArea; kGraph.cellsX = kCellsX; kGraph.cellsZ = kCellsZ;
+    kGraph.useMask = true;
+    kGraph.mask.type = pcg::PcgMaskType::Radial;
+    kGraph.mask.center = pcg::FxVec3{ pcg::kOne * 16, 0, pcg::kOne * 16 };
+    kGraph.mask.radius = kRadius;
+    kGraph.density = pcg::kOne;
+    kGraph.transform.randomYaw = true; kGraph.transform.scaleLo = kScaleLo; kGraph.transform.scaleHi = kScaleHi;
+    kGraph.prune = true; kGraph.pruneRadius = kPruneRadius;
+
+    const pcg::fx extX = kArea.max.x - kArea.min.x;
+    const pcg::fx extZ = kArea.max.z - kArea.min.z;
+    const pcg::PcgStream st{kSeed, kSalt};
+
+    auto renderInstances = [&](const std::vector<pcg::PcgInstance>& insts, std::vector<uint8_t>& out) {
+        out.assign((size_t)kImg * kImg * 4, 0);
+        for (size_t pp = 0; pp < (size_t)kImg * kImg; ++pp) {
+            out[pp * 4 + 0] = 12; out[pp * 4 + 1] = 10; out[pp * 4 + 2] = 8; out[pp * 4 + 3] = 255;
+        }
+        auto putPx = [&](int ix, int iy, uint8_t b, uint8_t g, uint8_t r) {
+            if (ix < 0 || ix >= (int)kImg || iy < 0 || iy >= (int)kImg) return;
+            uint8_t* d = &out[((size_t)iy * kImg + ix) * 4];
+            d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+        };
+        auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t b, uint8_t g, uint8_t r) {
+            int dx = x1 - x0, dy = y1 - y0;
+            int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+            int sx = dx < 0 ? -1 : 1, sy = dy < 0 ? -1 : 1;
+            int err = adx - ady;
+            for (;;) {
+                putPx(x0, y0, b, g, r);
+                if (x0 == x1 && y0 == y1) break;
+                int e2 = 2 * err;
+                if (e2 > -ady) { err -= ady; x0 += sx; }
+                if (e2 <  adx) { err += adx; y0 += sy; }
+            }
+        };
+        for (size_t i = 0; i < insts.size(); ++i) {
+            const pcg::PcgInstance& in = insts[i];
+            const int cx = (int)(((int64_t)(in.pos.x - kArea.min.x) * (int64_t)kImg) / (int64_t)extX);
+            const int cy = (int)(((int64_t)(in.pos.z - kArea.min.z) * (int64_t)kImg) / (int64_t)extZ);
+            const pcg::fx armW = fpx::fxmul((pcg::fx)kArmLen, in.scale);
+            const pcg::FxVec3 arms[4] = {
+                { armW, 0, 0}, {-armW, 0, 0}, {0, 0, armW}, {0, 0,-armW},
+            };
+            for (int a = 0; a < 4; ++a) {
+                const pcg::FxVec3 rv = fpx::FxRotate(in.orient, arms[a]);
+                const int ex = cx + (int)(((int64_t)rv.x * (int64_t)kImg) / (int64_t)extX);
+                const int ey = cy + (int)(((int64_t)rv.z * (int64_t)kImg) / (int64_t)extZ);
+                drawLine(cx, cy, ex, ey, 120, 150, 200);
+            }
+            putPx(cx, cy, 220, 230, 240);
+        }
+    };
+
+    const std::vector<pcg::PcgInstance> survA = pcg::Generate(kGraph, st);
+    const std::vector<pcg::PcgInstance> survB = pcg::Generate(kGraph, st);
+    std::vector<uint8_t> imgA, imgB;
+    renderInstances(survA, imgA);
+    renderInstances(survB, imgB);
+    const uint32_t kInst = (uint32_t)survA.size();
+    const bool twoRunIdentical = (imgA.size() == imgB.size()) &&
+                                 (std::memcmp(imgA.data(), imgB.data(), imgA.size()) == 0) &&
+                                 (survA.size() == survB.size());
+
+    pcg::PcgGraph kNoPrune = kGraph; kNoPrune.prune = false;
+    const std::vector<pcg::PcgInstance> beforePrune = pcg::Generate(kNoPrune, st);
+    const uint32_t kBefore = (uint32_t)beforePrune.size();
+
+    uint32_t overlaps = 0;
+    for (size_t i = 0; i < survA.size(); ++i)
+        for (size_t j = i + 1; j < survA.size(); ++j) {
+            const pcg::FxVec3 d{ survA[i].pos.x - survA[j].pos.x, 0, survA[i].pos.z - survA[j].pos.z };
+            const pcg::fx ri = fpx::fxmul(kPruneRadius, survA[i].scale);
+            const pcg::fx rj = fpx::fxmul(kPruneRadius, survA[j].scale);
+            if (fpx::FxLength(d) < ri + rj) ++overlaps;
+        }
+
+    std::vector<pcg::PcgInstance> shuffled(beforePrune.rbegin(), beforePrune.rend());
+    const std::vector<pcg::PcgInstance> survOrig = pcg::PruneOverlaps(beforePrune, kPruneRadius);
+    const std::vector<pcg::PcgInstance> survShuf = pcg::PruneOverlaps(shuffled,    kPruneRadius);
+    bool shuffledMatch = (survOrig.size() == survShuf.size());
+    for (size_t i = 0; i < survOrig.size() && shuffledMatch; ++i) {
+        const pcg::PcgInstance& a = survOrig[i]; const pcg::PcgInstance& b = survShuf[i];
+        if (a.pos.x != b.pos.x || a.pos.z != b.pos.z || a.orient.y != b.orient.y || a.scale != b.scale)
+            shuffledMatch = false;
+    }
+
+    const bool provenanceOk = (kInst < kBefore) && (kInst > 0);
+
+    if (!twoRunIdentical || overlaps != 0 || !shuffledMatch || !provenanceOk)
+        return fail("pcg5-graph: determinism/overlap/shuffle/provenance check failed");
+
+    std::printf("pcg5-graph: layered pipeline scatter->mask->transform->prune (seed=%u)\n", kSeed);
+    std::printf("pcg5-graph: two-run BYTE-IDENTICAL\n");
+    std::printf("pcg5-graph: no surviving pair interpenetrates {survivors:%u, overlaps:%u}\n", kInst, overlaps);
+    std::printf("pcg5-graph: prune is order-canonical: shuffled input -> SAME survivors {shuffledMatch:%s}\n",
+                shuffledMatch ? "true" : "false");
+    std::printf("pcg5-graph: lockstep: peerA == peerB from seed alone (byte-identical) {instances:%u}\n", kInst);
+    std::printf("pcg5-graph: provenance {stages:4, beforePrune:%u, survivors:%u}\n", kBefore, kInst);
+
+    if (!WritePNG(outPath, imgA, kImg, kImg)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — pcg5 declarative pipeline + overlap-prune (%u survivors, seed=%u)\n",
+                outPath, kImg, kImg, kInst, kSeed);
+    return 0;
+}
+
 // ===== Slice VD1 — Deterministic Gameplay / Netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS showcase
 // (--vd1-world) (the BEACHHEAD of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO
 // new RHI; the verdict.h entity world + command bus is header-only integer math, so on Metal it runs the IDENTICAL
@@ -70122,6 +70256,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pcg4-rules") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pcg4_rules.png";
             try { return RunPcg4RulesShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pcg5-graph <out.png>: render the Deterministic PCG DECLARATIVE LAYERED PIPELINE + OVERLAP-PRUNE
+        // showcase (Slice PCG5, the 5th slice of FLAGSHIP #22 — THE DETERMINISM HEADLINE). PURE CPU — runs the
+        // IDENTICAL pcg.h declarative Generate (scatter->mask->transform->prune) the Vulkan --pcg5-graph-shot runs
+        // (the 2D top-down plot of the NON-OVERLAPPING surviving oriented, scaled markers — each arm rotated by
+        // fpx::FxRotate, pure-integer pixel map) -> bit-identical cross-backend BY CONSTRUCTION; the proof lines
+        // match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--pcg5-graph") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pcg5_graph.png";
+            try { return RunPcg5GraphShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vd1-world <out.png>: render the Deterministic Gameplay / Netcode ENTITY WORLD + INPUT-COMMAND BUS

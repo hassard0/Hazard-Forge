@@ -329,6 +329,111 @@ int main() {
         check(differ, "PCG4 seed-sensitive: a different seed yields a different yaw/scale sequence");
     }
 
+    // ================= PCG5: declarative layered pipeline + overlap-prune (THE DETERMINISM HEADLINE) =======
+    // no-overlaps / prune-removes-some / shuffle-invariance / lockstep+purity / no-op / empty.
+    {
+        // A fixed graph: a denser scatter so the prune has real work to do (overlaps to remove).
+        const pcg::PcgArea area{ pcg::FxVec3{0, 0, 0}, pcg::FxVec3{kOne * 32, 0, kOne * 32} };
+        const int cellsX = 24, cellsZ = 24;                // 576 candidate cells (dense -> overlaps)
+        const pcg::PcgStream st{ 1337u, 0x5CA77E20u };
+
+        pcg::PcgGraph g;
+        g.area = area; g.cellsX = cellsX; g.cellsZ = cellsZ;
+        g.useMask = true;
+        g.mask.type = pcg::PcgMaskType::Radial;
+        g.mask.center = pcg::FxVec3{ kOne * 16, 0, kOne * 16 };
+        g.mask.radius = kOne * 32 / 3;
+        g.density = kOne;
+        g.transform.randomYaw = true; g.transform.scaleLo = kOne / 2; g.transform.scaleHi = kOne * 3 / 2;
+        g.prune = true;
+        g.pruneRadius = kOne;                              // big enough to force removals in the dense field
+
+        // The pre-prune instances (mask+transform, NO prune) — the PruneOverlaps input.
+        pcg::PcgGraph gNoPrune = g; gNoPrune.prune = false;
+        const std::vector<pcg::PcgInstance> beforePrune = pcg::Generate(gNoPrune, st);
+
+        // The pruned output.
+        const std::vector<pcg::PcgInstance> survivors = pcg::Generate(g, st);
+
+        // (1) no overlaps — EVERY surviving pair satisfies FxLength(pos_i-pos_j) >= r_i+r_j (O(K^2)).
+        bool noOverlap = true;
+        for (size_t i = 0; i < survivors.size() && noOverlap; ++i)
+            for (size_t j = i + 1; j < survivors.size() && noOverlap; ++j) {
+                const pcg::FxVec3 d{ survivors[i].pos.x - survivors[j].pos.x, 0,
+                                     survivors[i].pos.z - survivors[j].pos.z };
+                const fx dist = hf::sim::fpx::FxLength(d);
+                const fx ri = pcg::fxmul(g.pruneRadius, survivors[i].scale);
+                const fx rj = pcg::fxmul(g.pruneRadius, survivors[j].scale);
+                if (dist < ri + rj) noOverlap = false;
+            }
+        check(noOverlap, "PCG5 no overlaps: every surviving pair has FxLength >= r_i+r_j (prune removed all overlaps)");
+
+        // (2) prune removes some — survivors < instances before prune (it did real work).
+        check(survivors.size() < beforePrune.size() && !survivors.empty(),
+              "PCG5 prune removes some: survivors < beforePrune (a non-empty strict subset)");
+
+        // (3) shuffle-invariance — reverse the pre-prune vector (a FIXED deterministic permutation, NO rng),
+        // run PruneOverlaps on BOTH, assert survivor sets BYTE-IDENTICAL (same positions + canonical order).
+        std::vector<pcg::PcgInstance> shuffled(beforePrune.rbegin(), beforePrune.rend());
+        const std::vector<pcg::PcgInstance> survOrig = pcg::PruneOverlaps(beforePrune, g.pruneRadius);
+        const std::vector<pcg::PcgInstance> survShuf = pcg::PruneOverlaps(shuffled,    g.pruneRadius);
+        bool shuffleMatch = (survOrig.size() == survShuf.size());
+        for (size_t i = 0; i < survOrig.size() && shuffleMatch; ++i) {
+            const pcg::PcgInstance& a = survOrig[i]; const pcg::PcgInstance& b = survShuf[i];
+            if (a.pos.x != b.pos.x || a.pos.y != b.pos.y || a.pos.z != b.pos.z) shuffleMatch = false;
+            if (a.orient.x != b.orient.x || a.orient.y != b.orient.y ||
+                a.orient.z != b.orient.z || a.orient.w != b.orient.w) shuffleMatch = false;
+            if (a.scale != b.scale) shuffleMatch = false;
+        }
+        check(shuffleMatch, "PCG5 shuffle-invariance: shuffled input -> SAME survivors (order-canonical prune)");
+
+        // (4) lockstep / purity — two Generate(g,st) calls byte-equal; a different seed -> different but valid
+        // (still no overlaps).
+        const std::vector<pcg::PcgInstance> survB = pcg::Generate(g, st);
+        bool lockstep = (survivors.size() == survB.size());
+        for (size_t i = 0; i < survivors.size() && lockstep; ++i) {
+            const pcg::PcgInstance& a = survivors[i]; const pcg::PcgInstance& b = survB[i];
+            if (a.pos.x != b.pos.x || a.pos.y != b.pos.y || a.pos.z != b.pos.z) lockstep = false;
+            if (a.orient.y != b.orient.y || a.orient.w != b.orient.w || a.scale != b.scale) lockstep = false;
+        }
+        check(lockstep, "PCG5 lockstep/purity: two Generate(g,stream) calls are byte-equal (peer determinism)");
+
+        const pcg::PcgStream st2{ 9173u, 0x5CA77E20u };    // a DIFFERENT seed
+        const std::vector<pcg::PcgInstance> survDiff = pcg::Generate(g, st2);
+        bool differ = (survDiff.size() != survivors.size());
+        for (size_t i = 0; i < survDiff.size() && i < survivors.size() && !differ; ++i)
+            if (survDiff[i].pos.x != survivors[i].pos.x || survDiff[i].pos.z != survivors[i].pos.z) differ = true;
+        check(differ, "PCG5 seed-sensitive: a different seed -> a different field");
+        bool diffNoOverlap = true;
+        for (size_t i = 0; i < survDiff.size() && diffNoOverlap; ++i)
+            for (size_t j = i + 1; j < survDiff.size() && diffNoOverlap; ++j) {
+                const pcg::FxVec3 d{ survDiff[i].pos.x - survDiff[j].pos.x, 0,
+                                     survDiff[i].pos.z - survDiff[j].pos.z };
+                const fx ri = pcg::fxmul(g.pruneRadius, survDiff[i].scale);
+                const fx rj = pcg::fxmul(g.pruneRadius, survDiff[j].scale);
+                if (hf::sim::fpx::FxLength(d) < ri + rj) diffNoOverlap = false;
+            }
+        check(diffNoOverlap, "PCG5 seed-sensitive: a different seed still yields a valid (no-overlap) field");
+
+        // (5) no-op — g.prune=false -> Generate == BuildInstances over the same scatter; AND pruneRadius<=0 ->
+        // all kept (canonical order, but same SET).
+        const std::vector<pcg::FxVec3> pts = pcg::ScatterMasked(st, area, cellsX, cellsZ, g.mask, g.density);
+        const std::vector<pcg::PcgInstance> directBuild = pcg::BuildInstances(pts, st, g.transform);
+        bool noopMatch = (beforePrune.size() == directBuild.size());
+        for (size_t i = 0; i < beforePrune.size() && noopMatch; ++i) {
+            const pcg::PcgInstance& a = beforePrune[i]; const pcg::PcgInstance& b = directBuild[i];
+            if (a.pos.x != b.pos.x || a.pos.z != b.pos.z || a.orient.y != b.orient.y || a.scale != b.scale)
+                noopMatch = false;
+        }
+        check(noopMatch, "PCG5 no-op: g.prune=false -> Generate == BuildInstances over the same scatter");
+        const std::vector<pcg::PcgInstance> allKept = pcg::PruneOverlaps(beforePrune, 0);
+        check(allKept.size() == beforePrune.size(), "PCG5 no-op: pruneRadius<=0 keeps ALL instances");
+
+        // (6) empty — cellsX<=0 -> empty.
+        pcg::PcgGraph gEmpty = g; gEmpty.cellsX = 0;
+        check(pcg::Generate(gEmpty, st).empty(), "PCG5 empty: cellsX<=0 -> empty graph");
+    }
+
     if (g_fail == 0) std::printf("pcg_test: ALL CHECKS PASSED\n");
     else std::printf("pcg_test: %d CHECK(S) FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
