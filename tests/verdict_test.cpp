@@ -963,6 +963,131 @@ int main() {
         }
     }
 
+    // ===== Issue #40 — Deterministic collision-event API: CollectHitEvents(world) =====
+    // CollectHitEvents is a PURE read of the POST-StepWorld world.cache (the contacts the sim solved) ->
+    // a per-colliding-ENTITY-PAIR OnHit list, canonical (a,b)-ascending, impulse = summed normalImpulse,
+    // point = the integer midpoint of the two bodies. Pins: two-run byte-identical; canonical sorted
+    // order; every event maps to two LIVE bound entities (a<b, impulse>0); a zero-collision control is
+    // empty; AND a contact whose one side is unbound (no gameplay entity) is SKIPPED.
+    {
+        namespace gjk      = hf::sim::gjk;
+        namespace warmhull = hf::sim::warmhull;
+        auto fi = [](int v) -> fx { return (fx)((int64_t)v * (int64_t)kOne); };
+        const FxQuat kIdentity{0, 0, 0, kOne};
+
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        convex::ConvexStepConfig stepCfg;
+        stepCfg.gravity = FxVec3{0, kGravY, 0}; stepCfg.dt = kOne / 60; stepCfg.solveIters = 8;
+        stepCfg.restitution = 0; stepCfg.slop = kOne / 64; stepCfg.beta = (fx)((int64_t)2 * kOne / 10);
+        stepCfg.linDamp = (fx)((int64_t)95 * kOne / 100); stepCfg.angDamp = kOne; stepCfg.posIters = 4;
+        warmhull::HullSleepConfig kCfg;
+        kCfg.warm = stepCfg; kCfg.sleepThreshold = kOne; kCfg.wakeThreshold = (fx)(2 * (int)kOne); kCfg.sleepTicks = 30;
+        const verdict::HazardRegion kHazard{fi(-9), fi(-9), fi(-9), fi(-9)};  // empty band
+        const uint32_t kTicks = 180u;
+        const int kStackN = 2;
+        const std::vector<verdict::Command> kNoCmds;
+
+        auto buildColliding = [&](verdict::VerdictWorld& w, std::vector<verdict::HitEvent>& out) {
+            gjk::HullWorld sim;
+            { fpx::FxBody b; b.pos={0,0,0}; b.orient={0,0,0,kOne}; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            for (int k = 0; k < kStackN; ++k) {
+                fpx::FxBody b; b.pos={0, fi(2 + 2 * k), 0}; b.orient={0,0,0,kOne};
+                b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0};
+                sim.bodies.push_back(b); sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            }
+            w.sim = sim;
+            const verdict::EntityId support = verdict::SpawnEntity(w, verdict::Transform2D{V(0,0,0), kIdentity});
+            verdict::BindBody(w, support, 0u);
+            for (int k = 0; k < kStackN; ++k) {
+                const verdict::EntityId be = verdict::SpawnEntity(w, verdict::Transform2D{V(0, 2 + 2 * k, 0), kIdentity});
+                verdict::BindBody(w, be, (uint32_t)(1 + k));
+            }
+            (void)support;
+            verdict::StepWorldN(w, kNoCmds, 0u, kHazard, verdict::kNoEntity, (fx)0, kCfg, kTicks);
+            out = verdict::CollectHitEvents(w);
+        };
+
+        verdict::VerdictWorld w; std::vector<verdict::HitEvent> ev;
+        buildColliding(w, ev);
+
+        // (1) two-run byte-identical.
+        {
+            verdict::VerdictWorld w2; std::vector<verdict::HitEvent> ev2;
+            buildColliding(w2, ev2);
+            check(verdict::HitEventVecsEqual(ev, ev2), "hit-events: two runs BYTE-IDENTICAL");
+        }
+        // (2) at least one collision + canonical sorted (a,b) order.
+        check(!ev.empty(), "hit-events: the dropping stack produced at least one collision event");
+        {
+            bool sorted = true;
+            for (size_t i = 1; i < ev.size(); ++i)
+                if (ev[i].a < ev[i-1].a || (ev[i].a == ev[i-1].a && ev[i].b < ev[i-1].b)) { sorted = false; break; }
+            check(sorted, "hit-events: canonical (a,b)-ascending order");
+        }
+        // (3) every event maps to two LIVE bound entities, a<b, impulse>0.
+        {
+            bool allValid = true;
+            for (size_t i = 0; i < ev.size(); ++i)
+                if (!(verdict::IsLive(w, ev[i].a) && verdict::IsLive(w, ev[i].b) &&
+                      verdict::EntityIsBodyBound(w, ev[i].a) && verdict::EntityIsBodyBound(w, ev[i].b) &&
+                      ev[i].a < ev[i].b && ev[i].impulse > 0)) { allValid = false; break; }
+            check(allValid, "hit-events: every event maps to two LIVE bound entities (a<b, impulse>0)");
+        }
+        // (4) the point is the integer midpoint of the two bodies' positions (exact integer average).
+        {
+            bool midOk = true;
+            for (size_t i = 0; i < ev.size(); ++i) {
+                // resolve each entity's bound body and recompute the midpoint.
+                auto bodyOf = [&](verdict::EntityId id) -> uint32_t {
+                    const hf::ecs::Entity e = w.handle.at(id);
+                    return w.reg.get<verdict::BodyRef>(e).simBodyIndex;
+                };
+                const FxVec3& pa = w.sim.bodies[bodyOf(ev[i].a)].pos;
+                const FxVec3& pb = w.sim.bodies[bodyOf(ev[i].b)].pos;
+                const fx mx = (fx)((fpx::FxAdd(pa, pb).x) >> 1);
+                const fx my = (fx)((fpx::FxAdd(pa, pb).y) >> 1);
+                const fx mz = (fx)((fpx::FxAdd(pa, pb).z) >> 1);
+                if (ev[i].point.x != mx || ev[i].point.y != my || ev[i].point.z != mz) { midOk = false; break; }
+            }
+            check(midOk, "hit-events: point == the integer midpoint of the two bodies' positions");
+        }
+        // (5) the zero-collision control: bodies far apart -> empty.
+        {
+            verdict::VerdictWorld cw;
+            gjk::HullWorld sim;
+            { fpx::FxBody b; b.pos={0,0,0}; b.orient={0,0,0,kOne}; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            { fpx::FxBody b; b.pos={fi(100), fi(100), 0}; b.orient={0,0,0,kOne}; b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            cw.sim = sim;
+            const verdict::EntityId c0 = verdict::SpawnEntity(cw, verdict::Transform2D{V(0,0,0), kIdentity}); verdict::BindBody(cw, c0, 0u);
+            const verdict::EntityId c1 = verdict::SpawnEntity(cw, verdict::Transform2D{V(100,100,0), kIdentity}); verdict::BindBody(cw, c1, 1u);
+            (void)c0; (void)c1;
+            verdict::StepWorldN(cw, kNoCmds, 0u, kHazard, verdict::kNoEntity, (fx)0, kCfg, 30u);
+            check(verdict::CollectHitEvents(cw).empty(), "hit-events: zero collisions -> empty (no-op)");
+        }
+        // (6) an UNBOUND side is skipped: rebuild the colliding scene but leave body 1 with NO gameplay
+        // entity bound -> any contact touching body 1 yields no event (one side has no entity).
+        {
+            verdict::VerdictWorld uw;
+            gjk::HullWorld sim;
+            { fpx::FxBody b; b.pos={0,0,0}; b.orient={0,0,0,kOne}; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            { fpx::FxBody b; b.pos={0, fi(2), 0}; b.orient={0,0,0,kOne}; b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            uw.sim = sim;
+            // Bind ONLY the static support (body 0); body 1 (the dynamic box) is NOT bound to any entity.
+            const verdict::EntityId s0 = verdict::SpawnEntity(uw, verdict::Transform2D{V(0,0,0), kIdentity}); verdict::BindBody(uw, s0, 0u);
+            (void)s0;
+            verdict::StepWorldN(uw, kNoCmds, 0u, kHazard, verdict::kNoEntity, (fx)0, kCfg, kTicks);
+            check(verdict::CollectHitEvents(uw).empty(),
+                  "hit-events: a contact with an UNBOUND side yields no event (only bound pairs fire)");
+        }
+        std::printf("hit-events: {events:%u} two-run BYTE-IDENTICAL, canonical, bound-pairs-only\n",
+                    (uint32_t)ev.size());
+    }
+
     if (g_fail == 0) std::printf("verdict_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

@@ -1495,5 +1495,152 @@ inline std::string SerializeStressReport(const StressReport& r) {
     return s;
 }
 
+// =================================================================================================
+// Issue #40 — DETERMINISTIC COLLISION-EVENT API — OnHit(actorA, actorB, point, impulse) (APPEND-ONLY;
+// VD1-VD6 + DX5/DX6 above are BYTE-FROZEN). A derived, per-tick gameplay OUTPUT layered on the existing
+// determinism contract — NOT a new slice of any flagship, NOT a new field on VerdictWorld, and NOT a
+// change to StepWorld.
+//
+// THE PROBLEM: gameplay samples that want "did entity A hit entity B, and how hard?" today re-roll their
+// own AABB / distance checks on top of the sim — duplicating (and risking diverging from) the contacts
+// the deterministic sim ALREADY solves bit-exactly. warmhull::StepWarmSleepHullWorld REWRITES
+// world.cache to EXACTLY this tick's solved contact manifold (one CachedHullContact per contact POINT,
+// keyed by an order-normalized HullContactKey{bodyA<bodyB, refFaceId, incVertId} + the solved
+// normalImpulse). That cache is part of the snapshot/lockstep state (the persist/VD4 lessons proved it is
+// bit-identical cross-platform + replayable), so a pure read of it after StepWorld is ALSO bit-identical.
+//
+// THE DESIGN: CollectHitEvents(world) is a PURE FUNCTION of the POST-StepWorld state (world.cache +
+// world.order + world.sim.bodies). It resolves each cache contact's two GLOBAL sim-body indices back to
+// the gameplay EntityIds bound to them (via world.order + BodyRef), aggregates per ENTITY-PAIR (summing
+// normalImpulse over the manifold's up-to-4 points -> one HitEvent per colliding pair = the collision
+// strength), and returns the events in a FIXED canonical (a,b)-ascending order. Gameplay calls StepWorld
+// then CollectHitEvents — the OnHit list, with NO bespoke overlap test.
+//
+// HONEST SCOPE: HitEvent.point is the deterministic MIDPOINT of the two bodies' positions (an integer
+// Q16.16 average), NOT a per-contact manifold point — precise contact points are re-derivable via the
+// manifold query later; the midpoint is the cheap, deterministic, good-enough "where" for a gameplay
+// event. A contact between two STATIC-only / unbound bodies (no gameplay entity on one side) is SKIPPED
+// (no entity to fire OnHit on). This adds NO field to VerdictWorld and modifies NO existing function ->
+// the VD4 snapshot / VD5 lockstep determinism is untouched (HitEvents are a derived per-tick OUTPUT,
+// recomputed each call, NEVER part of the snapshot). PURE CPU INTEGER (strict 0px): NO new render RHI,
+// NO new shader, NO new compute. All sim headers + ecs.h BYTE-UNCHANGED; verdict.h is APPEND-ONLY.
+// =================================================================================================
+
+// ----- HitEvent: a deterministic collision event (the per-pair OnHit gameplay reads after StepWorld) -
+// The two colliding entities in canonical order (a < b by EntityId — a FIXED total order), the contact
+// LOCATION (the deterministic midpoint of the two bodies' positions, Q16.16), and the summed
+// normalImpulse over the pair's contact points (Q16.16 — the collision STRENGTH). All integer.
+struct HitEvent {
+    EntityId a = kNoEntity;   // the two colliding entities (a < b by EntityId, deterministic order)
+    EntityId b = kNoEntity;
+    FxVec3   point{};         // contact location = deterministic midpoint of the two bodies' positions (Q16.16)
+    fx       impulse = 0;     // summed normalImpulse over the pair's contact points (Q16.16) — collision strength
+};
+
+// ----- HitEventsEqual / HitEventVecsEqual: field-wise equality (the two-run BYTE-IDENTICAL proof) -----
+// Padding-safe field-wise compares (the POD HitEvent has padding between EntityId/FxVec3/fx, so NO
+// memcmp). Two HitEvent vectors are equal iff the SAME sequence of {a, b, point, impulse}.
+inline bool HitEventsEqual(const HitEvent& x, const HitEvent& y) {
+    return x.a == y.a && x.b == y.b &&
+           x.point.x == y.point.x && x.point.y == y.point.y && x.point.z == y.point.z &&
+           x.impulse == y.impulse;
+}
+inline bool HitEventVecsEqual(const std::vector<HitEvent>& a, const std::vector<HitEvent>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (!HitEventsEqual(a[i], b[i])) return false;
+    return true;
+}
+
+// ----- CollectHitEvents(world) -> the per-pair OnHit list, canonical (a,b)-ascending -----------------
+// A PURE FUNCTION of the POST-StepWorld state (world.cache + world.order + world.sim.bodies). Steps:
+//   (1) Build a FIXED-order reverse map sim-body-index -> EntityId by scanning world.order (skip an
+//       entity with no bound BodyRef / simBodyIndex==kNoBody / out-of-range). FIRST entity to claim a
+//       body index wins (a 1:1 binding is the contract; a double-bind is a caller bug, resolved
+//       deterministically by order[] position).
+//   (2) Iterate world.cache.entries in FIXED order. Resolve key.bodyA / key.bodyB -> EntityIds via the
+//       map; SKIP a contact where EITHER side is unmapped (e.g. a static-only support with no gameplay
+//       entity). Aggregate per ENTITY-PAIR (canonical a<b by EntityId): SUM normalImpulse across that
+//       pair's contact points (a manifold has up to 4 points -> ONE HitEvent per pair).
+//   (3) point = the deterministic midpoint of the two bodies' positions: (posA+posB) averaged via the
+//       Q16.16 helpers (FxAdd then a >>1 per component — an exact integer average, NO float). Honestly
+//       the inter-body midpoint, NOT a per-contact manifold point.
+//   (4) Return the events sorted by (a, b) ascending (a FIXED deterministic total order) -> canonical.
+// Bit-identical cross-platform because world.cache + world.sim.bodies are (the persist/VD lessons).
+inline std::vector<HitEvent> CollectHitEvents(const VerdictWorld& world) {
+    const size_t nBodies = world.sim.bodies.size();
+
+    // (1) the FIXED-order reverse map sim-body-index -> EntityId (FIRST claimant wins).
+    std::vector<EntityId> bodyToEntity(nBodies, kNoEntity);
+    for (size_t i = 0; i < world.order.size(); ++i) {
+        const EntityId id = world.order[i];
+        auto it = world.handle.find(id);
+        if (it == world.handle.end()) continue;
+        const ecs::Entity e = it->second;
+        if (!world.reg.valid(e)) continue;
+        if (!world.reg.has<BodyRef>(e)) continue;
+        const uint32_t bi = world.reg.get<BodyRef>(e).simBodyIndex;
+        if (bi == kNoBody || (size_t)bi >= nBodies) continue;   // unbound / out-of-range -> not a sim body
+        if (bodyToEntity[(size_t)bi] == kNoEntity) bodyToEntity[(size_t)bi] = id;  // first wins (deterministic)
+    }
+
+    // (2) aggregate normalImpulse per ENTITY-PAIR over the cache, in FIXED cache order. The pair count is
+    // tiny (a handful of colliding bodies); a flat vector + a fixed linear scan is the deterministic
+    // baseline (the warmhull::HullCache shape — no hash-order nondeterminism).
+    struct PairAccum { EntityId a; EntityId b; uint32_t bodyA; uint32_t bodyB; fx impulse; };
+    std::vector<PairAccum> pairs;
+    for (size_t c = 0; c < world.cache.entries.size(); ++c) {
+        const warmhull::CachedHullContact& ce = world.cache.entries[c];
+        const uint32_t bA = ce.key.bodyA, bB = ce.key.bodyB;
+        if ((size_t)bA >= nBodies || (size_t)bB >= nBodies) continue;   // defensive (the key is sim-internal)
+        const EntityId eA = bodyToEntity[(size_t)bA];
+        const EntityId eB = bodyToEntity[(size_t)bB];
+        if (eA == kNoEntity || eB == kNoEntity) continue;   // a static-only / unbound side -> no gameplay event
+        if (eA == eB) continue;                              // a body cannot hit itself (defensive)
+        // Canonical entity order (a < b by EntityId); carry the matching sim-body index for the midpoint.
+        EntityId pa = eA, pb = eB; uint32_t pba = bA, pbb = bB;
+        if (pb < pa) { EntityId te = pa; pa = pb; pb = te; uint32_t tb = pba; pba = pbb; pbb = tb; }
+        bool found = false;
+        for (size_t p = 0; p < pairs.size(); ++p) {
+            if (pairs[p].a == pa && pairs[p].b == pb) {
+                pairs[p].impulse = (fx)((int64_t)pairs[p].impulse + (int64_t)ce.normalImpulse);  // sum the manifold
+                found = true;
+                break;
+            }
+        }
+        if (!found) pairs.push_back(PairAccum{pa, pb, pba, pbb, ce.normalImpulse});
+    }
+
+    // (3) one HitEvent per pair: point = the integer midpoint of the two bodies' positions (NO float).
+    std::vector<HitEvent> events;
+    events.reserve(pairs.size());
+    for (size_t p = 0; p < pairs.size(); ++p) {
+        const FxVec3& posA = world.sim.bodies[(size_t)pairs[p].bodyA].pos;
+        const FxVec3& posB = world.sim.bodies[(size_t)pairs[p].bodyB].pos;
+        const FxVec3 sum = fpx::FxAdd(posA, posB);
+        HitEvent ev;
+        ev.a       = pairs[p].a;
+        ev.b       = pairs[p].b;
+        ev.point   = FxVec3{(fx)(sum.x >> 1), (fx)(sum.y >> 1), (fx)(sum.z >> 1)};  // exact integer average
+        ev.impulse = pairs[p].impulse;
+        events.push_back(ev);
+    }
+
+    // (4) canonical total order: sort by (a, b) ascending. A self-contained insertion sort (the event
+    // count is tiny — a handful of colliding pairs) keeps this header dependency-free (NO <algorithm>
+    // added to the frozen include block) AND deterministic (a stable, fixed-comparator pass).
+    auto less = [](const HitEvent& x, const HitEvent& y) {
+        if (x.a != y.a) return x.a < y.a;
+        return x.b < y.b;
+    };
+    for (size_t i = 1; i < events.size(); ++i) {
+        HitEvent key = events[i];
+        size_t j = i;
+        while (j > 0 && less(key, events[j - 1])) { events[j] = events[j - 1]; --j; }
+        events[j] = key;
+    }
+    return events;
+}
+
 }  // namespace verdict
 }  // namespace hf::game
