@@ -207,6 +207,28 @@ float4 main(PSInput i) : SV_Target {
         rgb += clearcoat * Fc * ccEnv * f.iblParams.y;
     }
 
+    // --- SUBSTRATE-LITE SHEEN LOBE (Issue #11, SB2). A retroreflective fabric/velvet rim
+    // (glTF KHR_materials_sheen: Charlie distribution + Ashikhmin visibility), on the normal-mapped N
+    // for the DIRECTIONAL light. Gated by f.substrateParams.z: sheen=0 is an EXACT identity over the
+    // base+clearcoat path (rgb += 0.0). THIS IS THE MAKE-OR-BREAK alongside SB1. ---
+    {
+        float sheen = f.substrateParams.z;
+        float3 sheenColor = float3(1.0, 1.0, 1.0);
+        float3 Ls = normalize(-f.lightDir.xyz);
+        float3 Hs = normalize(Ls + V);
+        float NoLs = max(dot(N, Ls), 0.0);
+        float NoVs = max(dot(N, V), 1e-4);
+        float NoHs = max(dot(N, Hs), 0.0);
+        float sr = clamp(0.3, 0.07, 1.0);                  // sheen roughness (fixed velvet)
+        float invR = 1.0 / sr;
+        float cos2h = NoHs * NoHs;
+        float sin2h = max(1.0 - cos2h, 0.0078125);
+        float Dch = (2.0 + invR) * pow(sin2h, invR * 0.5) * (1.0 / (2.0 * 3.14159265));   // D_charlie
+        float Vash = 1.0 / max(4.0 * (NoLs + NoVs - NoLs * NoVs), 1e-4);                   // V_ashikhmin
+        float3 sheenLobe = sheenColor * (Dch * Vash * NoLs);
+        rgb += sheen * sheenLobe * (f.lightColor.rgb * shadow) * ao;
+    }
+
     // --- Emissive (sRGB -> linear), ADDED after lighting. ---
     float3 emis = SrgbToLinear(gEmissive.Sample(gEmissiveSmp, i.uv).rgb);
     rgb += emis;
