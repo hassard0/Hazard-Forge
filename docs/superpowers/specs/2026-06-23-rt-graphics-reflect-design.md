@@ -75,3 +75,40 @@ bit-exact int64 `fx` parity (the HLSL RayQuery kernels are SPIR-V-only). The har
 int64 fx math is bit-identical to the CPU/HLSL reference so the strict-zero goldens don't move. Does NOT
 block #34. Flag to the user for buy-in as its own flagship sequence. (A `shaders/rt_query.metal` stub hints
 at prior exploration — read it before scoping.)
+
+---
+## ATTEMPT 1 DIAGNOSIS (2026-06-23) — PARKED, not merged
+
+An implementer built the full feature; the controller gate caught a real bug; the attempt was DISCARDED
+(no orphaned branch, master clean). What was learned:
+
+**The CORE #34 capability WORKS.** The RHI plumbing (GraphicsPipelineDesc.accelStructureBinding, the
+vulkan_pipeline graphics accel set layout, the vulkan_command_buffer graphics-bind-point BindAccelStructure,
+the ps_6_5 rt_reflect_graphics.frag) all compiled and ran: the TLAS traverses from a FRAGMENT shader and
+AABB primitives ray-trace correctly (the ground + 2 boxes rendered + shadowed in the graphics-RT image).
+So a fragment shader CAN ray-query the accel structure — the issue's core ask is feasible exactly as designed.
+
+**THE BUG: set-3 binding 13 (the FIRST cluster binding) reads WRONG data in the graphics push-descriptor
+path; bindings 14 and 15 work.** The showcase bound its 3 scene SSBOs (spheres/aabbs/params) via
+`BindLightClusters` to set-3 bindings 13/14/15. Spheres (at 13) rendered as background (garbage geometry:
+probed s.cx read small while tag was a valid index and primIndex varied). PROVEN by a swap test: swapping to
+aabbs@13 / spheres@14 made the AABBs (ground+boxes) vanish and the SPHERES render correctly — so it is
+BINDING 13 (the first `writes[0]` in the cluster `vkCmdPushDescriptorSetKHR`), independent of the buffer.
+
+**Likely root cause (for the next attempt to verify):** an off-by-one / first-write issue in the graphics
+cluster push-descriptor, OR the placeholder set-1/set-2 layouts that `usesLightClusters` pushes (materialSetLayout
+at set 1, a placeholder at set 2) shift the effective descriptor for the first cluster binding. WORTH CHECKING
+whether the shipped clustered-lighting slice (AG) actually exercises binding 13 in practice, or only 14/15 —
+binding 13 may have a latent bug never hit before.
+
+**FIX OPTIONS (next attempt):**
+1. Fix the RHI graphics cluster push so binding 13 reads correctly (the principled fix — also de-risks the
+   clustered-lighting feature). Start by dumping the descriptor writes / validating the set-3 layout vs the
+   placeholder sets 1/2 for the usesLightClusters graphics pipeline.
+2. AVOID binding 13: bind only 2 cluster SSBOs (spheres@14, aabbs@15, both known-good) and move the small
+   `params` struct into the frame UBO (set 0, usesFrameUniforms — proven working in this path); OR pack
+   spheres+aabbs into one buffer (raw int/ByteAddressBuffer, manual unpack since GpuSphere/GpuAabb have
+   different primIndex offsets) at binding 14 + params at 15.
+
+Option 2 is the faster path to a green gate; option 1 is the better engine fix. The Mac bake + verify.ps1
+registration steps from the original spec still apply once spheres render correctly on Vulkan.
