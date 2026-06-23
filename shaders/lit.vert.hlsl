@@ -42,6 +42,20 @@ struct VSOutput {
 #define HF_MATERIAL pc.material
 #endif
 
+// Per-draw albedo tint (issue #38): material.z packs an RGB multiplier so a sample can recolor a mesh
+// ("make the car red") WITHOUT swapping its texture material. Packing: z = floor(r*255)*65536 +
+// floor(g*255)*256 + floor(b*255), each channel 0-255 — exact in a float (max 2^24-1). z == 0 is the
+// UNTINTED sentinel -> white (every existing draw sets material.z=0, so all goldens are unchanged).
+// The tint rides on o.color, which every lit fragment shader already multiplies into albedo, so this
+// one vertex-shader line gives per-draw tinting across all lit pipelines with no fragment changes.
+float3 HfUnpackTint(float packed) {
+    if (packed <= 0.0) return float3(1.0, 1.0, 1.0);
+    float r = floor(packed / 65536.0);
+    float g = floor((packed - r * 65536.0) / 256.0);
+    float b = packed - r * 65536.0 - g * 256.0;
+    return float3(r, g, b) / 255.0;
+}
+
 VSOutput main(VSInput i) {
     VSOutput o;
     float4 world = mul(HF_MODEL, float4(i.pos, 1.0));
@@ -53,7 +67,7 @@ VSOutput main(VSInput i) {
     // World-space tangent (rotation + uniform scale only, same caveat as the normal). Not yet
     // re-orthonormalized; the fragment shader Gram-Schmidts it against the interpolated normal.
     o.wtangent = mul((float3x3)HF_MODEL, i.tangent);
-    o.color = i.color; o.uv = i.uv;
+    o.color = i.color * HfUnpackTint(HF_MATERIAL.z); o.uv = i.uv;  // issue #38: per-draw albedo tint
     o.material = HF_MATERIAL.xy;  // pass metallic+roughness through to the fragment
     return o;
 }

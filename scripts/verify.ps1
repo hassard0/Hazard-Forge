@@ -78,6 +78,7 @@ $Goldens = @(
     @{ Name = 'instanced';     Flag = '--instanced' }            # Slice Q
     @{ Name = 'ibl_helmet';    Flag = '--ibl' }                  # Slice R
     @{ Name = 'ibl_dim';       Flag = '--ibl-dim' }              # Issue #39 (per-pipeline IBL exposure multiplier — the SAME helmet scene with FrameData.iblParams.y dialed to 0.4 so the reflected env is dimmer; demonstrates over-exposure control without engine-shader edits. FLOAT visresolve-bar golden like ibl_helmet)
+    @{ Name = 'ibl_tint';      Flag = '--ibl-tint' }             # Issue #38 (per-draw albedo tint — the SAME helmet recolored RED via the push-constant material.z pack [lit.vert HfUnpackTint folds it into o.color, which every lit frag multiplies into albedo]; proof a mesh recolors WITHOUT swapping its 5-texture PBR material. FLOAT visresolve-bar golden)
     @{ Name = 'physics';       Flag = '--physics' }              # Slice S
     @{ Name = 'transparency';  Flag = '--transparency' }         # Slice T
     @{ Name = 'bloom';         Flag = '--bloom' }                # Slice U

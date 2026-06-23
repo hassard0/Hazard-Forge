@@ -180,6 +180,9 @@ struct FrameData {
 // (every showcase renders unchanged); the --ibl-dim flag lowers it to demonstrate the over-exposure
 // control without engine-shader edits. Set in main() before the IBL showcase runs.
 static float gIblIntensity = 1.0f;
+// Issue #38: per-draw albedo tint packed into the push-constant material.z (0 = untinted). --ibl-tint
+// sets red to prove a mesh can be recolored without swapping its PBR material.
+static float gIblTintPacked = 0.0f;
 
 static std::string LoadText(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -704,7 +707,7 @@ static int RunPbrShowcase(const char* outPath) {
                 float pc[20];
                 for (int k = 0; k < 16; ++k) pc[k] = helmetModel.m[k];
                 pc[16] = helmet.metallicFactor; pc[17] = helmet.roughnessFactor;
-                pc[18] = 0.0f; pc[19] = 0.0f;
+                pc[18] = gIblTintPacked; pc[19] = 0.0f;  // issue #38: per-draw albedo tint (0 = untinted)
                 cmd.PushConstants(pc, sizeof(pc));
                 cmd.BindMaterialPBR(*helmet.baseColor, *helmet.metalRough, *helmet.normalMap,
                                     *helmet.emissive, *helmet.occlusion);
@@ -1571,7 +1574,7 @@ static int RunIblShowcase(const char* outPath) {
                 float pc[20];
                 for (int k = 0; k < 16; ++k) pc[k] = helmetModel.m[k];
                 pc[16] = helmet.metallicFactor; pc[17] = helmet.roughnessFactor;
-                pc[18] = 0.0f; pc[19] = 0.0f;
+                pc[18] = gIblTintPacked; pc[19] = 0.0f;  // issue #38: per-draw albedo tint (0 = untinted)
                 cmd.PushConstants(pc, sizeof(pc));
                 cmd.BindMaterialPBR(*helmet.baseColor, *helmet.metalRough, *helmet.normalMap,
                                     *helmet.emissive, *helmet.occlusion);
@@ -2074,7 +2077,7 @@ static int RunCapstoneShowcase(const char* outPath, ScriptedCamera scripted = {}
                 float pc[20];
                 for (int k = 0; k < 16; ++k) pc[k] = helmetModel.m[k];
                 pc[16] = helmet.metallicFactor; pc[17] = helmet.roughnessFactor;
-                pc[18] = 0.0f; pc[19] = 0.0f;
+                pc[18] = gIblTintPacked; pc[19] = 0.0f;  // issue #38: per-draw albedo tint (0 = untinted)
                 cmd.PushConstants(pc, sizeof(pc));
                 cmd.BindMaterialPBR(*helmet.baseColor, *helmet.metalRough, *helmet.normalMap,
                                     *helmet.emissive, *helmet.occlusion);
@@ -2391,7 +2394,7 @@ static int RunBloomShowcase(const char* outPath) {
                 float pc[20];
                 for (int k = 0; k < 16; ++k) pc[k] = helmetModel.m[k];
                 pc[16] = helmet.metallicFactor; pc[17] = helmet.roughnessFactor;
-                pc[18] = 0.0f; pc[19] = 0.0f;
+                pc[18] = gIblTintPacked; pc[19] = 0.0f;  // issue #38: per-draw albedo tint (0 = untinted)
                 cmd.PushConstants(pc, sizeof(pc));
                 cmd.BindMaterialPBR(*helmet.baseColor, *helmet.metalRough, *helmet.normalMap,
                                     *helmet.emissive, *helmet.occlusion);
@@ -65120,6 +65123,14 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ibl-dim") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ibl_dim.png";
             gIblIntensity = 0.4f;
+            try { return RunIblShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ibl-tint <out.png>: the IBL helmet recolored RED via the per-draw material.z albedo tint
+        // (issue #38) — proof you can tint a mesh without swapping its 5-texture PBR material.
+        if (argc > 1 && std::strcmp(argv[1], "--ibl-tint") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ibl_tint.png";
+            gIblTintPacked = 16711680.0f;  // red (255,0,0): 255*65536
             try { return RunIblShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
