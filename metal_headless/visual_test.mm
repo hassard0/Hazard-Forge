@@ -35103,6 +35103,151 @@ static int RunAi2QueryShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice AI3 — Deterministic AI LINE-OF-SIGHT / PERCEPTION (the feasibility CRUX) showcase ============
+// (--ai3-los) (the 3rd slice of the DETERMINISTIC AI flagship #28, hf::ai). PURE CPU — NO GPU compute, NO new
+// shader, NO new RHI; the ai.h line-of-sight is header-only INTEGER math (segment-vs-AABB slab test, every
+// `t` a fraction num/den compared by cross-multiplication, NO float, NO division), so on Metal it runs the
+// IDENTICAL pure-CPU visibility raster the Vulkan --ai3-los-shot runs on Windows -> bit-identical cross-
+// backend BY CONSTRUCTION (strict 0px). Builds the SAME canonical arena (BuildAi3Scene: agent + target + box
+// blockers + a raster grid), runs LineOfSight(agent, cellCenter) for every cell, asserts the 4 proofs (proof
+// lines match the Vulkan side EXACTLY), and renders the PURE-INTEGER 2D top-down visibility raster (visible
+// cells dim-blue, occluded cells dark, the blocker boxes outlined, agent + target crossed — the blockers cast
+// a coherent shadow). New golden tests/golden/metal/ai3_los.png (Mac-baked by the controller); two runs DIFF
+// 0.0000.
+static int RunAi3LosShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace ai = hf::ai;
+
+    // Build the canonical scene (== the Vulkan --ai3-los-shot + the ai_los_test).
+    const ai::Ai3Scene scene = ai::BuildAi3Scene();
+    const int kGridW = scene.gridW, kGridH = scene.gridH;
+    const int kBlockers = (int)scene.blockers.size();
+
+    // Compute the visibility raster.
+    std::vector<uint8_t> vis((size_t)kGridW * kGridH, 0u);
+    int visibleCount = 0, occludedCount = 0;
+    for (int z = 0; z < kGridH; ++z)
+        for (int x = 0; x < kGridW; ++x) {
+            const hf::sim::fpx::FxVec3 cell{ai::CellCenterWorld(x), 0, ai::CellCenterWorld(z)};
+            const bool v = ai::LineOfSight(scene.agent, cell, scene.blockers.data(), kBlockers);
+            vis[(size_t)(z * kGridW + x)] = v ? 1u : 0u;
+            if (v) ++visibleCount; else ++occludedCount;
+        }
+
+    // PROOF (1) the ray/blocker counts + the visible/occluded tally.
+    const int kRays = kGridW * kGridH;
+    std::printf("ai3-los: {rays:%d, blockers:%d} visible=%d occluded=%d (integer slab test, NO float)\n",
+                kRays, kBlockers, visibleCount, occludedCount);
+
+    // PROOF (2) the falsifiable occlusion.
+    const bool seeTarget = ai::LineOfSight(scene.agent, scene.target, scene.blockers.data(), kBlockers);
+    const hf::sim::fpx::FxVec3 clearLane{ai::CellCenterWorld(1), 0, ai::CellCenterWorld(14)};
+    const bool seeClear = ai::LineOfSight(scene.agent, clearLane, scene.blockers.data(), kBlockers);
+    if (seeTarget || !seeClear) return fail("ai3-los: occlusion proof failed");
+    std::printf("ai3-los: target behind blocker -> NOT visible; clear lane -> visible (occlusion correct)\n");
+
+    // PROOF (3) two-run determinism.
+    std::vector<uint8_t> vis2((size_t)kGridW * kGridH, 0u);
+    for (int z = 0; z < kGridH; ++z)
+        for (int x = 0; x < kGridW; ++x) {
+            const hf::sim::fpx::FxVec3 cell{ai::CellCenterWorld(x), 0, ai::CellCenterWorld(z)};
+            vis2[(size_t)(z * kGridW + x)] =
+                ai::LineOfSight(scene.agent, cell, scene.blockers.data(), kBlockers) ? 1u : 0u;
+        }
+    if (vis != vis2) return fail("ai3-los: two visibility rasters differ (nondeterministic LOS)");
+    std::printf("ai3-los determinism: two visibility rasters BYTE-IDENTICAL\n");
+
+    // PROOF (4) the cross-vendor declaration.
+    std::printf("ai3-los: strict cross-vendor 0.0000 expected at the bake (integer segment-vs-AABB)\n");
+
+    // --- 2D top-down render (IDENTICAL to the Vulkan --ai3-los-shot). ---
+    const int kPx = 28, kMargin = 24;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kGridW * kPx);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kGridH * kPx);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 10; bgra[pp * 4 + 1] = 8; bgra[pp * 4 + 2] = 6; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto cellPx = [&](int cx, int cz, int& px, int& py) {
+        px = kMargin + cx * kPx;
+        py = kMargin + cz * kPx;
+    };
+    auto cellCenterPx = [&](int cx, int cz, int& px, int& py) {
+        px = kMargin + cx * kPx + kPx / 2;
+        py = kMargin + cz * kPx + kPx / 2;
+    };
+    auto fillRect = [&](int x0, int y0, int w, int h, const Vec3& col) {
+        for (int yy = 0; yy < h; ++yy)
+            for (int xx = 0; xx < w; ++xx) putPx(x0 + xx, y0 + yy, col);
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            putPx(x0, y0, col);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    auto thickCross = [&](int cx, int cy, int half, const Vec3& col) {
+        for (int o = -1; o <= 1; ++o) {
+            drawLine(cx - half, cy + o, cx + half, cy + o, col);
+            drawLine(cx + o, cy - half, cx + o, cy + half, col);
+        }
+    };
+
+    const Vec3 kVisCol{0.16f, 0.34f, 0.52f};
+    const Vec3 kOccCol{0.05f, 0.04f, 0.04f};
+    for (int z = 0; z < kGridH; ++z)
+        for (int x = 0; x < kGridW; ++x) {
+            int px, py; cellPx(x, z, px, py);
+            const bool v = vis[(size_t)(z * kGridW + x)] != 0u;
+            fillRect(px + 1, py + 1, kPx - 2, kPx - 2, v ? kVisCol : kOccCol);
+        }
+
+    const Vec3 kBlockCol{0.85f, 0.55f, 0.20f};
+    const Vec3 kBlockFill{0.32f, 0.20f, 0.07f};
+    for (int bi = 0; bi < kBlockers; ++bi) {
+        const ai::AiBlocker& b = scene.blockers[(size_t)bi];
+        const int bx0 = (int)(b.min.x >> hf::sim::fpx::kFrac);
+        const int bz0 = (int)(b.min.z >> hf::sim::fpx::kFrac);
+        const int bx1 = (int)(b.max.x >> hf::sim::fpx::kFrac);
+        const int bz1 = (int)(b.max.z >> hf::sim::fpx::kFrac);
+        const int px0 = kMargin + bx0 * kPx, py0 = kMargin + bz0 * kPx;
+        const int px1 = kMargin + bx1 * kPx, py1 = kMargin + bz1 * kPx;
+        fillRect(px0, py0, px1 - px0, py1 - py0, kBlockFill);
+        drawLine(px0, py0, px1, py0, kBlockCol); drawLine(px0, py1, px1, py1, kBlockCol);
+        drawLine(px0, py0, px0, py1, kBlockCol); drawLine(px1, py0, px1, py1, kBlockCol);
+    }
+
+    {
+        const int agx = (int)(scene.agent.x >> (hf::sim::fpx::kFrac));
+        const int agz = (int)(scene.agent.z >> (hf::sim::fpx::kFrac));
+        int apx, apy; cellCenterPx(agx, agz, apx, apy);
+        thickCross(apx, apy, 9, Vec3{0.20f, 0.90f, 0.95f});
+        const int tgx = (int)(scene.target.x >> (hf::sim::fpx::kFrac));
+        const int tgz = (int)(scene.target.z >> (hf::sim::fpx::kFrac));
+        int tpx, tpy; cellCenterPx(tgx, tgz, tpx, tpy);
+        thickCross(tpx, tpy, 9, Vec3{0.95f, 0.25f, 0.85f});
+    }
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — ai3 line-of-sight visibility raster (%d rays, %d visible, %d blockers)\n",
+                outPath, imgW, imgH, kRays, visibleCount, kBlockers);
+    return 0;
+}
+
 // ===== Slice VD1 — Deterministic Gameplay / Netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS showcase
 // (--vd1-world) (the BEACHHEAD of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO
 // new RHI; the verdict.h entity world + command bus is header-only integer math, so on Metal it runs the IDENTICAL
@@ -63325,6 +63470,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ai2-query") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ai2_query.png";
             try { return RunAi2QueryShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ai3-los <out.png>: render the Deterministic AI LINE-OF-SIGHT / PERCEPTION showcase (Slice AI3, the
+        // feasibility CRUX of the DETERMINISTIC AI flagship #28). PURE CPU — runs the IDENTICAL ai.h canonical
+        // arena + integer segment-vs-AABB visibility raster the Vulkan --ai3-los-shot runs -> the converged
+        // raster is bit-identical cross-backend BY CONSTRUCTION; the 4 proof lines match the Vulkan side
+        // EXACTLY. NO shader added (ai.h is header-only; the LOS is pure integer, NO float, NO division).
+        if (argc > 1 && std::strcmp(argv[1], "--ai3-los") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ai3_los.png";
+            try { return RunAi3LosShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vd2-tick <out.png>: render the Deterministic Gameplay / Netcode SYSTEM SCHEDULE + GAMEPLAY TICK

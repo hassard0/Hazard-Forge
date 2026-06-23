@@ -1054,6 +1054,17 @@ hf_add_pure_test(ai_tree_test)
 # ai.h now #includes nav/navmesh.h read-only (FROZEN). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(ai_query_test)
 
+# Deterministic AI Slice 3 (Slice AI3, the feasibility CRUX of FLAGSHIP #28): the PURE-INTEGER line-of-sight /
+# perception layer (engine/ai/ai.h, APPEND-ONLY over AI1/AI2). Pins the integer segment-vs-AABB slab test
+# (LineOfSight — no float, no division; every parametric `t` is a fraction num/den compared by cross-
+# multiplication, the navmesh.h PointInTriXZ discipline) + the pinned boundary/corner rule (a grazing/touching
+# contact is NOT blocked; a positive-measure penetration IS): two-run determinism, a ray through a blocker is
+# occluded, a ray missing all is visible, a ray ending before a blocker is visible (the [0,1] clamp), a ray
+# starting inside a blocker is occluded, an axis-parallel ray grazing a face is NOT blocked, a ray ending at a
+# box corner is NOT blocked, and WritePerception writes canSeeTarget + the last-seen cell. Pure C++ (hf_core),
+# ASan-eligible.
+hf_add_pure_test(ai_los_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16

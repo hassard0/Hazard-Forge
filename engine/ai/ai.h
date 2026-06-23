@@ -583,5 +583,223 @@ inline EqsQuery BuildAi2Scene(const NavScene& scene) {
     return q;
 }
 
+// =====================================================================================================
+// Slice AI3 — LINE-OF-SIGHT / PERCEPTION: a DETERMINISTIC INTEGER segment-vs-AABB visibility test.
+// =====================================================================================================
+// AI1 (decision tree) + AI2 (environment queries) above are BYTE-FROZEN — everything below is APPEND-ONLY.
+// AI3 adds PERCEPTION: can the agent SEE the target? The engine has NO line-of-sight / raycast / segment-
+// intersection on a deterministic path (the only ray test is the FLOAT GPU ray tracer, which is non-
+// deterministic across vendors). LOS is INVENTED here as a PURE-INTEGER, bit-identical visibility test —
+// because the textbook float DDA (tMax/tDelta) and any float parametric `t` diverge across compilers/
+// backends. AI4 (perception->decision) and AI5 (rollback divergence) ride on this being EXACT.
+//
+// THE FORMULATION: segment-vs-AABB by an INTEGER SLAB TEST (no float `t`, no division). For a segment
+// p0->p1 (direction d = p1-p0) vs an axis-aligned box [bmin, bmax], the slab test finds the parametric
+// entry/exit `t` per axis. The float version DIVIDES (t = (bmin.a - p0.a)/d.a) and compares floats — BOTH
+// non-deterministic. The INTEGER version keeps each `t` as a FRACTION num/den (NORMALIZED to den > 0) and
+// compares two fractions by CROSS-MULTIPLICATION (a/b < c/d  <=>  a*d < c*b for b,d > 0 — int64 inter-
+// mediates, the navmesh.h:126 PointInTriXZ integer edge-function discipline), so there is NO division and
+// NO float. The segment hits the box iff max(entry_t over axes) <= min(exit_t over axes) AND that overlap
+// intersects [0,1] (clip the segment to its endpoints). LineOfSight = NOT (the segment hits ANY blocker).
+//
+// THE PINNED TIE/BOUNDARY RULE: a segment that merely TOUCHES a box (grazes a face/edge/corner, or whose
+// tEnter == tExit at a single point, or whose entry/exit coincides exactly with t==0 / t==1) is treated as
+// NOT blocked. Concretely the slab overlap test uses STRICT `<` at the box faces (tEnter < tExit, not <=),
+// so a measure-zero grazing contact does NOT occlude. Rationale: an agent standing flush against a wall,
+// or a sight-line skimming a corner, should still SEE past it — the binary visible/occluded answer favors
+// visibility at the boundary. This rule is applied IDENTICALLY on every axis + at the [0,1] clip, so two
+// runs and both backends agree by construction (it is all integer comparison). A segment that PENETRATES a
+// box interior (a positive-measure overlap) IS blocked. A segment whose endpoint lies strictly INSIDE a
+// box is blocked (the interior overlap is non-degenerate). DEGENERATE p0==p1 (a zero-length segment): the
+// "from" point only sees itself; it is blocked iff that point is strictly inside a box (the same interior
+// rule). AXIS-PARALLEL degenerate (d.a == 0 on some axis): no slab fraction exists for that axis; instead
+// the segment is inside that slab iff p0.a is STRICTLY between bmin.a and bmax.a (bmin.a < p0.a < bmax.a) —
+// the same strict-interior rule, NO division. If p0.a is on/outside the slab face the segment misses the
+// box on that axis (NOT blocked). PURE INTEGER, deterministic, bit-identical CPU/Vulkan/Metal.
+//
+// COORDINATE BOUND (overflow safety): coords are Q16.16 world units. A cross-multiply forms num*den where
+// num = (boxFace - p0.a) is a difference of two coords and den = |d.a| is a difference of two coords. To
+// keep num*den within int64 (|product| < 2^63 ≈ 9.22e18) with margin, the LOS scene keeps |coord| <= ~256
+// world units (|coord| <= 256<<16 ≈ 1.68e7 -> |num|,|den| <= ~3.4e7 -> |num*den| <= ~1.2e15 << 2^63). The
+// AI3 showcase scene (a ~16-unit arena) is far inside this; LineOfSight DEFENSIVELY notes the bound but
+// does not clamp (the bound is a scene contract, like fpx.h's +-32768 position bound).
+
+// ----- AiBlocker: an axis-aligned integer box obstacle (the LOS occluder) ------------------------------
+// min/max are inclusive Q16.16 world corners (min.a <= max.a per axis). The 2D XZ horizontal-plane LOS for
+// the NPC sample uses the X and Z extents; the Y extent is carried for provenance (a future 3D refinement)
+// but the 2D test (LineOfSightXZ) reads only X/Z. A point is strictly inside iff min.a < p.a < max.a on
+// BOTH tested axes (the pinned strict-interior rule). Structurally an fpx::FxAabb (lo/hi) — we name it
+// AiBlocker for the AI vocabulary; it is trivially convertible.
+struct AiBlocker {
+    fpx::FxVec3 min, max;   // inclusive Q16.16 world corners (min.a <= max.a)
+};
+
+// ----- StrictlyBetween(v, lo, hi): the integer strict-interior predicate (lo < v < hi) -----------------
+// Pure integer compare. Touching a face (v == lo or v == hi) is NOT inside (the pinned boundary rule).
+inline bool StrictlyBetween(fpx::fx v, fpx::fx lo, fpx::fx hi) {
+    return lo < v && v < hi;
+}
+
+// ----- PointInsideBlockerXZ(p, b): is p STRICTLY inside the blocker's XZ footprint? --------------------
+// Used for the degenerate cases (a zero-length segment / an endpoint inside a box). Strict on BOTH X and Z
+// (the pinned interior rule); a point on a face/edge is NOT inside. Pure integer.
+inline bool PointInsideBlockerXZ(const fpx::FxVec3& p, const AiBlocker& b) {
+    return StrictlyBetween(p.x, b.min.x, b.max.x) && StrictlyBetween(p.z, b.min.z, b.max.z);
+}
+
+// ----- SegmentHitsBlockerXZ(p0, p1, b): the INTEGER slab test on the XZ plane ---------------------------
+// Returns true iff the segment p0->p1 PENETRATES the blocker's XZ footprint (a positive-measure overlap),
+// per the pinned strict-boundary rule (a grazing/touching contact returns false). PURE INTEGER, NO float,
+// NO division — every `t` is a fraction num/den (den > 0 after sign normalization), every comparison is a
+// cross-multiplication in int64 (the PointInTriXZ edge-function discipline). The interval algebra:
+//
+//   For each tested axis (X, then Z) with direction component dc = p1.a - p0.a:
+//     * dc == 0 (axis-parallel): the segment is inside the slab for ALL t iff p0.a is STRICTLY between
+//       bmin.a and bmax.a; otherwise it misses the box -> return false (NOT blocked). No fraction added.
+//     * dc != 0: the segment crosses the slab faces at entry_t = (entryFace - p0.a)/dc and
+//       exit_t = (exitFace - p0.a)/dc, where (entryFace, exitFace) = (bmin.a, bmax.a) if dc > 0 else
+//       (bmax.a, bmin.a) [so entry_t <= exit_t]. Each is normalized to a den > 0 fraction.
+//   The box is hit iff the per-axis [entry_t, exit_t] intervals, intersected with [0, 1], have a
+//   POSITIVE-measure overlap: max(entry_t, 0) < min(exit_t, 1) (STRICT — the grazing rule). All compares
+//   are cross-multiplications; the running max-entry / min-exit are kept as fractions.
+//
+// Implementation keeps the running tEnter (a fraction, init 0/1 for the [0,1] clip) and tExit (init 1/1),
+// updating tEnter = max(tEnter, entry_t) and tExit = min(tExit, exit_t) per crossing axis, then returns
+// tEnter < tExit (STRICT). A fraction is (num, den) with den > 0.
+struct AiFrac { int64_t num; int64_t den; };   // den > 0 invariant (sign normalized)
+
+// FracLess(a, b): a.num/a.den < b.num/b.den, given a.den>0 && b.den>0. Cross-multiply in int64 (the scene
+// coordinate bound keeps num*den < 2^63). Pure integer.
+inline bool FracLess(const AiFrac& a, const AiFrac& b) {
+    return a.num * b.den < b.num * a.den;
+}
+
+inline bool SegmentHitsBlockerXZ(const fpx::FxVec3& p0, const fpx::FxVec3& p1, const AiBlocker& b) {
+    // The running hit interval, clipped to [0,1]: tEnter starts at 0/1, tExit at 1/1.
+    AiFrac tEnter{0, 1};
+    AiFrac tExit {1, 1};
+
+    // Process X then Z (the 2D XZ footprint). A fixed-order, branch-deterministic loop.
+    const fpx::fx p0a[2] = {p0.x, p0.z};
+    const fpx::fx p1a[2] = {p1.x, p1.z};
+    const fpx::fx bmin[2] = {b.min.x, b.min.z};
+    const fpx::fx bmax[2] = {b.max.x, b.max.z};
+
+    for (int ax = 0; ax < 2; ++ax) {
+        const int64_t dc = (int64_t)p1a[ax] - (int64_t)p0a[ax];   // direction component (int64, no overflow)
+        const int64_t lo = (int64_t)bmin[ax];
+        const int64_t hi = (int64_t)bmax[ax];
+        const int64_t p  = (int64_t)p0a[ax];
+        if (dc == 0) {
+            // Axis-parallel: inside the slab for all t iff p0.a STRICTLY between bmin/bmax; else MISS.
+            if (!(lo < p && p < hi)) return false;   // outside/on the slab face -> not blocked (strict rule)
+            continue;                                // inside the slab on this axis: no fraction constraint
+        }
+        // entry/exit faces ordered so entry_t <= exit_t (depends on the sign of dc).
+        int64_t entryFace, exitFace;
+        if (dc > 0) { entryFace = lo; exitFace = hi; }
+        else        { entryFace = hi; exitFace = lo; }
+        // entry_t = (entryFace - p)/dc, exit_t = (exitFace - p)/dc. Normalize to den > 0 (flip sign if dc<0).
+        AiFrac entryT{entryFace - p, dc};
+        AiFrac exitT { exitFace - p, dc};
+        if (dc < 0) { entryT.num = -entryT.num; entryT.den = -entryT.den;
+                      exitT.num  = -exitT.num;  exitT.den  = -exitT.den; }
+        // tEnter = max(tEnter, entry_t); tExit = min(tExit, exit_t) — fraction compares (cross-multiply).
+        if (FracLess(tEnter, entryT)) tEnter = entryT;
+        if (FracLess(exitT,  tExit )) tExit  = exitT;
+        // Early-out: an empty (or grazing) interval can never become a positive overlap (intervals only
+        // shrink) -> not blocked. STRICT: tEnter >= tExit means no positive-measure overlap.
+        if (!FracLess(tEnter, tExit)) return false;
+    }
+    // A positive-measure overlap of all axis slabs with [0,1] -> the segment penetrates the box.
+    return FracLess(tEnter, tExit);
+}
+
+// ----- LineOfSight(from, to, blockers, count): true (visible) iff NO blocker occludes the segment -------
+// The PERCEPTION primitive: returns false (occluded) iff the segment from->to PENETRATES any blocker's XZ
+// footprint, true (visible) otherwise. Handles the degenerate from==to (sees itself unless strictly inside
+// a box). PURE INTEGER, deterministic, bit-identical CPU/Vulkan/Metal — the strict-zero cross-vendor LOS.
+inline bool LineOfSight(const fpx::FxVec3& from, const fpx::FxVec3& to,
+                        const AiBlocker* blockers, int count) {
+    const bool degenerate = (from.x == to.x && from.z == to.z);
+    for (int i = 0; i < count; ++i) {
+        const AiBlocker& b = blockers[i];
+        if (degenerate) {
+            if (PointInsideBlockerXZ(from, b)) return false;   // zero-length: blocked iff strictly inside
+        } else {
+            if (SegmentHitsBlockerXZ(from, to, b)) return false;
+        }
+    }
+    return true;
+}
+
+// ----- The AI3 perception blackboard keys (the canonical perception write) -----------------------------
+// kBbCanSeeTarget carries the binary visibility (1 visible / 0 occluded); kBbLastSeenCellX/Z carry the
+// last-seen target cell (integer voxel) when visible (left UNCHANGED when occluded — a "last known
+// position" memory). Distinct keys from AI1's kBbEnemyClose(0)/kBbState(1) and within [0,kMaxBbKeys).
+inline constexpr int kBbCanSeeTarget = 2;   // output: 1 if the agent can see the target, else 0
+inline constexpr int kBbLastSeenCellX = 3;  // output: the target's last-seen integer cell x (when visible)
+inline constexpr int kBbLastSeenCellZ = 4;  // output: the target's last-seen integer cell z (when visible)
+
+// ----- WritePerception(bb, canSee, lastSeenX, lastSeenZ): the perception->blackboard helper ------------
+// Writes canSeeTarget (1/0). When canSee, ALSO updates the last-seen cell (a "I saw the target HERE"
+// memory the decision tree can chase toward); when occluded, the last-seen cell is LEFT UNCHANGED (the
+// agent remembers where it last saw the target). Pure integer mutation; deterministic.
+inline void WritePerception(Blackboard& bb, bool canSee, int32_t lastSeenX, int32_t lastSeenZ) {
+    bb.Set(kBbCanSeeTarget, canSee ? 1 : 0);
+    if (canSee) {
+        bb.Set(kBbLastSeenCellX, lastSeenX);
+        bb.Set(kBbLastSeenCellZ, lastSeenZ);
+    }
+}
+
+// ----- The canonical AI3 line-of-sight scene (the showcase + the test share ONE scene) -----------------
+// A small 2D arena (XZ), Q16.16 world units. An agent at one corner, a target at the opposite corner, and
+// a set of axis-aligned box blockers between them (so the direct lane to the target is occluded while side
+// lanes are clear — the "shadow" the raster must show). A fixed raster grid spans the arena; the showcase
+// runs LineOfSight(agent, cellCenter) for every cell. All integer; deterministic by construction. The
+// arena is kArenaCells x kArenaCells world units (well inside the +-256 coordinate bound).
+inline constexpr int kArenaCells = 16;            // the raster grid is kArenaCells x kArenaCells
+inline constexpr int kMaxBlockers = 8;            // the fixed blocker count bound for the scene
+
+struct Ai3Scene {
+    fpx::FxVec3 agent;                            // the LOS source (Q16.16 world)
+    fpx::FxVec3 target;                           // the LOS target (Q16.16 world)
+    std::vector<AiBlocker> blockers;             // the axis-aligned box occluders
+    int gridW = kArenaCells, gridH = kArenaCells; // the raster grid dims (cells)
+};
+
+// CellToWorld helpers: a cell index maps to the Q16.16 world coord of its CENTER (cell c -> (c + 0.5)
+// world units). PURE INTEGER: (c*2 + 1) half-units, i.e. ((2c+1) * kOne) / 2 = (2c+1) << (kFrac-1).
+inline fpx::fx CellCenterWorld(int c) {
+    return (fpx::fx)(((int64_t)(2 * c + 1)) << (fpx::kFrac - 1));   // (c + 0.5) world units in Q16.16
+}
+
+// ----- BuildAi3Scene(): the canonical agent + target + blockers + grid ---------------------------------
+// Agent at cell (1,1)'s center; target at cell (14,14)'s center (the diagonal). Three axis-aligned box
+// blockers straddling the middle so the DIRECT diagonal lane is occluded but clear side lanes exist — the
+// raster shows a coherent shadow behind each box. The blocker corners are EXACT integer world units (whole
+// cells, no half-cell ambiguity at the showcase tie cases). Deterministic.
+inline Ai3Scene BuildAi3Scene() {
+    Ai3Scene s;
+    s.gridW = kArenaCells; s.gridH = kArenaCells;
+    s.agent.x  = CellCenterWorld(1);  s.agent.y  = 0; s.agent.z  = CellCenterWorld(1);
+    s.target.x = CellCenterWorld(14); s.target.y = 0; s.target.z = CellCenterWorld(14);
+
+    auto box = [](int x0, int z0, int x1, int z1) {
+        // a box on WHOLE world-unit corners (xc..x1) x (zc..z1), Q16.16. y spans a nominal [0,2] (provenance).
+        AiBlocker b;
+        b.min.x = (fpx::fx)((int64_t)x0 << fpx::kFrac); b.min.z = (fpx::fx)((int64_t)z0 << fpx::kFrac);
+        b.max.x = (fpx::fx)((int64_t)x1 << fpx::kFrac); b.max.z = (fpx::fx)((int64_t)z1 << fpx::kFrac);
+        b.min.y = 0; b.max.y = (fpx::fx)((int64_t)2 << fpx::kFrac);
+        return b;
+    };
+    // A central diagonal wall (broken into boxes) blocking the agent->target line; a clear side lane stays.
+    s.blockers.push_back(box(6,  4, 8,  9));   // a vertical bar mid-arena (occludes the direct diagonal)
+    s.blockers.push_back(box(9,  9, 12, 11));  // a horizontal bar lower-right (a second shadow caster)
+    s.blockers.push_back(box(3,  10, 5, 12));  // a small box lower-left (an isolated shadow)
+    return s;
+}
+
 }  // namespace ai
 }  // namespace hf
