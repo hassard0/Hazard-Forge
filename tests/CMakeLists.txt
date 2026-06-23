@@ -1147,6 +1147,18 @@ hf_add_pure_test(grain_test)
 # ASan-eligible. particles.h #includes fpx.h + grain.h read-only.
 hf_add_pure_test(particles_test)
 
+# Deterministic PCG Slice 1 (Slice PCG1, the BEACHHEAD of FLAGSHIP #22): the seeded hash-PRNG primitive
+# (engine/pcg/pcg.h, namespace hf::pcg) every later PCG slice consumes — a deterministic seeded integer
+# hash-PRNG in Q16.16, pure int32 (MSL-native). Reuses the ParticleHash avalanche SHAPE + the EmitDir no-trig
+# direction table from engine/sim/particles.h VERBATIM (so the determinism story is identical) and fpx.h
+# (fx/kOne/kFrac/fxmul/FxVec3) read-only. Pins: PcgHash replay-stable + distinct; PcgRand01 in [0,kOne) (a
+# pure top-16-bits shift, strict < kOne, NO div/float); PcgRandRange in [lo,hi] (+ degenerate lo==hi -> lo);
+# seed-sensitivity (a different seed -> a different sequence); PcgStream salt separation (same seed, different
+# salt -> different stream; salt 0 == the bare-seed overload); and a uniformity sanity check (bucket N=4096
+# PcgRand01 samples into K bins, every bin within a LOOSE INTEGER band of N/K — no float tolerance). Pure C++
+# (hf_core), ASan-eligible. pcg.h #includes fpx.h + particles.h read-only.
+hf_add_pure_test(pcg_test)
+
 # Deterministic Integer Broadphase Slice 1 (Slice BP1, the BEACHHEAD of FLAGSHIP #23): the BODY GRID + CSR CELL
 # TABLE core (engine/sim/broad.h) the GPU shaders/broad_cell_{count,scan,emit}.comp.hlsl copy VERBATIM + prove
 # bit-identical. The grain.h GrainGrid/GrainCellTable count->scan->emit, keyed on fpx::FxBody. broad_test pins

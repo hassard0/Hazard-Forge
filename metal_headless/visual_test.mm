@@ -99,6 +99,7 @@
 #include "sim/fluid.h"              // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp + the Vulkan --fluid-integrate-shot
 #include "sim/grain.h"              // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp + the Vulkan --grain-integrate-shot
 #include "sim/particles.h"          // Slice PT1: deterministic GPU particles Q16.16 emitter + integrator (FxParticle/ParticlePool/EmitParticle/IntegrateParticles/RecycleDead/StepEmitIntegrate, free-list) — shared verbatim with particles_integrate.comp + the Vulkan --pt1-emit-shot; the Metal --pt1-emit runs the CPU StepEmitIntegrate (int64 integrator -> Vulkan-only shader)
+#include "pcg/pcg.h"                // Slice PCG1: deterministic PCG seeded hash-PRNG primitive (PcgHash/PcgRand01/PcgRandRange/PcgUnitDir/PcgStream) Q16.16 pure-int32 — reuses particles.h ParticleHash + EmitDir; the Metal --pcg1-hash runs the IDENTICAL pure-integer point-plot the Vulkan --pcg1-hash-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/broad.h"              // Slice BP1: deterministic integer broadphase THE BODY GRID + CSR CELL TABLE (BodyGrid/MakeBodyGrid/BodyCellOf/FlatBodyCellId/BodyCellTable/BuildBodyCellTable/BodyGridMeasure, keyed on fpx::FxBody) — shared verbatim with broad_cell_{count,scan,emit}.comp (MSL-NATIVE) + the Vulkan --broad-cell-shot; Metal --broad-cell DISPATCHES the GPU shaders
 #include "sim/couple.h"             // Slice CP1: deterministic rigid<->fluid coupling unified world + body->fluid grid-hash query (CoupleWorld/GatherBodyParticles/BodyParticleAccept) — shared verbatim with couple_body_{count,scan,emit}.comp + the Vulkan --couple-query-shot
 #include "sim/couple_grain.h"       // Slice CG1: deterministic rigid<->grain coupling unified bodies+grains world + body->grain grid-hash query (CGrainWorld/GatherBodyGrains/BodyGrainAccept) — shared verbatim with cgrain_body_{count,scan,emit}.comp + the Vulkan --cgrain-query-shot
@@ -40400,6 +40401,84 @@ static int RunAi5LockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PCG1 — Deterministic PCG SEEDED HASH-PRNG PRIMITIVE showcase (--pcg1-hash) (the BEACHHEAD of
+// FLAGSHIP #22, hf::pcg). PURE CPU — NO GPU compute, NO new shader, NO new RHI; pcg.h is header-only pure-int32
+// math, so on Metal it runs the IDENTICAL deterministic seeded hash-PRNG the Vulkan --pcg1-hash-shot runs on
+// Windows -> the 2D point-field golden is bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-
+// pixel). Renders the first N=4096 samples p_i = (PcgRand01(stream, 2i), PcgRand01(stream, 2i+1)) mapped to
+// INTEGER pixel coords by a pure shift (rand>>8 -> [0,255]) — NO float pixel math; the proof lines (incl. the
+// different-seed-different-field check) match the Vulkan side EXACTLY. The fixed SEED/SALT/N/IMG MUST be
+// IDENTICAL to the Vulkan --pcg1-hash-shot. New golden tests/golden/metal/pcg1_hash.png (baked on the Mac by
+// the controller); two runs DIFF 0.0000.
+static int RunPcg1HashShowcase(const char* outPath) {
+    namespace pcg = hf::pcg;
+    // THE FIXED SHOWCASE PARAMS — IDENTICAL to the Vulkan --pcg1-hash-shot (main.cpp).
+    const uint32_t kSeed = 1337u;
+    const uint32_t kSalt = 0x5CA77E20u;
+    const uint32_t kN    = 4096u;
+    const uint32_t kImg  = 256u;
+
+    auto renderField = [&](uint32_t seed, uint32_t salt, std::vector<uint8_t>& out, uint32_t& inRange) {
+        out.assign((size_t)kImg * kImg * 4, 0);
+        for (size_t pp = 0; pp < (size_t)kImg * kImg; ++pp) {
+            out[pp * 4 + 0] = 12; out[pp * 4 + 1] = 10; out[pp * 4 + 2] = 8; out[pp * 4 + 3] = 255;
+        }
+        const pcg::PcgStream st{seed, salt};
+        inRange = 0;
+        auto putPx = [&](int ix, int iy, uint8_t b, uint8_t g, uint8_t r) {
+            if (ix < 0 || ix >= (int)kImg || iy < 0 || iy >= (int)kImg) return;
+            uint8_t* d = &out[((size_t)iy * kImg + ix) * 4];
+            d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+        };
+        for (uint32_t i = 0; i < kN; ++i) {
+            const pcg::fx rx = pcg::PcgRand01(st, 2u * i);
+            const pcg::fx ry = pcg::PcgRand01(st, 2u * i + 1u);
+            if (rx >= 0 && rx < pcg::kOne && ry >= 0 && ry < pcg::kOne) ++inRange;
+            const int px = (int)((uint32_t)rx >> 8);
+            const int py = (int)((uint32_t)ry >> 8);
+            putPx(px,     py,     220, 230, 240);
+            putPx(px - 1, py,     120, 150, 200);
+            putPx(px + 1, py,     120, 150, 200);
+            putPx(px,     py - 1, 120, 150, 200);
+            putPx(px,     py + 1, 120, 150, 200);
+        }
+    };
+    auto checksum = [](const std::vector<uint8_t>& img) {
+        uint32_t h = 2166136261u;
+        for (uint8_t byte : img) { h ^= byte; h *= 16777619u; }
+        return h;
+    };
+
+    std::vector<uint8_t> imgA1, imgA2;
+    uint32_t inRangeA1 = 0, inRangeA2 = 0;
+    renderField(kSeed, kSalt, imgA1, inRangeA1);
+    renderField(kSeed, kSalt, imgA2, inRangeA2);
+    const bool twoRunIdentical = (imgA1.size() == imgA2.size()) &&
+                                 (std::memcmp(imgA1.data(), imgA2.data(), imgA1.size()) == 0);
+    if (!twoRunIdentical || inRangeA1 != kN)
+        return fail("pcg1-hash: two runs differ or out-of-range (nondeterministic PRNG)");
+
+    std::vector<uint8_t> imgB;
+    uint32_t inRangeB = 0;
+    const uint32_t kSeedB = kSeed ^ 0xA5A5A5A5u;
+    renderField(kSeedB, kSalt, imgB, inRangeB);
+    const uint32_t hA = checksum(imgA1);
+    const uint32_t hB = checksum(imgB);
+    if (hA == hB || inRangeB != kN)
+        return fail("pcg1-hash: different seed did not produce a different valid field");
+
+    std::printf("pcg1-hash: seeded hash-PRNG (N=%u samples, seed=%u)\n", kN, kSeed);
+    std::printf("pcg1-hash: two-run BYTE-IDENTICAL\n");
+    std::printf("pcg1-hash: different seed -> different field {seedA_hash:%u, seedB_hash:%u} "
+                "hA != hB (same N, both valid)\n", hA, hB);
+    std::printf("pcg1-hash: provenance {samples:4096, range:[0,kOne), uniform:true}\n");
+
+    if (!WritePNG(outPath, imgA1, kImg, kImg)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — pcg1 seeded hash-PRNG point-field (N=%u, seed=%u)\n",
+                outPath, kImg, kImg, kN, kSeed);
+    return 0;
+}
+
 // ===== Slice VD1 — Deterministic Gameplay / Netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS showcase
 // (--vd1-world) (the BEACHHEAD of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO
 // new RHI; the verdict.h entity world + command bus is header-only integer math, so on Metal it runs the IDENTICAL
@@ -69668,6 +69747,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--wh4-stack") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_wh4_stack.png";
             try { return RunWh4StackShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pcg1-hash <out.png>: render the Deterministic PCG SEEDED HASH-PRNG PRIMITIVE showcase (Slice PCG1, the
+        // BEACHHEAD of FLAGSHIP #22). PURE CPU — runs the IDENTICAL pcg.h seeded hash-PRNG the Vulkan
+        // --pcg1-hash-shot runs (the 2D point-plot of the first N=4096 samples, pure-integer pixel map) -> the
+        // point-field is bit-identical cross-backend BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY.
+        // NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--pcg1-hash") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pcg1_hash.png";
+            try { return RunPcg1HashShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vd1-world <out.png>: render the Deterministic Gameplay / Netcode ENTITY WORLD + INPUT-COMMAND BUS
