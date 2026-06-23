@@ -25,6 +25,40 @@
 | PBR + IBL, GTAO, SSS, bloom, DoF, TAA, motion blur, CAS, auto-exposure, color grade | ✅ | `--pbr`, `--ibl`, `--gtao`, `--sss`, `--bloom`, `--dof`, `--taa`, `--motion-blur`, `--cas`, `--auto-exposure`, `--color-grade` | Full post stack |
 | Animated shaders (time-driven sky/water/foliage/VFX) | ✅ | `--sky-animated`; `FrameData.skyParams.zw = (time, frameIndex)` | The per-frame time channel (issue #5); shared `procedural_sky.hlsli` (issue #4) |
 
+### HDR image-based lighting (IBL) — issue #8
+
+✅ **The `--ibl` showcase *is* the HDR-IBL sample** (the `ibl_helmet` golden): it loads the HDR environment, builds the
+IBL, and renders the DamagedHelmet catching real environmental detail in its metal — not the procedural-sky gradient.
+The pieces, and the minimal wiring:
+
+- `engine/asset/env_loader.cpp` loads `assets/env/env.hdr` (the path is `HF_ENV_PATH`, defined in the sample
+  CMakeLists).
+- `shaders/lit_pbr_ibl.frag.hlsl` consumes the HDR environment cube for both the diffuse irradiance and the specular
+  reflection; `shaders/sky_hdr.frag.hlsl` is the matching HDR sky sampler.
+- Wire it like the `--ibl` handler: load the env cube → bind it to the IBL slot → use the `lit_pbr_ibl` pipeline
+  instead of `lit.frag`. The `--ibl` showcase in `samples/hello_triangle/main.cpp` / `metal_headless/visual_test.mm`
+  is the copy-paste reference. (To make this even more extractable as a standalone `samples/hdr_ibl_demo/`, that's a
+  welcome follow-up — the capability + golden already ship.)
+
+### Reflections — the options — issue #6
+
+The *simple* `lit.frag.hlsl` reflects the procedural sky only (fast, no scene-radiance input — a metallic surface
+shows the sky, not the car driving past). Dynamic scene-object reflections **are** available, through dedicated paths
+— each a public showcase:
+
+- **Screen-space reflections** — `--ssr` (+ `--ssgi`/`--ssgi-temporal` for screen-space GI): reflects on-screen
+  geometry, cheapest dynamic-object reflection.
+- **Planar mirror reflections** — `--planar` (golden `planar_reflection`): a true mirror plane (floor/glass) that
+  reflects the scene.
+- **Cubemap probes** — `--refl-probe` (box-projected static) and `--capture-probe` (dynamic cubemap capture): local
+  reflections for a room/region.
+- **Ray-traced reflections** — `--rt4-reflect`: ground-truth RT reflections (see Hardware ray tracing below).
+
+Pick by need: SSR for cheap on-screen, planar for a mirror surface, probes for a localized environment, RT for
+ground truth. *Honest note:* composing these into the *simple* lit pipeline **by default** (so any `lit.frag` surface
+auto-reflects dynamic geometry without opting into a path) is a genuine architectural enhancement, not yet done — today
+you select the reflection path explicitly, as above.
+
 ## Hardware ray tracing (deterministically reconciled) — issues #7, #13
 
 ✅ **Ships as a full RHI accel-structure seam.** Flagship #28 added `IAccelerationStructure` / BLAS / TLAS + inline ray
@@ -75,12 +109,32 @@ Niagara-class** system (mesh emission, force fields, GPU collisions, a node grap
 deterministic GPU sim flagships (grain/fluid/cloth) already provide the GPU-particle *substrate*. Tracked as a future
 flagship.
 
-## Animation — issues (foundation for #17, #25)
+## Animation — issue #17
 
-✅ Skeletal **skinning** (`--skinning`, the GPU-skinned Fox), an animation **state machine** cross-fade (`--anim-fsm`),
-animation **blending** (`--anim-blend`), and a full **deterministic IK control-rig** (`--ik1-angle` … `--ik6-render`:
-two-bone + FABRIK + look-at + skeleton bridge + lockstep + a lit skinned capstone) — bit-identical, rollback-replayable
-IK. See ARCHITECTURE "Deterministic IK control-rig".
+✅ **Skinned glTF animation ships, and `--skinning` is the public animated sample** (the GPU-skinned **Fox.glb**,
+which is an animated model — the Fox is posed by sampling its animation, then GPU-skinned and rendered). The full set:
+**skinning** (`--skinning`), an animation **state-machine** cross-fade (`--anim-fsm`), animation **blending**
+(`--anim-blend`), and a **deterministic IK control-rig** (`--ik1-angle` … `--ik6-render`: two-bone + FABRIK + look-at +
+skeleton bridge + lockstep + a lit skinned capstone, bit-identical + rollback-replayable). See ARCHITECTURE
+"Deterministic IK control-rig".
+
+**The loader *does* surface skeleton + animation** (the issue's premise that it only handles static meshes is out of
+date): `asset::LoadSkinnedGltfModel(device, path)` returns a `SkinnedModel` with `.skeleton` + `.animations`
+(`FindAnimation("Survey"/"Walk"/"Run")`). The load → play path:
+
+```cpp
+auto fox = asset::LoadSkinnedGltfModel(*device, HF_FOX_MODEL_PATH);   // skeleton + animations
+const anim::Animation* clip = fox.FindAnimation("Survey");
+auto pose    = anim::SampleLocalPose(fox.skeleton, *clip, timeSeconds);   // sample at any time
+auto palette = anim::PaletteFromLocalPose(fox.skeleton, pose);           // joint matrices for the GPU
+device->SetJointPalette(palette.data(), palette.size() * sizeof(Mat4));  // bind, draw with lit_skinned.vert
+```
+
+Drive `timeSeconds` from your frame clock to play it; use `anim::StateMachine::Evaluate` for a cross-faded FSM, or
+`BlendAnimations` for a blend. The `--skinning` / `--anim-fsm` handlers in `samples/hello_triangle/main.cpp` /
+`metal_headless/visual_test.mm` are the copy-paste references. **Genuine gap:** **morph targets** (blend-shapes — for
+facial animation / vehicle wheel-deform) are not yet extracted by the glTF loader; tracked as a follow-up. (Rotating
+*wheels* are a skeletal/transform animation, which the path above already supports.)
 
 ## Agent / developer experience
 
