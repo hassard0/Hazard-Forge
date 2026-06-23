@@ -87,6 +87,18 @@ float3 hfCookTorrance(float3 N, float3 V, float3 L, float3 radiance,
 // Approximate sRGB -> linear (gamma 2.2).
 float3 SrgbToLinear(float3 c) { return pow(saturate(c), 2.2); }
 
+// --- SUBSTRATE-LITE IRIDESCENCE / thin-film (Issue #11, SB3). A crude view-angle thin-film
+// interference approximation (NOT physically exact — the engine's approximate-but-golden-locked
+// altitude): the optical-path-difference grows toward grazing angles, driving 3 phase-shifted cosines
+// (R/G/B 120deg apart) -> an oil-slick / soap-bubble rainbow tint. Used in main() to LERP the base
+// specular F0 toward this spectral tint, gated by f.substrateParams.w (iridescence=0 -> F0 unchanged).
+float3 hfIridescence(float cosTheta, float thickness) {
+    float opd = thickness * (1.0 - cosTheta);          // crude OPD, grows toward grazing angles
+    const float TAU = 6.2831853;
+    float3 phase = float3(opd * TAU, opd * TAU + 2.0944, opd * TAU + 4.1888);  // R, G, B 120deg apart
+    return saturate(0.5 + 0.5 * cos(phase));
+}
+
 float4 main(PSInput i) : SV_Target {
     float3 Ng = normalize(i.wnormal);
 
@@ -107,6 +119,15 @@ float4 main(PSInput i) : SV_Target {
     float  metallic  = saturate(mr.b * i.material.x);
     float  roughness = clamp(mr.g * i.material.y, 0.05, 1.0);
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), albedo, metallic);
+
+    // --- SUBSTRATE-LITE IRIDESCENCE (Issue #11, SB3). LERP the base specular F0 toward a thin-film
+    // spectral tint, gated by f.substrateParams.w. Placed AFTER F0 is computed and BEFORE F0 is
+    // consumed by hfCookTorrance (direct) and the IBL specular Fresnel, so the iridescent tint shows
+    // in BOTH the lit highlight and the env reflection. iridescence=0 -> lerp(F0, _, 0) == F0 EXACTLY
+    // -> byte-identical to the base lit_pbr_ibl render. THIS IS THE MAKE-OR-BREAK identity. ---
+    float iridescence = f.substrateParams.w;
+    float NoVi = max(dot(N, V), 1e-4);
+    F0 = lerp(F0, hfIridescence(NoVi, 3.0), iridescence);
 
     // --- Ambient occlusion (R channel, linear). ---
     float ao = gOcclusion.Sample(gOcclusionSmp, i.uv).r;
