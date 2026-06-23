@@ -22442,16 +22442,18 @@ static int RunPt2ForcesShowcase(const char* outPath) {
 
     // The TWO force fields, host-snapped Q16.16, in FIXED array order [vortex, attractor] (== the Vulkan side).
     std::vector<pt::ForceField> fields(2);
+    // IDENTICAL to the Vulkan --pt2-forces-shot scene (main.cpp) — the two MUST match or the cross-backend
+    // golden diverges (the pool is a pure function of these fields).
     fields[0].kind = pt::kFieldVortex;
-    fields[0].center = pt::FxVec3{0, pt::kOne * 3 / 2, 0};      // (0, 1.5, 0)
+    fields[0].center = pt::FxVec3{0, pt::kOne, 0};             // (0, 1.0, 0)
     fields[0].axis = pt::FxVec3{0, pt::kOne, 0};               // +Y unit
-    fields[0].strength = pt::kOne * 6;
-    fields[0].radius = pt::kOne * 4;
+    fields[0].strength = pt::kOne * 5;                        // swirl strength
+    fields[0].radius = pt::kOne * 5;                          // influence radius
     fields[1].kind = pt::kFieldPoint;
-    fields[1].center = pt::FxVec3{pt::kOne * 2, pt::kOne * 2, 0};  // (2, 2, 0)
+    fields[1].center = pt::FxVec3{pt::kOne * 5 / 2, pt::kOne * 3 / 2, 0};  // (2.5, 1.5, 0)
     fields[1].axis = pt::FxVec3{0, 0, 0};
-    fields[1].strength = pt::kOne * 5;                       // + => attract
-    fields[1].radius = pt::kOne * 5;
+    fields[1].strength = pt::kOne * 3;                       // + => attract
+    fields[1].radius = pt::kOne * 6;
     const uint32_t kFieldCount = (uint32_t)fields.size();
 
     // std430 FxParticle mirror (== the Vulkan --pt2-forces-shot FxParticleGpu): 12 x int32 (48).
