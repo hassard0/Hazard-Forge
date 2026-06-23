@@ -1075,6 +1075,15 @@ hf_add_pure_test(ai_los_test)
 # ai.h composes the frozen AI1-AI3 primitives + the frozen navmesh A*. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(ai_agent_test)
 
+# Deterministic AI Slice 5 (Slice AI5, THE MOAT HEADLINE of FLAGSHIP #28): the pure-CPU LOCKSTEP + ROLLBACK
+# harness over the NPC AI decisions (engine/ai/ai.h: SimAiTick / SnapshotAi / RestoreAi / AiStatesEqual /
+# RunAiLockstep / RunAiRollback). Pins: snapshot/restore round-trip bit-exact (agents+player+tick); two-peer
+# lockstep convergence (whole AI state equal each tick from the player-move stream ONLY); rollback
+# corrected==authority; the mispredict (a wrong player move flipping a chase<->patrol decision) GENUINELY
+# diverged; a no-op mispredict does NOT diverge (the flag is falsifiable); two runs byte-identical. The const
+# navmesh/tree/blockers are re-supplied as params (NOT snapshotted). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(ai_lockstep_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16

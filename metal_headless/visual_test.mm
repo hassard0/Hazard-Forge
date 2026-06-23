@@ -35438,6 +35438,209 @@ static int RunAi4AgentShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice AI5 — Deterministic AI LOCKSTEP + ROLLBACK over the NPC AI decisions showcase =================
+// (--ai5-lockstep) (THE MOAT HEADLINE, the 5th slice of the DETERMINISTIC AI flagship #28, hf::ai). PURE CPU —
+// NO GPU compute, NO new shader, NO new RHI; ai.h's lockstep/rollback machinery is header-only INTEGER math
+// over the frozen AI4 StepAiWorld, so on Metal it runs the IDENTICAL pure-CPU RunAiLockstep + RunAiRollback
+// the Vulkan --ai5-lockstep-shot runs on Windows -> bit-identical cross-backend BY CONSTRUCTION (strict 0px).
+// Builds the SAME canonical AI4 scene (navmesh + N agents + a player + blockers) + the SAME player-move stream,
+// runs RunAiLockstep (two peers fed ONLY the input stream re-derive the bit-identical AI world) + RunAiRollback
+// (a mispredicted player move flipping a chase<->patrol decision rolled back -> corrected==authority), asserts
+// the 4 proofs (proof lines match the Vulkan side EXACTLY), and renders the converged authority world as the
+// AI4-style 2D top-down. New golden tests/golden/metal/ai5_lockstep.png (Mac-baked by the controller); two
+// runs DIFF 0.0000.
+static int RunAi5LockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace ai  = hf::ai;
+    namespace fpx = hf::sim::fpx;
+    namespace nav = hf::nav;
+
+    // The canonical AI4 scene (== the Vulkan --ai5-lockstep-shot + the ai_lockstep_test).
+    const ai::Ai4Scene scene = ai::BuildAi4Scene();
+    const ai::AiSimState init = ai::BuildAi5InitialState(scene);
+    const int kAgents = (int)scene.agents.size();
+    const int kBlockers = (int)scene.blockers.size();
+    const int kTicks = 16;
+    const int kRollbackAt = 6;
+    const ai::AiBlocker* blockers = scene.blockers.data();
+
+    auto move = [](int tick, int dx, int dz) {
+        return ai::AiCommand{tick, fpx::FxVec3{(fpx::fx)(dx << fpx::kFrac), 0, (fpx::fx)(dz << fpx::kFrac)}};
+    };
+    const std::vector<ai::AiCommand> authStream = {
+        move(2, -1, 0), move(4, -1, 0), move(6, 0, -1), move(8, -1, 0), move(10, 0, -1),
+    };
+
+    // === PROOF (1) authority==replica. ===
+    bool ident = false;
+    const ai::AiSimState authority =
+        ai::RunAiLockstep(init, scene.nav, scene.trees, blockers, kBlockers, authStream, kTicks, &ident);
+    {
+        bool ident2 = false;
+        const ai::AiSimState replica =
+            ai::RunAiLockstep(init, scene.nav, scene.trees, blockers, kBlockers, authStream, kTicks, &ident2);
+        if (!ident || !ident2 || !ai::AiStatesEqual(authority, replica))
+            return fail("ai5-lockstep: authority != replica (nondeterministic)");
+    }
+    std::printf("ai5-lockstep: {ticks:%d, agents:%d} authority==replica BIT-IDENTICAL "
+                "(decisions+queries+paths) from inputs ONLY\n", kTicks, kAgents);
+
+    // === PROOF (2) determinism. ===
+    {
+        bool ident3 = false;
+        const ai::AiSimState run2 =
+            ai::RunAiLockstep(init, scene.nav, scene.trees, blockers, kBlockers, authStream, kTicks, &ident3);
+        if (!ai::AiStatesEqual(authority, run2))
+            return fail("ai5-lockstep: two runs differ (nondeterministic)");
+    }
+    std::printf("ai5-lockstep determinism: two RunAiLockstep runs BYTE-IDENTICAL\n");
+
+    // === PROOF (3) rollback==authority + the mispredict genuinely diverged. ===
+    {
+        const std::vector<ai::AiCommand> mispredict = { move(kRollbackAt, 20, 20) };
+        bool correctedEq = false, diverged = false;
+        const ai::AiSimState corrected =
+            ai::RunAiRollback(init, scene.nav, scene.trees, blockers, kBlockers, authStream, mispredict,
+                              kTicks, kRollbackAt, &correctedEq, &diverged);
+        if (!correctedEq || !ai::AiStatesEqual(corrected, authority))
+            return fail("ai5-lockstep: rollback corrected != authority");
+        if (!diverged)
+            return fail("ai5-lockstep: mispredict did NOT diverge (not a real fix)");
+    }
+    std::printf("ai5-lockstep rollback: corrected==authority BIT-EXACT; pre-rollback mispredict "
+                "DIFFERED (BT decision + dest + corridor diverged)\n");
+
+    // === PROOF (4) snapshot/restore round-trip bit-exact. ===
+    {
+        ai::AiSimState s = init;
+        for (int t = 0; t < 5; ++t)
+            ai::SimAiTick(s, scene.nav, scene.trees, blockers, kBlockers, authStream, t);
+        const ai::AiSimState saved = s;
+        const ai::AiSnapshot snap = ai::SnapshotAi(s);
+        for (int t = 5; t < 10; ++t)
+            ai::SimAiTick(s, scene.nav, scene.trees, blockers, kBlockers, authStream, t);
+        ai::RestoreAi(s, snap);
+        if (s.tick != 5 || !ai::AiStatesEqual(s, saved))
+            return fail("ai5-lockstep: snapshot/restore round-trip not bit-exact");
+    }
+    std::printf("ai5-lockstep: snapshot/restore round-trip BIT-EXACT (agents+player+tick); "
+                "strict cross-vendor 0.0000 expected at the bake\n");
+
+    // --- 2D top-down render of the converged AUTHORITY world (IDENTICAL to the Vulkan --ai5-lockstep-shot). ---
+    const std::vector<ai::AiAgent>& agents = authority.agents;
+    const nav::Heightfield& hfd = scene.nav.hf;
+    const int kGridW = hfd.w, kGridH = hfd.h;
+    const int kPx = 14, kMargin = 24;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kGridW * kPx);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kGridH * kPx);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 12; bgra[pp * 4 + 1] = 10; bgra[pp * 4 + 2] = 8; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto voxCenterPx = [&](int vx, int vz, int& px, int& py) {
+        px = kMargin + vx * kPx + kPx / 2;
+        py = kMargin + vz * kPx + kPx / 2;
+    };
+    auto fillRect = [&](int x0, int y0, int w, int h, const Vec3& col) {
+        for (int yy = 0; yy < h; ++yy)
+            for (int xx = 0; xx < w; ++xx) putPx(x0 + xx, y0 + yy, col);
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            putPx(x0, y0, col);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    auto thickCross = [&](int cx, int cy, int half, const Vec3& col) {
+        for (int o = -1; o <= 1; ++o) {
+            drawLine(cx - half, cy + o, cx + half, cy + o, col);
+            drawLine(cx + o, cy - half, cx + o, cy + half, col);
+        }
+    };
+    auto disc = [&](int cx, int cy, int r, const Vec3& col) {
+        for (int yy = -r; yy <= r; ++yy)
+            for (int xx = -r; xx <= r; ++xx)
+                if (xx * xx + yy * yy <= r * r) putPx(cx + xx, cy + yy, col);
+    };
+
+    const Vec3 kNodeCol{0.30f, 0.34f, 0.40f};
+    const Vec3 kEdgeCol{0.18f, 0.20f, 0.26f};
+    for (size_t p = 0; p < scene.nav.polys.size(); ++p) {
+        int px, py; voxCenterPx(scene.nav.cx[p], scene.nav.cz[p], px, py);
+        for (int e = 0; e < 3; ++e) {
+            const uint32_t nb = scene.nav.polys[p].nbr[e];
+            if (nb == nav::kNoNeighbour || nb >= (uint32_t)scene.nav.polys.size()) continue;
+            int qx, qy; voxCenterPx(scene.nav.cx[nb], scene.nav.cz[nb], qx, qy);
+            drawLine(px, py, qx, qy, kEdgeCol);
+        }
+    }
+    for (size_t p = 0; p < scene.nav.polys.size(); ++p) {
+        int px, py; voxCenterPx(scene.nav.cx[p], scene.nav.cz[p], px, py);
+        disc(px, py, 4, kNodeCol);
+    }
+
+    const Vec3 kBlockCol{0.85f, 0.55f, 0.20f};
+    const Vec3 kBlockFill{0.30f, 0.18f, 0.06f};
+    for (int bi = 0; bi < kBlockers; ++bi) {
+        const ai::AiBlocker& b = scene.blockers[(size_t)bi];
+        const int bx0 = ((int)(b.min.x >> fpx::kFrac)) * scene.nav.navScale;
+        const int bz0 = ((int)(b.min.z >> fpx::kFrac)) * scene.nav.navScale;
+        const int bx1 = ((int)(b.max.x >> fpx::kFrac)) * scene.nav.navScale;
+        const int bz1 = ((int)(b.max.z >> fpx::kFrac)) * scene.nav.navScale;
+        const int px0 = kMargin + bx0 * kPx, py0 = kMargin + bz0 * kPx;
+        const int px1 = kMargin + bx1 * kPx, py1 = kMargin + bz1 * kPx;
+        fillRect(px0, py0, px1 - px0, py1 - py0, kBlockFill);
+        drawLine(px0, py0, px1, py0, kBlockCol); drawLine(px0, py1, px1, py1, kBlockCol);
+        drawLine(px0, py0, px0, py1, kBlockCol); drawLine(px1, py0, px1, py1, kBlockCol);
+    }
+
+    int plvx, plvz; ai::AiWorldToVoxel(scene.nav, authority.playerPos, plvx, plvz);
+    int plpx, plpy; voxCenterPx(plvx, plvz, plpx, plpy);
+
+    const Vec3 kChaseCol{0.95f, 0.30f, 0.25f};
+    const Vec3 kPatrolCol{0.30f, 0.80f, 0.45f};
+    const Vec3 kCorridorCol{0.55f, 0.55f, 0.75f};
+    const Vec3 kLosVis{0.35f, 0.85f, 0.45f};
+    const Vec3 kLosOcc{0.55f, 0.22f, 0.20f};
+    for (int ai_i = 0; ai_i < kAgents; ++ai_i) {
+        const ai::AiAgent& a = agents[(size_t)ai_i];
+        int avx, avz; ai::AiWorldToVoxel(scene.nav, a.pos, avx, avz);
+        int apx, apy; voxCenterPx(avx, avz, apx, apy);
+        for (size_t k = 0; k + 1 < a.corridor.size(); ++k) {
+            const uint32_t p0 = a.corridor[k], p1 = a.corridor[k + 1];
+            if (p0 >= scene.nav.polys.size() || p1 >= scene.nav.polys.size()) continue;
+            int x0, y0, x1, y1;
+            voxCenterPx(scene.nav.cx[p0], scene.nav.cz[p0], x0, y0);
+            voxCenterPx(scene.nav.cx[p1], scene.nav.cz[p1], x1, y1);
+            drawLine(x0, y0, x1, y1, kCorridorCol);
+        }
+        const bool sees = (a.bb.Get(ai::kBbCanSeeTarget) != 0);
+        drawLine(apx, apy, plpx, plpy, sees ? kLosVis : kLosOcc);
+        disc(apx, apy, 6, (a.state == ai::kAgentChase) ? kChaseCol : kPatrolCol);
+    }
+    thickCross(plpx, plpy, 8, Vec3{0.95f, 0.25f, 0.85f});
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — ai5 lockstep converged AI world top-down "
+                "(%d agents, %d ticks, rollbackAt %d, %d blockers)\n",
+                outPath, imgW, imgH, kAgents, kTicks, kRollbackAt, kBlockers);
+    return 0;
+}
+
 // ===== Slice VD1 — Deterministic Gameplay / Netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS showcase
 // (--vd1-world) (the BEACHHEAD of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO
 // new RHI; the verdict.h entity world + command bus is header-only integer math, so on Metal it runs the IDENTICAL
@@ -63680,6 +63883,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ai4-agent") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ai4_agent.png";
             try { return RunAi4AgentShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ai5-lockstep <out.png>: render the Deterministic AI LOCKSTEP + ROLLBACK over the NPC AI decisions
+        // showcase (Slice AI5, THE MOAT HEADLINE of the DETERMINISTIC AI flagship #28). PURE CPU — runs the
+        // IDENTICAL ai.h canonical AI4 scene + player-move stream through RunAiLockstep (two peers fed ONLY the
+        // input stream re-derive the bit-identical AI world) + RunAiRollback (a mispredicted chase<->patrol
+        // decision rolled back -> corrected==authority) the Vulkan --ai5-lockstep-shot runs -> the converged
+        // AI world is bit-identical cross-backend BY CONSTRUCTION; the 4 proof lines match the Vulkan side
+        // EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--ai5-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ai5_lockstep.png";
+            try { return RunAi5LockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vd2-tick <out.png>: render the Deterministic Gameplay / Netcode SYSTEM SCHEDULE + GAMEPLAY TICK

@@ -1097,5 +1097,226 @@ inline Ai4Scene BuildAi4Scene() {
     return s;
 }
 
+// =====================================================================================================
+// Slice AI5 — DETERMINISTIC AI: LOCKSTEP + ROLLBACK over the NPC AI decisions (THE MOAT HEADLINE).
+// =====================================================================================================
+// AI1 (decision tree) + AI2 (environment queries) + AI3 (line-of-sight) + AI4 (the composed NPC tick)
+// above are BYTE-FROZEN — everything below is APPEND-ONLY. AI5 is the moat HEADLINE a float engine cannot
+// do: it proves the NPC AI is true cross-platform LOCKSTEP + ROLLBACK-replayable. Two peers fed ONLY a
+// deterministic INPUT stream (the player's per-tick moves — which drive each agent's perception ->
+// decision -> query -> path -> act) re-simulate to a BIT-IDENTICAL AI world (every agent's chase/patrol
+// decision, chosen destination, corridor, and position); a mispredicted player move that flips a BT
+// decision (chase<->patrol) is corrected exactly by rolling back to a snapshot and re-simulating.
+//
+// THE FPX5/VD5/IK5 LOCKSTEP MOLD (the const-topology discipline):
+//   * The REPLAYABLE STATE = the agents + the player position + the tick (AiSimState). The player's moves
+//     are the INPUT (AiCommand); each agent's full AI state (blackboard, decision, destination, corridor,
+//     position) is RE-DERIVED each tick by the frozen StepAi from the (moved) player + the const
+//     navmesh/tree/blockers. The navmesh + tree + blockers are CONST scene topology — re-supplied at
+//     restore as PARAMS, NOT in the snapshot (the IK5 base-pose / VD5 hulls discipline; snapshotting the
+//     const topology is wasteful and the restore re-seeds it from the caller).
+//   * SimAiTick = apply this tick's player move (playerPos += delta in FIXED command order) -> StepAiWorld
+//     (the frozen AI4 pass: perceive/decide/query/path/act for every agent + the move). Deterministic by
+//     construction (the AI4 fixed-order integer pass). Two peers running the same SimAiTick over the same
+//     player-move stream are byte-identical; rollback restores the exact AiSimState + re-sims.
+//   * The SNAPSHOT captures the agents + player + tick. AiStatesEqual compares them in fixed order (the
+//     DigestAgents currency). RestoreAi restores them; the const navmesh/tree/blockers are caller params.
+//   * The MISPREDICT is a player move that flips a DECISION. The WRONG stream moves the player out of an
+//     agent's chase range (or behind a blocker) at the rollback tick, so an agent that should CHASE instead
+//     PATROLs -> the mispredicted state diverges across the agent's decision AND destination AND corridor
+//     AND position; the rollback corrects it exactly.
+//   * Determinism BY CONSTRUCTION: the cross-backend zero-diff golden of the converged authority world IS
+//     the lockstep evidence (both backends run the same CPU SimAiTick). PURE CPU — no GPU, no shader, no TDR.
+
+// ----- AiCommand: ONE per-tick player move (the input that drives the AI) -------------------------------
+// At `tick`, add `playerDelta` to the player position BEFORE the AI4 pass of that tick. The harness applies
+// every command whose cmd.tick == tick in ARRAY ORDER (the IK5 IkCommand / VD5 Command scripted-input-per-
+// tick shape). The player move is the INPUT; the agents' AI states are the re-derived STATE. Pure integer
+// (playerDelta is a Q16.16 FxVec3).
+struct AiCommand {
+    int         tick = 0;        // the tick this player move fires at
+    fpx::FxVec3 playerDelta{};   // the Q16.16 world-space player move (the input driving each agent's AI)
+};
+
+// ----- AiSimState: the mutable replayable AI state (the agents + the player position + the tick) ---------
+// `agents` carry the per-agent AI state (the AI4 AiAgent array, index == identity); `playerPos` is the
+// movable player (the perception target the input moves); `tick` is the current sim tick. The navmesh +
+// the decision-tree table + the blockers are CONST scene topology re-supplied as PARAMS — they are NOT
+// part of the replayable state and are NOT snapshotted (the IK5/VD5 const-topology lesson). The whole
+// struct is a deterministic function of the inputs (the player-move stream) over the const topology.
+struct AiSimState {
+    std::vector<AiAgent> agents;     // the NPC agents (the AI4 parallel array, the re-derived state)
+    fpx::FxVec3          playerPos{};// the player position (Q16.16 world) — moved by the input each tick
+    int                  tick = 0;   // the current sim tick (advanced by SimAiTick)
+};
+
+// ----- SimAiTick: the deterministic per-tick step (apply this tick's player move + run the AI4 pass) -----
+// (0) APPLY this tick's commands in ARRAY ORDER (every cmd with cmd.tick == tick) — playerPos += playerDelta
+//     — BEFORE the AI pass so the moved player drives this tick's perception/decision. (1) StepAiWorld (the
+//     frozen AI4 pass: perceive/decide/query/path/act for every agent in FIXED order, then the move). (2)
+//     advance state.tick. The const navmesh/tree/blockers are PARAMS. Pure integer (the AI4 pass) + the
+//     deterministic host player nudge -> bit-identical on every peer/platform. The IK5 SimIkTick /
+//     VD5 SimVerdictTick twin (the input is a PLAYER MOVE rather than a target move / impulse).
+inline void SimAiTick(AiSimState& state, const NavScene& navmesh,
+                      const std::vector<DecisionTree>& trees,
+                      const AiBlocker* blockers, int blockerCount,
+                      const std::vector<AiCommand>& commands, int tick) {
+    for (size_t c = 0; c < commands.size(); ++c) {
+        if (commands[c].tick == tick) {
+            state.playerPos.x += commands[c].playerDelta.x;
+            state.playerPos.y += commands[c].playerDelta.y;
+            state.playerPos.z += commands[c].playerDelta.z;
+        }
+    }
+    StepAiWorld(state.agents, navmesh, blockers, blockerCount, state.playerPos, trees);
+    state.tick = tick + 1;
+}
+
+// ----- AiSnapshot: the captured mutable AI state (the agents + the player + the tick) -------------------
+// The replayable state is the agents + the player position + the tick (the rollback restore point). The
+// navmesh/tree/blockers are immutable structure (re-supplied at restore) so they are NOT snapshotted —
+// EXACTLY the mutable state is captured (the IK5/VD5 minimal-snapshot shape).
+struct AiSnapshot {
+    std::vector<AiAgent> agents;     // the per-agent AI state at the snapshot tick
+    fpx::FxVec3          playerPos{};// the player position at the snapshot tick
+    int                  tick = 0;   // the tick this snapshot was taken at
+};
+
+// ----- SnapshotAi: capture the mutable state (the rollback restore point) -------------------------------
+// Bit-exact round-trip with RestoreAi: RestoreAi(state, SnapshotAi(state0)) leaves state's agents + player
+// + tick == state0's byte-for-byte. The navmesh/tree/blockers are untouched (immutable structure).
+inline AiSnapshot SnapshotAi(const AiSimState& state) {
+    AiSnapshot snap;
+    snap.agents    = state.agents;     // deep copy of the parallel agent array (incl. each corridor vector)
+    snap.playerPos = state.playerPos;
+    snap.tick      = state.tick;
+    return snap;
+}
+
+// ----- RestoreAi: restore the agents + player + tick from a snapshot (the rollback) ---------------------
+// Restores the whole mutable state and leaves the sim resuming at snap.tick. Bit-exact round-trip with
+// SnapshotAi. The navmesh/tree/blockers are caller params (NOT restored here — the const topology).
+inline void RestoreAi(AiSimState& state, const AiSnapshot& snap) {
+    state.agents    = snap.agents;
+    state.playerPos = snap.playerPos;
+    state.tick      = snap.tick;
+}
+
+// ----- AgentEqual(a, b): byte-equality of one agent's replayable AI fields (fixed order) ----------------
+// Compares the DigestAgents currency (pos/state/navTarget/corridorStep/corridor) PLUS the blackboard slots
+// (the perception/decision memory) — the whole per-agent AI state. Pure integer compare; FIXED order.
+inline bool AgentEqual(const AiAgent& a, const AiAgent& b) {
+    if (a.pos.x != b.pos.x || a.pos.y != b.pos.y || a.pos.z != b.pos.z) return false;
+    if (a.state != b.state) return false;
+    if (a.navTarget != b.navTarget) return false;
+    if (a.corridorStep != b.corridorStep) return false;
+    if (a.corridor.size() != b.corridor.size()) return false;
+    for (size_t k = 0; k < a.corridor.size(); ++k)
+        if (a.corridor[k] != b.corridor[k]) return false;
+    for (int s = 0; s < kMaxBbKeys; ++s)
+        if (a.bb.slot[(size_t)s] != b.bb.slot[(size_t)s]) return false;
+    return true;
+}
+
+// ----- AiStatesEqual: whole-AI-state byte-equality (the agents + the player + the tick) -----------------
+// Two states are equal iff the player position + the tick are byte-equal AND every agent (fixed array
+// order) is AgentEqual. The navmesh/tree/blockers are CONST + identical by construction so they are not
+// compared — the equality is over EXACTLY the replayable state (the IK5 IkStatesEqual / VD5 whole-world
+// shape). Pure integer compare.
+inline bool AiStatesEqual(const AiSimState& a, const AiSimState& b) {
+    if (a.tick != b.tick) return false;
+    if (a.playerPos.x != b.playerPos.x || a.playerPos.y != b.playerPos.y ||
+        a.playerPos.z != b.playerPos.z) return false;
+    if (a.agents.size() != b.agents.size()) return false;
+    for (size_t i = 0; i < a.agents.size(); ++i)
+        if (!AgentEqual(a.agents[i], b.agents[i])) return false;
+    return true;
+}
+
+// ----- RunAiLockstep: authority + replica from the SAME inputs, bit-identical every tick ----------------
+// THE peer entry point (the IK5 RunIkLockstep / VD5 RunVerdictLockstep control flow over SimAiTick). Run
+// `ticks` SimAiTicks from a COPY of `initialState`, applying the player-move stream -> the converged AI
+// world. authority = the run; replica = the SAME from the SAME init + stream (INPUTS ONLY — no state
+// shared) -> BIT-IDENTICAL by determinism. This function ASSERTS authority == replica EACH tick
+// (AiStatesEqual); the caller also compares two RunAiLockstep returns for the determinism proof. Sets
+// *identical (false if the per-tick lockstep invariant ever broke — unreachable for a deterministic sim)
+// and returns the converged authority state. The const navmesh/tree/blockers are PARAMS (re-supplied).
+inline AiSimState RunAiLockstep(const AiSimState& initialState, const NavScene& navmesh,
+                                const std::vector<DecisionTree>& trees,
+                                const AiBlocker* blockers, int blockerCount,
+                                const std::vector<AiCommand>& commands, int ticks, bool* identical) {
+    AiSimState authority = initialState;   // a fresh copy (agents + player + tick)
+    AiSimState replica   = initialState;   // the second peer fed the SAME inputs
+    bool ident = true;
+    for (int t = 0; t < ticks; ++t) {
+        SimAiTick(authority, navmesh, trees, blockers, blockerCount, commands, t);
+        SimAiTick(replica,   navmesh, trees, blockers, blockerCount, commands, t);
+        if (!AiStatesEqual(authority, replica)) ident = false;   // the lockstep invariant — must hold each tick
+    }
+    if (identical) *identical = ident;
+    return authority;
+}
+
+// ----- RunAiRollback: snapshot -> mispredict diverges -> rollback -> corrected == authority --------------
+// The rollback harness (the IK5 RunIkRollback / VD5 RunVerdictRollback control flow over SimAiTick). (1)
+// advance ticks 0..rollbackAt from `initialState` applying authStream; (2) SAVE an AiSnapshot AT rollbackAt
+// (the agents + player + tick); (2b) speculatively advance <=3 ticks with the MISPREDICTED stream (a WRONG
+// player move that flips an agent's chase<->patrol decision — the client prediction that diverges across
+// the BT decision + dest + corridor + position); (3) ROLLBACK — RestoreAi to the snapshot + RE-SIMULATE
+// rollbackAt..ticks with the CORRECT authStream -> the corrected final state. Sets *correctedEq (corrected
+// == the straight authority run) AND *diverged (the speculative pre-rollback state DIFFERED from the
+// authority at that tick — a REAL divergence was fixed). Returns the corrected state. The const
+// navmesh/tree/blockers are PARAMS (re-supplied at every Sim*/Run*).
+inline AiSimState RunAiRollback(const AiSimState& initialState, const NavScene& navmesh,
+                                const std::vector<DecisionTree>& trees,
+                                const AiBlocker* blockers, int blockerCount,
+                                const std::vector<AiCommand>& authStream,
+                                const std::vector<AiCommand>& mispredictStream,
+                                int ticks, int rollbackAt, bool* correctedEq, bool* diverged) {
+    // The straight authority run (the truth the rollback must reproduce).
+    bool authIdent = true;
+    const AiSimState authority =
+        RunAiLockstep(initialState, navmesh, trees, blockers, blockerCount, authStream, ticks, &authIdent);
+
+    AiSimState state = initialState;
+    // (1) advance 0..rollbackAt with the authoritative stream.
+    for (int t = 0; t < rollbackAt; ++t)
+        SimAiTick(state, navmesh, trees, blockers, blockerCount, authStream, t);
+    // (2) SAVE the snapshot at rollbackAt (the rollback restore point — the agents + player + tick).
+    const AiSnapshot snap = SnapshotAi(state);
+
+    // (2b) speculatively advance <=3 ticks with the MISPREDICTED stream (the wrong player move that diverges).
+    int specTicks = ticks - rollbackAt;
+    if (specTicks > 3) specTicks = 3;
+    AiSimState spec = state;   // a copy to measure the speculative divergence against the authority
+    for (int s = 0; s < specTicks; ++s)
+        SimAiTick(spec, navmesh, trees, blockers, blockerCount, mispredictStream, rollbackAt + s);
+    // the authority advanced to the SAME tick (with the correct stream) for the divergence comparison.
+    AiSimState authAtSpec = initialState;
+    for (int t = 0; t < rollbackAt + specTicks; ++t)
+        SimAiTick(authAtSpec, navmesh, trees, blockers, blockerCount, authStream, t);
+    const bool didDiverge = !AiStatesEqual(spec, authAtSpec);
+
+    // (3) ROLLBACK: restore the snapshot (agents + player + tick) + re-sim rollbackAt..ticks with authStream.
+    RestoreAi(state, snap);
+    for (int t = state.tick; t < ticks; ++t)
+        SimAiTick(state, navmesh, trees, blockers, blockerCount, authStream, t);
+
+    if (correctedEq) *correctedEq = AiStatesEqual(state, authority);
+    if (diverged)    *diverged    = didDiverge;
+    return state;
+}
+
+// ----- BuildAi5InitialState(scene): the AI5 initial sim state from the canonical AI4 scene -------------
+// The replayable state seeded from the canonical AI4 scene (the agents at their poly centroids + the
+// player at the component goal). The navmesh/tree/blockers stay in the scene as the const params. tick 0.
+inline AiSimState BuildAi5InitialState(const Ai4Scene& scene) {
+    AiSimState s;
+    s.agents    = scene.agents;
+    s.playerPos = scene.player;
+    s.tick      = 0;
+    return s;
+}
+
 }  // namespace ai
 }  // namespace hf
