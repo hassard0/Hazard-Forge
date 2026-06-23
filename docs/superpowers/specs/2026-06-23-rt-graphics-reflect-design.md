@@ -112,3 +112,33 @@ binding 13 may have a latent bug never hit before.
 
 Option 2 is the faster path to a green gate; option 1 is the better engine fix. The Mac bake + verify.ps1
 registration steps from the original spec still apply once spheres render correctly on Vulkan.
+
+---
+## ATTEMPT 2 PLAN — avoid binding 13 entirely (DO THIS)
+
+Re-implement the feature. The RHI plumbing from attempt 1 was CORRECT — redo it exactly per the
+"Implementation plan" section above (rhi.h `GraphicsPipelineDesc::accelStructureBinding`, the vulkan_pipeline
+graphics accel set, the vulkan_command_buffer graphics-bind-point `BindAccelStructure`, the ps_6_5
+`rt_reflect_graphics.frag` ported verbatim from rt_reflect.comp). The ONLY change vs attempt 1 is HOW the
+scene data reaches the fragment shader — attempt 1's `gParams` at cluster binding 13 read garbage.
+
+**Bind the scene data avoiding binding 13:**
+- `gSpheres` → cluster binding **14**, `gAabbs` → cluster binding **15** (both PROVEN working). In the host,
+  call `BindLightClusters(dummy, spheresBuf, aabbsBuf)` so the first arg (the broken binding 13) gets a throwaway
+  buffer and spheres/aabbs land on 14/15. In the shader: `[[vk::binding(14,3)]] StructuredBuffer<GpuSphere> gSpheres`,
+  `[[vk::binding(15,3)]] StructuredBuffer<GpuAabb> gAabbs`.
+- `gParams` → the **frame UBO at set 0 binding 0** (the `usesFrameUniforms` path, PROVEN working — boxes were
+  positioned correctly from it in attempt 1). The showcase already uploads a DUMMY FrameData via
+  `SetFrameUniforms`; instead upload the RT params bytes (eye/right/up/forward/light/plane/counts, ~112 B, well
+  under kFrameUboSize 1024). In the shader declare a custom cbuffer matching those bytes:
+  `[[vk::binding(0,0)]] cbuffer RtFrame { int4 eye; int4 right; int4 up; int4 forward; int4 light; int4 plane; uint4 counts; };`
+  and read params from it instead of `gParams[0]`. (The pipeline's set-0 layout is just a UBO at binding 0; the
+  shader interprets the bytes — no RHI change needed.)
+
+This uses only proven-good bindings (14, 15, frame UBO) and never reads cluster binding 13.
+
+**Completion criteria (do NOT stop early):** build Windows, run `--rt-reflect-graphics-shot`, and CONFIRM the
+`HW(GRAPHICS)==CPU image BYTE-EQUAL` proof line PRINTS (exit 0) with the SPHERES rendering — i.e. the whole
+scene (ground + boxes + 16 spheres + reflections) matches the CPU reference. If spheres are still missing, the
+binding is still wrong — fix it before committing. Only commit once the proof passes. Then it's mergeable and
+the controller bakes the Metal golden.
