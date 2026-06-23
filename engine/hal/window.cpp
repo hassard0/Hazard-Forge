@@ -57,6 +57,51 @@ static runtime::Key MapScancode(SDL_Scancode sc) {
         case SDL_SCANCODE_G: return K::G;   // editor: gizmo Translate
         case SDL_SCANCODE_R: return K::R;   // editor: gizmo Rotate
         case SDL_SCANCODE_T: return K::T;   // editor: gizmo Scale
+        // --- extended binding set (issue #2): full alphabet, digit row, arrows, function keys, extras ---
+        case SDL_SCANCODE_B: return K::B;
+        case SDL_SCANCODE_C: return K::C;
+        case SDL_SCANCODE_F: return K::F;
+        case SDL_SCANCODE_H: return K::H;
+        case SDL_SCANCODE_I: return K::I;
+        case SDL_SCANCODE_J: return K::J;
+        case SDL_SCANCODE_K: return K::K;
+        case SDL_SCANCODE_L: return K::L;
+        case SDL_SCANCODE_M: return K::M;
+        case SDL_SCANCODE_N: return K::N;
+        case SDL_SCANCODE_U: return K::U;
+        case SDL_SCANCODE_V: return K::V;
+        case SDL_SCANCODE_X: return K::X;
+        case SDL_SCANCODE_Y: return K::Y;
+        case SDL_SCANCODE_Z: return K::Z;
+        case SDL_SCANCODE_0: return K::Num0;
+        case SDL_SCANCODE_1: return K::Num1;
+        case SDL_SCANCODE_2: return K::Num2;
+        case SDL_SCANCODE_3: return K::Num3;
+        case SDL_SCANCODE_4: return K::Num4;
+        case SDL_SCANCODE_5: return K::Num5;
+        case SDL_SCANCODE_6: return K::Num6;
+        case SDL_SCANCODE_7: return K::Num7;
+        case SDL_SCANCODE_8: return K::Num8;
+        case SDL_SCANCODE_9: return K::Num9;
+        case SDL_SCANCODE_LEFT:  return K::Left;
+        case SDL_SCANCODE_RIGHT: return K::Right;
+        case SDL_SCANCODE_UP:    return K::Up;
+        case SDL_SCANCODE_DOWN:  return K::Down;
+        case SDL_SCANCODE_TAB:       return K::Tab;
+        case SDL_SCANCODE_RETURN:    return K::Enter;
+        case SDL_SCANCODE_BACKSPACE: return K::Backspace;
+        case SDL_SCANCODE_F1:  return K::F1;
+        case SDL_SCANCODE_F2:  return K::F2;
+        case SDL_SCANCODE_F3:  return K::F3;
+        case SDL_SCANCODE_F4:  return K::F4;
+        case SDL_SCANCODE_F5:  return K::F5;
+        case SDL_SCANCODE_F6:  return K::F6;
+        case SDL_SCANCODE_F7:  return K::F7;
+        case SDL_SCANCODE_F8:  return K::F8;
+        case SDL_SCANCODE_F9:  return K::F9;
+        case SDL_SCANCODE_F10: return K::F10;
+        case SDL_SCANCODE_F11: return K::F11;
+        case SDL_SCANCODE_F12: return K::F12;
         default: return K::Count;
     }
 }

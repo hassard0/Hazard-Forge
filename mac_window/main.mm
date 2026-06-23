@@ -386,6 +386,23 @@ static runtime::Key MapKeyCode(unsigned short kc) {
         case 0x0F: return K::R;
         case 0x11: return K::T;
         case 0x35: return K::Esc;
+        // --- extended binding set (issue #2): standard kVK_ANSI_* / kVK_* codes ---
+        case 0x0B: return K::B;  case 0x08: return K::C;  case 0x03: return K::F;
+        case 0x04: return K::H;  case 0x22: return K::I;  case 0x26: return K::J;
+        case 0x28: return K::K;  case 0x25: return K::L;  case 0x2E: return K::M;
+        case 0x2D: return K::N;  case 0x20: return K::U;  case 0x09: return K::V;
+        case 0x07: return K::X;  case 0x10: return K::Y;  case 0x06: return K::Z;
+        case 0x1D: return K::Num0; case 0x12: return K::Num1; case 0x13: return K::Num2;
+        case 0x14: return K::Num3; case 0x15: return K::Num4; case 0x17: return K::Num5;
+        case 0x16: return K::Num6; case 0x1A: return K::Num7; case 0x1C: return K::Num8;
+        case 0x19: return K::Num9;
+        case 0x7B: return K::Left; case 0x7C: return K::Right;
+        case 0x7E: return K::Up;   case 0x7D: return K::Down;
+        case 0x30: return K::Tab;  case 0x24: return K::Enter; case 0x33: return K::Backspace;
+        case 0x7A: return K::F1;  case 0x78: return K::F2;  case 0x63: return K::F3;
+        case 0x76: return K::F4;  case 0x60: return K::F5;  case 0x61: return K::F6;
+        case 0x62: return K::F7;  case 0x64: return K::F8;  case 0x65: return K::F9;
+        case 0x6D: return K::F10; case 0x67: return K::F11; case 0x6F: return K::F12;
         default:   return K::Count;
     }
 }
