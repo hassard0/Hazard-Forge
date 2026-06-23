@@ -187,6 +187,73 @@ int main() {
         check(pcg::ScatterGrid(stA, degenerate, cellsX, cellsZ).empty(), "PCG2 no-op: degenerate area -> empty");
     }
 
+    // ================= PCG3: density mask + importance rejection (no-op / zero / monotone / replay / contain) =
+    {
+        // The same fixed square XZ patch as PCG2's checks, a sub-area radius for a genuine subset.
+        const pcg::PcgArea area{ pcg::FxVec3{0, kOne * 2, 0}, pcg::FxVec3{kOne * 16, kOne * 2, kOne * 16} };
+        const int cellsX = 8, cellsZ = 6;                  // 48 candidate cells
+        const pcg::PcgStream st{ 2024u, 0x5CA77E20u };
+
+        // The PCG2 candidates (the importance-rejection input — the mask only REMOVES from THIS set).
+        const std::vector<pcg::FxVec3> grid = pcg::ScatterGrid(st, area, cellsX, cellsZ);
+
+        // (1) no-op == PCG2 — a Uniform mask + density == kOne returns BYTE-EQUAL to ScatterGrid (same
+        // positions, same order). The make-or-break no-op proof.
+        pcg::PcgMask uniform;                               // default type == Uniform
+        const std::vector<pcg::FxVec3> kept = pcg::ScatterMasked(st, area, cellsX, cellsZ, uniform, kOne);
+        bool noop = (kept.size() == grid.size());
+        for (size_t i = 0; i < grid.size() && noop; ++i)
+            if (kept[i].x != grid[i].x || kept[i].y != grid[i].y || kept[i].z != grid[i].z) noop = false;
+        check(noop, "PCG3 no-op: Uniform mask + density==kOne == ScatterGrid byte-equal (positions+order)");
+
+        // (2) zero mask — a Radial mask with radius <= 0 keeps 0 points; AND density==0 keeps 0 points.
+        pcg::PcgMask zeroRadial;
+        zeroRadial.type = pcg::PcgMaskType::Radial;
+        zeroRadial.center = pcg::FxVec3{ kOne * 8, kOne * 2, kOne * 8 };
+        zeroRadial.radius = 0;                             // degenerate -> 0 everywhere
+        check(pcg::ScatterMasked(st, area, cellsX, cellsZ, zeroRadial, kOne).empty(),
+              "PCG3 zero mask: Radial radius<=0 keeps 0 points");
+        check(pcg::ScatterMasked(st, area, cellsX, cellsZ, uniform, 0).empty(),
+              "PCG3 zero mask: density==0 keeps 0 points");
+
+        // (3) radial monotone — kept count NON-DECREASING as density sweeps 0 -> kOne, AND a radial disc with a
+        // radius smaller than the area keeps a STRICT subset (< full grid).
+        pcg::PcgMask radial;
+        radial.type = pcg::PcgMaskType::Radial;
+        radial.center = pcg::FxVec3{ kOne * 8, kOne * 2, kOne * 8 };   // centre of the 16x16 area
+        radial.radius = kOne * 5;                          // < the area extent -> a genuine subset
+        size_t prev = 0;
+        bool monotone = true;
+        for (int s = 0; s <= 8 && monotone; ++s) {
+            const fx density = (fx)((int64_t)kOne * s / 8);            // 0, kOne/8, ... kOne
+            const size_t n = pcg::ScatterMasked(st, area, cellsX, cellsZ, radial, density).size();
+            if (n < prev) monotone = false;
+            prev = n;
+        }
+        check(monotone, "PCG3 radial monotone: kept count non-decreasing as density sweeps 0 -> kOne");
+        const std::vector<pcg::FxVec3> disc = pcg::ScatterMasked(st, area, cellsX, cellsZ, radial, kOne);
+        check(disc.size() < grid.size() && !disc.empty(),
+              "PCG3 radial subset: radius < area keeps a strict non-empty subset (< full grid)");
+
+        // (4) replay-stable — two calls with the same args are byte-equal.
+        const std::vector<pcg::FxVec3> disc2 = pcg::ScatterMasked(st, area, cellsX, cellsZ, radial, kOne);
+        bool replay = (disc.size() == disc2.size());
+        for (size_t i = 0; i < disc.size() && replay; ++i)
+            if (disc[i].x != disc2[i].x || disc[i].y != disc2[i].y || disc[i].z != disc2[i].z) replay = false;
+        check(replay, "PCG3 replay-stable: two ScatterMasked calls with the same args are byte-equal");
+
+        // (5) containment — every survivor is one of the ScatterGrid candidates (the mask only REMOVES, never
+        // moves). Same fixed order, so each survivor matches some candidate exactly.
+        bool contained = true;
+        for (size_t i = 0; i < disc.size() && contained; ++i) {
+            bool found = false;
+            for (size_t j = 0; j < grid.size() && !found; ++j)
+                if (disc[i].x == grid[j].x && disc[i].y == grid[j].y && disc[i].z == grid[j].z) found = true;
+            if (!found) contained = false;
+        }
+        check(contained, "PCG3 containment: every survivor is one of the ScatterGrid candidates (mask removes only)");
+    }
+
     if (g_fail == 0) std::printf("pcg_test: ALL CHECKS PASSED\n");
     else std::printf("pcg_test: %d CHECK(S) FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

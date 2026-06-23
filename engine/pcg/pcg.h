@@ -136,4 +136,79 @@ inline std::vector<FxVec3> ScatterGrid(const PcgStream& stream, const PcgArea& a
     return out;
 }
 
+// ===== Slice PCG3 — Analytic density mask + importance rejection (the 3rd slice of FLAGSHIP #22) ============
+// The control layer over PCG2's ScatterGrid: an analytic DENSITY MASK (a scalar field in Q16.16) the scatter
+// follows. A candidate point survives in proportion to mask*density at its position (importance rejection), so
+// density VARIES across the area (a falloff disc, a half-plane) instead of a uniform grid. Builds on PCG2's
+// ScatterGrid (candidate positions IDENTICAL to PCG2) and adds the FIRST int64 path of the PCG arc — the radial
+// mask's FxLength (the int64 integer sqrt). But PCG is a CPU-side host generator (NO GPU shader), so it runs
+// CPU-on-both-backends -> still byte-identical cross-backend (a strict zero-differing-pixel golden), the same
+// integer discipline as the rest of the flagship. Only the radial Eval touches int64 (FxLength); the rest int32.
+
+// ----- PcgMaskType / PcgMask: an analytic Q16.16 weight field over the area -----------------------------------
+// Eval(p) returns a Q16.16 weight clamped to [0, kOne]:
+//   * Uniform   -> always kOne (the no-op control — every point passes).
+//   * Radial    -> clamp(kOne - fxdiv(dist, radius), 0, kOne), dist = FxLength of (p - center) with Y zeroed
+//     (the XZ distance; FxLength is the int64 path, reused from fpx.h VERBATIM). 1 at the centre, falling
+//     linearly to 0 at radius, 0 beyond. radius <= 0 -> 0 everywhere (a degenerate/zero mask).
+//   * HalfPlane -> kOne on the inward side of the plane through center with normal axis, 0 on the other side
+//     (a hard 0/kOne step via the sign of the integer dot product (p-center)·axis). Secondary mask — kept simple.
+enum class PcgMaskType { Uniform, Radial, HalfPlane };
+
+struct PcgMask {
+    PcgMaskType type   = PcgMaskType::Uniform;
+    FxVec3      center;      // Radial: disc centre (XZ); HalfPlane: a point on the plane
+    fx          radius = 0;  // Radial: falloff radius
+    FxVec3      axis;        // HalfPlane: the inward normal (XZ)
+
+    fx Eval(const FxVec3& p) const {
+        switch (type) {
+            case PcgMaskType::Uniform:
+                return kOne;                                   // every point passes (the no-op control)
+            case PcgMaskType::Radial: {
+                if (radius <= 0) return 0;                     // degenerate/zero mask -> 0 everywhere
+                // XZ distance (Y zeroed): the int64 FxLength path (reused from fpx.h verbatim).
+                const FxVec3 d{ p.x - center.x, 0, p.z - center.z };
+                const fx dist = hf::sim::fpx::FxLength(d);     // int64 integer sqrt, Q16.16
+                const fx w = kOne - hf::sim::fpx::fxdiv(dist, radius);
+                if (w <= 0)    return 0;                       // at/beyond the rim
+                if (w >= kOne) return kOne;                    // at/inside the centre (dist==0)
+                return w;                                      // linear falloff in (0, kOne)
+            }
+            case PcgMaskType::HalfPlane: {
+                // Sign of the integer dot product (p - center)·axis (int64 intermediate, no overflow). >= 0 is
+                // the inward side -> kOne; the other side -> 0. A hard 0/kOne step (kept simple).
+                const int64_t dot = (int64_t)(p.x - center.x) * (int64_t)axis.x +
+                                    (int64_t)(p.y - center.y) * (int64_t)axis.y +
+                                    (int64_t)(p.z - center.z) * (int64_t)axis.z;
+                return dot >= 0 ? kOne : 0;
+            }
+        }
+        return kOne;                                           // unreachable; defensive no-op
+    }
+};
+
+// ----- ScatterMasked: PCG2's ScatterGrid filtered by importance rejection against the mask -------------------
+// Generate the PCG2 grid (call ScatterGrid internally so the candidate positions are IDENTICAL to PCG2), then
+// KEEP each candidate (in the same fixed cell order) iff fxmul(mask.Eval(p), density) > PcgRand01(keepStream,
+// idx), where keepStream is `stream` with a DISTINCT salt (stream.salt ^ 0xA11C0DEu) so the keep-decision draw
+// is independent of the jitter draw, and idx is the linear cell index. Returns the surviving subset (variable
+// count, FIXED order). density = kOne + a Uniform mask keeps ALL points (fxmul(kOne,kOne)=kOne > PcgRand01 in
+// [0,kOne) ALWAYS -> the no-op == ScatterGrid); density = 0 keeps NONE. Only the radial Eval touches int64
+// (FxLength); the rest is int32. The mask only REMOVES candidates — it never moves them.
+inline std::vector<FxVec3> ScatterMasked(const PcgStream& stream, const PcgArea& area, int cellsX, int cellsZ,
+                                         const PcgMask& mask, fx density) {
+    std::vector<FxVec3> out;
+    const std::vector<FxVec3> cand = ScatterGrid(stream, area, cellsX, cellsZ);  // PCG2 candidates (IDENTICAL)
+    if (cand.empty()) return out;                              // no-op control (empty grid -> empty subset)
+    const PcgStream keepStream{ stream.seed, stream.salt ^ 0xA11C0DEu };  // independent keep-decision stream
+    out.reserve(cand.size());
+    for (uint32_t idx = 0; idx < (uint32_t)cand.size(); ++idx) {
+        const FxVec3& p = cand[idx];
+        const fx weight = fxmul(mask.Eval(p), density);        // mask*density in Q16.16
+        if (weight > PcgRand01(keepStream, idx)) out.push_back(p);  // importance rejection (same fixed order)
+    }
+    return out;
+}
+
 }  // namespace hf::pcg

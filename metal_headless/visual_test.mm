@@ -40580,6 +40580,108 @@ static int RunPcg2ScatterShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PCG3 — Deterministic PCG ANALYTIC DENSITY MASK + IMPORTANCE REJECTION showcase (--pcg3-mask) (the
+// 3rd slice of FLAGSHIP #22, hf::pcg). PURE CPU — NO GPU compute, NO new shader, NO new RHI; pcg.h is header-only
+// integer math (only the radial Eval touches int64 FxLength, CPU-side), so on Metal it runs the IDENTICAL
+// deterministic radial-density disc (ScatterMasked) the Vulkan --pcg3-mask-shot runs on Windows -> the 2D
+// masked-disc golden is bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). Renders the
+// surviving subset of the 48x48=2304 candidates mapped to INTEGER pixel coords by pure integer math
+// (point*kImg/extent, int64 intermediate — NO float pixel rounding); the proof lines (incl. the no-op control +
+// the strict-subset + monotonicity + zero-mask) match the Vulkan side EXACTLY. The fixed
+// SEED/SALT/AREA/CELLS/MASK/DENSITY/IMG MUST be IDENTICAL to the Vulkan --pcg3-mask-shot. New golden
+// tests/golden/metal/pcg3_mask.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunPcg3MaskShowcase(const char* outPath) {
+    namespace pcg = hf::pcg;
+    // THE FIXED SHOWCASE PARAMS — IDENTICAL to the Vulkan --pcg3-mask-shot (main.cpp).
+    const uint32_t kSeed   = 1337u;
+    const uint32_t kSalt   = 0x5CA77E20u;
+    const int      kCellsX = 48;
+    const int      kCellsZ = 48;
+    const uint32_t kImg    = 256u;
+    const pcg::PcgArea kArea{ pcg::FxVec3{0, 0, 0}, pcg::FxVec3{pcg::kOne * 32, 0, pcg::kOne * 32} };
+    const pcg::fx kRadius = pcg::kOne * 32 / 3;
+    pcg::PcgMask kMask;
+    kMask.type   = pcg::PcgMaskType::Radial;
+    kMask.center = pcg::FxVec3{ pcg::kOne * 16, 0, pcg::kOne * 16 };
+    kMask.radius = kRadius;
+    const pcg::fx kDensity = pcg::kOne;
+
+    const pcg::fx extX = kArea.max.x - kArea.min.x;
+    const pcg::fx extZ = kArea.max.z - kArea.min.z;
+    const pcg::PcgStream st{kSeed, kSalt};
+
+    auto renderMasked = [&](const std::vector<pcg::FxVec3>& pts, std::vector<uint8_t>& out) {
+        out.assign((size_t)kImg * kImg * 4, 0);
+        for (size_t pp = 0; pp < (size_t)kImg * kImg; ++pp) {
+            out[pp * 4 + 0] = 12; out[pp * 4 + 1] = 10; out[pp * 4 + 2] = 8; out[pp * 4 + 3] = 255;
+        }
+        auto putPx = [&](int ix, int iy, uint8_t b, uint8_t g, uint8_t r) {
+            if (ix < 0 || ix >= (int)kImg || iy < 0 || iy >= (int)kImg) return;
+            uint8_t* d = &out[((size_t)iy * kImg + ix) * 4];
+            d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+        };
+        for (size_t i = 0; i < pts.size(); ++i) {
+            const pcg::FxVec3& p = pts[i];
+            const int px = (int)(((int64_t)(p.x - kArea.min.x) * (int64_t)kImg) / (int64_t)extX);
+            const int py = (int)(((int64_t)(p.z - kArea.min.z) * (int64_t)kImg) / (int64_t)extZ);
+            putPx(px,     py,     220, 230, 240);
+            putPx(px - 1, py,     120, 150, 200);
+            putPx(px + 1, py,     120, 150, 200);
+            putPx(px,     py - 1, 120, 150, 200);
+            putPx(px,     py + 1, 120, 150, 200);
+        }
+    };
+
+    const std::vector<pcg::FxVec3> ptsA1 = pcg::ScatterMasked(st, kArea, kCellsX, kCellsZ, kMask, kDensity);
+    const std::vector<pcg::FxVec3> ptsA2 = pcg::ScatterMasked(st, kArea, kCellsX, kCellsZ, kMask, kDensity);
+    std::vector<uint8_t> imgA1, imgA2;
+    renderMasked(ptsA1, imgA1);
+    renderMasked(ptsA2, imgA2);
+    const uint32_t kCount = (uint32_t)(kCellsX * kCellsZ);
+    const uint32_t kKept  = (uint32_t)ptsA1.size();
+    const bool twoRunIdentical = (imgA1.size() == imgA2.size()) &&
+                                 (std::memcmp(imgA1.data(), imgA2.data(), imgA1.size()) == 0) &&
+                                 (ptsA1.size() == ptsA2.size());
+
+    pcg::PcgMask uniform;
+    const std::vector<pcg::FxVec3> ptsNoop = pcg::ScatterMasked(st, kArea, kCellsX, kCellsZ, uniform, pcg::kOne);
+    const std::vector<pcg::FxVec3> ptsGrid = pcg::ScatterGrid(st, kArea, kCellsX, kCellsZ);
+    bool noop = (ptsNoop.size() == ptsGrid.size()) && (ptsGrid.size() == (size_t)kCount);
+    for (size_t i = 0; i < ptsGrid.size() && noop; ++i)
+        if (ptsNoop[i].x != ptsGrid[i].x || ptsNoop[i].y != ptsGrid[i].y ||
+            ptsNoop[i].z != ptsGrid[i].z) noop = false;
+
+    const uint32_t zeroMaskKept = (uint32_t)pcg::ScatterMasked(st, kArea, kCellsX, kCellsZ, uniform, 0).size();
+
+    bool monotone = true;
+    size_t prevN = 0;
+    for (int s = 0; s <= 8 && monotone; ++s) {
+        const pcg::fx density = (pcg::fx)((int64_t)pcg::kOne * s / 8);
+        const size_t n = pcg::ScatterMasked(st, kArea, kCellsX, kCellsZ, kMask, density).size();
+        if (n < prevN) monotone = false;
+        prevN = n;
+    }
+
+    const bool subset = (kKept < kCount) && (kKept > 0);
+
+    if (!twoRunIdentical || !noop || zeroMaskKept != 0 || !monotone || !subset)
+        return fail("pcg3-mask: determinism/no-op/zero/monotone/subset check failed");
+
+    std::printf("pcg3-mask: radial density mask (cells=%u, radius=%d, density=kOne, seed=%u)\n",
+                kCount, kRadius, kSeed);
+    std::printf("pcg3-mask: two-run BYTE-IDENTICAL\n");
+    std::printf("pcg3-mask: uniform mask + density=kOne == ScatterGrid BYTE-IDENTICAL (no-op control) {full:%u}\n",
+                kCount);
+    std::printf("pcg3-mask: radial keeps a deterministic subset {kept:%u, of:%u} K < %u AND monotone in density\n",
+                kKept, kCount, kCount);
+    std::printf("pcg3-mask: provenance {maskType:radial, kept:%u, zero-mask:%u}\n", kKept, zeroMaskKept);
+
+    if (!WritePNG(outPath, imgA1, kImg, kImg)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — pcg3 radial density mask (%u kept of %u, seed=%u)\n",
+                outPath, kImg, kImg, kKept, kCount, kSeed);
+    return 0;
+}
+
 // ===== Slice VD1 — Deterministic Gameplay / Netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS showcase
 // (--vd1-world) (the BEACHHEAD of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO
 // new RHI; the verdict.h entity world + command bus is header-only integer math, so on Metal it runs the IDENTICAL
@@ -69868,6 +69970,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pcg2-scatter") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pcg2_scatter.png";
             try { return RunPcg2ScatterShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pcg3-mask <out.png>: render the Deterministic PCG ANALYTIC DENSITY MASK + IMPORTANCE REJECTION showcase
+        // (Slice PCG3, the 3rd slice of FLAGSHIP #22). PURE CPU — runs the IDENTICAL pcg.h ScatterMasked the Vulkan
+        // --pcg3-mask-shot runs (the 2D top-down plot of the radial-density disc — the surviving subset of the
+        // 48x48=2304 candidates, pure-integer pixel map) -> the masked disc is bit-identical cross-backend BY
+        // CONSTRUCTION; the proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--pcg3-mask") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pcg3_mask.png";
+            try { return RunPcg3MaskShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vd1-world <out.png>: render the Deterministic Gameplay / Netcode ENTITY WORLD + INPUT-COMMAND BUS
