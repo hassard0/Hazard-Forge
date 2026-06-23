@@ -153,16 +153,19 @@ static int fail(const std::string& msg) {
     return 1;
 }
 
-// ---- Per-frame uniform block — must match shaders/lit.metal + shaders/shadow.metal FrameData
-// (288 bytes) byte-for-byte. Layout mirrors the Vulkan sample (samples/hello_triangle/main.cpp). ----
+// ---- Per-frame uniform block — must match shaders/frame_data.hlsli (the shared FrameData) and the
+// generated MSL byte-for-byte. Layout mirrors the Vulkan sample (samples/hello_triangle/main.cpp).
+// With HF_MAX_POINT_LIGHTS=8 (issue #3) the shader-visible block is 512 B; the trailing prevViewProj
+// brings this CPU struct to 576 B (< kFrameUboSize 1024). ----
 struct FrameData {
     float vp[16];
     float lightDir[4];
     float lightColor[4];
     float viewPos[4];
     float ptCount[4];          // x = number of active point lights (unused here)
-    float ptPos[3][4];
-    float ptColor[3][4];
+    // Point-light arrays — HF_MAX_POINT_LIGHTS=8 (issue #3, matches shaders/frame_data.hlsli).
+    float ptPos[8][4];
+    float ptColor[8][4];
     float lightViewProj[16];   // directional light's view*ortho (for shadow mapping)
     float camFwd[4];           // sky/camera-basis fields (unused here; layout parity)
     float camRight[4];

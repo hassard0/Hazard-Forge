@@ -18,11 +18,7 @@ struct VSOutput {
     // interpolated world normal (B = cross(N,T)). Interpolated like the normal.
     [[vk::location(5)]] float3 wtangent : TANGENT;
 };
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 // HF_MSL_GEN: the glslang HLSL frontend (glslc/glslangValidator, used on macOS where DXC is
 // unavailable) does NOT honour [[vk::push_constant]] — it lowers it to a plain Uniform buffer at
 // (set 0, binding 0), colliding with the Frame cbuffer. So for the MSL-generation path only we

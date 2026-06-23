@@ -23,11 +23,7 @@ struct VSOutput {
     // comes straight from the push constant, no perspective division needed).
     [[vk::location(1)]] nointerpolation float4 colorAlpha : TEXCOORD1;
 };
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 // HF_MSL_GEN: glslang lowers [[vk::push_constant]] to a UBO at (set0,binding0) colliding with Frame,
 // so for the MSL path declare the push block as an explicit cbuffer at distinct bindings (matching the
 // engine's flat Metal buffer indices: vertex buffer0 = vertex stream, buffer1 = FrameData, buffer2 =

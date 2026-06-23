@@ -11,11 +11,7 @@ struct VSOutput {
     [[vk::builtin("PointSize")]] float psize : PSIZE;  // Vulkan gl_PointSize
 };
 
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 // Match the engine binding convention used by the other shaders: real Frame cbuffer at (0,0) for
 // DXC/Vulkan; HF_MSL_GEN moves it to (1,0) so spirv-cross emits Metal buffer(1) (see lit.vert.hlsl).
 #ifdef HF_MSL_GEN

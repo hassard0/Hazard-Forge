@@ -4,13 +4,7 @@
 // The gradient/haze/sun math lives in the SHARED procedural_sky.hlsli (HFSkyColor) so the sky pass and
 // the lit pass's IBL reflection stay in lock-step (issue #4) — see lit.frag.hlsl / pbr_core.hlsli.
 #include "procedural_sky.hlsli"
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    // skyParams: x=tanHalfFov, y=aspect, z=time(seconds), w=frameIndex (issue #5; the time channel an
-    // animated sky/water/foliage shader reads — see shaders/sky_animated.frag.hlsl).
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
 struct PSInput { float4 pos : SV_Position; [[vk::location(0)]] float2 uv : TEXCOORD0; };
 

@@ -10,11 +10,7 @@
 // rgb = water shading, a = 1 (full coverage where the grid rasterizes; the composite blends it over
 // the scene). Bindings: FrameData at set 0 b0 (sky/light/camera), the scene-color RT + G-buffer pair
 // at set 1 (t0/s0 + t3/s3, bound via BindTexturePair). Existing shaders + goldens UNTOUCHED.
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams; // skyParams.x=tanHalfFov, .y=aspect
-};
+#include "frame_data.hlsli"
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
 [[vk::binding(0, 1)]] Texture2D    gScene : register(t0);   // HDR opaque scene color (to refract)
 [[vk::binding(1, 1)]] SamplerState gSmp   : register(s0);

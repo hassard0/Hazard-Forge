@@ -52,8 +52,9 @@ struct FrameData {
     float lightColor[4];
     float viewPos[4];
     float ptCount[4];
-    float ptPos[3][4];
-    float ptColor[3][4];
+    // Point-light arrays — HF_MAX_POINT_LIGHTS=8 (issue #3, matches shaders/frame_data.hlsli).
+    float ptPos[8][4];
+    float ptColor[8][4];
     float lightViewProj[16];
     float camFwd[4];
     float camRight[4];

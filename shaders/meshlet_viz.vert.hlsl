@@ -16,11 +16,7 @@ struct VSOutput {
     float4 clip : SV_Position;
     [[vk::location(0)]] float3 color : COLOR;  // per-cluster flat color * fixed Lambert
 };
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 // Same HF_MSL_GEN split as lit.vert: glslang (macOS, no DXC) lowers [[vk::push_constant]] to a plain
 // Uniform at (set 0, binding 0), colliding with the Frame cbuffer — so for the MSL-gen path the push
 // constant is an explicit cbuffer at distinct bindings (Frame=binding1, PushC=binding2) that

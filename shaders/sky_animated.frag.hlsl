@@ -12,12 +12,7 @@
 // same inputs -> same time -> bit-exact golden). The --sky-animated-shot golden is captured at a
 // FIXED time (2.0s) so it is reproducible; an interactive run advances time so the clouds drift.
 #include "procedural_sky.hlsli"
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    // skyParams: x=tanHalfFov, y=aspect, z=time(seconds), w=frameIndex (issue #5 time channel).
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
 struct PSInput { float4 pos : SV_Position; [[vk::location(0)]] float2 uv : TEXCOORD0; };
 

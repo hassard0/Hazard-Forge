@@ -17,12 +17,9 @@
 // and lit.frag, so a sky retune updates every reflection too (issue #4). See procedural_sky.hlsli.
 #include "procedural_sky.hlsli"
 
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    // skyParams: x=tanHalfFov, y=aspect, z=time(seconds), w=frameIndex (issue #5 time channel).
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+// FrameData is the single source of truth in frame_data.hlsli (issue #3). The generated material
+// shaders that include this core therefore share the EXACT same per-frame layout as lit.frag et al.
+#include "frame_data.hlsli"
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
 [[vk::binding(1, 0)]] Texture2D    gShadow    : register(t1);
 [[vk::binding(2, 0)]] SamplerState gShadowSmp : register(s1);

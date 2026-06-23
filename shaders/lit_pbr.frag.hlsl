@@ -3,11 +3,7 @@
 // metallic-roughness (G=roughness, B=metallic), emissive, and ambient occlusion — on top of the
 // base-color + tangent-space normal map the lit pass already had. Kept as a SEPARATE shader so the
 // golden-locked lit pipeline is undisturbed. The vertex shader is the shared lit.vert.hlsl.
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
 // Shadow map lives in the per-frame set (set 0): binding 1 = depth image, binding 2 = sampler.
 [[vk::binding(1, 0)]] Texture2D    gShadow    : register(t1);

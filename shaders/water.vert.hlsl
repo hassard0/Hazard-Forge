@@ -17,11 +17,7 @@ struct VSOutput {
     [[vk::location(0)]] float3 wpos : POSITION0;   // displaced world position
     [[vk::location(1)]] float2 grid : TEXCOORD0;   // base grid (x,z) BEFORE displacement (for normals)
 };
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 
 // Water params (SHARED by the vertex + fragment stage; fragmentPushConstants=true). Layout matches the
 // CPU WaterParams struct in main.cpp byte-for-byte. The 3-wave set is passed as 3*float4

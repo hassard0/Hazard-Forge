@@ -20,11 +20,7 @@ struct VSOutput {
     [[vk::location(4)]] nointerpolation float4 material : TEXCOORD1;
     [[vk::location(5)]] float3 wtangent : TANGENT;
 };
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 // Same HF_MSL_GEN seam-discipline as lit.vert: glslang lowers [[vk::push_constant]] to a plain uniform,
 // so for MSL generation we declare the model+material as an explicit cbuffer at distinct bindings whose
 // spirv-cross flat indices match the engine's vertex buffer1=FrameData / buffer2=model layout. The

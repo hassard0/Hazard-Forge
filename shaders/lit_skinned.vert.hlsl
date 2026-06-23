@@ -22,11 +22,7 @@ struct VSOutput {
     [[vk::location(4)]] nointerpolation float2 material : TEXCOORD1; // x=metallic, y=roughness
     [[vk::location(5)]] float3 wtangent : TANGENT;
 };
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 // 64-joint palette (set 2). The CPU writes palette[j] = global[j] * inverseBind[j]; vertices index
 // into it via the joint-index quad. See lit.vert.hlsl for the HF_MSL_GEN binding rationale; the
 // joint palette adds set 2 -> binding(3,2) so spirv-cross --msl-decoration-binding lands it at the

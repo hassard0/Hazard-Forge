@@ -3,11 +3,7 @@
 // 2D texture on the dedicated environment set, set 3) at LOD 0 for the background instead of the
 // procedural gradient. Outputs LINEAR HDR radiance — the post pass does exposure + ACES, so this
 // must NOT pre-tonemap. Kept as a SEPARATE shader so the golden-locked sky.frag is undisturbed.
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams; // .x=tanHalfFov, .y=aspect
-};
+#include "frame_data.hlsli"
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
 // HDR environment map: dedicated set 3 (binding 11 = image, 12 = sampler). The binding numbers are
 // chosen so spirv-cross --msl-decoration-binding lands them on Metal texture(11)/sampler(12).

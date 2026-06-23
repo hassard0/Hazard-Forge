@@ -10,11 +10,7 @@ struct VSOutput {
     float4 pos   : SV_Position;
     float3 color : COLOR;
 };
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 // See shaders/lit.vert.hlsl for the HF_MSL_GEN rationale. This shader has no push constant, so on
 // the generated-MSL path the FrameData cbuffer lands at binding(1,0) (the engine's flat Metal
 // frame-uniform slot); on the Vulkan/DXC path it is set 0 binding 0 (the per-frame UBO).

@@ -17,11 +17,7 @@ struct VSOutput {
     // Per-object glass parameters, constant across the primitive: rgb = tint, w = base alpha.
     [[vk::location(2)]] nointerpolation float4 tintAlpha : TEXCOORD0;
 };
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 // Same HF_MSL_GEN handling as lit.vert.hlsl: glslang lowers [[vk::push_constant]] to a plain uniform
 // at (set 0, binding 0), colliding with Frame, so for the MSL-generation path we declare the push
 // block as an explicit cbuffer at distinct bindings (Frame -> buffer(1), PushC -> buffer(2) after

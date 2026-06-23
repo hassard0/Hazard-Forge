@@ -11,11 +11,7 @@
 // Density, and returns Beer(opticalDepth) in [0,1] (1 = full sun, 0 = fully shadowed). The slab
 // altitudes / fixed time / coverage / march steps arrive in a push constant (set by the showcase to the
 // SAME clouds:: constants as CH). DETERMINISTIC: fixed time, fixed steps, integer-lattice hash noise.
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
 [[vk::binding(1, 0)]] Texture2D    gShadow    : register(t1);
 [[vk::binding(2, 0)]] SamplerState gShadowSmp : register(s1);

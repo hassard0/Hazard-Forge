@@ -28,11 +28,7 @@ struct VSOutput {
     [[vk::location(4)]] nointerpolation float2 material : TEXCOORD1; // x=metallic, y=roughness
     [[vk::location(5)]] float3 wtangent : TANGENT;
 };
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 // PushC now carries ONLY the per-draw material (the model matrix comes from the instance stream).
 #ifdef HF_MSL_GEN
 [[vk::binding(1, 0)]] cbuffer Frame { FrameData f; };

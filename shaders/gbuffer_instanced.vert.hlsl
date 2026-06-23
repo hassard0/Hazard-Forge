@@ -18,11 +18,7 @@ struct VSOutput {
     [[vk::location(0)]] float3 vnormal : NORMAL;     // view-space normal
     [[vk::location(1)]] float3 vpos    : POSITION0;  // view-space position
 };
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 #ifdef HF_MSL_GEN
 [[vk::binding(1, 0)]] cbuffer Frame { FrameData f; };
 [[vk::binding(2, 0)]] cbuffer PushC { float4x4 view; };

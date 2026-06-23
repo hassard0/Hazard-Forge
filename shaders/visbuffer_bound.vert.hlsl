@@ -16,11 +16,7 @@ struct VSOutput {
     float4 clip : SV_Position;
     [[vk::location(0)]] nointerpolation uint clusterID : CLUSTERID;
 };
-struct FrameData {
-    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
-    float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
-    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
-};
+#include "frame_data.hlsli"
 
 // Same HF_MSL_GEN split as meshlet_viz.vert: glslang lowers [[vk::push_constant]] to a Uniform colliding
 // with Frame, so for the MSL-gen path the push constant is an explicit cbuffer at distinct bindings
