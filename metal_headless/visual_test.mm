@@ -22368,22 +22368,24 @@ static int RunPt1EmitShowcase(const char* outPath) {
 
     // --- Golden: a PURE-INTEGER side-view debug-viz (IDENTICAL to the Vulkan --pt1-emit-shot by
     // construction). Each ALIVE particle a hashColor(seed) dot at (pos.x>>kFrac, pos.y>>kFrac). ---
-    const int kPxPerUnit = 24, kMargin = 24, kWorldHalfW = 4, kWorldH = 8;
-    const uint32_t imgW = (uint32_t)(kMargin * 2 + (2 * kWorldHalfW) * kPxPerUnit);
-    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    // FIXED-POINT world->pixel transform (IDENTICAL to the Vulkan --pt1-emit-shot): scale the RAW Q16.16
+    // position by kPxPerUnit via int64 so sub-unit fountain detail survives; origin x centered, y=0 a third
+    // down (room for the gravity fall). PURE INTEGER -> bit-identical to the Vulkan side-view by construction.
+    const int kPxPerUnit = 40;
+    const uint32_t imgW = 240, imgH = 240;
+    const int originPxX = (int)imgW / 2;
+    const int originPxY = (int)imgH / 3;
     std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
     for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
         bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
     }
-    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
-        ix = kMargin + (worldX + kWorldHalfW) * kPxPerUnit;
-        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    auto worldToPx = [&](int32_t wpx, int32_t wpy, int& ix, int& iy) {
+        ix = originPxX + (int)(((int64_t)wpx * kPxPerUnit) >> pt::kFrac);
+        iy = originPxY - (int)(((int64_t)wpy * kPxPerUnit) >> pt::kFrac);  // y up
     };
     for (uint32_t i = 0; i < kCapacity; ++i) {
         if (!(particles[(size_t)i].flags & pt::kFlagAlive)) continue;
-        const int wx = particles[(size_t)i].px >> pt::kFrac;
-        const int wy = particles[(size_t)i].py >> pt::kFrac;
-        int cx, cy; worldToPx(wx, wy, cx, cy);
+        int cx, cy; worldToPx(particles[(size_t)i].px, particles[(size_t)i].py, cx, cy);
         Vec3 col = vg::hashColor(particles[(size_t)i].seed);
         for (int dy = 0; dy <= 1; ++dy)
             for (int dx = 0; dx <= 1; ++dx) {
