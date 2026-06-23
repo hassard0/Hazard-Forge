@@ -23908,6 +23908,214 @@ static int RunGrainLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PT5 — Deterministic GPU Particles LOCKSTEP + ROLLBACK proof showcase (--pt5-lockstep) (the
+// NETCODE HEADLINE of FLAGSHIP #19, the GR5/FL5/CL5/FPX5 twin over PARTICLES). PURE CPU — NO GPU dispatch,
+// NO new shader, NO new RHI; both Vulkan-Windows (--pt5-lockstep-shot) and Metal-Mac run the IDENTICAL CPU
+// harness (engine/sim/particles.h::RunParticleLockstep/RunParticleRollback) so the converged-pool-state golden
+// is bit-identical cross-backend BY CONSTRUCTION (that cross-platform bit-identity IS the lockstep evidence).
+// Builds the PT4 fountain scene (emitter + vortex field + ground + 2 spheres), runs authority=RunParticleLockstep
+// + replica=RunParticleLockstep + rolledBack=RunParticleRollback over the SAME scripted ParticleCommand streams
+// as the Vulkan --pt5-lockstep-shot, asserts authority==replica + rollback-corrects-to-authority BIT-EXACT +
+// snapshot round-trip + the snapshot-completeness control diverges, and CPU-colors the SAME converged-pool
+// side-view golden (the PT4 transform VERBATIM) -> bit-identical cross-backend. New golden
+// tests/golden/metal/pt5_lockstep.png. THE SCENE/STREAM BELOW ARE BYTE-IDENTICAL to the Vulkan --pt5-lockstep-shot.
+static int RunPt5LockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace pt = hf::sim::particles;
+    namespace vg = render::vg;
+
+    // ===== THE PT5 SCENE — MUST be byte-identical to the Vulkan --pt5-lockstep-shot (main.cpp) =====
+    const pt::fx kGravY = (pt::fx)(-9.8 * (double)pt::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const pt::fx kDt      = pt::kOne / 60;
+    const pt::fx kDragK   = pt::kOne / 50;
+    const pt::fx kSpeed   = pt::kOne * 2;
+    const pt::fx kLife    = pt::kOne * 3;
+    const pt::fx kGroundY = -pt::kOne * 2;
+    const pt::fx kRadius  = pt::kParticleRadius;
+    const pt::fx kRestit  = pt::kParticleRestitution;
+    const uint32_t kCapacity = 240;
+    const uint32_t kTicks    = 240;
+    const uint32_t kRollbackAt = 60;
+    const pt::FxVec3 kGravity{0, kGravY, 0};
+
+    pt::EmitterConfig cfg0;
+    cfg0.origin = pt::FxVec3{0, pt::kOne * 3, 0};
+    cfg0.ratePerTick = (pt::fx)2;
+    cfg0.lifetime = kLife;
+    cfg0.speed = kSpeed;
+    cfg0.emitterId = 1u;
+
+    // ONE vortex field deflecting the stream sideways (FIXED array order; == the Vulkan side).
+    std::vector<pt::ForceField> fields(1);
+    fields[0].kind = pt::kFieldVortex;
+    fields[0].center = pt::FxVec3{0, pt::kOne, 0};
+    fields[0].axis = pt::FxVec3{0, pt::kOne, 0};
+    fields[0].strength = pt::kOne * 5;
+    fields[0].radius = pt::kOne * 5;
+    const uint32_t kFieldCount = (uint32_t)fields.size();
+
+    std::vector<pt::ParticleSphereCollider> spheres(2);
+    spheres[0].center = pt::FxVec3{-pt::kOne, 0, 0};
+    spheres[0].radius = pt::kOne;
+    spheres[1].center = pt::FxVec3{pt::kOne * 5 / 4, -pt::kOne / 2, 0};
+    spheres[1].radius = pt::kOne * 3 / 4;
+    const uint32_t kSphereCount = (uint32_t)spheres.size();
+
+    // The initial snapshot (a fresh empty pool + cfg0) — the lockstep "init" both peers clone from.
+    pt::ParticlePool pool0 = pt::InitParticlePool(kCapacity);
+    const pt::ParticleSnapshot init = pt::SnapshotParticles(pool0, cfg0);
+
+    // The scripted authoritative command stream (the deterministic inputs on the wire). ARRAY ORDER == the
+    // deterministic contract. (BYTE-IDENTICAL to the Vulkan --pt5-lockstep-shot authStream.)
+    const std::vector<pt::ParticleCommand> authStream = {
+        pt::ParticleCommand{40,  pt::kCmdGust,        pt::FxVec3{pt::kOne * 3, 0, 0}, 0},
+        pt::ParticleCommand{80,  pt::kCmdBurst,       pt::FxVec3{pt::kOne, pt::kOne * 4, 0}, 16},
+        pt::ParticleCommand{120, pt::kCmdMoveEmitter, pt::FxVec3{pt::kOne, pt::kOne * 3, 0}, 0},
+        pt::ParticleCommand{160, pt::kCmdGust,        pt::FxVec3{0, 0, pt::kOne * 2}, 0},
+    };
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+
+    std::vector<pt::ParticleCommand> mispredictStream = authStream;
+    mispredictStream.push_back(pt::ParticleCommand{kRollbackAt, pt::kCmdGust,
+                                                   pt::FxVec3{pt::kOne * 40, 0, 0}, 0});
+
+    // === The harness ===
+    const pt::ParticleSnapshot authority = pt::RunParticleLockstep(
+        init, authStream.data(), kCommandCount, kTicks, fields.data(), kFieldCount, kGravity, kDragK, kDt,
+        kGroundY, kRadius, kRestit, spheres.data(), kSphereCount);
+    const pt::ParticleSnapshot replica = pt::RunParticleLockstep(
+        init, authStream.data(), kCommandCount, kTicks, fields.data(), kFieldCount, kGravity, kDragK, kDt,
+        kGroundY, kRadius, kRestit, spheres.data(), kSphereCount);
+    const pt::ParticleSnapshot rolledBack = pt::RunParticleRollback(
+        init, authStream.data(), kCommandCount, mispredictStream.data(), (uint32_t)mispredictStream.size(),
+        kTicks, kRollbackAt, fields.data(), kFieldCount, kGravity, kDragK, kDt, kGroundY, kRadius, kRestit,
+        spheres.data(), kSphereCount);
+
+    auto poolOf = [](const pt::ParticleSnapshot& s) {
+        pt::ParticlePool p;
+        p.particles = s.particles; p.freeList = s.freeList;
+        p.spawnCursor = s.spawnCursor; p.tick = s.tick;
+        return p;
+    };
+    const uint32_t kAlive = pt::CountAlive(poolOf(authority));
+
+    // PROOF (1) LOCKSTEP: replica (inputs-only) == authority BIT-EXACT.
+    if (!pt::ParticleStatesEqual(poolOf(authority), poolOf(replica)))
+        return fail("pt5-lockstep: replica != authority (inputs-only re-sim diverged)");
+    std::printf("pt5-lockstep: replica==authority {alive:%u, ticks:%u, commands:%u} BIT-EXACT (inputs-only)\n",
+                kAlive, kTicks, kCommandCount);
+
+    // PROOF (2) ROLLBACK: rolledBack == authority BIT-EXACT, AND the mispredicted state DIFFERED.
+    const pt::ParticleSnapshot mispredicted = pt::RunParticleLockstep(
+        init, mispredictStream.data(), (uint32_t)mispredictStream.size(), kTicks, fields.data(), kFieldCount,
+        kGravity, kDragK, kDt, kGroundY, kRadius, kRestit, spheres.data(), kSphereCount);
+    const bool divergenceExisted = !pt::ParticleStatesEqual(poolOf(mispredicted), poolOf(authority));
+    if (!pt::ParticleStatesEqual(poolOf(rolledBack), poolOf(authority)))
+        return fail("pt5-lockstep: rollback != authority (misprediction not corrected)");
+    if (!divergenceExisted)
+        return fail("pt5-lockstep: mispredicted state == authority (vacuous rollback proof)");
+    std::printf("pt5-lockstep rollback: corrected==authority BIT-EXACT (mispredict@tick%u diverged "
+                "then converged)\n", kRollbackAt);
+
+    // PROOF (3) determinism + snapshot round-trip.
+    const pt::ParticleSnapshot authority2 = pt::RunParticleLockstep(
+        init, authStream.data(), kCommandCount, kTicks, fields.data(), kFieldCount, kGravity, kDragK, kDt,
+        kGroundY, kRadius, kRestit, spheres.data(), kSphereCount);
+    if (!pt::ParticleStatesEqual(poolOf(authority2), poolOf(authority)))
+        return fail("pt5-lockstep: two runs differ (nondeterministic)");
+    {
+        pt::ParticleSnapshot p = pt::RunParticleLockstep(
+            init, authStream.data(), kCommandCount, kRollbackAt, fields.data(), kFieldCount, kGravity,
+            kDragK, kDt, kGroundY, kRadius, kRestit, spheres.data(), kSphereCount);
+        pt::ParticlePool  pool; pt::EmitterConfig cfg;
+        pt::RestoreParticles(pool, cfg, p);
+        const pt::ParticleSnapshot snap = pt::SnapshotParticles(pool, cfg);
+        pt::SimParticleTick(pool, cfg, authStream.data(), kCommandCount, fields.data(), kFieldCount,
+                            kGravity, kDragK, kDt, kGroundY, kRadius, kRestit, spheres.data(), kSphereCount);
+        pt::RestoreParticles(pool, cfg, snap);
+        if (!pt::ParticleStatesEqual(pool, poolOf(snap)))
+            return fail("pt5-lockstep: snapshot round-trip != original");
+    }
+    std::printf("pt5-lockstep determinism: two runs BYTE-IDENTICAL + snapshot round-trip exact\n");
+
+    // PROOF (4) THE SNAPSHOT-COMPLETENESS CONTROL (the crux): a snapshot that captures ONLY the particle array
+    // (NOT freeList/spawnCursor) restored + re-advanced DIVERGES from the full-snapshot reference.
+    {
+        const uint32_t kMid = 100, kTail = 60;
+        pt::ParticleSnapshot atMid = pt::RunParticleLockstep(
+            init, authStream.data(), kCommandCount, kMid, fields.data(), kFieldCount, kGravity, kDragK,
+            kDt, kGroundY, kRadius, kRestit, spheres.data(), kSphereCount);
+        pt::ParticlePool fullPool; pt::EmitterConfig fullCfg;
+        pt::RestoreParticles(fullPool, fullCfg, atMid);
+        for (uint32_t t = kMid; t < kMid + kTail; ++t)
+            pt::SimParticleTick(fullPool, fullCfg, authStream.data(), kCommandCount, fields.data(),
+                                kFieldCount, kGravity, kDragK, kDt, kGroundY, kRadius, kRestit,
+                                spheres.data(), kSphereCount);
+        pt::ParticlePool badPool; pt::EmitterConfig badCfg;
+        pt::RestoreParticles(badPool, badCfg, atMid);
+        badPool.freeList    = init.freeList;     // STALE (the empty-pool free-list)
+        badPool.spawnCursor = init.spawnCursor;  // STALE (0)
+        for (uint32_t t = kMid; t < kMid + kTail; ++t)
+            pt::SimParticleTick(badPool, badCfg, authStream.data(), kCommandCount, fields.data(),
+                                kFieldCount, kGravity, kDragK, kDt, kGroundY, kRadius, kRestit,
+                                spheres.data(), kSphereCount);
+        if (pt::ParticleStatesEqual(fullPool, badPool))
+            return fail("pt5-lockstep: snapshot-completeness control did NOT diverge (vacuous)");
+    }
+    std::printf("pt5-lockstep snapshot-completeness: omit freeList/spawnCursor -> diverges (the crux control)\n");
+
+    std::printf("pt5-lockstep: {capacity:%u, alive:%u, ticks:%u, commands:%u, rollback-at:%u}\n",
+                kCapacity, kAlive, kTicks, kCommandCount, kRollbackAt);
+
+    // --- Golden: the converged AUTHORITY pool side-view (the PT4 transform VERBATIM; IDENTICAL to the Vulkan
+    // --pt5-lockstep-shot by construction). Ground line + sphere outlines + hashColor(seed) dots. ---
+    const int kPxPerUnit = 40;
+    const uint32_t imgW = 240, imgH = 240;
+    const int originPxX = (int)imgW / 2;
+    const int originPxY = (int)imgH / 3;
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int32_t wpx, int32_t wpy, int& ix, int& iy) {
+        ix = originPxX + (int)(((int64_t)wpx * kPxPerUnit) >> pt::kFrac);
+        iy = originPxY - (int)(((int64_t)wpy * kPxPerUnit) >> pt::kFrac);  // y up
+    };
+    auto putPx = [&](int ix, int iy, uint8_t r, uint8_t gg, uint8_t b) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = b; dst[1] = gg; dst[2] = r; dst[3] = 255;
+    };
+    {
+        int gx0, gy0; worldToPx(0, kGroundY, gx0, gy0);
+        for (int x = 0; x < (int)imgW; ++x) putPx(x, gy0, 90, 80, 60);
+    }
+    for (uint32_t s = 0; s < kSphereCount; ++s) {
+        int cxPx, cyPx; worldToPx(spheres[s].center.x, spheres[s].center.y, cxPx, cyPx);
+        const int rPx = (int)(((int64_t)spheres[s].radius * kPxPerUnit) >> pt::kFrac);
+        const int r2lo = (rPx - 1) * (rPx - 1), r2hi = (rPx + 1) * (rPx + 1);
+        for (int dy = -rPx - 1; dy <= rPx + 1; ++dy)
+            for (int dx = -rPx - 1; dx <= rPx + 1; ++dx) {
+                const int d2 = dx * dx + dy * dy;
+                if (d2 >= r2lo && d2 <= r2hi) putPx(cxPx + dx, cyPx + dy, 70, 110, 130);
+            }
+    }
+    for (uint32_t i = 0; i < kCapacity; ++i) {
+        const pt::FxParticle& p = authority.particles[(size_t)i];
+        if (!(p.flags & pt::kFlagAlive)) continue;
+        int cx, cy; worldToPx(p.pos.x, p.pos.y, cx, cy);
+        Vec3 col = vg::hashColor(p.seed);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx)
+                putPx(cx + dx, cy + dy, (uint8_t)(col.x * 255.0f + 0.5f),
+                      (uint8_t)(col.y * 255.0f + 0.5f), (uint8_t)(col.z * 255.0f + 0.5f));
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — particle lockstep+rollback converged state (%u alive)\n",
+                outPath, imgW, imgH, kAlive);
+    return 0;
+}
+
 // ===== Slice CL1 — Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR showcase (--cloth-integrate)
 // (the BEACHHEAD of FLAGSHIP #8). Like FPX1 (and UNLIKE the int32 FPX2/NAV broadphase shaders), the cloth
 // integrate is int64 (gravity*dt over Q16.16 overflows int32 — the SAME form as fpx_integrate.comp), so
@@ -64537,6 +64745,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pt4-step") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pt4_step.png";
             try { return RunPt4StepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pt5-lockstep <out.png>: render the Deterministic GPU Particles LOCKSTEP + ROLLBACK proof showcase
+        // (Slice PT5, the NETCODE HEADLINE of FLAGSHIP #19, the GR5/FL5/CL5/FPX5 twin over PARTICLES). PURE CPU:
+        // runs the particles.h lockstep/rollback harness (RunParticleLockstep authority + replica,
+        // RunParticleRollback) over the PT4 fountain scene + a scripted ParticleCommand stream, asserts
+        // authority==replica + rollback-corrects-to-authority BIT-EXACT + snapshot-completeness control diverges,
+        // and CPU-colors the converged-pool side-view golden — IDENTICAL to the Vulkan --pt5-lockstep-shot by
+        // construction. New golden tests/golden/metal/pt5_lockstep.png. NO GPU compute, NO new shader, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--pt5-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pt5_lockstep.png";
+            try { return RunPt5LockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --grain-neighbors <out.png>: render the Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH

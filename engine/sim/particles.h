@@ -629,5 +629,180 @@ inline void StepParticlesN(ParticlePool& pool, const EmitterConfig& cfg, const F
         StepParticles(pool, cfg, fields, count, gravity, dragK, dt, groundY, radius, e, spheres, sphereCount);
 }
 
+// ===== Slice PT5 — Lockstep + rollback (the NETCODE HEADLINE) (Issue #19, flagship #19, 5th slice) =======
+#include <cstring>   // PT5: std::memcmp for the bit-exact ParticleStatesEqual slot-array compare (append-only,
+                     // mid-file include is legal C++ — PT1-PT4 lines above stay byte-frozen).
+// APPEND-ONLY: everything above (PT1 + PT2 + PT3 + PT4) is BYTE-FROZEN. PT5 is the moat headline: two peers fed
+// ONLY an input-command stream re-derive the EXACT particle pool bit-for-bit, and a rollback re-sims from a
+// snapshot bit-exact. PURE CPU — NO GPU dispatch, NO new shader, NO new RHI. It is a determinism PROPERTY of the
+// bit-exact PT4 StepParticles (the cross-backend zero-diff golden IS the lockstep evidence). Mirrors the
+// grain/fpx lockstep harness VERBATIM in shape (grain.h::GrainCommand/ApplyGrainCommand/SimGrainTick/
+// SnapshotGrain/RestoreGrain/RunGrainLockstep/RunGrainRollback, themselves the fpx.h::FxCommand/SnapshotWorld/
+// RestoreWorld/RunLockstep/RunRollback twins) — the SAME shape over ParticlePool + EmitterConfig.
+//
+// A ParticleCommand is the deterministic per-tick INPUT a netcode layer would put on the wire (NOT full state),
+// applied (in ARRAY ORDER) BEFORE StepParticles on its .tick. kCmdBurst spawns `argi` extra particles at `arg`
+// (a burst — a temp EmitterConfig whose origin=arg, ratePerTick=argi, reusing EmitParticle's single-thread
+// free-list LIFO spawn so the slots are replay-stable); kCmdGust adds `arg` (a velocity delta) to EVERY ALIVE
+// particle (a wind gust); kCmdMoveEmitter relocates cfg.origin to `arg`. A std::vector<ParticleCommand> is the
+// command STREAM, processed in ARRAY ORDER for each tick (the deterministic-order contract — the same order on
+// every peer/platform), so authority + replica fed the same stream re-derive the same pool exactly.
+
+inline constexpr uint32_t kCmdBurst       = 0u; // spawn `argi` extra particles at point `arg` (a burst)
+inline constexpr uint32_t kCmdGust        = 1u; // add velocity delta `arg` to ALL alive particles (a wind gust)
+inline constexpr uint32_t kCmdMoveEmitter = 2u; // relocate the emitter origin to `arg` (a point)
+
+struct ParticleCommand {
+    uint32_t tick = 0;          // the tick this input applies on
+    uint32_t kind = kCmdBurst;  // kCmdBurst / kCmdGust / kCmdMoveEmitter
+    FxVec3   arg{};             // the Q16.16 payload (burst point / gust delta-velocity / new emitter origin)
+    int32_t  argi = 0;          // an integer payload (kCmdBurst: the extra-particle count)
+};
+
+// ApplyParticleCommand(pool, cfg, cmd): apply ONE input command to the pool/cfg deterministically (FIXED order,
+// pure integer). kCmdBurst spawns argi particles at arg via EmitParticle (single-thread free-list LIFO — a temp
+// EmitterConfig whose origin=arg, ratePerTick=argi, the rest of cfg carried), so the burst slots are replay-
+// stable; kCmdGust adds arg to every ALIVE particle's velocity (skip dead/empty slots, so the byte image stays
+// pinned); kCmdMoveEmitter sets cfg.origin = arg. Unknown kind is a no-op. The input event the lockstep/rollback
+// streams are made of. The grain.h::ApplyGrainCommand twin (over the particle pool + emitter config).
+inline void ApplyParticleCommand(ParticlePool& pool, EmitterConfig& cfg, const ParticleCommand& cmd) {
+    if (cmd.kind == kCmdBurst) {
+        EmitterConfig burst = cfg;          // carry lifetime/speed/emitterId; override origin + count
+        burst.origin = cmd.arg;
+        burst.ratePerTick = (fx)cmd.argi;   // a small plain integer count (Emit reads the raw value < kOne)
+        Emit(pool, burst);                  // single-thread host-ordered LIFO spawn (replay-stable slots)
+    } else if (cmd.kind == kCmdGust) {
+        for (FxParticle& p : pool.particles) {
+            if (!(p.flags & kFlagAlive)) continue;   // dead/empty slots untouched (byte image pinned)
+            p.vel.x += cmd.arg.x;
+            p.vel.y += cmd.arg.y;
+            p.vel.z += cmd.arg.z;
+        }
+    } else if (cmd.kind == kCmdMoveEmitter) {
+        cfg.origin = cmd.arg;
+    }
+}
+
+// SimParticleTick(pool, cfg, cmds, cmdCount, fields, fc, g, dragK, dt, groundY, radius, e, spheres, sc): the
+// deterministic per-tick step. (1) apply ALL commands in `cmds` whose .tick == pool.tick, in ARRAY ORDER (the
+// deterministic input-order contract); (2) StepParticles one full PT4 tick (Emit -> forces+integrate -> collide
+// -> recycle -> ++tick). Pure integer, fixed order -> bit-identical on every peer/platform. The grain.h::
+// SimGrainTick twin (StepParticles replaces StepGrainFriction). Note: the commands gate on pool.tick (BEFORE the
+// StepParticles ++tick), so a command with .tick==T is applied exactly when the pool is at tick T.
+inline void SimParticleTick(ParticlePool& pool, EmitterConfig& cfg, const ParticleCommand* cmds, uint32_t cmdCount,
+                            const ForceField* fields, uint32_t fc, const FxVec3& g, fx dragK, fx dt,
+                            fx groundY, fx radius, fx e, const ParticleSphereCollider* spheres, uint32_t sc) {
+    for (uint32_t c = 0; c < cmdCount; ++c)
+        if (cmds[c].tick == pool.tick) ApplyParticleCommand(pool, cfg, cmds[c]);
+    StepParticles(pool, cfg, fields, fc, g, dragK, dt, groundY, radius, e, spheres, sc);
+}
+
+// THE SNAPSHOT CRUX: capture the ENTIRE pool — particles + freeList + spawnCursor + tick — PLUS the emitter cfg,
+// because spawn/death IS the sim. A snapshot that omits the free-list/spawnCursor re-spawns into WRONG slots
+// (or with a wrong hash) on restore -> divergence (the PT5 snapshot-completeness control proves this). The
+// grain.h::SnapshotGrain twin, but a STRUCT (the pool is more than one vector — the GrainParticle array is the
+// whole state there; here the free-list + cursor + cfg are sim state too).
+struct ParticleSnapshot {
+    std::vector<FxParticle> particles;   // the full slot array (alive + dead + empty — the whole byte image)
+    std::vector<uint32_t>   freeList;    // the LIFO free-list (DETERMINISM-CRITICAL — which slots the next spawn uses)
+    uint32_t                spawnCursor = 0;  // the monotone spawn counter (DETERMINISM-CRITICAL — the spawn hash stream)
+    uint32_t                tick = 0;         // the current sim tick
+    EmitterConfig           cfg{};            // the emitter config (kCmdMoveEmitter mutates it — part of the sim state)
+};
+
+// SnapshotParticles(pool, cfg): a DEEP copy of the entire pool + the emitter config (the rollback primitive — a
+// lossless saved tick). (std::vector copy is a deep copy.) The grain.h::SnapshotGrain twin.
+inline ParticleSnapshot SnapshotParticles(const ParticlePool& pool, const EmitterConfig& cfg) {
+    ParticleSnapshot s;
+    s.particles   = pool.particles;     // deep copy
+    s.freeList    = pool.freeList;      // deep copy (DETERMINISM-CRITICAL)
+    s.spawnCursor = pool.spawnCursor;   // (DETERMINISM-CRITICAL)
+    s.tick        = pool.tick;
+    s.cfg         = cfg;
+    return s;
+}
+
+// RestoreParticles(pool, cfg, s): overwrite the pool + cfg from a saved snapshot (the rollback). Bit-exact round-
+// trip with SnapshotParticles (RestoreParticles(p, c, SnapshotParticles(p0, c0)) leaves p == p0 + c == c0 byte-
+// for-byte). The grain.h::RestoreGrain twin.
+inline void RestoreParticles(ParticlePool& pool, EmitterConfig& cfg, const ParticleSnapshot& s) {
+    pool.particles   = s.particles;
+    pool.freeList    = s.freeList;
+    pool.spawnCursor = s.spawnCursor;
+    pool.tick        = s.tick;
+    cfg              = s.cfg;
+}
+
+// ParticleStatesEqual(a, b): full bit-exact compare of two pools — the slot array (memcmp, 48-byte std430 stride)
+// AND the free-list AND the spawnCursor AND the tick. The lockstep/rollback proof memcmps with THIS (capturing
+// the free-list/cursor is necessary — they are sim state, not bookkeeping; the snapshot-completeness control
+// proves omitting them diverges). Returns true iff every byte matches.
+inline bool ParticleStatesEqual(const ParticlePool& a, const ParticlePool& b) {
+    if (a.particles.size() != b.particles.size()) return false;
+    if (a.particles.size() != 0 &&
+        std::memcmp(a.particles.data(), b.particles.data(), a.particles.size() * sizeof(FxParticle)) != 0)
+        return false;
+    if (a.freeList != b.freeList) return false;
+    if (a.spawnCursor != b.spawnCursor) return false;
+    if (a.tick != b.tick) return false;
+    return true;
+}
+
+// RunParticleLockstep(init, stream, streamCount, T, ...): THE peer entry point. Clone a peer from `init`
+// (RestoreParticles, the family-parity path) + run T SimParticleTicks applying the command stream -> the final
+// pool. authority = RunParticleLockstep(...); replica = RunParticleLockstep(...) from the SAME init + stream
+// (inputs ONLY — no state shared) -> BIT-IDENTICAL by determinism (the lockstep proof ParticleStatesEqual's
+// them). The grain.h::RunGrainLockstep twin. Returns the converged ParticleSnapshot (so the caller can render
+// the AUTHORITY pool). The scene params are passed through to StepParticles verbatim.
+inline ParticleSnapshot RunParticleLockstep(const ParticleSnapshot& init, const ParticleCommand* stream,
+                                            uint32_t streamCount, uint32_t T,
+                                            const ForceField* fields, uint32_t fc, const FxVec3& g, fx dragK,
+                                            fx dt, fx groundY, fx radius, fx e,
+                                            const ParticleSphereCollider* spheres, uint32_t sc) {
+    ParticlePool  pool;
+    EmitterConfig cfg;
+    RestoreParticles(pool, cfg, init);            // clone the peer from init (inputs-only, no state shared)
+    for (uint32_t t = 0; t < T; ++t)
+        SimParticleTick(pool, cfg, stream, streamCount, fields, fc, g, dragK, dt, groundY, radius, e, spheres, sc);
+    return SnapshotParticles(pool, cfg);
+}
+
+// RunParticleRollback(init, authStream, authCount, mispredictStream, mispredictCount, T, rollbackAt, ...): the
+// rollback harness. (1) run ticks 0..rollbackAt from init applying authStream, then SAVE a snapshot AT rollbackAt
+// (before that tick is simulated); (2) speculatively advance a few ticks from the snapshot with the MISPREDICTED
+// stream (the wrong input) — the client prediction that diverges; (3) "receive" the authoritative input ->
+// RestoreParticles to the snapshot + RE-SIMULATE rollbackAt..T with the CORRECT authStream -> the corrected pool.
+// The proof asserts this == RunParticleLockstep(init, authStream, T) (rollback corrected the misprediction
+// EXACTLY) AND that the mispredicted-before-rollback state DIFFERED (a real divergence was fixed). The grain.h::
+// RunGrainRollback twin. Returns the corrected ParticleSnapshot.
+inline ParticleSnapshot RunParticleRollback(const ParticleSnapshot& init,
+                                            const ParticleCommand* authStream, uint32_t authCount,
+                                            const ParticleCommand* mispredictStream, uint32_t mispredictCount,
+                                            uint32_t T, uint32_t rollbackAt,
+                                            const ForceField* fields, uint32_t fc, const FxVec3& g, fx dragK,
+                                            fx dt, fx groundY, fx radius, fx e,
+                                            const ParticleSphereCollider* spheres, uint32_t sc) {
+    ParticlePool  pool;
+    EmitterConfig cfg;
+    RestoreParticles(pool, cfg, init);
+    // (1) advance 0..rollbackAt with the authoritative stream.
+    for (uint32_t t = 0; t < rollbackAt; ++t)
+        SimParticleTick(pool, cfg, authStream, authCount, fields, fc, g, dragK, dt, groundY, radius, e, spheres, sc);
+    // (2) SAVE the snapshot at rollbackAt (the rollback restore point).
+    const ParticleSnapshot snap = SnapshotParticles(pool, cfg);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong input) — the divergent
+    // client prediction. Bounded to the remaining ticks (<=3).
+    uint32_t specTicks = (T > rollbackAt) ? (T - rollbackAt) : 0u;
+    if (specTicks > 3u) specTicks = 3u;
+    for (uint32_t s = 0; s < specTicks; ++s)
+        SimParticleTick(pool, cfg, mispredictStream, mispredictCount, fields, fc, g, dragK, dt, groundY, radius, e,
+                        spheres, sc);
+    // (3) ROLLBACK: restore the snapshot + re-simulate rollbackAt..T with the CORRECT authStream.
+    RestoreParticles(pool, cfg, snap);
+    for (uint32_t t = rollbackAt; t < T; ++t)
+        SimParticleTick(pool, cfg, authStream, authCount, fields, fc, g, dragK, dt, groundY, radius, e, spheres, sc);
+    return SnapshotParticles(pool, cfg);
+}
+
 }  // namespace particles
 }  // namespace hf::sim

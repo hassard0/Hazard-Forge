@@ -585,6 +585,122 @@ int main() {
         }
     }
 
+    // ================= Slice PT5: LOCKSTEP + ROLLBACK — inputs-only equal, rollback corrects, snapshot ====
+    // round-trip exact, snapshot-completeness control diverges (the NETCODE HEADLINE). PURE CPU.
+    {
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const fx dt = kOne / 60, drag = kOne / 50;
+        const pt::FxVec3 grav{0, kGravY, 0};
+        const fx groundY = -kOne * 2;
+        const fx radius = pt::kParticleRadius;
+        const fx e = pt::kParticleRestitution;
+
+        const uint32_t cap = 240;
+        const uint32_t T = 240;
+        const uint32_t rollbackAt = 60;
+        pt::EmitterConfig cfg0;
+        cfg0.origin = pt::FxVec3{0, kOne * 3, 0}; cfg0.ratePerTick = (fx)2; cfg0.lifetime = kOne * 3;
+        cfg0.speed = kOne * 2; cfg0.emitterId = 1u;
+
+        std::vector<pt::ForceField> fields(1);
+        fields[0].kind = pt::kFieldVortex;
+        fields[0].center = pt::FxVec3{0, kOne, 0};
+        fields[0].axis = pt::FxVec3{0, kOne, 0};
+        fields[0].strength = kOne * 5;
+        fields[0].radius = kOne * 5;
+        const uint32_t fc = (uint32_t)fields.size();
+
+        std::vector<pt::ParticleSphereCollider> spheres(2);
+        spheres[0].center = pt::FxVec3{-kOne, 0, 0}; spheres[0].radius = kOne;
+        spheres[1].center = pt::FxVec3{kOne * 5 / 4, -kOne / 2, 0}; spheres[1].radius = kOne * 3 / 4;
+        const uint32_t sc = (uint32_t)spheres.size();
+
+        pt::ParticlePool pool0 = pt::InitParticlePool(cap);
+        const pt::ParticleSnapshot init = pt::SnapshotParticles(pool0, cfg0);
+
+        const std::vector<pt::ParticleCommand> authStream = {
+            pt::ParticleCommand{40,  pt::kCmdGust,        pt::FxVec3{kOne * 3, 0, 0}, 0},
+            pt::ParticleCommand{80,  pt::kCmdBurst,       pt::FxVec3{kOne, kOne * 4, 0}, 16},
+            pt::ParticleCommand{120, pt::kCmdMoveEmitter, pt::FxVec3{kOne, kOne * 3, 0}, 0},
+            pt::ParticleCommand{160, pt::kCmdGust,        pt::FxVec3{0, 0, kOne * 2}, 0},
+        };
+        const uint32_t cc = (uint32_t)authStream.size();
+        std::vector<pt::ParticleCommand> mispredictStream = authStream;
+        mispredictStream.push_back(pt::ParticleCommand{rollbackAt, pt::kCmdGust, pt::FxVec3{kOne * 40, 0, 0}, 0});
+
+        auto poolOf = [](const pt::ParticleSnapshot& s) {
+            pt::ParticlePool p;
+            p.particles = s.particles; p.freeList = s.freeList;
+            p.spawnCursor = s.spawnCursor; p.tick = s.tick;
+            return p;
+        };
+
+        const pt::ParticleSnapshot authority = pt::RunParticleLockstep(
+            init, authStream.data(), cc, T, fields.data(), fc, grav, drag, dt, groundY, radius, e,
+            spheres.data(), sc);
+
+        // --- (1) lockstep: replica (inputs-only) == authority BIT-EXACT ---
+        {
+            const pt::ParticleSnapshot replica = pt::RunParticleLockstep(
+                init, authStream.data(), cc, T, fields.data(), fc, grav, drag, dt, groundY, radius, e,
+                spheres.data(), sc);
+            check(pt::ParticleStatesEqual(poolOf(authority), poolOf(replica)),
+                  "PT5 lockstep: replica == authority BIT-EXACT (inputs-only re-derivation)");
+            check(pt::CountAlive(poolOf(authority)) > 0, "PT5 lockstep: authority pool is alive (non-degenerate)");
+        }
+
+        // --- (2) rollback: corrected == authority AND the mispredicted state DIFFERED ---
+        {
+            const pt::ParticleSnapshot rolledBack = pt::RunParticleRollback(
+                init, authStream.data(), cc, mispredictStream.data(), (uint32_t)mispredictStream.size(),
+                T, rollbackAt, fields.data(), fc, grav, drag, dt, groundY, radius, e, spheres.data(), sc);
+            const pt::ParticleSnapshot mispredicted = pt::RunParticleLockstep(
+                init, mispredictStream.data(), (uint32_t)mispredictStream.size(), T, fields.data(), fc, grav,
+                drag, dt, groundY, radius, e, spheres.data(), sc);
+            check(pt::ParticleStatesEqual(poolOf(rolledBack), poolOf(authority)),
+                  "PT5 rollback: corrected == authority BIT-EXACT");
+            check(!pt::ParticleStatesEqual(poolOf(mispredicted), poolOf(authority)),
+                  "PT5 rollback: mispredicted state DIFFERED from authority (real divergence fixed)");
+        }
+
+        // --- (3) snapshot round-trip exact: Restore(Snapshot(p)) == p ---
+        {
+            pt::ParticleSnapshot p = pt::RunParticleLockstep(
+                init, authStream.data(), cc, rollbackAt, fields.data(), fc, grav, drag, dt, groundY, radius, e,
+                spheres.data(), sc);
+            pt::ParticlePool pool; pt::EmitterConfig cfg;
+            pt::RestoreParticles(pool, cfg, p);
+            const pt::ParticleSnapshot snap = pt::SnapshotParticles(pool, cfg);
+            pt::SimParticleTick(pool, cfg, authStream.data(), cc, fields.data(), fc, grav, drag, dt, groundY,
+                                radius, e, spheres.data(), sc);   // mutate
+            pt::RestoreParticles(pool, cfg, snap);
+            check(pt::ParticleStatesEqual(pool, poolOf(snap)),
+                  "PT5 snapshot: RestoreParticles(SnapshotParticles(p)) == p BIT-EXACT");
+        }
+
+        // --- (4) snapshot-completeness control: omitting freeList/spawnCursor DIVERGES ---
+        {
+            const uint32_t mid = 100, tail = 60;
+            pt::ParticleSnapshot atMid = pt::RunParticleLockstep(
+                init, authStream.data(), cc, mid, fields.data(), fc, grav, drag, dt, groundY, radius, e,
+                spheres.data(), sc);
+            pt::ParticlePool fullPool; pt::EmitterConfig fullCfg;
+            pt::RestoreParticles(fullPool, fullCfg, atMid);
+            for (uint32_t t = mid; t < mid + tail; ++t)
+                pt::SimParticleTick(fullPool, fullCfg, authStream.data(), cc, fields.data(), fc, grav, drag, dt,
+                                    groundY, radius, e, spheres.data(), sc);
+            pt::ParticlePool badPool; pt::EmitterConfig badCfg;
+            pt::RestoreParticles(badPool, badCfg, atMid);
+            badPool.freeList = init.freeList;        // STALE (omit the free-list)
+            badPool.spawnCursor = init.spawnCursor;  // STALE (omit the cursor)
+            for (uint32_t t = mid; t < mid + tail; ++t)
+                pt::SimParticleTick(badPool, badCfg, authStream.data(), cc, fields.data(), fc, grav, drag, dt,
+                                    groundY, radius, e, spheres.data(), sc);
+            check(!pt::ParticleStatesEqual(fullPool, badPool),
+                  "PT5 snapshot-completeness: omit freeList/spawnCursor -> DIVERGES (the crux control)");
+        }
+    }
+
     if (g_fail == 0) std::printf("particles_test: ALL CHECKS PASSED\n");
     else std::printf("particles_test: %d CHECK(S) FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
