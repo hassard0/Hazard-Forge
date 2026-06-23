@@ -281,6 +281,24 @@ float4 main(PSInput i) : SV_Target {
         rgb += aniso * (anisoSpec - isoSpec) * (f.lightColor.rgb * shadow);    // aniso=0 -> +0 -> identity
     }
 
+    // --- SUBSTRATE-LITE SUBSURFACE SCATTERING / wrap-diffuse (Issue #11, SB5). A cheap wrap-diffuse
+    // approximation (skin/wax/marble/jade): light wraps past the terminator so the day/night line softens
+    // and glows into shadow. ADDS only the EXTRA scattered light beyond the base clamped Lambert cosine
+    // (wrapped - clamped), scattered through the non-metallic albedo, shadowed + AO'd like the base diffuse.
+    // Gated by f.substrateParams2.y: sss=0 -> extra*0 -> rgb += 0.0 -> EXACT identity over the base
+    // lit_pbr_ibl render. THIS IS THE MAKE-OR-BREAK (the gate guarantees the zero identity). ---
+    {
+        float sss = f.substrateParams2.y;
+        const float wrap = 0.5;                              // wrap width (how far light bleeds past the terminator)
+        float3 Ls = normalize(-f.lightDir.xyz);
+        float rawNoL = dot(N, Ls);
+        float NoLc   = max(rawNoL, 0.0);                     // the base Lambert cosine
+        float wrappedNoL = saturate((rawNoL + wrap) / (1.0 + wrap));
+        float extra = max(wrappedNoL - NoLc, 0.0);           // >=0: the extra light scattered past/at the terminator
+        // Scatter the EXTRA diffuse through the (non-metallic) albedo, shadowed + AO'd like the base diffuse.
+        rgb += sss * (1.0 - metallic) * albedo * (extra * (1.0 / 3.14159265)) * (f.lightColor.rgb * shadow) * ao;
+    }
+
     // --- Emissive (sRGB -> linear), ADDED after lighting. ---
     float3 emis = SrgbToLinear(gEmissive.Sample(gEmissiveSmp, i.uv).rgb);
     rgb += emis;
