@@ -61,9 +61,12 @@ you select the reflection path explicitly, as above.
 
 ## Hardware ray tracing (deterministically reconciled) — issues #7, #13
 
-✅ **Ships as a full RHI accel-structure seam.** Flagship #28 added `IAccelerationStructure` / BLAS / TLAS + inline ray
-query over `VK_KHR_ray_query` (Vulkan) and `MTLAccelerationStructure` + `intersection_query` (Metal) — *not* a single
-hint shader. The public path:
+✅ **Ships as a full RHI accel-structure seam on Vulkan.** The RT flagship added `IAccelerationStructure` / BLAS / TLAS
++ inline ray query over `VK_KHR_ray_query` (Vulkan) to the RHI — *not* a single hint shader — and (#34) extended the
+accel binding to graphics/fragment pipelines. **Metal note (see the honest caveat below):** the Metal
+`MTLAccelerationStructure` + `intersection_query` path is proven *standalone* in the headless test (RT2b,
+`--rt2-query-hw`), NOT wired into `engine/rhi_metal/` — so the RHI accel seam is Vulkan-only today, and the Metal
+showcases run the deterministic CPU reference. The public path:
 
 - `--rt1-trace` — the deterministic Q16.16 **software reference tracer** (the "ground-truth reference mode" of issue
   #13 — every HW path is validated to agree with it).
@@ -115,10 +118,15 @@ extension of the existing PBD solvers.
 
 ## Particles / VFX — issue #19
 
-🟡 **Partial.** A CPU particle/VFX emitter ships (`--vfx`, additive billboard fountain). A full **GPU-driven
-Niagara-class** system (mesh emission, force fields, GPU collisions, a node graph) is a **genuine gap** — though the
-deterministic GPU sim flagships (grain/fluid/cloth) already provide the GPU-particle *substrate*. Tracked as a future
-flagship.
+✅ **A deterministic GPU particle system ships** (`engine/sim/particles.h`, `--pt1-emit` … `--pt6-render`): a
+free-list emitter (no atomics, no `rand` — spawn is a pure function of the command stream), **force fields**
+(point/vortex/wind), **particle-vs-world collision** (ground + spheres + restitution bounce), the composed
+`StepParticles` tick, **lockstep/rollback replay**, and a **lit 3D capstone** (the spark-fountain money-shot). The
+entire sim is Q16.16, **bit-identical CPU/Vulkan/Metal AND lockstep/rollback-replayable** — which float Niagara
+cannot do (two machines re-derive the exact same fountain, every spark, from inputs alone). Honest v1 scope: a pure
+emitter (no particle-particle/SPH — the grid-hash is reuse-ready for a future slice), sphere-instanced particles (not
+sprites/ribbons), no mesh/skinned emission. The older CPU billboard emitter (`--vfx`) also remains. See ARCHITECTURE
+"Deterministic GPU particle system".
 
 ## Animation — issue #17
 
@@ -159,9 +167,15 @@ See ARCHITECTURE "The Agent Experience (AX) product".
 ### Genuinely not yet built (honest gaps / roadmap)
 
 These are real features Hazard Forge does **not** yet ship, tracked as future flagships: a visual-scripting / Blueprint
-layer, a UMG-class retained-mode UI framework, a cinematic Sequencer, a GPU profiler / frame-debugger UI, spatial /
-graph-based audio (a deterministic integer mixer ships, but no HRTF/graph), a production networking layer (dedicated
-server / RPC / replication graph — a deterministic lockstep *substrate* ships beneath it), an AI behaviour-tree + EQS
-layer (navmesh + deterministic A* ship: `--nav-path`), a PCG framework, foliage-at-scale, temporal upscaling
-(TSR/FSR/DLSS-class), broader platform targets (Linux / mobile / console), wider asset import (FBX/OBJ/USD; glTF ships),
-and a layered (Substrate-style) material BRDF. See the roadmap in the project notes.
+layer (#24), a UMG-class retained-mode UI framework (#30), a cinematic Sequencer (#25), a GPU profiler / frame-debugger
+UI (#31), spatial / graph-based audio (#26 — a deterministic integer mixer ships, but no HRTF/graph), a production
+networking layer (#27 — dedicated server / RPC / replication graph; a deterministic lockstep *substrate* ships beneath
+it), a PCG framework (#22), foliage-at-scale (#21), temporal upscaling (#20, TSR/FSR/DLSS-class), broader platform
+targets (#23, Linux / mobile / console), wider asset import (#15/#16 — FBX/OBJ/USD; glTF ships), and Metal hardware ray
+tracing *through the RHI* (#35 — Vulkan HW RT ships; Metal HW `intersection_query` is proven standalone in RT2b but not
+yet in the RHI). See the roadmap in the project notes.
+
+**Recently shipped — moved OUT of this list:** ✅ **deterministic GPU particles** (#19, `--pt1-emit`…`--pt6-render`),
+✅ **Substrate-lite layered materials** (#11, `--sb1-clearcoat`…`--sb6-substrate` — clearcoat/sheen/iridescence/aniso/
+SSS), ✅ **deterministic AI** (#28, `--ai1-tree`…`--ai6-render` — decision/behaviour trees + environment queries (EQS) +
+integer line-of-sight, on the navmesh + deterministic A*).
