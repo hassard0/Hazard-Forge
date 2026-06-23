@@ -91,7 +91,10 @@ float4 main(PSInput i) : SV_Target {
         if (prevClip.w > 1e-6) {
             float2 prevNdc = prevClip.xy / prevClip.w;
             prevUV = prevNdc * 0.5 + 0.5;
-            prevUV.y = (HF_YS < 0.0) ? 1.0 - prevUV.y : prevUV.y;  // motion_blur prevPx convention
+            // TEXTURE-SAMPLE Y convention (distinct from motion_blur, which uses prevUV as a velocity DELTA,
+            // not a texture sample): the history RT samples Y-flipped on Metal relative to Vulkan. Empirically
+            // HF_YS=-1 on Vulkan (sample prevUV directly) and HF_YS=+1 on Metal (sample 1-y). Flip on Metal:
+            prevUV.y = (HF_YS > 0.0) ? 1.0 - prevUV.y : prevUV.y;
             // History reprojected off-screen -> disocclusion: there is no valid history here.
             disoccluded = any(prevUV < 0.0) || any(prevUV > 1.0);
         } else {
