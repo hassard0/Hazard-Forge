@@ -578,6 +578,8 @@ int main() {
             bool sawAi2QueryFeature = false;
             // Slice AI3: the ai3-los capability is advertised (the integer line-of-sight / perception test).
             bool sawAi3LosFeature = false;
+            // Slice AI4: the ai4-agent capability is advertised (the composed NPC agent in the gameplay tick).
+            bool sawAi4AgentFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -845,6 +847,7 @@ int main() {
                     if (AsString(el->value) == "ai1-tree") sawAi1TreeFeature = true;
                     if (AsString(el->value) == "ai2-query") sawAi2QueryFeature = true;
                     if (AsString(el->value) == "ai3-los") sawAi3LosFeature = true;
+                    if (AsString(el->value) == "ai4-agent") sawAi4AgentFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -1087,6 +1090,7 @@ int main() {
             check(sawAi1TreeFeature, "engine.features includes ai1-tree");
             check(sawAi2QueryFeature, "engine.features includes ai2-query");
             check(sawAi3LosFeature, "engine.features includes ai3-los");
+            check(sawAi4AgentFeature, "engine.features includes ai4-agent");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1378,6 +1382,8 @@ int main() {
         bool sawAi2QueryShot = false;
         // Slice AI3: the --ai3-los-shot showcase flag is listed in the showcase manifest.
         bool sawAi3LosShot = false;
+        // Slice AI4: the --ai4-agent-shot showcase flag is listed in the showcase manifest.
+        bool sawAi4AgentShot = false;
         // Slice VD1: the --vd1-world-shot showcase flag is listed in the showcase manifest.
         bool sawVd1WorldShot = false;
         // Slice VD2: the --vd2-tick-shot showcase flag is listed in the showcase manifest.
@@ -1768,6 +1774,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--ai1-tree-shot") sawAi1TreeShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ai2-query-shot") sawAi2QueryShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ai3-los-shot") sawAi3LosShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--ai4-agent-shot") sawAi4AgentShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vd1-world-shot") sawVd1WorldShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vd2-tick-shot") sawVd2TickShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vd3-world-shot") sawVd3WorldShot = true;
@@ -2006,6 +2013,7 @@ int main() {
         check(sawAi1TreeShot, "showcases manifest includes --ai1-tree-shot");
         check(sawAi2QueryShot, "showcases manifest includes --ai2-query-shot");
         check(sawAi3LosShot, "showcases manifest includes --ai3-los-shot");
+        check(sawAi4AgentShot, "showcases manifest includes --ai4-agent-shot");
         check(sawVd1WorldShot, "showcases manifest includes --vd1-world-shot");
         check(sawVd2TickShot, "showcases manifest includes --vd2-tick-shot");
         check(sawVd3WorldShot, "showcases manifest includes --vd3-world-shot");

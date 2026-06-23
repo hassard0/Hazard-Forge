@@ -35248,6 +35248,196 @@ static int RunAi3LosShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice AI4 — Deterministic AI THE NPC AGENT IN THE GAMEPLAY TICK showcase ===========================
+// (--ai4-agent) (the 4th slice of the DETERMINISTIC AI flagship #28, hf::ai). PURE CPU — NO GPU compute, NO
+// new shader, NO new RHI; ai.h composes the frozen AI1-AI3 primitives + the frozen navmesh A* in header-only
+// INTEGER math, so on Metal it runs the IDENTICAL pure-CPU StepAiWorld sequence the Vulkan --ai4-agent-shot
+// runs on Windows -> bit-identical cross-backend BY CONSTRUCTION (strict 0px). Builds the SAME canonical
+// scene (ai::BuildAi4Scene: the navmesh + N agents + a player + blockers), runs StepAiWorld for K ticks (each
+// agent: perceive AI3 LOS -> decide AI1 tree -> query AI2 -> path nav A* -> act), asserts the 4 proofs (proof
+// lines match the Vulkan side EXACTLY), and renders the PURE-INTEGER 2D top-down (navmesh poly centroids +
+// blockers + agents colored by BT state + their corridors + the player + LOS lines). New golden
+// tests/golden/metal/ai4_agent.png (Mac-baked by the controller); two runs DIFF 0.0000.
+static int RunAi4AgentShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace ai  = hf::ai;
+    namespace fpx = hf::sim::fpx;
+    namespace nav = hf::nav;
+
+    // Build the canonical scene (== the Vulkan --ai4-agent-shot + the ai_agent_test).
+    ai::Ai4Scene scene = ai::BuildAi4Scene();
+    const int kAgents = (int)scene.agents.size();
+    const int kBlockers = (int)scene.blockers.size();
+    const int kTicks = 24;
+
+    // Run K ticks of the composed AI world (perceive/decide/query/path/act per agent, fixed order).
+    for (int t = 0; t < kTicks; ++t)
+        ai::StepAiWorld(scene.agents, scene.nav, scene.blockers.data(), kBlockers,
+                        scene.player, scene.trees);
+
+    // PROOF (1): the headline {agents, tick} + agent 0's state/dest/corridor.
+    {
+        const ai::AiAgent& a0 = scene.agents[0];
+        const char* st = (a0.state == ai::kAgentChase) ? "CHASE" : "PATROL";
+        std::printf("ai4-agent: {agents:%d, tick:%d} agent 0 state=%s dest=%d corridor=%d\n",
+                    kAgents, kTicks, st, a0.navTarget, (int)a0.corridor.size());
+    }
+
+    // PROOF (2): the falsifiable perception->decision beat.
+    {
+        ai::Ai4Scene v = ai::BuildAi4Scene();
+        ai::AiAgent& a = v.agents[0];
+        v.player = fpx::FxVec3{a.pos.x + (fpx::fx)(1 << fpx::kFrac), 0, a.pos.z};
+        std::vector<ai::AiBlocker> none;
+        ai::StepAi(v.agents, v.nav, none.data(), 0, v.player, v.trees);
+        const bool chaseVisible = (v.agents[0].state == ai::kAgentChase);
+
+        ai::Ai4Scene o = ai::BuildAi4Scene();
+        ai::AiAgent& b = o.agents[0];
+        o.player = fpx::FxVec3{b.pos.x + (fpx::fx)(4 << fpx::kFrac), 0, b.pos.z};
+        const int ax = (int)(b.pos.x >> fpx::kFrac), az = (int)(b.pos.z >> fpx::kFrac);
+        ai::AiBlocker wall;
+        wall.min = fpx::FxVec3{(fpx::fx)((ax + 1) << fpx::kFrac), 0, (fpx::fx)((az - 2) << fpx::kFrac)};
+        wall.max = fpx::FxVec3{(fpx::fx)((ax + 3) << fpx::kFrac), (fpx::fx)(2 << fpx::kFrac),
+                               (fpx::fx)((az + 2) << fpx::kFrac)};
+        std::vector<ai::AiBlocker> one = { wall };
+        ai::StepAi(o.agents, o.nav, one.data(), 1, o.player, o.trees);
+        const bool patrolOccluded = (o.agents[0].state == ai::kAgentPatrol) &&
+                                    (o.agents[0].bb.Get(ai::kBbCanSeeTarget) == 0);
+        if (!chaseVisible || !patrolOccluded) return fail("ai4-agent: perception->decision proof failed");
+        std::printf("ai4-agent: player visible -> CHASE (BT switched on perception); occluded -> PATROL\n");
+    }
+
+    // PROOF (3): two-run determinism — a second K-tick sequence has the SAME agent-state digest.
+    const uint64_t digest = ai::DigestAgents(scene.agents);
+    {
+        ai::Ai4Scene s2 = ai::BuildAi4Scene();
+        for (int t = 0; t < kTicks; ++t)
+            ai::StepAiWorld(s2.agents, s2.nav, s2.blockers.data(), (int)s2.blockers.size(),
+                            s2.player, s2.trees);
+        if (ai::DigestAgents(s2.agents) != digest)
+            return fail("ai4-agent: two StepAiWorld sequences differ (nondeterministic agent state)");
+    }
+    std::printf("ai4-agent determinism: two StepAiWorld sequences BYTE-IDENTICAL "
+                "(agent-state digest %016llx)\n", (unsigned long long)digest);
+
+    // PROOF (4): the cross-vendor declaration.
+    std::printf("ai4-agent: strict cross-vendor 0.0000 expected at the bake "
+                "(integer sense+decide+query+path in the tick)\n");
+
+    // --- 2D top-down render (IDENTICAL to the Vulkan --ai4-agent-shot). ---
+    const nav::Heightfield& hfd = scene.nav.hf;
+    const int kGridW = hfd.w, kGridH = hfd.h;
+    const int kPx = 14, kMargin = 24;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kGridW * kPx);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kGridH * kPx);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 12; bgra[pp * 4 + 1] = 10; bgra[pp * 4 + 2] = 8; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto voxCenterPx = [&](int vx, int vz, int& px, int& py) {
+        px = kMargin + vx * kPx + kPx / 2;
+        py = kMargin + vz * kPx + kPx / 2;
+    };
+    auto fillRect = [&](int x0, int y0, int w, int h, const Vec3& col) {
+        for (int yy = 0; yy < h; ++yy)
+            for (int xx = 0; xx < w; ++xx) putPx(x0 + xx, y0 + yy, col);
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            putPx(x0, y0, col);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    auto thickCross = [&](int cx, int cy, int half, const Vec3& col) {
+        for (int o = -1; o <= 1; ++o) {
+            drawLine(cx - half, cy + o, cx + half, cy + o, col);
+            drawLine(cx + o, cy - half, cx + o, cy + half, col);
+        }
+    };
+    auto disc = [&](int cx, int cy, int r, const Vec3& col) {
+        for (int yy = -r; yy <= r; ++yy)
+            for (int xx = -r; xx <= r; ++xx)
+                if (xx * xx + yy * yy <= r * r) putPx(cx + xx, cy + yy, col);
+    };
+
+    const Vec3 kNodeCol{0.30f, 0.34f, 0.40f};
+    const Vec3 kEdgeCol{0.18f, 0.20f, 0.26f};
+    for (size_t p = 0; p < scene.nav.polys.size(); ++p) {
+        int px, py; voxCenterPx(scene.nav.cx[p], scene.nav.cz[p], px, py);
+        for (int e = 0; e < 3; ++e) {
+            const uint32_t nb = scene.nav.polys[p].nbr[e];
+            if (nb == nav::kNoNeighbour || nb >= (uint32_t)scene.nav.polys.size()) continue;
+            int qx, qy; voxCenterPx(scene.nav.cx[nb], scene.nav.cz[nb], qx, qy);
+            drawLine(px, py, qx, qy, kEdgeCol);
+        }
+    }
+    for (size_t p = 0; p < scene.nav.polys.size(); ++p) {
+        int px, py; voxCenterPx(scene.nav.cx[p], scene.nav.cz[p], px, py);
+        disc(px, py, 4, kNodeCol);
+    }
+
+    const Vec3 kBlockCol{0.85f, 0.55f, 0.20f};
+    const Vec3 kBlockFill{0.30f, 0.18f, 0.06f};
+    for (int bi = 0; bi < kBlockers; ++bi) {
+        const ai::AiBlocker& b = scene.blockers[(size_t)bi];
+        const int bx0 = ((int)(b.min.x >> fpx::kFrac)) * scene.nav.navScale;
+        const int bz0 = ((int)(b.min.z >> fpx::kFrac)) * scene.nav.navScale;
+        const int bx1 = ((int)(b.max.x >> fpx::kFrac)) * scene.nav.navScale;
+        const int bz1 = ((int)(b.max.z >> fpx::kFrac)) * scene.nav.navScale;
+        const int px0 = kMargin + bx0 * kPx, py0 = kMargin + bz0 * kPx;
+        const int px1 = kMargin + bx1 * kPx, py1 = kMargin + bz1 * kPx;
+        fillRect(px0, py0, px1 - px0, py1 - py0, kBlockFill);
+        drawLine(px0, py0, px1, py0, kBlockCol); drawLine(px0, py1, px1, py1, kBlockCol);
+        drawLine(px0, py0, px0, py1, kBlockCol); drawLine(px1, py0, px1, py1, kBlockCol);
+    }
+
+    int plvx, plvz; ai::AiWorldToVoxel(scene.nav, scene.player, plvx, plvz);
+    int plpx, plpy; voxCenterPx(plvx, plvz, plpx, plpy);
+
+    const Vec3 kChaseCol{0.95f, 0.30f, 0.25f};
+    const Vec3 kPatrolCol{0.30f, 0.80f, 0.45f};
+    const Vec3 kCorridorCol{0.55f, 0.55f, 0.75f};
+    const Vec3 kLosVis{0.35f, 0.85f, 0.45f};
+    const Vec3 kLosOcc{0.55f, 0.22f, 0.20f};
+    for (int ai_i = 0; ai_i < kAgents; ++ai_i) {
+        const ai::AiAgent& a = scene.agents[(size_t)ai_i];
+        int avx, avz; ai::AiWorldToVoxel(scene.nav, a.pos, avx, avz);
+        int apx, apy; voxCenterPx(avx, avz, apx, apy);
+        for (size_t k = 0; k + 1 < a.corridor.size(); ++k) {
+            const uint32_t p0 = a.corridor[k], p1 = a.corridor[k + 1];
+            if (p0 >= scene.nav.polys.size() || p1 >= scene.nav.polys.size()) continue;
+            int x0, y0, x1, y1;
+            voxCenterPx(scene.nav.cx[p0], scene.nav.cz[p0], x0, y0);
+            voxCenterPx(scene.nav.cx[p1], scene.nav.cz[p1], x1, y1);
+            drawLine(x0, y0, x1, y1, kCorridorCol);
+        }
+        const bool sees = (a.bb.Get(ai::kBbCanSeeTarget) != 0);
+        drawLine(apx, apy, plpx, plpy, sees ? kLosVis : kLosOcc);
+        disc(apx, apy, 6, (a.state == ai::kAgentChase) ? kChaseCol : kPatrolCol);
+    }
+    thickCross(plpx, plpy, 8, Vec3{0.95f, 0.25f, 0.85f});
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — ai4 NPC agent top-down (%d agents, %d ticks, %d blockers)\n",
+                outPath, imgW, imgH, kAgents, kTicks, kBlockers);
+    return 0;
+}
+
 // ===== Slice VD1 — Deterministic Gameplay / Netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS showcase
 // (--vd1-world) (the BEACHHEAD of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO
 // new RHI; the verdict.h entity world + command bus is header-only integer math, so on Metal it runs the IDENTICAL
@@ -63480,6 +63670,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ai3-los") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ai3_los.png";
             try { return RunAi3LosShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ai4-agent <out.png>: render the Deterministic AI THE NPC AGENT IN THE GAMEPLAY TICK showcase
+        // (Slice AI4, the 4th slice of the DETERMINISTIC AI flagship #28). PURE CPU — runs the IDENTICAL
+        // ai.h canonical scene + StepAiWorld sequence (perceive AI3 -> decide AI1 -> query AI2 -> path nav
+        // A* -> act) the Vulkan --ai4-agent-shot runs -> the converged agent world is bit-identical
+        // cross-backend BY CONSTRUCTION; the 4 proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--ai4-agent") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ai4_agent.png";
+            try { return RunAi4AgentShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vd2-tick <out.png>: render the Deterministic Gameplay / Netcode SYSTEM SCHEDULE + GAMEPLAY TICK

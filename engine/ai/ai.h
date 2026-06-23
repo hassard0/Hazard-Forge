@@ -801,5 +801,301 @@ inline Ai3Scene BuildAi3Scene() {
     return s;
 }
 
+// =====================================================================================================
+// Slice AI4 — THE NPC AGENT IN THE GAMEPLAY TICK (sense -> decide -> query -> path -> act).
+// =====================================================================================================
+// AI1 (decision tree) + AI2 (environment queries) + AI3 (line-of-sight) above are BYTE-FROZEN —
+// everything below is APPEND-ONLY. AI4 COMPOSES the three frozen primitives + the frozen navmesh A*
+// into a working NPC: one deterministic per-agent update, run for every agent in a FIXED array order,
+// that (1) PERCEIVES the player (AI3 LineOfSight + integer distance), (2) DECIDES patrol-vs-chase (the
+// AI1 TickTree on the perception blackboard), (3) QUERIES a destination cell (AI2 RunQuery over the
+// navmesh), (4) PATHS to it (nav::FindPath -> a poly corridor), and (5) ACTS by stepping its position
+// toward the next corridor centroid. The whole pass is PURE INTEGER (Q16.16 + the frozen integer
+// primitives) in a FIXED order, so two StepAiWorld sequences are byte-identical BY CONSTRUCTION, and
+// (like AI1-AI3) the cross-backend bar is strict 0.0000.
+//
+// THE order[]-KEYED CONTRACT: the agents are a parallel std::vector<AiAgent> updated STRICTLY in array
+// index order (the index IS the agent's pinned identity — the verdict order[] discipline). Each beat
+// mutates the agent in place with integer math; no float, no allocator-dependent container drives the
+// order, so every peer/platform re-derives the same agent states.
+//
+// COMPOSE, DON'T MODIFY: StepAiWorld runs StepAi (the AI pass) then steps the agent transforms — it
+// does NOT edit verdict::StepWorld (a parallel composition, the IK4/IK5 "don't edit the frozen step"
+// discipline). The agent IS conceptually a verdict entity (its pos is the gameplay Transform2D.pos);
+// AI4 keeps the AI state in the parallel AiAgent array keyed by index and steps the pos directly, so
+// the frozen verdict tick is untouched.
+
+// ----- AgentState: the NPC behaviour state (the AI1 tree's kStatePatrol/kStateChase, named for AI4) -----
+inline constexpr int kAgentPatrol = (int)kStatePatrol;   // 1 — patrol a ring point (player not visible/far)
+inline constexpr int kAgentChase  = (int)kStateChase;    // 2 — chase toward the player's last-seen cell
+
+// ----- The AI4 blackboard threshold + scene tuning (integer / Q16.16) ----------------------------------
+// The DECISION beat writes a Q16.16 "enemy proximity" score into kBbEnemyClose that the AI1 tree's
+// condLeaf tests against kEnemyThreshold (1.0). We map "player visible AND within kChaseRangeWorld WORLD
+// units" -> a proximity >= 1.0 (CHASE), else < 1.0 (PATROL). The proximity is a pure-integer function of
+// the visibility bit + the integer WORLD Manhattan distance (NO float, NO sqrt): visible && |dx|+|dz| <=
+// range -> kOne, else 0. World units (not voxels) so the threshold reads intuitively in the agent space.
+inline constexpr int32_t kChaseRangeWorld = 6;   // chase iff the player is within this many WORLD units (Manhattan)
+
+// The AI4 destination-query ring radius (Q16.16 WORLD units). Sized a few world units so a ring candidate
+// reaches a NEIGHBOURING nav poly (the navmesh polys are ~3-5 voxels = ~1 world unit apart at the scene's
+// navScale=4) -> RunQuery picks a destination poly DIFFERENT from the agent's own poly -> nav::FindPath
+// returns a real multi-poly corridor to steer along (a single-poly result would be a degenerate path).
+inline constexpr fpx::fx kAiRingRadius = (fpx::fx)(3 * (1 << fpx::kFrac));   // 3.0 world units in Q16.16
+
+// ----- AiAgent: the per-agent AI state (a parallel-array entry, index == the pinned agent identity) -----
+// pos is the agent's Q16.16 world position (the gameplay Transform2D.pos); bb is its perception/decision
+// blackboard; treeIndex selects the decision tree (all agents share the canonical BuildAi1Tree in the
+// AI4 scene, but the field keeps the door open for per-agent trees); state is the last decided
+// AgentState; navCell{X,Z} is the agent's current integer nav cell; navTarget is the chosen destination
+// poly id; corridor + corridorStep are the FindPath corridor and the index of the next centroid to steer
+// toward. All integer; the whole struct is a deterministic function of the inputs.
+struct AiAgent {
+    int          treeIndex = 0;                 // which decision tree (index into a tree table; 0 = canonical)
+    Blackboard   bb{};                          // the perception/decision blackboard (AI1/AI3 keys)
+    fpx::FxVec3  pos{};                          // Q16.16 world position (the agent's Transform2D.pos)
+    int          state = kAgentPatrol;          // the last decided AgentState (kAgentPatrol / kAgentChase)
+    int32_t      navCellX = 0, navCellZ = 0;    // the agent's current integer nav voxel cell
+    uint32_t     navPoly  = nav::kNoCameFrom;   // the agent's current nav poly id (nearest centroid)
+    int          navTarget = -1;                // the chosen destination poly id (-1 = none)
+    uint32_t     patrolPoly = nav::kNoCameFrom; // the fixed PATROL objective poly (a reachable far poly in the agent's component)
+    int32_t      destWorldX = 0, destWorldZ = 0;// the destination steer point in Q16.16 world (next centroid)
+    std::vector<uint32_t> corridor{};           // the FindPath corridor (poly-id sequence), empty if none
+    int          corridorStep = 0;              // index of the next corridor poly to steer toward
+};
+
+// ----- voxelToWorld / worldToVoxel for the agent (the AI2 NavScene mapping, integer) -------------------
+// The navmesh centroids are integer voxel units; the agent world coords are Q16.16. The AI2 BuildAi2Scene
+// used voxel/navScale -> world. AI4 reuses that SAME mapping so the agents live in the navmesh's space.
+inline fpx::fx AiVoxelToWorld(const NavScene& scene, int32_t v) {
+    // voxel -> world units (v / navScale) -> Q16.16 (<< kFrac). Integer (truncating); the AI2 convention.
+    return (fpx::fx)(((int64_t)v / (int64_t)scene.navScale) << fpx::kFrac);
+}
+inline void AiWorldToVoxel(const NavScene& scene, const fpx::FxVec3& w, int32_t& vx, int32_t& vz) {
+    vx = (w.x >> fpx::kFrac) * scene.navScale;
+    vz = (w.z >> fpx::kFrac) * scene.navScale;
+}
+
+// ----- AiAgentStep: the agent's per-tick integer move toward its current steer point (Q16.16) ----------
+// The ACT beat. The agent moves a fixed Q16.16 step toward (destWorldX, destWorldZ); the move is clamped
+// so it never overshoots the steer point (integer min of the remaining delta and the step). Pure integer:
+// the per-axis signed delta, its magnitude clamped to kStepLen, applied to pos. NO float, NO sqrt — an
+// axis-independent (Manhattan-style) move so the whole act is integer + deterministic (a Euclidean
+// normalize would need a divide; the axis-clamped move is exact + bit-stable).
+inline constexpr fpx::fx kAgentStepLen = kOne / 4;   // 0.25 world units / tick (Q16.16)
+
+inline void AiAgentMoveToward(AiAgent& a, int32_t destX, int32_t destZ, fpx::fx stepLen) {
+    auto moveAxis = [stepLen](fpx::fx cur, fpx::fx dst) -> fpx::fx {
+        const int64_t delta = (int64_t)dst - (int64_t)cur;
+        if (delta == 0) return cur;
+        const int64_t mag = delta < 0 ? -delta : delta;
+        const int64_t step = mag < (int64_t)stepLen ? mag : (int64_t)stepLen;   // never overshoot
+        return (fpx::fx)(cur + (delta < 0 ? -step : step));
+    };
+    a.pos.x = moveAxis(a.pos.x, destX);
+    a.pos.z = moveAxis(a.pos.z, destZ);
+}
+
+// ----- StepAi(agents, scene, blockers, count, playerPos): the FIVE-BEAT per-agent pass, FIXED order ----
+// For each agent in array index order: PERCEIVE (LineOfSight to the player + integer cell distance ->
+// the blackboard) -> DECIDE (TickTree on the canonical AI1 tree -> kBbState = PATROL/CHASE) -> QUERY
+// (RunQuery a ring around the agent toward the player's last-seen cell [chase] or a fixed patrol anchor
+// [patrol] -> a destination poly) -> PATH (nav::FindPath agent poly -> destination poly -> corridor) ->
+// (the ACT beat sets the next steer point; the move itself is StepAiWorld so the perceive/decide all run
+// BEFORE any agent moves — a fixed read-then-write order). PURE INTEGER, deterministic. `trees` is the
+// per-treeIndex decision-tree table (the AI4 scene passes {BuildAi1Tree()}).
+inline void StepAi(std::vector<AiAgent>& agents, const NavScene& scene,
+                   const AiBlocker* blockers, int blockerCount,
+                   const fpx::FxVec3& playerPos, const std::vector<DecisionTree>& trees) {
+    // The player's nav cell (integer voxel) — the chase target + the last-seen cell.
+    int32_t playerVx = 0, playerVz = 0;
+    AiWorldToVoxel(scene, playerPos, playerVx, playerVz);
+
+    for (size_t i = 0; i < agents.size(); ++i) {
+        AiAgent& a = agents[i];
+
+        // --- (1) PERCEIVE: LineOfSight(agent, player) + the integer WORLD distance -> the blackboard ---
+        const bool canSee = LineOfSight(a.pos, playerPos, blockers, blockerCount);
+        AiWorldToVoxel(scene, a.pos, a.navCellX, a.navCellZ);
+        // WritePerception: canSeeTarget + (when visible) the player's last-seen cell (a memory, AI3).
+        WritePerception(a.bb, canSee, playerVx, playerVz);
+        // The "enemy proximity" the AI1 condLeaf tests: visible AND within chase range -> 1.0, else 0.
+        // The chase test is a WORLD-space Manhattan distance (|dx|+|dz|), pure integer (NO sqrt).
+        const int64_t wdx = (int64_t)playerPos.x - (int64_t)a.pos.x;
+        const int64_t wdz = (int64_t)playerPos.z - (int64_t)a.pos.z;
+        const int64_t worldDist = (wdx < 0 ? -wdx : wdx) + (wdz < 0 ? -wdz : wdz);
+        const int64_t chaseRange = (int64_t)kChaseRangeWorld << fpx::kFrac;   // world units -> Q16.16
+        const int32_t proximity = (canSee && worldDist <= chaseRange) ? kEnemyThreshold : 0;
+        a.bb.Set(kBbEnemyClose, proximity);
+
+        // --- (2) DECIDE: the frozen AI1 TickTree -> kBbState (CHASE if proximity >= 1.0, else PATROL) ---
+        const DecisionTree& tree = trees[(size_t)((a.treeIndex >= 0 && a.treeIndex < (int)trees.size())
+                                                  ? a.treeIndex : 0)];
+        TickTree(tree, a.bb);
+        a.state = (int)a.bb.Get(kBbState);
+
+        // --- (3) QUERY: a ring around the agent; the scoring target = chase (player last-seen) or -------
+        //     patrol (a fixed ring anchor offset from the agent). RunQuery picks the closest reachable.
+        a.navPoly = PolyOfPoint(scene, a.navCellX, a.navCellZ);
+        EqsQuery q;
+        q.anchor  = a.pos;
+        q.radius  = kAiRingRadius;        // the AI4 ring radius (a few world units so candidates reach
+                                          // neighbouring polys -> a real multi-poly corridor)
+        q.count   = kRingDirCount;
+        q.agentVx = a.navCellX;
+        q.agentVz = a.navCellZ;
+        if (a.state == kAgentChase) {
+            // Chase: steer toward the player's LAST-SEEN cell (the AI3 memory in the blackboard).
+            const int32_t lx = a.bb.Get(kBbLastSeenCellX);
+            const int32_t lz = a.bb.Get(kBbLastSeenCellZ);
+            q.target.x = AiVoxelToWorld(scene, lx); q.target.y = 0;
+            q.target.z = AiVoxelToWorld(scene, lz);
+        } else {
+            // Patrol: steer toward the agent's FIXED patrol objective poly (a reachable far poly in its
+            // own component — set at scene build). A deterministic ring objective that yields a real path.
+            const uint32_t pp = (a.patrolPoly != nav::kNoCameFrom &&
+                                 a.patrolPoly < (uint32_t)scene.polys.size())
+                                ? a.patrolPoly : a.navPoly;
+            if (pp != nav::kNoCameFrom && pp < (uint32_t)scene.polys.size()) {
+                q.target.x = AiVoxelToWorld(scene, scene.cx[pp]); q.target.y = 0;
+                q.target.z = AiVoxelToWorld(scene, scene.cz[pp]);
+            } else {
+                q.target = a.pos;   // no objective -> degenerate (hold position)
+            }
+        }
+        const EqsResult r = RunQuery(q, scene);
+        // Map the chosen ring candidate -> its nav poly = the destination poly.
+        if (r.bestIndex >= 0) {
+            const std::vector<fpx::FxVec3> cands = GenerateRing(q.anchor, q.radius, q.count);
+            const fpx::FxVec3& dst = cands[(size_t)r.bestIndex];
+            int32_t dvx, dvz; AiWorldToVoxel(scene, dst, dvx, dvz);
+            a.navTarget = (int)PolyOfPoint(scene, dvx, dvz);
+        } else {
+            a.navTarget = (int)a.navPoly;
+        }
+
+        // --- (4) PATH: nav::FindPath agent poly -> destination poly -> the corridor --------------------
+        a.corridor.clear();
+        a.corridorStep = 0;
+        if (a.navPoly != nav::kNoCameFrom && a.navTarget >= 0) {
+            nav::FindPath(scene.polys, scene.cx, scene.cz, a.navPoly, (uint32_t)a.navTarget, a.corridor);
+        }
+
+        // --- (5) ACT (set the steer point): the next corridor centroid (or the destination directly) ---
+        // The MOVE itself happens in StepAiWorld AFTER every agent has perceived/decided (read-then-write).
+        if (a.corridor.size() >= 2) {
+            // Steer toward the SECOND corridor poly's centroid (the next waypoint, not the current cell).
+            const uint32_t nextPoly = a.corridor[1];
+            a.corridorStep = 1;
+            a.destWorldX = AiVoxelToWorld(scene, scene.cx[nextPoly]);
+            a.destWorldZ = AiVoxelToWorld(scene, scene.cz[nextPoly]);
+        } else if (a.state == kAgentChase) {
+            // No corridor (already at the goal poly / single-poly path): steer straight toward the player.
+            a.destWorldX = playerPos.x;
+            a.destWorldZ = playerPos.z;
+        } else {
+            // Patrol with no corridor: hold position (steer to self -> a zero move).
+            a.destWorldX = a.pos.x;
+            a.destWorldZ = a.pos.z;
+        }
+    }
+}
+
+// ----- StepAiWorld(agents, scene, blockers, count, playerPos, trees): the parallel composition wrapper --
+// Runs the AI pass (StepAi — perceive/decide/query/path/act, all agents in FIXED order) THEN steps every
+// agent's transform toward its chosen steer point (a second FIXED-order pass — read-then-write so the
+// perception is over the PRE-move positions). Does NOT touch verdict::StepWorld. Pure integer; two
+// StepAiWorld sequences over the same inputs are byte-identical BY CONSTRUCTION.
+inline void StepAiWorld(std::vector<AiAgent>& agents, const NavScene& scene,
+                        const AiBlocker* blockers, int blockerCount,
+                        const fpx::FxVec3& playerPos, const std::vector<DecisionTree>& trees) {
+    StepAi(agents, scene, blockers, blockerCount, playerPos, trees);
+    // ACT (move): step each agent toward its steer point, in FIXED array order.
+    for (size_t i = 0; i < agents.size(); ++i) {
+        AiAgent& a = agents[i];
+        AiAgentMoveToward(a, a.destWorldX, a.destWorldZ, kAgentStepLen);
+    }
+}
+
+// ----- DigestAgents(agents): FNV-1a over each agent's pos/state/nav/corridor in FIXED order -------------
+// The AI4 proof currency: folds, for each agent in array index order, its pos (x,y,z), state, navTarget,
+// corridorStep, and the corridor poly ids — all LSB-first, the DigestBlackboard byte order. Two equal
+// agent arrays hash IDENTICALLY; any changed agent field changes the digest. Mirrors verdict.h's FNV
+// constants. Pure integer.
+inline uint64_t DigestAgents(const std::vector<AiAgent>& agents) {
+    uint64_t h = 1469598103934665603ull;            // the FNV-1a 64-bit offset basis
+    auto fold32 = [&h](uint32_t v) {
+        for (int b = 0; b < 4; ++b) { h ^= (uint64_t)(uint8_t)(v >> (b * 8)); h *= 1099511628211ull; }
+    };
+    for (size_t i = 0; i < agents.size(); ++i) {
+        const AiAgent& a = agents[i];
+        fold32((uint32_t)a.pos.x);
+        fold32((uint32_t)a.pos.y);
+        fold32((uint32_t)a.pos.z);
+        fold32((uint32_t)a.state);
+        fold32((uint32_t)a.navTarget);
+        fold32((uint32_t)a.corridorStep);
+        fold32((uint32_t)a.corridor.size());
+        for (size_t k = 0; k < a.corridor.size(); ++k) fold32((uint32_t)a.corridor[k]);
+    }
+    return h;
+}
+
+// ----- Ai4Scene: the canonical AI4 scenario (the navmesh + N agents + a player + the blockers) ---------
+// Bundles the AI2 NavScene + a fixed set of agents (placed at deterministic poly centroids in the
+// largest component) + a movable player + a set of AiBlocker occluders (so an agent's LOS to the player
+// can be toggled by the blocker — the falsifiable perception->decision beat) + the decision-tree table.
+struct Ai4Scene {
+    NavScene                  nav;          // the canonical navmesh (BuildNavScene)
+    std::vector<AiAgent>      agents;       // the NPC agents (parallel array, index == identity)
+    fpx::FxVec3               player{};     // the player position (Q16.16 world) — the perception target
+    std::vector<AiBlocker>    blockers;     // the LOS occluders (can hide the player from an agent)
+    std::vector<DecisionTree> trees;        // the per-treeIndex decision-tree table (0 = BuildAi1Tree)
+};
+
+// ----- BuildAi4Scene(): the navmesh + agents + player + blockers ---------------------------------------
+// Builds the canonical navmesh, places the player at the largest component's GOAL poly centroid, the
+// agents at deterministic poly centroids in that component (the START poly + a couple of others), and a
+// blocker between an agent and the player so toggling it flips that agent CHASE<->PATROL. All integer;
+// deterministic by construction. (The blocker corners are EXACT integer world units in the agents'
+// world space so the LOS slab test hits clean cases.)
+inline Ai4Scene BuildAi4Scene() {
+    Ai4Scene s;
+    s.nav = BuildNavScene();
+    s.trees.push_back(BuildAi1Tree());
+
+    // The player at the largest component's GOAL poly centroid; agents seeded around the START poly.
+    uint32_t startPoly = 0u, goalPoly = 0u;
+    nav::SelectStartGoal(s.nav.polys, s.nav.cx, s.nav.cz, startPoly, goalPoly);
+
+    auto polyWorld = [&](uint32_t p, fpx::FxVec3& out) {
+        out.x = AiVoxelToWorld(s.nav, s.nav.cx[p]); out.y = 0;
+        out.z = AiVoxelToWorld(s.nav, s.nav.cz[p]);
+    };
+    polyWorld(goalPoly, s.player);
+
+    // Place up to 3 agents at distinct polys in the largest component (start + the next two by id).
+    const uint32_t comp = s.nav.comp.empty() ? 0u : s.nav.comp[startPoly];
+    std::vector<uint32_t> seedPolys;
+    seedPolys.push_back(startPoly);
+    for (uint32_t p = 0; p < (uint32_t)s.nav.polys.size() && seedPolys.size() < 3; ++p) {
+        if (p == startPoly || p == goalPoly) continue;
+        if (!s.nav.comp.empty() && s.nav.comp[p] != comp) continue;
+        seedPolys.push_back(p);
+    }
+    // The fixed PATROL objective = the component's GOAL poly (a reachable far poly) — so a patrolling
+    // agent paths along a real corridor (NOT toward an unreachable other-component poly).
+    for (uint32_t sp : seedPolys) {
+        AiAgent a;
+        a.treeIndex = 0;
+        polyWorld(sp, a.pos);
+        a.state = kAgentPatrol;
+        a.patrolPoly = (sp == goalPoly) ? startPoly : goalPoly;   // patrol toward the far end of the component
+        s.agents.push_back(a);
+    }
+
+    return s;
+}
+
 }  // namespace ai
 }  // namespace hf
