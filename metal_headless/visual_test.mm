@@ -52107,6 +52107,308 @@ static int RunCgfRenderShowcase(const char* outPath) {
 }
 
 // --- Deterministic GPU Granular/Sand LIT 3D RENDER CAPSTONE showcase (Slice GR6, the money-shot COMPLETING
+// --- Deterministic GPU Particles LIT 3D RENDER CAPSTONE showcase (Slice PT6, the money-shot COMPLETING
+// FLAGSHIP #19). Mirrors the Vulkan --pt6-render-shot path EXACTLY: runs the bit-exact PT1-PT5 particle sim (a
+// spark FOUNTAIN — the SAME emitter + VORTEX force field + gravity + ground + static sphere, host-side
+// StepParticlesN — pure integer / byte-identical cross-backend) to a representative STEADY tick, builds one per-
+// instance model matrix per ALIVE particle (particles.h::ParticleToRenderInstances — the ONE float divide
+// pos/(float)kOne + particle-radius scale, render-only, dead slots skipped), and renders the fountain as lit 3D
+// INSTANCED spheres through the EXISTING instanced lit pipeline (lit_instanced.vert.gen.metal +
+// lit.frag.gen.metal — the --grain-render/--fpx-render wiring) over the ground + sky + shadow. THE SCENE/RECIPE
+// BELOW IS IDENTICAL to the Vulkan --pt6-render-shot so the POOL is byte-identical by construction (the float
+// render then differs cross-vendor by the documented baseline). The FLOAT visresolve-bar: Metal-render==Metal-
+// golden DIFF 0.0000 (determinism, two-run) + provenance (every instance transform IS the bit-exact
+// FxParticle::pos). New golden tests/golden/metal/pt6_render.png. NO new shader, NO RHI.
+static int RunPt6RenderShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace pt = hf::sim::particles;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === The bit-exact PT1-PT5 spark-fountain sim -> a steady fountain in flight (the SAME particles.h scene +
+    // recipe as the Vulkan --pt6-render-shot — byte-identical pool/transforms by construction). An emitter
+    // spraying upward, a VORTEX field swirling the plume, gravity, a ground plane, and a static sphere. ===
+    const pt::fx kGravY = (pt::fx)(-9.8 * (double)pt::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const pt::fx kDt       = pt::kOne / 60;
+    const pt::fx kDragK    = pt::kOne / 64;
+    const pt::fx kGroundY  = 0;
+    const pt::fx kRadius   = pt::kParticleRadius;
+    const pt::fx kRestit   = pt::kParticleRestitution;
+    const pt::FxVec3 kGravity{0, kGravY, 0};
+    const uint32_t kCapacity = 4096;
+
+    pt::EmitterConfig cfg{};
+    cfg.origin      = pt::FxVec3{0, pt::kOne / 4, 0};
+    cfg.ratePerTick = (pt::fx)8;
+    cfg.lifetime    = pt::kOne * 5 / 2;
+    cfg.speed       = pt::kOne * 12;
+    cfg.emitterId   = 1u;
+
+    pt::ForceField vortex{};
+    vortex.kind     = pt::kFieldVortex;
+    vortex.center   = pt::FxVec3{0, 0, 0};
+    vortex.axis     = pt::FxVec3{0, pt::kOne, 0};
+    vortex.strength = pt::kOne * 6;
+    vortex.radius   = pt::kOne * 8;
+    const pt::ForceField fields[1] = {vortex};
+    const uint32_t kFieldCount = 1;
+
+    pt::ParticleSphereCollider sphere0{};
+    sphere0.center = pt::FxVec3{pt::kOne * 3, pt::kOne * 3 / 2, 0};
+    sphere0.radius = pt::kOne * 3 / 2;
+    const pt::ParticleSphereCollider spheres[1] = {sphere0};
+    const uint32_t kSphereCount = 1;
+
+    const int kSteps = 90;
+
+    pt::ParticlePool pool = pt::InitParticlePool(kCapacity);
+    pt::StepParticlesN(pool, cfg, fields, kFieldCount, kGravity, kDragK, kDt, kGroundY, kRadius, kRestit,
+                       spheres, kSphereCount, kSteps);
+    const uint32_t kAliveCount = pt::CountAlive(pool);
+
+    const float kParticleRenderRadius = pt::ParticleToFloat(kRadius);
+    const std::vector<Mat4> mats = pt::ParticleToRenderInstances(pool, kParticleRenderRadius);
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(mats.size());
+    for (const Mat4& m : mats) {
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        instances.push_back(inst);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+    // === Reuse the EXISTING instanced lit pipeline (the --grain-render/--fpx-render wiring). ===
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = device->Swapchain().ColorFormat();
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    std::unique_ptr<rhi::IBuffer> instanceBuffer;
+    if (kInstanceCount > 0) {
+        rhi::BufferDesc instBufDesc;
+        instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+        instBufDesc.initialData = instances.data();
+        instBufDesc.usage = rhi::BufferUsage::Vertex;
+        instanceBuffer = device->CreateBuffer(instBufDesc);
+    }
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+    // Fixed 3/4 camera + directional light (== the Vulkan --pt6-render-shot camera).
+    const Vec3 eye{13.0f, 9.0f, 13.0f};
+    const Vec3 center{1.0f, 3.5f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{1.0f, 3.0f, 0.0f};
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 22.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-16.0f, 16.0f, -16.0f, 16.0f, 1.0f, 52.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instShadowPipeline);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instPipeline);
+                float material[4] = {1.0f, 0.55f, 0.15f, 0.0f};   // a warm SPARK-colored particle material
+                cmd.PushConstants(material, sizeof(material));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    // PROOF (1) provenance + stats. "shaded" = non-dark pixels (the lit ground + fountain).
+    uint32_t shaded = 0;
+    for (size_t p = 0; p + 3 < bgra.size(); p += 4)
+        if ((int)bgra[p] + (int)bgra[p + 1] + (int)bgra[p + 2] > 60) ++shaded;
+    std::printf("pt6-render: {particles:%u, instances:%u, shaded:%u} (deterministic particles -> lit 3D render)\n",
+                kAliveCount, kInstanceCount, shaded);
+    if (kInstanceCount != kAliveCount) return fail("pt6-render instances != alive");
+
+    // PROOF (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("pt6-render two renders DIFFER (nondeterministic)");
+    std::printf("pt6-render determinism: two renders BYTE-IDENTICAL\n");
+
+    // PROOF (3) coverage / coherence + provenance: shaded>0, not uniform, instances == recomputed.
+    if (shaded == 0) return fail("pt6-render coverage 0 (nothing shaded)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("pt6-render uniform image (no coherent fountain)");
+    {
+        const std::vector<Mat4> rebuild = pt::ParticleToRenderInstances(pool, kParticleRenderRadius);
+        if (rebuild.size() != mats.size() ||
+            std::memcmp(rebuild.data(), mats.data(), mats.size() * sizeof(Mat4)) != 0)
+            return fail("pt6-render provenance: instances != recomputed ParticleToRenderInstances");
+    }
+    std::printf("pt6-render coverage: %u shaded (coherent lit fountain), provenance instances == "
+                "ParticleToRenderInstances\n", shaded);
+
+    // PROOF (4) empty no-op: an empty pool -> zero instances -> the cleared base scene.
+    {
+        pt::ParticlePool emptyPool = pt::InitParticlePool(kCapacity);
+        if (!pt::ParticleToRenderInstances(emptyPool, kParticleRenderRadius).empty())
+            return fail("pt6-render empty pool not empty");
+    }
+    std::printf("pt6-render empty: base scene (no-op)  (zero alive -> cleared ground/sky, no instances)\n");
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — deterministic particle spark fountain lit 3D render (%u alive)\n",
+                outPath, cw, ch, kAliveCount);
+    return 0;
+}
+
+// --- Deterministic GPU Granular/Sand LIT 3D RENDER CAPSTONE showcase (Slice GR6, the money-shot COMPLETING
 // FLAGSHIP #10 — the TENTH flagship). Mirrors the Vulkan --grain-render-shot path EXACTLY: runs the bit-exact
 // GR1-GR5 friction sim (the SAME tall/narrow 4x8x4 staggered column dropped onto FLAT ground, NO container,
 // host-side StepGrainFrictionSteps — pure integer) to a settled ANGLE-OF-REPOSE CONE, builds one per-instance
@@ -65152,6 +65454,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--grain-render") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_grain_render.png";
             try { return RunGrainRenderShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pt6-render <out.png>: render the Deterministic GPU Particles LIT 3D RENDER capstone showcase (Slice
+        // PT6, the money-shot COMPLETING FLAGSHIP #19). Runs the bit-exact PT1-PT5 spark-fountain sim (the SAME
+        // emitter + vortex field + gravity + ground + sphere scene as the Vulkan --pt6-render-shot, host-side
+        // StepParticlesN — pure integer) to a steady tick, builds one model matrix per ALIVE particle
+        // (ParticleToRenderInstances), and renders the fountain as lit 3D instanced spheres through the EXISTING
+        // instanced lit pipeline (the --grain-render/--fpx-render wiring) over the ground/sky/shadow. The pool +
+        // transforms are byte-identical to the Vulkan --pt6-render-shot by construction. FLOAT visresolve-bar:
+        // Metal-render==Metal-golden DIFF 0.0000 + provenance; cross-vendor ~the float baseline. New golden
+        // tests/golden/metal/pt6_render.png. NO new shader, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--pt6-render") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pt6_render.png";
+            try { return RunPt6RenderShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --couple-render <out.png>: render the Deterministic Rigid<->Fluid Coupling LIT 3D RENDER capstone

@@ -804,5 +804,56 @@ inline ParticleSnapshot RunParticleRollback(const ParticleSnapshot& init,
     return SnapshotParticles(pool, cfg);
 }
 
+// ===== Slice PT6 — Lit 3D render capstone (the FLOAT money-shot, COMPLETES flagship #19) =================
+// APPEND-ONLY: everything above (PT1 + PT2 + PT3 + PT4 + PT5) is BYTE-FROZEN. PT6 turns the bit-exact particle
+// pool into a lit 3D INSTANCED-sphere render — a deterministic spark FOUNTAIN. These helpers are the ONLY float
+// in particles.h and are STRICTLY RENDER-ONLY: they READ the pool's bit-exact integer pos (never mutate it),
+// so the sim path above stays pure integer. They mirror grain.h::GrainToFloat / GrainVertToWorld /
+// GrainParticleTransform / GrainToRenderInstances (grain.h:991-1021) VERBATIM over an FxParticle instead of a
+// GrainParticle. The provenance: every render transform IS a bit-exact FxParticle::pos (the settled output of
+// the bit-exact StepParticlesN). A particle sphere is rotation-invariant, so the transform is translate * scale
+// (NO rotation — the GR6 grain / FL6 droplet case, NOT the FPX6 rigid-body orient). NO new shader, NO new RHI —
+// the caller feeds the output into the EXISTING instanced lit-sphere pipeline (lit_instanced.vert + lit.frag +
+// scene::InstanceTransformLayout). THE GATE IS A FLOAT visresolve-bar (UNLIKE PT1-PT5): the SIM/pool is bit-
+// exact + byte-identical cross-backend, but the final raster/shade is float -> the rendered image is NOT bit-
+// identical Vulkan-vs-Metal. The gate is Metal two-run BYTE-IDENTICAL + provenance + a documented cross-vendor
+// mean (the GR6/FPX6 float baseline), NOT a strict-zero cross-backend pixel compare.
+
+// ParticleToFloat(v): the single host fixed-point->float conversion, v in Q16.16 -> float world units (the
+// grain::GrainToFloat twin; v / (float)kOne). The ONE place particle render touches float.
+inline float ParticleToFloat(fx v) { return (float)v / (float)kOne; }
+
+// ParticleVertToWorld(p): the float world position of a Q16.16 vector (pos.xyz / (float)kOne). The ONE host
+// float crossing the PT6 render uses — render-only; the bit-exact integer pos is untouched. The grain::
+// GrainVertToWorld twin.
+inline math::Vec3 ParticleVertToWorld(const FxVec3& p) {
+    return math::Vec3{ParticleToFloat(p.x), ParticleToFloat(p.y), ParticleToFloat(p.z)};
+}
+
+// ParticleTransform(p, radius): the render-only model matrix for ONE particle — a unit sphere TRANSLATED to the
+// particle's float world position (ParticleVertToWorld(p.pos)) and SCALED by the particle radius (a float world-
+// unit radius). translate(pos/kOne) * scale(radius) (no rotation — a spark sphere is rotation-invariant). Pure
+// deterministic host float (no RNG, no clock). The provenance: the transform IS the bit-exact FxParticle::pos.
+// The grain::GrainParticleTransform twin.
+inline math::Mat4 ParticleTransform(const FxParticle& p, float radius) {
+    const math::Vec3 t = ParticleVertToWorld(p.pos);
+    return math::Mat4::Translate(t) * math::Mat4::Scale(math::Vec3{radius, radius, radius});
+}
+
+// ParticleToRenderInstances(pool, radius): build ONE per-instance model matrix per ALIVE particle (dead/empty
+// slots SKIPPED — the alive-bit guard, so the instance set is exactly the live spark count). Output is a flat
+// std::vector<math::Mat4> (the caller copies each into a scene::InstanceData the EXISTING instanced lit pipeline
+// consumes). A PURE FUNCTION of the pool (two calls byte-equal — no RNG, no clock). Empty/all-dead pool -> empty
+// output (the empty no-op: zero instances -> the cleared base scene). Render-only, deterministic, NO sim
+// mutation. The grain::GrainToRenderInstances twin over the FxParticle pool (with the alive-bit guard).
+inline std::vector<math::Mat4> ParticleToRenderInstances(const ParticlePool& pool, float radius) {
+    std::vector<math::Mat4> out;
+    out.reserve(pool.particles.size());
+    for (const FxParticle& p : pool.particles)
+        if (p.flags & kFlagAlive)   // dead/empty slots skipped — exactly one transform per ALIVE particle
+            out.push_back(ParticleTransform(p, radius));
+    return out;
+}
+
 }  // namespace particles
 }  // namespace hf::sim

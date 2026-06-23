@@ -701,6 +701,78 @@ int main() {
         }
     }
 
+    // ================= PT6 ParticleToRenderInstances: provenance (count==alive, pure fn, dead skipped) ====
+    // The render helper turns the bit-exact pool into one float model matrix per ALIVE particle (dead/empty
+    // slots skipped), a PURE FUNCTION of the pool. The render-only float crossing — render-only, NO sim mutation.
+    {
+        const uint32_t cap = 256;
+        const fx grav_y = -(fx)(98 * kOne / 10);          // -9.8 (exact-ish; the sign/magnitude is irrelevant here)
+        const pt::FxVec3 grav{0, grav_y, 0};
+        const fx drag = kOne / 64, dt = kOne / 60, groundY = 0;
+        const fx radius = pt::kParticleRadius, e = pt::kParticleRestitution;
+        const float renderRadius = pt::ParticleToFloat(radius);
+
+        pt::EmitterConfig cfg;
+        cfg.origin = pt::FxVec3{0, kOne / 4, 0}; cfg.ratePerTick = (fx)8;
+        cfg.lifetime = kOne * 5 / 2; cfg.speed = kOne * 12; cfg.emitterId = 1u;
+
+        std::vector<pt::ForceField> fields(1);
+        fields[0].kind = pt::kFieldVortex; fields[0].center = pt::FxVec3{0, 0, 0};
+        fields[0].axis = pt::FxVec3{0, kOne, 0}; fields[0].strength = kOne * 6; fields[0].radius = kOne * 8;
+        const uint32_t fc = (uint32_t)fields.size();
+
+        std::vector<pt::ParticleSphereCollider> spheres(1);
+        spheres[0].center = pt::FxVec3{kOne * 3, kOne * 3 / 2, 0}; spheres[0].radius = kOne * 3 / 2;
+        const uint32_t sc = (uint32_t)spheres.size();
+
+        pt::ParticlePool pool = pt::InitParticlePool(cap);
+        pt::StepParticlesN(pool, cfg, fields.data(), fc, grav, drag, dt, groundY, radius, e,
+                           spheres.data(), sc, 60);
+        const uint32_t alive = pt::CountAlive(pool);
+        check(alive > 0, "PT6 ParticleToRenderInstances: the test pool has alive particles (non-degenerate)");
+
+        // (1) instance count == alive count (one transform per ALIVE particle, dead/empty slots skipped).
+        const std::vector<math::Mat4> mats = pt::ParticleToRenderInstances(pool, renderRadius);
+        check((uint32_t)mats.size() == alive,
+              "PT6 ParticleToRenderInstances: instance count == alive count (dead/empty slots skipped)");
+
+        // (2) PURE FUNCTION: two calls byte-equal (no RNG, no clock, no sim mutation).
+        const std::vector<math::Mat4> mats2 = pt::ParticleToRenderInstances(pool, renderRadius);
+        check(mats.size() == mats2.size() &&
+              std::memcmp(mats.data(), mats2.data(), mats.size() * sizeof(math::Mat4)) == 0,
+              "PT6 ParticleToRenderInstances: two calls BYTE-IDENTICAL (pure function of the pool)");
+
+        // (2b) the call did not mutate the pool (render-only — the sim path stays bit-exact).
+        {
+            pt::ParticlePool poolCopy = pool;
+            (void)pt::ParticleToRenderInstances(poolCopy, renderRadius);
+            check(pt::ParticleStatesEqual(pool, poolCopy),
+                  "PT6 ParticleToRenderInstances: render call does NOT mutate the pool (render-only)");
+        }
+
+        // (3) dead/empty slots skipped: an all-dead pool -> ZERO instances (the empty no-op).
+        {
+            pt::ParticlePool emptyPool = pt::InitParticlePool(cap);
+            check(pt::ParticleToRenderInstances(emptyPool, renderRadius).empty(),
+                  "PT6 ParticleToRenderInstances: empty (all-dead) pool -> zero instances (the empty no-op)");
+        }
+
+        // (3b) provenance: each transform's translation == ParticleVertToWorld of the corresponding ALIVE pos.
+        {
+            bool provOk = true;
+            size_t mi = 0;
+            for (const pt::FxParticle& p : pool.particles) {
+                if (!(p.flags & pt::kFlagAlive)) continue;
+                const math::Vec3 t = pt::ParticleVertToWorld(p.pos);
+                const math::Mat4& m = mats[mi++];
+                // column-major translate*scale: translation in m.m[12..14].
+                if (m.m[12] != t.x || m.m[13] != t.y || m.m[14] != t.z) { provOk = false; break; }
+            }
+            check(provOk && mi == mats.size(),
+                  "PT6 ParticleToRenderInstances: every transform's translation IS the bit-exact ParticleVertToWorld(pos)");
+        }
+    }
+
     if (g_fail == 0) std::printf("particles_test: ALL CHECKS PASSED\n");
     else std::printf("particles_test: %d CHECK(S) FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
