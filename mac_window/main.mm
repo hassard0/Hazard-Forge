@@ -60,6 +60,8 @@ struct FrameData {
     float camRight[4];
     float camUp[4];
     float skyParams[4];
+    float prevViewProj[16];    // TAA (Slice AP): view-proj reprojection (layout parity with visual_test)
+    float iblParams[4];        // x = env maxLod for the IBL pass (issue #33: dedicated, was skyParams.z)
 };
 
 static std::string LoadText(const std::string& path) {

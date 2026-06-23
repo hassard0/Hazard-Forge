@@ -157,7 +157,7 @@ static int fail(const std::string& msg) {
 // ---- Per-frame uniform block — must match shaders/frame_data.hlsli (the shared FrameData) and the
 // generated MSL byte-for-byte. Layout mirrors the Vulkan sample (samples/hello_triangle/main.cpp).
 // With HF_MAX_POINT_LIGHTS=8 (issue #3) the shader-visible block is 512 B; the trailing prevViewProj
-// brings this CPU struct to 576 B (< kFrameUboSize 1024). ----
+// + iblParams (issue #33) bring this CPU struct to 592 B (< kFrameUboSize 1024). ----
 struct FrameData {
     float vp[16];
     float lightDir[4];
@@ -173,6 +173,7 @@ struct FrameData {
     float camUp[4];
     float skyParams[4];
     float prevViewProj[16];    // TAA (Slice AP): previous frame's view-proj (layout parity; identity reprojection)
+    float iblParams[4];        // x = env maxLod for the IBL pass (issue #33: dedicated, was skyParams.z)
 };
 
 static std::string LoadText(const std::string& path) {
@@ -1516,7 +1517,7 @@ static int RunIblShowcase(const char* outPath) {
         fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
         fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
         fd.skyParams[1] = aspect;
-        fd.skyParams[2] = envMaxLod;   // env maxLod for the IBL fragment shader (Slice R)
+        fd.iblParams[0] = envMaxLod;   // env maxLod for the IBL fragment shader (Slice R)
     }
 
     render::RenderGraph graph;
@@ -1950,7 +1951,7 @@ static int RunCapstoneShowcase(const char* outPath, ScriptedCamera scripted = {}
         fd.camUp[0]=camUp.x; fd.camUp[1]=camUp.y; fd.camUp[2]=camUp.z;
         fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
         fd.skyParams[1] = aspect;
-        fd.skyParams[2] = envMaxLod;
+        fd.iblParams[0] = envMaxLod;
     }
 
     std::sort(glass.begin(), glass.end(), [&](const Glass& a, const Glass& b) {
@@ -2318,7 +2319,7 @@ static int RunBloomShowcase(const char* outPath) {
         fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
         fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
         fd.skyParams[1] = aspect;
-        fd.skyParams[2] = envMaxLod;
+        fd.iblParams[0] = envMaxLod;
     }
 
     const float kExposure = 1.7f;

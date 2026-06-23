@@ -26,8 +26,15 @@
 struct FrameData {
     float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
     float4 ptCount; float4 ptPos[HF_MAX_POINT_LIGHTS]; float4 ptColor[HF_MAX_POINT_LIGHTS]; float4x4 lightViewProj;
-    // skyParams: x=tanHalfFov, y=aspect, z=time(seconds), w=frameIndex (issue #5 time channel).
+    // skyParams: x=tanHalfFov, y=aspect, z=time(seconds), w=frameIndex (issue #5 time channel —
+    // now uncontested; the IBL maxLod that used to overload skyParams.z moved to iblParams.x below).
     float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
+    // prevViewProj: TAA reprojection matrix. The C++ FrameData carries it after skyParams (offset 512),
+    // so it is mirrored here byte-for-byte to keep iblParams at the SAME offset (576) on both sides —
+    // even though no frame_data.hlsli consumer reads it (motion_blur / taa_resolve roll their own).
+    // iblParams.x = env maxLod for the IBL pass (issue #33): a DEDICATED slot so HDR-IBL objects and an
+    // animated sky (which needs skyParams.z=time, issue #5) can coexist in one frame without colliding.
+    float4x4 prevViewProj; float4 iblParams;
 };
 
 #endif // HF_FRAME_DATA_HLSLI

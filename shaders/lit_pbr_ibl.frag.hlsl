@@ -161,7 +161,7 @@ float4 main(PSInput i) : SV_Target {
     // the mirror direction at a roughness-selected mip; diffuse irradiance is a very-blurred mip of
     // the env in the surface-normal direction. Replaces the procedural SkyColor() IBL. ---
     {
-        float maxLod = f.skyParams.z;   // = mipLevels - 1, passed per-frame for the IBL pass
+        float maxLod = f.iblParams.x;   // = mipLevels - 1 (issue #33: dedicated slot, was skyParams.z)
         float3 R = reflect(-V, N);
         float  NoV = max(dot(N, V), 0.0);
         float3 F   = F0 + (max((1.0 - roughness).xxx, F0) - F0) * pow(1.0 - NoV, 5.0);
