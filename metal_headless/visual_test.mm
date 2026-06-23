@@ -34933,6 +34933,176 @@ static int RunAi1TreeShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice AI2 — Deterministic AI ENVIRONMENT QUERIES — integer scoring over the navmesh showcase
+// (--ai2-query) (the 2nd slice of the DETERMINISTIC AI flagship #28, hf::ai). PURE CPU — NO GPU compute, NO
+// new shader, NO new RHI; the ai.h environment-query layer is header-only integer math over the FROZEN nav
+// navmesh, so on Metal it runs the IDENTICAL pure-CPU query the Vulkan --ai2-query-shot runs on Windows ->
+// the converged candidate-score viz is bit-identical cross-backend BY CONSTRUCTION (strict 0px). Builds the
+// SAME canonical navmesh (BuildNavScene) + agent + target (BuildAi2Scene), generates + scores the ring
+// candidates, runs RunQuery, asserts the 4 proofs (proof lines match the Vulkan side EXACTLY), and renders
+// the PURE-INTEGER 2D top-down query viz (navmesh poly outlines, candidates colored by integer score, the
+// best ringed, agent + target crossed). New golden tests/golden/metal/ai2_query.png (Mac-baked by the
+// controller); two runs DIFF 0.0000.
+static int RunAi2QueryShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace ai  = hf::ai;
+    namespace nav = hf::nav;
+
+    // Build the canonical navmesh + the canonical query (== the Vulkan --ai2-query-shot + the ai_query_test).
+    const ai::NavScene scene = ai::BuildNavScene();
+    const ai::EqsQuery query = ai::BuildAi2Scene(scene);
+    const int kCandidates = (int)ai::GenerateRing(query.anchor, query.radius, query.count).size();
+    const int kScorers    = ai::kQueryScorers;
+
+    // PROOF (1) the best candidate + its combined integer score.
+    const ai::EqsResult best = ai::RunQuery(query, scene);
+    std::printf("ai2-query: {candidates:%d, scorers:%d} best=%d score=%d (integer distance\xC2\xB2+reachability)\n",
+                kCandidates, kScorers, best.bestIndex, (int)best.bestScore);
+
+    // PROOF (2) reachability count.
+    const int kReachable = ai::CountReachable(query, scene);
+    std::printf("ai2-query reachability: %d/%d candidates nav-reachable (nav::FindPath finite cost)\n",
+                kReachable, kCandidates);
+
+    // PROOF (3) two-run determinism (best index + score byte-identical), incl. the tie-break.
+    const ai::EqsResult run2 = ai::RunQuery(query, scene);
+    if (best.bestIndex != run2.bestIndex || best.bestScore != run2.bestScore)
+        return fail("ai2-query: two runs differ (nondeterministic query)");
+    {
+        ai::NavScene emptyScene; emptyScene.navScale = 1;
+        emptyScene.nComp = nav::ConnectedComponents(emptyScene.polys, emptyScene.comp);
+        ai::EqsQuery tieQ = query; tieQ.radius = 0;
+        const ai::EqsResult tie = ai::RunQuery(tieQ, emptyScene);
+        if (tie.bestIndex != 0) return fail("ai2-query: tie-break did not resolve to the lowest index");
+    }
+    std::printf("ai2-query determinism: two RunQuery runs BYTE-IDENTICAL (tie-break lowest index)\n");
+
+    // PROOF (4) the cross-vendor declaration.
+    std::printf("ai2-query: strict cross-vendor 0.0000 expected at the bake (no float in generator or scorer)\n");
+
+    // --- The candidates + their scores (the rendered data; pure integer). ---
+    const std::vector<hf::sim::fpx::FxVec3> cands = ai::GenerateRing(query.anchor, query.radius, query.count);
+    std::vector<int32_t> candScore((size_t)kCandidates, 0);
+    std::vector<uint8_t> candReachable((size_t)kCandidates, 0u);
+    int32_t minScore = 0x7FFFFFFF, maxReachScore = 0;
+    for (int i = 0; i < kCandidates; ++i) {
+        candScore[(size_t)i] = ai::ScoreCandidate(cands[(size_t)i], query, scene);
+        candReachable[(size_t)i] =
+            (ai::ScoreNavReachable(cands[(size_t)i], query.agentVx, query.agentVz, scene) == 0) ? 1u : 0u;
+        if (candReachable[(size_t)i]) {
+            if (candScore[(size_t)i] < minScore) minScore = candScore[(size_t)i];
+            if (candScore[(size_t)i] > maxReachScore) maxReachScore = candScore[(size_t)i];
+        }
+    }
+    if (minScore == 0x7FFFFFFF) minScore = 0;
+
+    // --- 2D top-down render in VOXEL space (IDENTICAL to the Vulkan --ai2-query-shot). ---
+    const int kGrid = scene.hf.w;                  // 32
+    const int kPx = 18, kMargin = 24;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kGrid * kPx);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kGrid * kPx);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 18; bgra[pp * 4 + 1] = 16; bgra[pp * 4 + 2] = 14; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto voxelPx = [&](int32_t vx, int32_t vz, int& px, int& py) {
+        px = kMargin + (int)vx * kPx + kPx / 2;
+        py = kMargin + (int)vz * kPx + kPx / 2;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            putPx(x0, y0, col);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    auto fillDisc = [&](int cx, int cy, int r, const Vec3& col) {
+        for (int dy = -r; dy <= r; ++dy)
+            for (int dx = -r; dx <= r; ++dx)
+                if (dx * dx + dy * dy <= r * r) putPx(cx + dx, cy + dy, col);
+    };
+    auto ringCircle = [&](int cx, int cy, int r, const Vec3& col) {
+        int x = r, y = 0, err = 1 - r;
+        while (x >= y) {
+            putPx(cx + x, cy + y, col); putPx(cx + y, cy + x, col);
+            putPx(cx - y, cy + x, col); putPx(cx - x, cy + y, col);
+            putPx(cx - x, cy - y, col); putPx(cx - y, cy - x, col);
+            putPx(cx + y, cy - x, col); putPx(cx + x, cy - y, col);
+            ++y;
+            if (err < 0) err += 2 * y + 1;
+            else { --x; err += 2 * (y - x) + 1; }
+        }
+    };
+    auto thickCross = [&](int cx, int cy, int half, const Vec3& col) {
+        for (int o = -1; o <= 1; ++o) {
+            drawLine(cx - half, cy + o, cx + half, cy + o, col);
+            drawLine(cx + o, cy - half, cx + o, cy + half, col);
+        }
+    };
+
+    const Vec3 kMeshCol{0.30f, 0.34f, 0.40f};
+    for (size_t p = 0; p < scene.polys.size(); ++p) {
+        const uint32_t vb = scene.polyVertBase[p];
+        int vpx[3], vpy[3];
+        for (int k = 0; k < 3; ++k) {
+            const uint32_t vi = vb + scene.polys[p].idx[k];
+            const int32_t vx = scene.flatVerts[(size_t)vi * 2u];
+            const int32_t vz = scene.flatVerts[(size_t)vi * 2u + 1u];
+            voxelPx(vx, vz, vpx[k], vpy[k]);
+        }
+        for (int k = 0; k < 3; ++k)
+            drawLine(vpx[k], vpy[k], vpx[(k + 1) % 3], vpy[(k + 1) % 3], kMeshCol);
+    }
+
+    for (int i = 0; i < kCandidates; ++i) {
+        int32_t cvx, cvz; ai::WorldToVoxel(scene, cands[(size_t)i], cvx, cvz);
+        int px, py; voxelPx(cvx, cvz, px, py);
+        Vec3 col;
+        if (!candReachable[(size_t)i]) {
+            col = Vec3{0.45f, 0.10f, 0.10f};
+        } else {
+            const int32_t span = (maxReachScore > minScore) ? (maxReachScore - minScore) : 1;
+            int32_t t256 = (int32_t)(((int64_t)(candScore[(size_t)i] - minScore) * 256) / span);
+            if (t256 < 0) t256 = 0; if (t256 > 256) t256 = 256;
+            const int r8 = (int)((51 * 256 + (166 - 51) * t256) / 256);
+            const int g8 = (int)((217 * 256 + (102 - 217) * t256) / 256);
+            const int b8 = 64;
+            col = Vec3{(float)r8 / 255.0f, (float)g8 / 255.0f, (float)b8 / 255.0f};
+        }
+        fillDisc(px, py, 4, col);
+    }
+    if (best.bestIndex >= 0 && best.bestIndex < kCandidates) {
+        int32_t bvx, bvz; ai::WorldToVoxel(scene, cands[(size_t)best.bestIndex], bvx, bvz);
+        int px, py; voxelPx(bvx, bvz, px, py);
+        ringCircle(px, py, 7, Vec3{1.00f, 1.00f, 0.30f});
+    }
+    {
+        int apx, apy; voxelPx(query.agentVx, query.agentVz, apx, apy);
+        thickCross(apx, apy, 7, Vec3{0.20f, 0.85f, 0.95f});
+        int32_t tvx, tvz; ai::WorldToVoxel(scene, query.target, tvx, tvz);
+        int tpx, tpy; voxelPx(tvx, tvz, tpx, tpy);
+        thickCross(tpx, tpy, 7, Vec3{0.95f, 0.25f, 0.85f});
+    }
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — ai2 environment-query viz (%d candidates, %d reachable, best %d)\n",
+                outPath, imgW, imgH, kCandidates, kReachable, best.bestIndex);
+    return 0;
+}
+
 // ===== Slice VD1 — Deterministic Gameplay / Netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS showcase
 // (--vd1-world) (the BEACHHEAD of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO
 // new RHI; the verdict.h entity world + command bus is header-only integer math, so on Metal it runs the IDENTICAL
@@ -63145,6 +63315,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ai1-tree") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ai1_tree.png";
             try { return RunAi1TreeShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ai2-query <out.png>: render the Deterministic AI ENVIRONMENT QUERIES — integer scoring over the navmesh
+        // showcase (Slice AI2, the 2nd slice of the DETERMINISTIC AI flagship #28). PURE CPU — runs the IDENTICAL
+        // ai.h canonical navmesh + agent + target + ring query the Vulkan --ai2-query-shot runs -> the converged
+        // candidate-score viz is bit-identical cross-backend BY CONSTRUCTION; the 4 proof lines match the Vulkan
+        // side EXACTLY. NO shader added (ai.h is header-only; #includes nav/navmesh.h read-only).
+        if (argc > 1 && std::strcmp(argv[1], "--ai2-query") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ai2_query.png";
+            try { return RunAi2QueryShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vd2-tick <out.png>: render the Deterministic Gameplay / Netcode SYSTEM SCHEDULE + GAMEPLAY TICK

@@ -1045,6 +1045,15 @@ hf_add_pure_test(verdict_test)
 # (#includes game/verdict.h + sim/fpx.h read-only). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(ai_tree_test)
 
+# Deterministic AI Slice 2 (Slice AI2, the 2nd slice of FLAGSHIP #28): the integer ENVIRONMENT QUERY layer
+# (engine/ai/ai.h, APPEND-ONLY over AI1). Pins the candidate generator + the integer scorer chain (Q16.16
+# distance² via verdict::FxDist2 + nav-reachability via nav::ConnectedComponents/FindPath) + RunQuery
+# (lowest combined score, tie -> lowest candidate index): two-run determinism, the closest reachable
+# candidate wins, an unreachable nearest candidate is penalized + never chosen, a constructed tie resolves
+# to the lowest index, the generator is deterministic, and ScoreDistanceSq == a hand-computed FxDist2.
+# ai.h now #includes nav/navmesh.h read-only (FROZEN). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(ai_query_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
