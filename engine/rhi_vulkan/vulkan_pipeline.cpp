@@ -189,6 +189,15 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
     else if (desc.usesBindlessTextures) setLayouts.push_back(device.environmentSetLayout()); // set 3 placeholder
     // set 4: the dedicated bindless texture array set (Slice BZ). Only the bindless lit pipeline.
     if (desc.usesBindlessTextures) setLayouts.push_back(device.bindlessSetLayout());  // set 4 (bindless)
+    // Issue #34: the dedicated RT-graphics accel set — appended at the NEXT free index past every set
+    // above (NOT a cluster binding; the cluster set 3 stays the spheres/aabbs SSBOs). With the RT
+    // showcase (frame set 0 + cluster placeholders 1/2 + cluster set 3) it lands at index 4. A ps_6_5
+    // RayQuery fragment shader reads the TLAS pushed here at VK_PIPELINE_BIND_POINT_GRAPHICS.
+    if (desc.accelStructureBinding >= 0) {
+        accelSetIndex_ = (uint32_t)setLayouts.size();
+        hasAccelSet_ = true;
+        setLayouts.push_back(device.accelGraphicsSetLayout((uint32_t)desc.accelStructureBinding));
+    }
     if (!setLayouts.empty()) {
         lci.setLayoutCount = (uint32_t)setLayouts.size();
         lci.pSetLayouts = setLayouts.data();

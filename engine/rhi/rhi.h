@@ -156,6 +156,15 @@ struct GraphicsPipelineDesc {
                                      // unchanged, so golden-locked pipelines (which leave this false)
                                      // are byte-for-byte unaffected. Mutually exclusive with
                                      // usesEnvironment (the clustered-lit shader does its own sky IBL).
+    // Issue #34 (ADDITIVE — mirrors ComputePipelineDesc::accelStructureBinding): when >= 0, the graphics
+    // pipeline layout appends a DEDICATED descriptor set (a UNUSED index past sets 0-4, see vulkan_pipeline)
+    // with ONE VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR binding at this slot, visible to the FRAGMENT
+    // stage, so a ps_6_5 RayQuery fragment shader (shaders/rt_reflect_graphics.frag) can trace rays — RT
+    // reflections from a raster pass. The TLAS is bound per pass via ICommandBuffer::BindAccelStructure
+    // (which pushes at VK_PIPELINE_BIND_POINT_GRAPHICS when a graphics pipeline is bound). Default -1 ->
+    // existing graphics pipelines keep their set layouts byte-for-byte unchanged (no accel set). The Metal
+    // backend ignores it (the RT graphics frag is Vulkan-only; Metal runs the CPU rtrace:: reference).
+    int accelStructureBinding = -1;
 };
 
 // Storage = read-write SSBO usable by a compute shader (and bindable as a vertex stream so a

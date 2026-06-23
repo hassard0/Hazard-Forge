@@ -29,6 +29,8 @@ void VulkanCommandBuffer::Begin(VkCommandBuffer cmd, VkImageView colorView,
     boundEnvironmentSet_ = 0;
     boundClusterSet_ = 0;
     boundPerDrawSet_ = 0;
+    boundHasAccelSet_ = false;
+    boundAccelGraphicsSet_ = 0;
 }
 
 void VulkanCommandBuffer::BeginSecondary(VkCommandBuffer cmd, VkExtent2D extent) {
@@ -44,6 +46,8 @@ void VulkanCommandBuffer::BeginSecondary(VkCommandBuffer cmd, VkExtent2D extent)
     boundEnvironmentSet_ = 0;
     boundClusterSet_ = 0;
     boundPerDrawSet_ = 0;
+    boundHasAccelSet_ = false;
+    boundAccelGraphicsSet_ = 0;
     VkViewport vp{0, 0, (float)extent_.width, (float)extent_.height, 0.0f, 1.0f};
     vkCmdSetViewport(cmd_, 0, 1, &vp);
     VkRect2D scissor{{0, 0}, extent_};
@@ -126,6 +130,8 @@ void VulkanCommandBuffer::BindPipeline(IPipeline& pipeline) {
     boundClusterSet_ = p.hasClusterSet() ? p.clusterSetIndex() : 0;
     boundPerDrawSet_ = p.hasPerDrawSet() ? p.perDrawSetIndex() : 0;
     boundBindlessSet_ = p.hasBindlessSet() ? p.bindlessSetIndex() : 0;
+    boundHasAccelSet_ = p.hasAccelSet();
+    boundAccelGraphicsSet_ = p.hasAccelSet() ? p.accelSetIndex() : 0;
     boundPushStages_ = p.pushConstantStages();
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, p.handle());
     // If the pipeline declares a per-frame set, bind the device's current frame set at set 0.
@@ -366,6 +372,7 @@ void VulkanCommandBuffer::EndRenderPass() {
 void VulkanCommandBuffer::BindComputePipeline(IComputePipeline& pipeline) {
     auto& p = static_cast<VulkanComputePipeline&>(pipeline);
     boundComputeLayout_ = p.layout();
+    boundHasAccelSet_ = false;  // Issue #34: a compute BindAccelStructure pushes at COMPUTE (set 0)
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, p.handle());
 }
 
@@ -401,8 +408,16 @@ void VulkanCommandBuffer::BindAccelStructure(IAccelStructure& tlas, uint32_t slo
     write.dstBinding = slot;
     write.descriptorCount = 1;
     write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-    device_.pushDescriptorFn()(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, boundComputeLayout_,
-                               /*set=*/0, 1, &write);
+    // Issue #34: when a GRAPHICS pipeline with the dedicated accel set is bound, push the TLAS at the
+    // graphics bind point against the graphics layout's appended accel set (the FRAGMENT-stage RayQuery
+    // path). Otherwise push at COMPUTE (set 0) — the existing RT compute path, byte-for-byte unchanged.
+    if (boundHasAccelSet_) {
+        device_.pushDescriptorFn()(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                                   boundAccelGraphicsSet_, 1, &write);
+    } else {
+        device_.pushDescriptorFn()(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, boundComputeLayout_,
+                                   /*set=*/0, 1, &write);
+    }
 }
 
 void VulkanCommandBuffer::BindShadowMapCompute(IRenderTarget& shadowMap) {

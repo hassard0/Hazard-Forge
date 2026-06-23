@@ -158,6 +158,15 @@ public:
     // has a handful of textures; this is the variable-count ceiling.
     static constexpr uint32_t kBindlessMaxTextures = 256;
 
+    // RT-graphics accel set layout (a DEDICATED set, FRAGMENT stage, Issue #34): ONE
+    // ACCELERATION_STRUCTURE_KHR binding at the slot the desc requests, so a ps_6_5 RayQuery fragment
+    // shader can trace rays. PUSH_DESCRIPTOR so the TLAS is bound inline via BindAccelStructure at
+    // VK_PIPELINE_BIND_POINT_GRAPHICS (no pool — mirrors the compute accel + cluster SSBO paths). Separate
+    // from every other set layout so existing pipelines are byte-for-byte unchanged. The binding slot is
+    // baked at create (the RT graphics frag declares it at binding `slot`). Lazily created (depends on the
+    // rayQuery device feature; nullptr if RT is unavailable).
+    VkDescriptorSetLayout accelGraphicsSetLayout(uint32_t slot);
+
     // Return (building + caching on first use) the descriptor set for a full-PBR material — the
     // wider set 1 pointing at the five textures' views. Keyed on the base-texture pointer (a
     // material binds a fixed 5-texture set), so the command-buffer BindMaterialPBR path re-binds an
@@ -225,6 +234,8 @@ private:
     VkDescriptorSetLayout clusterSetLayout_ = VK_NULL_HANDLE;      // dedicated set 3 for clustered lights
     VkDescriptorSetLayout perDrawSetLayout_ = VK_NULL_HANDLE;      // dedicated set 2 for MDI per-draw (Slice BM)
     VkDescriptorSetLayout bindlessSetLayout_ = VK_NULL_HANDLE;     // dedicated set 4 for bindless textures (Slice BZ)
+    VkDescriptorSetLayout accelGraphicsSetLayout_ = VK_NULL_HANDLE; // dedicated set for RT-graphics accel (Issue #34)
+    uint32_t              accelGraphicsSlot_ = 0;                  // the accel binding slot baked into the layout
     VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;
 
     // 1x1 flat tangent-space normal map (RGBA 128,128,255,255 -> (0,0,1) after decode), used as the

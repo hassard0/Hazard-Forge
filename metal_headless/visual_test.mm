@@ -20077,6 +20077,87 @@ static int RunRt4ReflectShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Issue #34 — RT ray query in a GRAPHICS (fragment) pipeline showcase (--rt-reflect-graphics). The
+// Vulkan --rt-reflect-graphics-shot wires REAL HW inline ray query in a ps_6_5 FRAGMENT shader (a fullscreen
+// raster pass, the accel structure bound to the GRAPHICS pipeline) and memcmp's HW(GRAPHICS)==CPU. The RT
+// graphics frag uses HLSL RayQuery + int64 -> Vulkan-SPIR-V-ONLY (glslc/spirv-cross can't lower to MSL), so
+// on Metal --rt-reflect-graphics runs the CPU rtrace::RenderSceneReflected reference (the SAME bit-exact
+// reference, byte-identical to the Vulkan HW result by construction) over the IDENTICAL RT4 scene. The image
+// is the SAME pixels as rt4_reflect (same scene/camera) but the golden is its own (rt_reflect_graphics.png,
+// Mac-baked by the CONTROLLER) — strict-zero integer cross-vendor.
+static int RunRtReflectGraphicsShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    using rt::fx; using rt::FxVec3; using rt::kOne; using rt::F;
+
+    const uint32_t kRtW = 320, kRtH = 240;
+
+    // The RT2 scene (the SAME primitives + camera the Vulkan --rt-reflect-graphics-shot defines; rtrace.h frozen).
+    std::vector<rt::RtSphere> spheresV;
+    std::vector<rt::RtAabb>   aabbsV;
+    uint32_t nextPrim = 0;
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(-20,1), F(-3,1), F(-20,1)},
+                                FxVec3{F(20,1),  F(-1,1), F(20,1)}, nextPrim++});
+    for (int gz = 0; gz < 4; ++gz) {
+        for (int gx = 0; gx < 4; ++gx) {
+            fx cx = F(2 * gx - 3, 1);
+            fx cz = F(2 + 2 * gz, 1);
+            fx cy = F(0, 1);
+            fx rad = (gz & 1) ? F(3, 4) : F(1, 1);
+            spheresV.push_back(rt::RtSphere{FxVec3{cx, cy, cz}, rad, nextPrim++});
+        }
+    }
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(-9,2), F(-1,1), F(1,1)},
+                                FxVec3{F(-5,2), F(3,2),  F(5,2)}, nextPrim++});
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(5,2),  F(-1,1), F(2,1)},
+                                FxVec3{F(9,2),  F(2,1),  F(7,2)}, nextPrim++});
+
+    rt::RtScene scene{};
+    scene.spheres = std::span<const rt::RtSphere>(spheresV);
+    scene.aabbs   = std::span<const rt::RtAabb>(aabbsV);
+    scene.lightDir = rt::RtNormalize(FxVec3{F(4,10), F(8,10), F(-3,10)});
+    scene.background = rt::PackRGBA8(34, 40, 56, 255);
+
+    rt::RtCamera cam{};
+    cam.eye     = FxVec3{F(0,1), F(2,1), F(-9,1)};
+    cam.right   = FxVec3{kOne, 0, 0};
+    cam.up      = FxVec3{0, kOne, 0};
+    cam.forward = FxVec3{0, 0, kOne};
+    cam.halfW   = F(7, 10);
+    cam.halfH   = F(7, 10);
+
+    const size_t kPixels = (size_t)kRtW * kRtH;
+    const uint32_t kPrimCount = (uint32_t)(spheresV.size() + aabbsV.size());
+
+    // CPU reflected reference (the bit-exact image the Vulkan --rt-reflect-graphics-shot proves the HW frag equal to).
+    std::vector<uint32_t> image(kPixels, 0);
+    uint32_t reflective = rt::RenderSceneReflected(scene, cam, kRtW, kRtH, std::span<uint32_t>(image));
+    std::printf("rt-reflect-graphics: {rays:%zu, prims:%u, reflective:%u} [Metal: CPU rtrace::RenderSceneReflected, "
+                "byte-identical to the Vulkan GRAPHICS HW result by construction]\n", kPixels, kPrimCount, reflective);
+
+    // Two-run determinism (the CPU reference is a pure function).
+    {
+        std::vector<uint32_t> image2(kPixels, 0);
+        rt::RenderSceneReflected(scene, cam, kRtW, kRtH, std::span<uint32_t>(image2));
+        if (std::memcmp(image.data(), image2.data(), kPixels * sizeof(uint32_t)) != 0)
+            return fail("rt-reflect-graphics: two CPU renders differ (nondeterministic)");
+        std::printf("rt-reflect-graphics determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // --- Write the image (RGBA8 row-major top-first -> BGRA for WritePNG). ---
+    std::vector<uint8_t> bgra(kPixels * 4, 0);
+    for (size_t p = 0; p < kPixels; ++p) {
+        uint32_t px = image[p];
+        bgra[p * 4 + 0] = (uint8_t)((px >> 16) & 0xFF);
+        bgra[p * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+        bgra[p * 4 + 2] = (uint8_t)(px & 0xFF);
+        bgra[p * 4 + 3] = (uint8_t)((px >> 24) & 0xFF);
+    }
+    if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — RT reflections from a GRAPHICS/fragment pass [CPU SW reference] (%u reflective)\n",
+                outPath, kRtW, kRtH, reflective);
+    return 0;
+}
+
 // ===== Slice RT6 — Hardware Ray Tracing THE LIT HERO CAPSTONE showcase (--rt6-hero) (FLAGSHIP #28, the
 // MONEY-SHOT). The Vulkan --rt6-hero-shot wires REAL HW inline ray query over a curated hero scene at
 // 480x360 (the full RT feature set — primary + hard shadows + mirror reflections + the mirror sphere — under
@@ -63515,6 +63596,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--rt4-reflect") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_rt4_reflect.png";
             try { return RunRt4ReflectShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --rt-reflect-graphics <out.png>: render the Issue #34 RT-in-a-GRAPHICS-pipeline showcase. The RT
+        // graphics frag uses HLSL RayQuery + int64 -> Vulkan-SPIR-V-ONLY, so Metal runs the CPU
+        // rtrace::RenderSceneReflected reference (byte-identical to the Vulkan GRAPHICS HW result by
+        // construction). New golden tests/golden/metal/rt_reflect_graphics.png.
+        if (argc > 1 && std::strcmp(argv[1], "--rt-reflect-graphics") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_rt_reflect_graphics.png";
+            try { return RunRtReflectGraphicsShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --rt6-hero <out.png>: render the Hardware Ray Tracing THE LIT HERO CAPSTONE showcase (Slice RT6,

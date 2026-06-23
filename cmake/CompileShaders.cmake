@@ -39,6 +39,13 @@ function(hf_compile_shaders)
       # portable form: SPV_KHR_ray_query named + the rest auto-pulled. If a DXC build still needs the dep
       # named, -fspv-extension=KHR (allow ALL KHR extensions) is the fallback.
       set(extra_dxc_flags -fspv-extension=KHR)
+    elseif(stage STREQUAL "psrq")
+      # Issue #34 — an inline-RAY-QUERY FRAGMENT shader (shaders/rt_reflect_graphics.frag): the csrq twin
+      # for the GRAPHICS pipeline. HLSL RayQuery in a ps_6_5 pixel entry; DXC lowers it to SPIR-V RayQueryKHR
+      # via SPV_KHR_ray_query (auto-pulled deps allowed via -fspv-extension=KHR). Additive — only the RT
+      # graphics frag uses psrq; every existing :ps entry keeps ps_6_0 (byte-for-byte unchanged SPIR-V).
+      set(profile "ps_6_5")
+      set(extra_dxc_flags -fspv-extension=KHR)
     else()
       message(FATAL_ERROR "Unknown shader stage: ${stage}")
     endif()

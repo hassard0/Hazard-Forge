@@ -39,6 +39,11 @@ public:
     // The bindless set's index in the pipeline layout (always 4: frame 0, material 1, set-2/3
     // placeholders, bindless 4).
     uint32_t bindlessSetIndex() const { return 4u; }
+    // True when the pipeline declares the dedicated RT-graphics accel set (Issue #34);
+    // BindAccelStructure pushes the TLAS there at VK_PIPELINE_BIND_POINT_GRAPHICS.
+    bool hasAccelSet() const { return hasAccelSet_; }
+    // The accel set's index in the pipeline layout (appended past every other set at create time).
+    uint32_t accelSetIndex() const { return accelSetIndex_; }
     // Stage flags the push-constant range is visible to (VERTEX, or VERTEX|FRAGMENT for the bloom
     // fullscreen passes). PushConstants pushes to exactly these stages.
     uint32_t pushConstantStages() const { return pushConstantStages_; }
@@ -53,6 +58,8 @@ private:
     bool hasClusterSet_ = false;
     bool hasPerDrawSet_ = false;
     bool hasBindlessSet_ = false;
+    bool hasAccelSet_ = false;            // Issue #34: dedicated RT-graphics accel set present
+    uint32_t accelSetIndex_ = 0;          // its appended set index
     uint32_t pushConstantStages_ = VK_SHADER_STAGE_VERTEX_BIT;
 };
 

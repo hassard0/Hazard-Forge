@@ -80,6 +80,8 @@ private:
     uint32_t boundClusterSet_ = 0;      // set index for BindLightClusters (set 3); 0 = pipeline has none
     uint32_t boundPerDrawSet_ = 0;      // set index for BindPerDrawData (set 2, Slice BM); 0 = none
     uint32_t boundBindlessSet_ = 0;     // set index for BindBindlessTextures (set 4, Slice BZ); 0 = none
+    bool boundHasAccelSet_ = false;     // Issue #34: bound GRAPHICS pipeline has a dedicated accel set
+    uint32_t boundAccelGraphicsSet_ = 0;// its set index (BindAccelStructure pushes the TLAS there @GRAPHICS)
     uint32_t boundPushStages_ = VK_SHADER_STAGE_VERTEX_BIT;  // stages PushConstants targets
     VkPipelineLayout boundComputeLayout_ = VK_NULL_HANDLE;  // for compute push-constants/descriptors
 };

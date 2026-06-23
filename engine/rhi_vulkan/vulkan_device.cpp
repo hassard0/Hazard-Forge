@@ -241,6 +241,27 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
     }
 }
 
+VkDescriptorSetLayout VulkanDevice::accelGraphicsSetLayout(uint32_t slot) {
+    // Issue #34 — lazily create the dedicated RT-graphics accel set layout: ONE
+    // ACCELERATION_STRUCTURE_KHR binding at `slot`, FRAGMENT stage, PUSH_DESCRIPTOR (the TLAS is pushed
+    // inline at VK_PIPELINE_BIND_POINT_GRAPHICS via BindAccelStructure — no pool, mirrors the compute
+    // accel path). One slot is used per run; assert it stays stable. Returns null if RT is unavailable.
+    if (accelGraphicsSetLayout_ != VK_NULL_HANDLE) return accelGraphicsSetLayout_;
+    VkDescriptorSetLayoutBinding as{};
+    as.binding = slot;
+    as.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    as.descriptorCount = 1;
+    as.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo slci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    slci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    slci.bindingCount = 1;
+    slci.pBindings = &as;
+    Check(vkCreateDescriptorSetLayout(device_, &slci, nullptr, &accelGraphicsSetLayout_),
+          "vkCreateDescriptorSetLayout(accelGraphics)");
+    accelGraphicsSlot_ = slot;
+    return accelGraphicsSetLayout_;
+}
+
 VulkanDevice::~VulkanDevice() {
     if (device_) vkDeviceWaitIdle(device_);
     // Per-thread MT recording resources (Slice AU): destroying each pool frees its secondary buffer.
@@ -784,6 +805,7 @@ void VulkanDevice::DestroyTextureResources() {
     if (clusterSetLayout_) vkDestroyDescriptorSetLayout(device_, clusterSetLayout_, nullptr);
     if (perDrawSetLayout_) vkDestroyDescriptorSetLayout(device_, perDrawSetLayout_, nullptr);
     if (bindlessSetLayout_) vkDestroyDescriptorSetLayout(device_, bindlessSetLayout_, nullptr);
+    if (accelGraphicsSetLayout_) vkDestroyDescriptorSetLayout(device_, accelGraphicsSetLayout_, nullptr);
     if (defaultSampler_) vkDestroySampler(device_, defaultSampler_, nullptr);
     if (shadowSampler_) vkDestroySampler(device_, shadowSampler_, nullptr);
     if (environmentSampler_) vkDestroySampler(device_, environmentSampler_, nullptr);

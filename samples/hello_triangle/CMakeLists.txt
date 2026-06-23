@@ -588,6 +588,15 @@ hf_compile_shaders(
     # can't lower to MSL) -> NOT in the Metal hf_gen_msl list; on Metal --rt4-reflect runs the CPU
     # rtrace::RenderSceneReflected (byte-identical by construction). The Vulkan side carries the HW==CPU memcmp.
     "shaders/rt_reflect.comp.hlsl:csrq"
+    # Issue #34: rt_reflect_graphics.frag is the GRAPHICS (fragment) twin of rt_reflect.comp — a ps_6_5
+    # RayQuery fragment shader (fullscreen pass, reuses post.vert) that traces the SAME DETERMINISTIC RT
+    # MIRROR REFLECTIONS body VERBATIM from a RASTER pass, proving a fragment shader can ray-query the
+    # accel structure (the TLAS bound to the GRAPHICS pipeline via BindAccelStructure). ATTEMPT-2 data
+    # binding: spheres/aabbs at cluster bindings 14/15, params via the frame UBO (NEVER the broken
+    # graphics cluster binding 13). The :psrq stage compiles it ps_6_5 + SPV_KHR_ray_query (HLSL RayQuery
+    # -> DXC SPIR-V RayQueryKHR). VULKAN-SPIR-V-ONLY (RayQuery + int64) -> NOT in the Metal MSL list; on
+    # Metal --rt-reflect-graphics runs the CPU rtrace::RenderSceneReflected (byte-identical by construction).
+    "shaders/rt_reflect_graphics.frag.hlsl:psrq"
     # Hardware Ray Tracing Slice 6 (Slice RT6, FLAGSHIP #28, the MONEY-SHOT CAPSTONE): rt_hero.comp is the LIT
     # HERO kernel — it COPIES the rt_reflect.comp body VERBATIM (primary closest-hit + primary shadow + the
     # one-bounce reflection + reflected shadow + the integer blend) with the ONE change that every MISS color
