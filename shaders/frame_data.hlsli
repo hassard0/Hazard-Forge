@@ -35,6 +35,12 @@ struct FrameData {
     // iblParams.x = env maxLod for the IBL pass (issue #33): a DEDICATED slot so HDR-IBL objects and an
     // animated sky (which needs skyParams.z=time, issue #5) can coexist in one frame without colliding.
     float4x4 prevViewProj; float4 iblParams;
+    // Substrate-lite layered materials (issue #11, SB1+). Appended at the TAIL so every existing field's
+    // byte offset is unchanged (the #33 lesson) — existing showcases leave these 0 and their shaders never
+    // read them, so existing goldens stay byte-identical. lit_substrate.frag reads these; clearcoat=0 is an
+    // exact identity over lit_pbr_ibl. substrateParams: x=clearcoat strength, y=clearcoatRoughness, z=sheen,
+    // w=iridescence. substrateParams2: x=anisotropy, y=SSS, z=tangentRotate, w=reserved.
+    float4 substrateParams; float4 substrateParams2;
 };
 
 #endif // HF_FRAME_DATA_HLSLI

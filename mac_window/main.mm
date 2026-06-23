@@ -62,6 +62,10 @@ struct FrameData {
     float skyParams[4];
     float prevViewProj[16];    // TAA (Slice AP): view-proj reprojection (layout parity with visual_test)
     float iblParams[4];        // x = env maxLod for the IBL pass (issue #33: dedicated, was skyParams.z)
+    // Substrate-lite layered materials (issue #11, SB1+). TAIL append, byte-for-byte parity with
+    // frame_data.hlsli + the other CPU FrameData mirrors. lit_substrate.frag reads these; 0 = identity.
+    float substrateParams[4];  // x=clearcoat, y=clearcoatRoughness, z=sheen, w=iridescence
+    float substrateParams2[4]; // x=anisotropy, y=SSS, z=tangentRotate, w=reserved
 };
 
 static std::string LoadText(const std::string& path) {

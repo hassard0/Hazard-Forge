@@ -119,6 +119,9 @@ hf_gen_msl(mat_normalmap.frag generated/mat_normalmap.frag.hlsl frag material_no
 # HLSL->SPIR-V->MSL toolchain; the env map binds at flat fragment texture(11)/sampler(12).
 hf_gen_msl(sky_hdr.frag      sky_hdr.frag.hlsl      frag sky_hdr_fragment)
 hf_gen_msl(lit_pbr_ibl.frag  lit_pbr_ibl.frag.hlsl  frag pbr_ibl_fragment)
+# Substrate-lite layered materials (issue #11, SB1): a copy of lit_pbr_ibl.frag + an additive clearcoat
+# BRDF lobe gated by FrameData.substrateParams. clearcoat=0 == lit_pbr_ibl byte-identical (the make-or-break).
+hf_gen_msl(lit_substrate.frag lit_substrate.frag.hlsl frag substrate_fragment)
 # Skinned-animation variants (Slice O): GPU skinning vertex shader (reuses lit.frag) + skinned
 # depth-only shadow vertex shader. Same HLSL->SPIR-V->MSL toolchain as the others.
 hf_gen_msl(lit_skinned.vert    lit_skinned.vert.hlsl    vert skinned_vertex)

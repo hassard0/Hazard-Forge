@@ -175,6 +175,10 @@ struct FrameData {
     float skyParams[4];
     float prevViewProj[16];    // TAA (Slice AP): previous frame's view-proj (layout parity; identity reprojection)
     float iblParams[4];        // x = env maxLod for the IBL pass (issue #33: dedicated, was skyParams.z)
+    // Substrate-lite layered materials (issue #11, SB1+). TAIL append, byte-for-byte parity with
+    // frame_data.hlsli + samples/hello_triangle/main.cpp. lit_substrate.frag reads these; 0 = identity.
+    float substrateParams[4];  // x=clearcoat, y=clearcoatRoughness, z=sheen, w=iridescence
+    float substrateParams2[4]; // x=anisotropy, y=SSS, z=tangentRotate, w=reserved
 };
 
 // Issue #39: per-pipeline IBL exposure multiplier written into FrameData.iblParams.y. 1.0 = stock
@@ -1605,6 +1609,246 @@ static int RunIblShowcase(const char* outPath) {
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — env %dx%d, %d mips\n",
                 outPath, cw, ch, env.width, env.height, env.mipLevels);
+    return 0;
+}
+
+// --- Substrate-lite CLEARCOAT showcase (Issue #11, Slice SB1). Mirrors RunIblShowcase: the SAME HDR
+// equirect skybox + ground + DamagedHelmet scene/camera/light/env, but the helmet's fragment pipeline
+// is lit_substrate.frag (lit_pbr_ibl + an additive clearcoat lobe) with fd.substrateParams[0]=0.9 /
+// [1]=0.08 (a glossy clear lacquer). Prints the 3 proof lines (fail loudly): (1) two-run byte-identical;
+// (2) THE ADDITIVITY CONTROL — clearcoat=0 through lit_substrate == lit_pbr_ibl byte-identical; (3)
+// clearcoat>0 adds a real second highlight. Writes the clearcoat-on PNG. -----------------------------
+static int RunSb1ClearcoatShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    hf::asset::EnvironmentMap env = hf::asset::LoadHdrEnvironment(*device, HF_ENV_PATH);
+    const float envMaxLod = (float)(env.mipLevels - 1);
+
+    // Helmet pipelines: lit_substrate (clearcoat) + the frozen lit_pbr_ibl (additivity-control ref).
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto subFs = loadMSL("lit_substrate.frag.gen.metal", "substrate_fragment");
+    auto iblFs = loadMSL("lit_pbr_ibl.frag.gen.metal", "pbr_ibl_fragment");
+    auto mkHelmetPipe = [&](rhi::IShaderModule* fs) {
+        rhi::GraphicsPipelineDesc d;
+        d.vertex = litVs.get(); d.fragment = fs;
+        d.vertexLayout = scene::MeshVertexLayout();
+        d.colorFormat = device->Swapchain().ColorFormat();
+        d.depthTest = true; d.usesFrameUniforms = true;
+        d.usesTexture = true; d.pbrMaterial = true;
+        d.usesEnvironment = true; d.pushConstantSize = sizeof(float) * 20;
+        return device->CreateGraphicsPipeline(d);
+    };
+    auto substratePipeline = mkHelmetPipe(subFs.get());
+    auto iblPipeline       = mkHelmetPipe(iblFs.get());
+
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky_hdr.frag.gen.metal", "sky_hdr_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    skyD.usesEnvironment = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+
+    hf::asset::PbrModel helmet = hf::asset::LoadPbrGltfModel(*device, HF_HELMET_MODEL_PATH);
+
+    const float scaleS = 1.6f;
+    Mat4 helmetModel = Mat4::Translate({0.0f, scaleS * 1.0f, 0.0f})
+                     * Mat4::RotateX(1.5707963f)
+                     * Mat4::Scale({scaleS, scaleS, scaleS});
+    Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+
+    const Vec3 eye{3.0f, 2.4f, 4.0f};
+    const Vec3 center{0.0f, 1.2f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 1.2f, 0.0f};
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 12.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-5.0f, 5.0f, -5.0f, 5.0f, 1.0f, 25.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+        fd.iblParams[0] = envMaxLod; fd.iblParams[1] = 1.0f;
+    }
+
+    auto renderOnce = [&](rhi::IPipeline& helmetPipe, float clearcoat, float ccRough,
+                          std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        FrameData lfd = fd;
+        lfd.substrateParams[0] = clearcoat;
+        lfd.substrateParams[1] = ccRough;
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&lfd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*shadowPipeline);
+                cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+                cmd.PushConstants(helmetModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(helmet.mesh.vertices());
+                cmd.BindIndexBuffer(helmet.mesh.indices());
+                cmd.DrawIndexed(helmet.mesh.indexCount());
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&lfd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                cmd.BindPipeline(*skyPipe);
+                cmd.BindEnvironment(*env.equirect);
+                cmd.Draw(3);
+                cmd.BindPipeline(*litPipeline);
+                {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                    pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                cmd.BindPipeline(helmetPipe);
+                {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = helmetModel.m[k];
+                    pc[16] = helmet.metallicFactor; pc[17] = helmet.roughnessFactor;
+                    pc[18] = 0.0f; pc[19] = 0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterialPBR(*helmet.baseColor, *helmet.metalRough, *helmet.normalMap,
+                                        *helmet.emissive, *helmet.occlusion);
+                    cmd.BindEnvironment(*env.equirect);
+                    cmd.BindVertexBuffer(helmet.mesh.vertices());
+                    cmd.BindIndexBuffer(helmet.mesh.indices());
+                    cmd.DrawIndexed(helmet.mesh.indexCount());
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*rt);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    const float kCc = 0.9f, kCcRough = 0.08f;
+    std::vector<uint8_t> pxA, pxB, pxZeroSub, pxIbl;
+    uint32_t cw = 0, ch = 0, tw = 0, th = 0;
+    if (!renderOnce(*substratePipeline, kCc, kCcRough, pxA, cw, ch))     return fail("no captured pixels (run A)");
+    if (!renderOnce(*substratePipeline, kCc, kCcRough, pxB, tw, th))     return fail("no captured pixels (run B)");
+    if (!renderOnce(*substratePipeline, 0.0f, kCcRough, pxZeroSub, tw, th)) return fail("no captured pixels (substrate cc=0)");
+    if (!renderOnce(*iblPipeline, 0.0f, kCcRough, pxIbl, tw, th))        return fail("no captured pixels (lit_pbr_ibl)");
+
+    bool twoRunSame = (pxA.size() == pxB.size()) && (std::memcmp(pxA.data(), pxB.data(), pxA.size()) == 0);
+    std::printf("sb1-clearcoat: two-run %s\n", twoRunSame ? "BYTE-IDENTICAL" : "DIFFER (FAIL)");
+    if (!twoRunSame) return fail("sb1 two-run not byte-identical");
+
+    bool additivity = (pxZeroSub.size() == pxIbl.size()) &&
+                      (std::memcmp(pxZeroSub.data(), pxIbl.data(), pxZeroSub.size()) == 0);
+    std::printf("sb1-clearcoat: clearcoat=0 == lit_pbr_ibl %s (additivity control)\n",
+                additivity ? "BYTE-IDENTICAL" : "DIFFER (FAIL)");
+    if (!additivity) return fail("sb1 additivity control FAILED (clearcoat=0 != lit_pbr_ibl)");
+
+    size_t nonBlack = 0; int specPeak = 0; bool anyDiff = false;
+    size_t nPix = pxA.size() / 4;
+    for (size_t p = 0; p < nPix; ++p) {
+        int b0 = pxA[p*4+0], g0 = pxA[p*4+1], r0 = pxA[p*4+2];
+        int bz = pxZeroSub[p*4+0], gz = pxZeroSub[p*4+1], rz = pxZeroSub[p*4+2];
+        int dr = r0 - rz, dg = g0 - gz, db = b0 - bz;
+        if (dr != 0 || dg != 0 || db != 0) { anyDiff = true; if (dr+dg+db > 0) nonBlack++; }
+        int mx = r0; if (g0 > mx) mx = g0; if (b0 > mx) mx = b0;
+        if (mx > specPeak) specPeak = mx;
+    }
+    std::printf("sb1-clearcoat: {nonBlackPixels:%zu, specPeak:%d} clearcoat>0 adds a second highlight\n",
+                nonBlack, specPeak);
+    if (!anyDiff || nonBlack == 0) return fail("clearcoat>0 produced no added highlight");
+
+    if (!WritePNG(outPath, pxA, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — env %dx%d, %d mips — clearcoat=%.2f ccRough=%.2f\n",
+                outPath, cw, ch, env.width, env.height, env.mipLevels, kCc, kCcRough);
     return 0;
 }
 
@@ -66977,6 +67221,13 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ibl") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ibl.png";
             try { return RunIblShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --sb1-clearcoat <out.png>: Substrate-lite clearcoat showcase (issue #11, SB1) — the SAME IBL
+        // helmet scene through lit_substrate.frag (lit_pbr_ibl + an additive clearcoat lobe).
+        if (argc > 1 && std::strcmp(argv[1], "--sb1-clearcoat") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_sb1_clearcoat.png";
+            try { return RunSb1ClearcoatShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ibl-dim <out.png>: the SAME IBL helmet showcase with the exposure multiplier dialed down
