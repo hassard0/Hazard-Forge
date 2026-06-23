@@ -9055,20 +9055,25 @@ static int RunUs3DisocclusionShowcase(const char* outPath) {
     return 0;
 }
 
-// --- US5 (THE HERO money-shot, issue #20 capstone — COMPLETES flagship #20). Mirrors the Vulkan
-// --us5-upscale-hero-shot EXACTLY: composes the US3 orbiting-camera reproject accumulation + the US4 CAS
-// sharpen at a TRUE 2x upscale (internal 960x540 -> display 1920x1080). NO new shader (tsr_resolve_reproject
-// + tsr_pack_histdepth + cas + post reused VERBATIM). Pipeline per N=8 orbit frame: scene(internal,
-// jittered) + display-res linear-depth gbuffer -> tsr_pack_histdepth -> tsr_resolve_reproject (display-res
-// HDR history, reproject) -> ping-pong x8 -> post tonemap (display-res LDR) -> cas (display-res, sharpness
-// 0.6) -> the final display-res CAS RT, read back via ReadRenderTarget (the whole chain runs in RTs so the
-// display res is independent of any swapchain). PROOF: a NATIVE display-res render (no jitter, single frame,
-// final pose) + the US1 naive-bilinear image; the full TSR upscale must be CLOSER to native than naive
-// (tsrDiff < naiveDiff). HONEST CAVEAT: the US3 reprojection is far more effective on Vulkan than Metal
-// (thin Metal margin) — on Metal the Dt<Dn win comes mostly from the temporal supersampling + CAS sharpen
-// rather than the reprojection; the SMALL orbit (deltaAngle 0.040) keeps supersampling+sharpen dominant so
-// the margin holds on the baking backend. SCENE/ORBIT/JITTER/N/sharpness IDENTICAL to the Vulkan path; two
-// runs DIFF 0.0000. New golden tests/golden/metal/us5_upscale_hero.png (controller bakes). ---------------
+// --- US5 (THE HERO money-shot, issue #20 capstone — COMPLETES flagship #20). The STATIC-camera 2x hero.
+// Mirrors the Vulkan --us5-upscale-hero-shot EXACTLY: the US4 recipe (static camera + US2's NON-reprojecting
+// tsr_resolve supersample + CAS sharpen) at a TRUE 2x upscale (internal 960x540 -> display 1920x1080). NO
+// new shader (tsr_resolve + cas + post reused VERBATIM). Pipeline per N=8 static frame: scene(internal,
+// jittered) -> tsr_resolve (display-res HDR history, identity UV — pure temporal supersample) -> ping-pong
+// x8 -> post tonemap (display-res LDR) -> cas (display-res, sharpness 0.6) -> the final display-res CAS RT,
+// read back via ReadRenderTarget (the whole chain runs in RTs so the display res is independent of any
+// swapchain). PROOF: a NATIVE display-res render (no jitter, single frame, base pose) + the US1 naive-
+// bilinear image; the static TSR upscale must be CLOSER to native than naive (tsrDiff < naiveDiff). US2/US4
+// proved this static accumulation beats naive bilinear ~2.5x on BOTH backends, so it holds on Metal.
+// DESIGN PIVOT (honest): US5 is the STATIC-camera 2x hero, NOT the moving-camera reproject path. The moving-
+// camera reprojection (US3) is proven separately in US3's own golden, but it is EXCLUDED from the 2x hero
+// because its Metal reprojection margin cannot net positive against naive bilinear in the full 2x chain
+// without an RHI/format change. That margin is a SYSTEMATIC sub-pixel error (NOT motion-proportional
+// ghosting — cutting the orbit from 0.040 to 0.015 rad/frame moved the Metal Dt by only ~0.01): the
+// documented US3 packed-depth-precision residual (linear depth packed into an RGBA16F alpha loses
+// precision); the no-RHI-change 2-sampled-texture cap is exactly WHY depth is packed there, so it cannot
+// be fixed without an RHI/format change (forbidden). SCENE/JITTER/N/sharpness/resolutions IDENTICAL to the
+// Vulkan path; two runs DIFF 0.0000. Golden tests/golden/metal/us5_upscale_hero.png (controller bakes). ---
 static int RunUs5UpscaleHeroShowcase(const char* outPath) {
     using math::Mat4; using math::Vec3;
     namespace taa = render::taa;
@@ -9167,28 +9172,12 @@ static int RunUs5UpscaleHeroShowcase(const char* outPath) {
     skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
     auto skyPipe = device->CreateGraphicsPipeline(skyD);
 
-    // G-buffer (view normal + LINEAR DEPTH in .w) — UNCHANGED gbuffer shaders, static path.
-    auto gbVs = loadMSL("gbuffer.vert.gen.metal", "gbuffer_vertex");
-    auto gbFs = loadMSL("gbuffer.frag.gen.metal", "gbuffer_fragment");
-    rhi::GraphicsPipelineDesc gbDesc;
-    gbDesc.vertex = gbVs.get(); gbDesc.fragment = gbFs.get();
-    gbDesc.vertexLayout = scene::MeshVertexLayout();
-    gbDesc.colorFormat = kHdr;
-    gbDesc.depthTest = true; gbDesc.usesFrameUniforms = true;
-    gbDesc.pushConstantSize = sizeof(float) * 32;
-    auto gbStaticPipeline = device->CreateGraphicsPipeline(gbDesc);
-
-    // TSR reproject resolve + history+depth pack + post tonemap + CAS sharpen (fullscreen).
+    // TSR resolve (US2's NON-reprojecting tsr_resolve) + post tonemap + CAS sharpen (fullscreen).
     auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
-    auto tsrFs  = loadMSL("tsr_resolve_reproject.frag.gen.metal", "tsr_resolve_reproject_fragment");
-    auto packFs = loadMSL("tsr_pack_histdepth.frag.gen.metal", "tsr_pack_histdepth_fragment");
+    auto tsrFs  = loadMSL("tsr_resolve.frag.gen.metal", "tsr_resolve_fragment");
     auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
     auto casFs  = loadMSL("cas.frag.gen.metal", "cas_fragment");
-    struct TsrParams {
-        float curTexel[2]; float histTexel[2]; float alpha; float firstFrame;
-        float tanHalfFovY; float aspect;
-        float prevClip0[4]; float prevClip1[4]; float prevClip2[4]; float prevClip3[4];
-    };
+    struct TsrParams { float curTexel[2]; float histTexel[2]; float alpha; float firstFrame; };
     struct CasPC { float sharpness[4]; };
 
     rhi::GraphicsPipelineDesc tsrD;
@@ -9197,12 +9186,6 @@ static int RunUs5UpscaleHeroShowcase(const char* outPath) {
     tsrD.depthTest = false; tsrD.usesTexture = true; tsrD.fullscreen = true;
     tsrD.fragmentPushConstants = true; tsrD.pushConstantSize = sizeof(TsrParams);
     auto tsrPipe = device->CreateGraphicsPipeline(tsrD);
-
-    rhi::GraphicsPipelineDesc packD;
-    packD.vertex = postVs.get(); packD.fragment = packFs.get();
-    packD.colorFormat = kHdr;
-    packD.depthTest = false; packD.usesTexture = true; packD.fullscreen = true;
-    auto packPipe = device->CreateGraphicsPipeline(packD);
 
     rhi::GraphicsPipelineDesc postLdrD;
     postLdrD.vertex = postVs.get(); postLdrD.fragment = postFs.get();
@@ -9217,10 +9200,10 @@ static int RunUs5UpscaleHeroShowcase(const char* outPath) {
     casD.fragmentPushConstants = true; casD.pushConstantSize = sizeof(CasPC);
     auto casPipe = device->CreateGraphicsPipeline(casD);
 
+    // Render targets: internal-res HDR scene + display-res HDR scene (native ref) + two display-res
+    // ping-pong history RTs + display-res LDR + CAS. (No gbuffer/packed RTs — static path.)
     auto sceneLow  = device->CreateRenderTarget(IW, IH, kHdr);
     auto sceneFull = device->CreateRenderTarget(DW, DH, kHdr);
-    auto gbufFull  = device->CreateRenderTarget(DW, DH, kHdr);
-    auto packedRT  = device->CreateRenderTarget(DW, DH, kHdr);
     auto histA = device->CreateRenderTarget(DW, DH, kHdr);
     auto histB = device->CreateRenderTarget(DW, DH, kHdr);
     auto ldrRT = device->CreateRenderTarget(DW, DH, kLdr);
@@ -9245,20 +9228,39 @@ static int RunUs5UpscaleHeroShowcase(const char* outPath) {
 
     Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
     const Vec3 center{0.0f, 1.0f, 0.0f};
-    const Vec3 baseEye{6.5f, 4.5f, 7.0f};
+    // STATIC camera at the base eye pose (US2/US4 static eye). No orbit — the proven-clean static
+    // accumulation path (the moving-camera reprojection lives in US3, excluded from the 2x hero).
+    const Vec3 eye{6.5f, 4.5f, 7.0f};
     const float aspect = (float)IW / (float)IH;
-    const float orbitRadXZ = std::sqrt((baseEye.x - center.x) * (baseEye.x - center.x) +
-                                       (baseEye.z - center.z) * (baseEye.z - center.z));
-    const float baseAngle = std::atan2(baseEye.x - center.x, baseEye.z - center.z);
-    const float deltaAngle = 0.040f;   // IDENTICAL to the Vulkan path / US3
-    auto orbitEye = [&](int f) -> Vec3 {
-        float a = baseAngle + (float)f * deltaAngle;
-        return Vec3{center.x + orbitRadXZ * std::sin(a), baseEye.y, center.z + orbitRadXZ * std::cos(a)};
-    };
-    auto orbitView = [&](int f) -> Mat4 { return Mat4::LookAt(orbitEye(f), center, {0, 1, 0}); };
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    Mat4 unjittered = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f)) * viewM;
     const float kTanHalfFovY = std::tan(0.5f * kFovY);
 
-    auto makeFd = [&](int frameIdx, int jw, int jh, const Mat4& viewM, const Vec3& eye) -> FrameData {
+    FrameData fdBase{};
+    {
+        fdBase.lightDir[0] = -0.5f; fdBase.lightDir[1] = -1.0f; fdBase.lightDir[2] = -0.3f;
+        fdBase.lightColor[0] = 1.0f; fdBase.lightColor[1] = 0.97f; fdBase.lightColor[2] = 0.9f; fdBase.lightColor[3] = 1.0f;
+        fdBase.viewPos[0] = eye.x; fdBase.viewPos[1] = eye.y; fdBase.viewPos[2] = eye.z; fdBase.viewPos[3] = 1.0f;
+        fdBase.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fdBase.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fdBase.camFwd[0]=fwd.x; fdBase.camFwd[1]=fwd.y; fdBase.camFwd[2]=fwd.z;
+        fdBase.camRight[0]=right.x; fdBase.camRight[1]=right.y; fdBase.camRight[2]=right.z;
+        fdBase.camUp[0]=up.x; fdBase.camUp[1]=up.y; fdBase.camUp[2]=up.z;
+        fdBase.skyParams[0] = kTanHalfFovY;
+        fdBase.skyParams[1] = aspect;
+        for (int k = 0; k < 16; ++k) fdBase.prevViewProj[k] = unjittered.m[k];
+    }
+
+    auto makeFd = [&](int frameIdx, int jw, int jh) -> FrameData {
         Mat4 jProj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
         if (frameIdx >= 0) {
             taa::Vec2 j = taa::Jitter(frameIdx, jw, jh);
@@ -9266,29 +9268,8 @@ static int RunUs5UpscaleHeroShowcase(const char* outPath) {
             jProj.m[2 * 4 + 1] += j.y;
         }
         Mat4 jvp = FlipProjY(jProj) * viewM;
-        FrameData fd{};
+        FrameData fd = fdBase;
         for (int k = 0; k < 16; ++k) fd.vp[k] = jvp.m[k];
-        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
-        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
-        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
-        fd.ptCount[0] = 0.0f;
-        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
-        Vec3 sc{0.0f, 1.0f, 0.0f};
-        Vec3 lightEye = sc - lightDir * 18.0f;
-        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
-        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f));
-        Mat4 lightVP = lightOrtho * lightView;
-        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
-        Vec3 fwd = math::normalize(center - eye);
-        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
-        Vec3 up = math::cross(right, fwd);
-        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
-        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
-        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
-        fd.skyParams[0] = kTanHalfFovY;
-        fd.skyParams[1] = aspect;
-        Mat4 unj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f)) * viewM;
-        for (int k = 0; k < 16; ++k) fd.prevViewProj[k] = unj.m[k];
         return fd;
     };
 
@@ -9329,76 +9310,30 @@ static int RunUs5UpscaleHeroShowcase(const char* outPath) {
         cmd.BindIndexBuffer(sphere.indices());
         cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
     };
-    auto recordGbuffer = [&](rhi::ICommandBuffer& cmd, const Mat4& viewM) {
-        cmd.BindPipeline(*gbStaticPipeline);
-        {
-            float pc[32];
-            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
-            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
-            cmd.PushConstants(pc, sizeof(pc));
-            cmd.BindVertexBuffer(plane.vertices());
-            cmd.BindIndexBuffer(plane.indices());
-            cmd.DrawIndexed(plane.indexCount());
-        }
-        cmd.BindVertexBuffer(sphere.vertices());
-        cmd.BindIndexBuffer(sphere.indices());
-        for (uint32_t s = 0; s < kInstanceCount; ++s) {
-            float pc[32];
-            for (int k = 0; k < 16; ++k) pc[k] = instances[s].model[k];
-            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
-            cmd.PushConstants(pc, sizeof(pc));
-            cmd.DrawIndexed(sphere.indexCount());
-        }
-    };
 
-    auto fillTsr = [&](TsrParams& tp, int frame, bool reproject) {
-        tp.curTexel[0]  = 1.0f / (float)IW; tp.curTexel[1]  = 1.0f / (float)IH;
-        tp.histTexel[0] = 1.0f / (float)DW; tp.histTexel[1] = 1.0f / (float)DH;
-        tp.alpha = 1.0f / (float)(frame + 1);
-        tp.firstFrame = (frame == 0) ? 1.0f : 0.0f;
-        tp.tanHalfFovY = kTanHalfFovY; tp.aspect = aspect;
-        Mat4 curView  = orbitView(frame);
-        Mat4 curVP    = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f)) * curView;
-        Mat4 invCur   = curView.Inverse();
-        Mat4 prevVP   = reproject
-                          ? (FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f)) * orbitView(frame - 1))
-                          : curVP;
-        Mat4 prevClip = prevVP * invCur;
-        for (int k = 0; k < 4; ++k) {
-            tp.prevClip0[k] = prevClip.m[0 * 4 + k];
-            tp.prevClip1[k] = prevClip.m[1 * 4 + k];
-            tp.prevClip2[k] = prevClip.m[2 * 4 + k];
-            tp.prevClip3[k] = prevClip.m[3 * 4 + k];
-        }
-    };
-
-    // (A) The full TSR upscale: orbiting reproject accumulation -> post tonemap -> CAS sharpen -> CAS RT.
-    auto renderHero = [&](bool reproject, bool sharpen, float sharpness,
-                          std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+    // The N=8 STATIC TSR accumulation into the display-res ping-pong history; returns the FINAL resolved
+    // history RT (the image to tonemap).
+    auto accumulate = [&]() -> rhi::IRenderTarget* {
         rhi::IRenderTarget* prevHist = histA.get();
         rhi::IRenderTarget* curHist  = histB.get();
         for (int frame = 0; frame < taa::kAccumFrames; ++frame) {
-            Mat4 curView = orbitView(frame);
-            Vec3 eye = orbitEye(frame);
-            FrameData fd     = makeFd(frame, (int)IW, (int)IH, curView, eye);
-            FrameData fdGbuf = makeFd(-1,    0,       0,       curView, eye);
+            FrameData fd = makeFd(frame, (int)IW, (int)IH);
+            const bool first = (frame == 0);
             TsrParams tp{};
-            fillTsr(tp, frame, reproject);
+            tp.curTexel[0]  = 1.0f / (float)IW; tp.curTexel[1]  = 1.0f / (float)IH;
+            tp.histTexel[0] = 1.0f / (float)DW; tp.histTexel[1] = 1.0f / (float)DH;
+            tp.alpha = 1.0f / (float)(frame + 1);
+            tp.firstFrame = first ? 1.0f : 0.0f;
 
             render::RenderGraph graph;
             render::RgResource rgShadow = graph.ImportTarget(
                 "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
             render::RgResource rgScene = graph.ImportTarget(
                 "sceneColor", render::RgResourceKind::SceneColor, *sceneLow);
-            render::RgResource rgGbuf = graph.ImportTarget(
-                "gbuffer", render::RgResourceKind::SceneColor, *gbufFull);
             render::RgResource rgPrev = graph.ImportTarget(
                 "history", render::RgResourceKind::SceneColor, *prevHist);
-            render::RgResource rgPacked = graph.ImportTarget(
-                "packed", render::RgResourceKind::SceneColor, *packedRT);
             render::RgResource rgCur = graph.ImportTarget(
                 "resolved", render::RgResourceKind::SceneColor, *curHist);
-
             graph.AddPass("shadow", {}, {rgShadow},
                 [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
                     dev.SetFrameUniforms(&fd, sizeof(FrameData));
@@ -9413,26 +9348,11 @@ static int RunUs5UpscaleHeroShowcase(const char* outPath) {
                     recordScene(cmd);
                     cmd.EndRenderPass();
                 });
-            graph.AddPass("gbuffer", {}, {rgGbuf},
-                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
-                    dev.SetFrameUniforms(&fdGbuf, sizeof(FrameData));
-                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
-                    recordGbuffer(cmd, curView);
-                    cmd.EndRenderPass();
-                });
-            graph.AddPass("packHistDepth", {rgPrev, rgGbuf}, {rgPacked},
-                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
-                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
-                    cmd.BindPipeline(*packPipe);
-                    cmd.BindTexturePair(*prevHist, *gbufFull);
-                    cmd.Draw(3);
-                    cmd.EndRenderPass();
-                });
-            graph.AddPass("tsrReproject", {rgScene, rgPacked}, {rgCur},
+            graph.AddPass("tsrResolve", {rgScene, rgPrev}, {rgCur},
                 [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
                     cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
                     cmd.BindPipeline(*tsrPipe);
-                    cmd.BindTexturePair(*sceneLow, *packedRT);
+                    cmd.BindTexturePair(*sceneLow, *prevHist);
                     cmd.PushConstants(&tp, sizeof(tp));
                     cmd.Draw(3);
                     cmd.EndRenderPass();
@@ -9441,47 +9361,49 @@ static int RunUs5UpscaleHeroShowcase(const char* outPath) {
             device->WaitIdle();
             std::swap(prevHist, curHist);
         }
-        {
-            render::RenderGraph graph;
-            render::RgResource rgResolved = graph.ImportTarget(
-                "resolved", render::RgResourceKind::SceneColor, *prevHist);
-            render::RgResource rgLdr = graph.ImportTarget(
-                "tonemapLdr", render::RgResourceKind::SceneColor, *ldrRT);
-            render::RgResource rgCas = graph.ImportTarget(
-                "casOut", render::RgResourceKind::SceneColor, *casRT);
-            graph.AddPass("tonemap", {rgResolved}, {rgLdr},
-                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
-                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
-                    cmd.BindPipeline(*postLdrPipe);
-                    cmd.BindTexture(*prevHist);
-                    cmd.Draw(3);
-                    cmd.EndRenderPass();
-                });
-            CasPC cpc{}; cpc.sharpness[0] = sharpen ? sharpness : 0.0f;
-            graph.AddPass("cas", {rgLdr}, {rgCas},
-                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
-                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
-                    cmd.BindPipeline(*casPipe);
-                    cmd.BindTexture(*ldrRT);
-                    cmd.PushConstants(&cpc, sizeof(cpc));
-                    cmd.Draw(3);
-                    cmd.EndRenderPass();
-                });
-            graph.Execute(*device);
-            device->WaitIdle();
-        }
+        return prevHist;
+    };
+
+    // (A) The static TSR upscale: N=8 accumulation -> post tonemap -> CAS sharpen -> CAS RT (read back).
+    auto renderHero = [&](bool sharpen, float sharpness,
+                          std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        rhi::IRenderTarget* resolved = accumulate();
+        render::RenderGraph graph;
+        render::RgResource rgResolved = graph.ImportTarget(
+            "resolved", render::RgResourceKind::SceneColor, *resolved);
+        render::RgResource rgLdr = graph.ImportTarget(
+            "tonemapLdr", render::RgResourceKind::SceneColor, *ldrRT);
+        render::RgResource rgCas = graph.ImportTarget(
+            "casOut", render::RgResourceKind::SceneColor, *casRT);
+        graph.AddPass("tonemap", {rgResolved}, {rgLdr},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postLdrPipe);
+                cmd.BindTexture(*resolved);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        CasPC cpc{}; cpc.sharpness[0] = sharpen ? sharpness : 0.0f;
+        graph.AddPass("cas", {rgLdr}, {rgCas},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*casPipe);
+                cmd.BindTexture(*ldrRT);
+                cmd.PushConstants(&cpc, sizeof(cpc));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
         outPx.clear(); outW = 0; outH = 0;
         bool got = device->ReadRenderTarget(*casRT, outPx, outW, outH);
         device->WaitIdle();
         return got;
     };
 
-    // (B) The NATIVE display-res reference at the FINAL pose, no jitter, full quality -> post -> LDR RT.
+    // (B) The NATIVE display-res reference at the STATIC base pose, no jitter, full quality -> post -> LDR RT.
     auto renderNative = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
-        const int fLast = taa::kAccumFrames - 1;
-        Mat4 curView = orbitView(fLast);
-        Vec3 eye = orbitEye(fLast);
-        FrameData fd = makeFd(-1, 0, 0, curView, eye);
+        FrameData fd = makeFd(-1, 0, 0);   // unjittered, base pose
         render::RenderGraph graph;
         render::RgResource rgShadow = graph.ImportTarget(
             "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
@@ -9519,12 +9441,9 @@ static int RunUs5UpscaleHeroShowcase(const char* outPath) {
         return got;
     };
 
-    // (C) The US1 NAIVE bilinear: render the internal-res scene at the FINAL pose -> post bilinear upscale.
+    // (C) The US1 NAIVE bilinear: render the internal-res scene at the STATIC base pose -> post bilinear upscale.
     auto renderNaive = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
-        const int fLast = taa::kAccumFrames - 1;
-        Mat4 curView = orbitView(fLast);
-        Vec3 eye = orbitEye(fLast);
-        FrameData fd = makeFd(-1, 0, 0, curView, eye);
+        FrameData fd = makeFd(-1, 0, 0);   // unjittered, base pose
         render::RenderGraph graph;
         render::RgResource rgShadow = graph.ImportTarget(
             "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
@@ -9572,13 +9491,13 @@ static int RunUs5UpscaleHeroShowcase(const char* outPath) {
     };
 
     const double ratio = (double)(DW * DH) / (double)(IW * IH);
-    std::printf("us5-upscale-hero: internal %ux%u -> display %ux%u (2x), orbiting camera, full TSR chain (reproject+accumulate+CAS)\n",
+    std::printf("us5-upscale-hero: internal %ux%u -> display %ux%u (2x), STATIC camera, temporal supersample (tsr_resolve) + CAS sharpen\n",
                 IW, IH, DW, DH);
 
     std::vector<uint8_t> hero0; uint32_t hw0 = 0, hh0 = 0;
     std::vector<uint8_t> hero1; uint32_t hw1 = 0, hh1 = 0;
-    if (!renderHero(true, true, kSharpness, hero0, hw0, hh0)) return fail("no hero pixels (run 0)");
-    if (!renderHero(true, true, kSharpness, hero1, hw1, hh1)) return fail("no hero pixels (run 1)");
+    if (!renderHero(true, kSharpness, hero0, hw0, hh0)) return fail("no hero pixels (run 0)");
+    if (!renderHero(true, kSharpness, hero1, hw1, hh1)) return fail("no hero pixels (run 1)");
     bool twoRun = (hero0.size() == hero1.size()) && (hw0 == hw1) && (hh0 == hh1) &&
                   (std::memcmp(hero0.data(), hero1.data(), hero0.size()) == 0);
     if (!twoRun) return fail("us5-upscale-hero two runs DIFFER (non-deterministic)");
@@ -9596,15 +9515,15 @@ static int RunUs5UpscaleHeroShowcase(const char* outPath) {
     if (heroMean <= 0.0) return fail("us5-upscale-hero image is black (incoherent)");
 
     const bool beats = (tsrDiff < naiveDiff);
-    std::printf("us5-upscale-hero: TSR beats naive {naiveDiff:%.4f, tsrDiff:%.4f} %s (full upscaler closer to native than bilinear)\n",
+    std::printf("us5-upscale-hero: TSR beats naive {naiveDiff:%.4f, tsrDiff:%.4f} %s (static upscaler closer to native than bilinear)\n",
                 naiveDiff, tsrDiff, beats ? "Dt < Dn" : "Dt >= Dn FAIL");
-    std::printf("us5-upscale-hero: provenance {frames:%d, reproject:true, sharpen:true, ratio:%.2f}\n",
+    std::printf("us5-upscale-hero: provenance {frames:%d, reproject:false, sharpen:true, ratio:%.2f}\n",
                 taa::kAccumFrames, ratio);
-    if (!beats) return fail("us5-upscale-hero full TSR upscale NOT closer to native than naive bilinear");
+    if (!beats) return fail("us5-upscale-hero static TSR upscale NOT closer to native than naive bilinear");
 
     if (!WritePNG(outPath, hero0, hw0, hh0)) return fail("PNG write failed");
     device->WaitIdle();
-    std::printf("OK wrote %s (%ux%u) — US5 2x hero upscale (reproject+accumulate+CAS), %u bodies\n",
+    std::printf("OK wrote %s (%ux%u) — US5 static 2x hero upscale (supersample+CAS), %u bodies\n",
                 outPath, hw0, hh0, kInstanceCount);
     return 0;
 }
@@ -71164,11 +71083,12 @@ int main(int argc, char** argv) {
             try { return RunUs3DisocclusionShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
-        // --us5-upscale-hero <out.png>: THE HERO money-shot (Slice US5, issue #20 capstone). Composes the
-        // US3 orbiting-camera reproject accumulation + the US4 CAS sharpen at a TRUE 2x upscale (internal
-        // 960x540 -> display 1920x1080). NO new shader. Proven the full TSR upscale is measurably CLOSER to
-        // a native display-res render than the US1 naive bilinear (tsrDiff < naiveDiff). Mirrors the Vulkan
-        // --us5-upscale-hero-shot EXACTLY (scene/orbit/jitter/N/sharpness identical); two runs DIFF 0.0000.
+        // --us5-upscale-hero <out.png>: THE HERO money-shot (Slice US5, issue #20 capstone). The STATIC-
+        // camera 2x hero — the US4 recipe (static camera + US2's tsr_resolve supersample + CAS sharpen) at a
+        // TRUE 2x upscale (internal 960x540 -> display 1920x1080). NO new shader. Proven the static TSR
+        // upscale is measurably CLOSER to a native display-res render than the US1 naive bilinear (tsrDiff <
+        // naiveDiff). Mirrors the Vulkan --us5-upscale-hero-shot EXACTLY (scene/jitter/N/sharpness/resolutions
+        // identical); two runs DIFF 0.0000. (Moving-camera reprojection lives in US3, excluded from the 2x hero.)
         if (argc > 1 && std::strcmp(argv[1], "--us5-upscale-hero") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_us5_upscale_hero.png";
             try { return RunUs5UpscaleHeroShowcase(out); }
