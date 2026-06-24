@@ -100,6 +100,7 @@
 #include "sim/grain.h"              // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp + the Vulkan --grain-integrate-shot
 #include "sim/particles.h"          // Slice PT1: deterministic GPU particles Q16.16 emitter + integrator (FxParticle/ParticlePool/EmitParticle/IntegrateParticles/RecycleDead/StepEmitIntegrate, free-list) — shared verbatim with particles_integrate.comp + the Vulkan --pt1-emit-shot; the Metal --pt1-emit runs the CPU StepEmitIntegrate (int64 integrator -> Vulkan-only shader)
 #include "pcg/pcg.h"                // Slice PCG1: deterministic PCG seeded hash-PRNG primitive (PcgHash/PcgRand01/PcgRandRange/PcgUnitDir/PcgStream) Q16.16 pure-int32 — reuses particles.h ParticleHash + EmitDir; the Metal --pcg1-hash runs the IDENTICAL pure-integer point-plot the Vulkan --pcg1-hash-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "foliage/foliage.h"        // Slice FO1 (FLAGSHIP #25 beachhead): deterministic integer WIND FIELD (kFoliageWind16 LUT / Gust / WindField / WindBend) Q16.16 — the audio kSineTable copied verbatim, NO runtime sin; the Metal --fo1-wind runs the IDENTICAL pure-integer wind heatmap the Vulkan --fo1-wind-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/broad.h"              // Slice BP1: deterministic integer broadphase THE BODY GRID + CSR CELL TABLE (BodyGrid/MakeBodyGrid/BodyCellOf/FlatBodyCellId/BodyCellTable/BuildBodyCellTable/BodyGridMeasure, keyed on fpx::FxBody) — shared verbatim with broad_cell_{count,scan,emit}.comp (MSL-NATIVE) + the Vulkan --broad-cell-shot; Metal --broad-cell DISPATCHES the GPU shaders
 #include "sim/couple.h"             // Slice CP1: deterministic rigid<->fluid coupling unified world + body->fluid grid-hash query (CoupleWorld/GatherBodyParticles/BodyParticleAccept) — shared verbatim with couple_body_{count,scan,emit}.comp + the Vulkan --couple-query-shot
 #include "sim/couple_grain.h"       // Slice CG1: deterministic rigid<->grain coupling unified bodies+grains world + body->grain grid-hash query (CGrainWorld/GatherBodyGrains/BodyGrainAccept) — shared verbatim with cgrain_body_{count,scan,emit}.comp + the Vulkan --cgrain-query-shot
@@ -40479,6 +40480,104 @@ static int RunPcg1HashShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FO1 — Deterministic integer WIND FIELD showcase (--fo1-wind) (the BEACHHEAD of FLAGSHIP #25,
+// DETERMINISTIC FOLIAGE AT SCALE, hf::foliage). PURE CPU — NO GPU compute, NO new shader, NO new RHI; foliage.h
+// is header-only pure-integer math (the kFoliageWind16 LUT = the audio kSineTable copied verbatim, indexed by an
+// integer phase accumulator — NO runtime sin), so on Metal it evaluates the IDENTICAL deterministic wind field
+// (WindBend) the Vulkan --fo1-wind-shot evaluates on Windows -> the 2D bend-heatmap golden is bit-identical
+// cross-backend BY CONSTRUCTION (strict zero-differing-pixel). Renders a 256x256 grid of XZ world positions over
+// a FIXED [0,64)^2 patch at a FIXED frame, each pixel colored by the SIGNED bend via PURE INTEGER math (positive
+// -> green ramp, negative -> blue ramp, magnitude clamp(|bend|>>shift,0,255) — NO float pixel math); the proof
+// lines (two-run identical, frame-sensitivity, the zero-amplitude no-op, provenance) match the Vulkan side
+// EXACTLY. The fixed WIND/FRAME/PATCH/IMG MUST be IDENTICAL to the Vulkan --fo1-wind-shot. New golden
+// tests/golden/metal/fo1_wind.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunFo1WindShowcase(const char* outPath) {
+    namespace fol = hf::foliage;
+    // THE FIXED SHOWCASE PARAMS — IDENTICAL to the Vulkan --fo1-wind-shot (main.cpp).
+    const uint32_t kImg    = 256u;
+    const uint32_t kFrame  = 90u;
+    const uint32_t kFrameB = 240u;
+    const int      kShift  = 8;
+    const fol::fx  kPatch  = fol::kOne * 64;
+    fol::WindField wind;
+    wind.gustCount = 3;
+    wind.master    = fol::kOne;
+    wind.gusts[0]  = fol::Gust{  1280,  448, 0x02000000u, fol::kOne / 3 };
+    wind.gusts[1]  = fol::Gust{   512, 1664, 0x01000000u, fol::kOne / 3 };
+    wind.gusts[2]  = fol::Gust{   960,  960, 0x03000000u, fol::kOne / 4 };
+
+    auto renderWind = [&](const fol::WindField& w, uint32_t frame, std::vector<uint8_t>& out,
+                          int64_t& maxAbsBend) {
+        out.assign((size_t)kImg * kImg * 4, 0);
+        maxAbsBend = 0;
+        for (uint32_t py = 0; py < kImg; ++py) {
+            const fol::fx wz = (fol::fx)(((int64_t)py * (int64_t)kPatch) / (int64_t)kImg);
+            for (uint32_t px = 0; px < kImg; ++px) {
+                const fol::fx wx = (fol::fx)(((int64_t)px * (int64_t)kPatch) / (int64_t)kImg);
+                const fol::fx bend = fol::WindBend(w, fol::FxVec3{wx, 0, wz}, frame);
+                const int64_t a = bend < 0 ? -(int64_t)bend : (int64_t)bend;
+                if (a > maxAbsBend) maxAbsBend = a;
+                int64_t m = a >> kShift;
+                if (m > 255) m = 255;
+                const uint8_t mag = (uint8_t)m;
+                uint8_t* d = &out[((size_t)py * kImg + px) * 4];
+                if (bend >= 0) {
+                    d[0] = (uint8_t)(mag / 6);
+                    d[1] = mag;
+                    d[2] = (uint8_t)(mag / 6);
+                } else {
+                    d[0] = mag;
+                    d[1] = (uint8_t)(mag / 6);
+                    d[2] = (uint8_t)(mag / 8);
+                }
+                d[3] = 255;
+            }
+        }
+    };
+    auto checksum = [](const std::vector<uint8_t>& img) {
+        uint32_t h = 2166136261u;
+        for (uint8_t byte : img) { h ^= byte; h *= 16777619u; }
+        return h;
+    };
+
+    std::vector<uint8_t> imgA1, imgA2;
+    int64_t maxA1 = 0, maxA2 = 0;
+    renderWind(wind, kFrame, imgA1, maxA1);
+    renderWind(wind, kFrame, imgA2, maxA2);
+    const bool twoRunIdentical = (imgA1.size() == imgA2.size()) &&
+                                 (std::memcmp(imgA1.data(), imgA2.data(), imgA1.size()) == 0);
+    if (!twoRunIdentical) return fail("fo1-wind: two runs differ");
+
+    std::vector<uint8_t> imgB;
+    int64_t maxB = 0;
+    renderWind(wind, kFrameB, imgB, maxB);
+    const uint32_t hA = checksum(imgA1);
+    const uint32_t hB = checksum(imgB);
+
+    fol::WindField zeroWind = wind;
+    zeroWind.master = 0;
+    std::vector<uint8_t> imgZero;
+    int64_t maxZero = 0;
+    renderWind(zeroWind, kFrame, imgZero, maxZero);
+
+    if (hA == hB || maxZero != 0 || maxA1 <= 0)
+        return fail("fo1-wind: frame-sensitivity / zero-amplitude / coherence control failed");
+
+    std::printf("fo1-wind: deterministic integer wind field (gusts=%d, frame=%u, patch 256x256)\n",
+                wind.gustCount, kFrame);
+    std::printf("fo1-wind: two-run BYTE-IDENTICAL\n");
+    std::printf("fo1-wind: different frame -> different field {frameA:0x%08X, frameB:0x%08X} Ha != Hb\n",
+                hA, hB);
+    std::printf("fo1-wind: zero-amplitude -> zero bend everywhere (no-op) {maxBend:%lld}\n",
+                (long long)maxZero);
+    std::printf("fo1-wind: provenance {gusts:%d, frame:%u}\n", wind.gustCount, kFrame);
+
+    if (!WritePNG(outPath, imgA1, kImg, kImg)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fo1 deterministic integer wind heatmap (gusts=%d, frame=%u)\n",
+                outPath, kImg, kImg, wind.gustCount, kFrame);
+    return 0;
+}
+
 // ===== Slice PCG2 — Deterministic PCG JITTERED-GRID POINT SCATTER showcase (--pcg2-scatter) (the 2nd slice of
 // FLAGSHIP #22, hf::pcg). PURE CPU — NO GPU compute, NO new shader, NO new RHI; pcg.h is header-only pure-int32
 // math, so on Metal it runs the IDENTICAL deterministic jittered-grid scatter (ScatterGrid) the Vulkan
@@ -70541,6 +70640,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pcg1-hash") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pcg1_hash.png";
             try { return RunPcg1HashShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fo1-wind <out.png>: render the Deterministic integer WIND FIELD showcase (Slice FO1, the BEACHHEAD of
+        // FLAGSHIP #25). PURE CPU — runs the IDENTICAL foliage.h WindBend the Vulkan --fo1-wind-shot runs (the 2D
+        // top-down bend heatmap over a fixed [0,64)^2 patch at a fixed frame, pure-integer pixel map) -> the wind
+        // field is bit-identical cross-backend BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY. NO
+        // shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--fo1-wind") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fo1_wind.png";
+            try { return RunFo1WindShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --pcg2-scatter <out.png>: render the Deterministic PCG JITTERED-GRID POINT SCATTER showcase (Slice PCG2,

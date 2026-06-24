@@ -1179,6 +1179,13 @@ hf_add_pure_test(particles_test)
 # (hf_core), ASan-eligible. pcg.h #includes fpx.h + particles.h read-only.
 hf_add_pure_test(pcg_test)
 
+# Slice FO1 (the BEACHHEAD of FLAGSHIP #25, DETERMINISTIC FOLIAGE AT SCALE): the deterministic integer WIND FIELD
+# (engine/foliage/foliage.h) — WindBend(wind,pos,frame) is a Q16.16 bend angle from a sum of host-baked sine "gust"
+# waves indexed by an integer phase accumulator into the committed kFoliageWind16 LUT (the audio kSineTable copied
+# verbatim) — bit-identical CPU<->Vulkan<->Metal, NO runtime sin/<cmath>. Pins determinism + the zero-amplitude
+# no-op + frame-sensitivity + LUT provenance. Pure C++ (hf_core), ASan-eligible. foliage.h #includes fpx.h read-only.
+hf_add_pure_test(foliage_test)
+
 # Deterministic Integer Broadphase Slice 1 (Slice BP1, the BEACHHEAD of FLAGSHIP #23): the BODY GRID + CSR CELL
 # TABLE core (engine/sim/broad.h) the GPU shaders/broad_cell_{count,scan,emit}.comp.hlsl copy VERBATIM + prove
 # bit-identical. The grain.h GrainGrid/GrainCellTable count->scan->emit, keyed on fpx::FxBody. broad_test pins
