@@ -1362,6 +1362,54 @@ new RHI** across the flagship.
 
 ---
 
+## Weather Layer — deterministic dynamic atmosphere (`engine/weather/weather.h`, namespace `hf::weather`) — flagship #27
+
+Slices WE1–WE6 finish the living world with **weather as a pure function of (seed, frame)**: drifting volumetric
+clouds, falling precipitation, and a time-of-day sun + sky, all bit-identical CPU↔Vulkan↔Metal. The moat (one
+comparison aside): a UE5-class volumetric-cloud/weather system is float and clock-driven, so two machines drift the
+clouds differently and the rain falls differently — weather can never be lockstep/netcode-replicated. Here the storm
+is a *replay*: two peers, given the same seed and frame counter, render the byte-identical drifting cloudscape with
+the byte-identical rain at the byte-identical sun angle. A key design note: the existing float `render/clouds.h`
+(`frac(sin())` cpu-mirror-of-shader) is the cross-vendor-divergent **render bridge**, NOT the data source — the
+deterministic weather DATA lives in the new `weather.h`, and the cloud/precip/sun-sky data carry strict-integer
+zero-diff cross-backend goldens (the strongest bar); only the final lit composite crosses to the FLOAT
+visresolve-bar. It composes the deterministic terrain (#26) and foliage (#25); **no new shader, no new RHI** across
+the flagship (the cloud render reuses the existing `clouds.frag` raymarch verbatim, driven by an integer-drift
+push-constant — the FO5/PT4 single-crossing precedent).
+
+- **Drifting cloud-density field (WE1).** `IntCloudDensity(x,z,frame,…)` — integer fBm value-noise (reusing
+  `terrain::IntValueNoise`) advected by an integer drift offset that grows with the frame, then coverage-carved into
+  a Q16.16 density. **Proof:** a pure-integer cloud-density slab cut, strict zero-diff, frame `F` vs `F+1` → drifted
+  (the clouds move), zero-coverage → clear-sky no-op. Golden `we1_clouddensity`.
+- **Precipitation field (WE2).** `PrecipDrop`/`GenPrecip` — each raindrop is a pure function of (seed, frame): a
+  fixed `PcgRandRange` scatter, and a Y that wraps via integer modulo of `fallSpeed·frame` (no accumulator state, no
+  float `particles.h`). **Proof:** a pure-integer side-view streak plot, strict zero-diff, frame advance → drops
+  descended, zero-count no-op. Golden `we2_precip`.
+- **Time-of-day sun + sky (WE3).** `SunSky(frame)` indexes the baked `kFoliageWind16` sine LUT for the sun's arc (a
+  quarter-cycle-shifted elevation peaking at noon, troughing at midnight) + a committed sky-color ramp
+  (midnight→dawn→noon→dusk). **Proof:** a pure-integer day-cycle strip plot, strict zero-diff, sun arcs (noon elev >
+  midnight), sky colors distinct, periodic over a 1440-frame day. Golden `we3_tod`.
+- **Lit drifting-cloud render (WE4, FLOAT).** `CloudDriftTime(frame)` feeds the WE1 integer drift (as a deterministic
+  float) into the existing `clouds.frag` advection, and `SunSky` drives the light dir/sky tint — the clouds drift and
+  are lit bit-identically by the frame, not a clock. **Proof:** two renders byte-identical + provenance (`cprm.time
+  == CloudDriftTime`, sun from `SunSky`); Metal two-run 0.0000, cross-vendor 3.95 (the lowest of any render slice).
+  Golden `we4_drift`.
+- **Weather over the meadow (WE5, FLOAT, composes #25+#26).** `RainToRenderInstances` (the foliage instanced-render
+  twin) draws the rain over the PT5 eroded-valley meadow, with the WE4 cloud pass overhead and the WE3 sun — one
+  composited scene. **Proof:** two renders byte-identical + provenance (every plant still seated + drift/precip/sun
+  all recompute) + empty-no-op. Golden `we5_storm`.
+- **The storm hero (WE6, FLOAT capstone).** A cinematic low camera across the eroded-valley meadow under a drifting
+  overcast with a heavy downpour at golden-hour dawn — the foliage leaning in the storm wind over the carved relief.
+  **Proof:** two renders byte-identical + provenance; Metal two-run 0.0000, cross-vendor 17.83, eyeballed. Golden
+  `we6_hero`. **Completes flagship #27 — deterministic weather**, and with it the deterministic living-world arc
+  (terrain → foliage → weather), every layer byte-reproducible and netcode-replayable. Honest scope: a single
+  raymarched cumulus slab (the existing `clouds.h` model), a baked sky-color ramp (not physically-based), a single
+  directional sun; instanced streak rain (no splash/wetness/accumulation; snow = the same field with a different
+  fall speed/color); a single scene (not a streamed sky); cloud lighting stays float in `clouds.frag` (only the
+  cloud-density data is the strict-integer golden); the sky-IBL cool tint carried by framing/drift/rain/sun.
+
+---
+
 ## Material / Shader Graph Layer (`engine/material/`)
 
 Phase 4 adds a **data-driven material system** that authors shaders as node graphs instead of hand-written HLSL, while preserving the "shaders are generated, not hand-written" and golden-stability invariants. It is pure host logic above the seam — no `vk*`/`MTL*`/`Backend` symbols — and is split into five concerns plus a build-time tool:
