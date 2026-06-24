@@ -16,9 +16,11 @@
 
 #include <cstdint>
 #include <vector>      // Slice FO2: PlaceFoliage returns std::vector<FoliageInstance>
+#include <cmath>       // Slice FO5 render bridge ONLY: std::sin/std::cos for the float wind lean quat (FLOAT)
 
 #include "sim/fpx.h"   // Q16.16 toolbox (read-only): fx / kOne / kFrac / fxmul / FxVec3
 #include "pcg/pcg.h"   // Slice FO2 (read-only): PcgGraph / PcgStream / PcgInstance / Generate — the placement engine
+#include "math/math.h" // Slice FO5 render bridge ONLY: math::Mat4 / Quat / Vec3 / FromTRS / Normalize (FLOAT)
 
 namespace hf::foliage {
 
@@ -207,6 +209,65 @@ inline void AssignLods(std::vector<FoliageInstance>& v, const FxVec3& camPos, fx
     for (FoliageInstance& inst : v) {
         inst.lod = FoliageLod(inst.base.pos, camPos, nearR, farR);
     }
+}
+
+// ===== Slice FO5 — LIT 3D render bridge (FLOAT, render-only — the SCALE money-shot of FLAGSHIP #25) =====
+// THE ONE FLOAT CROSSING of the whole flagship. FO1-FO4 above stay STRICT INTEGER (bit-exact cross-platform);
+// here — and ONLY here — we cross to float to build per-instance render transforms for the rasterizer. This is
+// the documented FLOAT visresolve-bar (the PCG6/PT6/GR6 precedent): the foliage DATA (FO2 placement + FO3 wind
+// sway + FO4 LOD) is bit-exact, the final raster/shade is float (cross-vendor ~the engine baseline, NOT held to
+// the integer zero-diff bar). The provenance proof: every transform derives from the bit-exact FoliageInstance
+// {base.pos, base.orient, base.scale, bend, lod} that PlaceFoliage/ApplyWind/AssignLods emit. Render-only — NOT
+// used by FO1-FO4, NO data mutation. The pcg::PcgToRenderInstances twin, but per-instance it ALSO bakes the
+// per-instance bend (a float LEAN about a fixed horizontal axis) AND HONORS the LOD (cull lod==3, far LODs a
+// touch smaller).
+
+// lodScale(lod): the per-LOD presentation scale (1.0 / 1.0 / 0.7 for LOD0/1/2 — far plants a touch smaller as a
+// billboard stand-in; honest v1). lod==3 is culled by the caller (never reaches here). FLOAT, render-only.
+inline float FoliageLodScale(uint32_t lod) {
+    return (lod >= 2u) ? 0.7f : 1.0f;
+}
+
+// FoliageToRenderInstances(instances, baseScale): build ONE column-major model matrix per NON-CULLED instance
+// (lod != 3). For each plant:
+//   t   = {FxToFloat(base.pos.x/y/z)} (the placement position, the ONE host fixed-point->float divide);
+//   yaw = normalize(Quat{FxToFloat(base.orient.x..w)}) (the placement yaw, renormalized in float);
+//   lean = a float quat rotating about a FIXED horizontal axis (+X) by FxToFloat(bend) — built directly with
+//          std::cos/std::sin of bend/2 (this is the FLOAT visresolve-bar code, NOT asserted bit-exact; float is
+//          allowed HERE in the render bridge ONLY);
+//   scale = FxToFloat(base.scale) * baseScale * FoliageLodScale(lod);
+//   out.push_back(FromTRS(t, lean*yaw, {scale,scale,scale})).
+// The composed rotation lean*yaw is the Hamilton product (math.h has no quat operator*, so it is spelled out
+// here, render-only). Output is the scene::InstanceData / InstanceTransformLayout packing (16 floats column-
+// major) the EXISTING instanced lit pipeline consumes, matching pcg::PcgToRenderInstances EXACTLY. Empty input
+// -> empty output (the empty no-op). Pure deterministic host float (no RNG, no clock). The ONLY float code in
+// foliage.h (clearly commented as the render bridge).
+inline std::vector<math::Mat4> FoliageToRenderInstances(const std::vector<FoliageInstance>& instances,
+                                                        float baseScale) {
+    std::vector<math::Mat4> out;
+    out.reserve(instances.size());
+    for (const FoliageInstance& inst : instances) {
+        if (inst.lod == 3u) continue;   // LOD3 = culled (beyond far radius) — skipped, never rendered
+        const math::Vec3 t{hf::sim::fpx::FxToFloat(inst.base.pos.x),
+                           hf::sim::fpx::FxToFloat(inst.base.pos.y),
+                           hf::sim::fpx::FxToFloat(inst.base.pos.z)};
+        const math::Quat yaw = math::Normalize(math::Quat{
+            hf::sim::fpx::FxToFloat(inst.base.orient.x), hf::sim::fpx::FxToFloat(inst.base.orient.y),
+            hf::sim::fpx::FxToFloat(inst.base.orient.z), hf::sim::fpx::FxToFloat(inst.base.orient.w)});
+        // The wind LEAN: a float quaternion about the FIXED horizontal axis +X by the Q16.16 bend angle.
+        const float bendRad = hf::sim::fpx::FxToFloat(inst.bend);
+        const float hs = std::sin(bendRad * 0.5f), hc = std::cos(bendRad * 0.5f);
+        const math::Quat lean{hs, 0.0f, 0.0f, hc};   // (x,y,z,w) = rotate about +X by bendRad
+        // lean * yaw (Hamilton product; math.h has no quat operator*, render-only here):
+        const math::Quat q{
+            lean.w * yaw.x + lean.x * yaw.w + lean.y * yaw.z - lean.z * yaw.y,
+            lean.w * yaw.y - lean.x * yaw.z + lean.y * yaw.w + lean.z * yaw.x,
+            lean.w * yaw.z + lean.x * yaw.y - lean.y * yaw.x + lean.z * yaw.w,
+            lean.w * yaw.w - lean.x * yaw.x - lean.y * yaw.y - lean.z * yaw.z};
+        const float s = hf::sim::fpx::FxToFloat(inst.base.scale) * baseScale * FoliageLodScale(inst.lod);
+        out.push_back(math::FromTRS(t, q, math::Vec3{s, s, s}));
+    }
+    return out;
 }
 
 }  // namespace hf::foliage
