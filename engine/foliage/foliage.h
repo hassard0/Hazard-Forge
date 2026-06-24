@@ -270,4 +270,47 @@ inline std::vector<math::Mat4> FoliageToRenderInstances(const std::vector<Foliag
     return out;
 }
 
+// ===== Slice FO6 — HERO render bridge (FLOAT, render-only — the CAPSTONE money-shot of FLAGSHIP #25) =====
+// APPEND-ONLY. FO6 is driver tuning (a closer/lower cinematic camera + bigger baseScale + a larger FO6 WindField
+// amplitude) on top of the EXISTING FO5 render path. The FO3 wind bend is a SMALL angle; at hero scale the lean
+// must be PERCEPTIBLE so the meadow visibly ripples. FoliageToRenderInstancesHero is FoliageToRenderInstances
+// VERBATIM except (1) the bend angle is scaled by a render-only `leanGain` BEFORE building the float lean quat,
+// and (2) the plant is scaled TALLER than wide by `heightMul` in its LOCAL frame (a non-uniform Y stretch applied
+// BEFORE the lean rotation via FromTRS's local scale) — so a sphere mesh reads as an upright BLADE whose tilt is
+// VISIBLE (a uniform sphere's lean is invisible; a tall blade's lean reads as a coherent ripple). Both are render-
+// only and do NOT touch the bit-exact FO1-FO4 data (the bend stored on each instance is UNCHANGED; only this
+// render transform amplifies + stretches it). leanGain==1 + heightMul==1 reproduces FoliageToRenderInstances byte-
+// for-byte. This is render-only (NOT used by FO1-FO5, NO data mutation); the provenance proof recomputes against
+// THIS same helper so the bit-exact derivation chain holds. The ONLY new code FO6 adds to foliage.h.
+inline std::vector<math::Mat4> FoliageToRenderInstancesHero(const std::vector<FoliageInstance>& instances,
+                                                           float baseScale, float leanGain, float heightMul) {
+    std::vector<math::Mat4> out;
+    out.reserve(instances.size());
+    for (const FoliageInstance& inst : instances) {
+        if (inst.lod == 3u) continue;   // LOD3 = culled (beyond far radius) — skipped, never rendered
+        const math::Vec3 t{hf::sim::fpx::FxToFloat(inst.base.pos.x),
+                           hf::sim::fpx::FxToFloat(inst.base.pos.y),
+                           hf::sim::fpx::FxToFloat(inst.base.pos.z)};
+        const math::Quat yaw = math::Normalize(math::Quat{
+            hf::sim::fpx::FxToFloat(inst.base.orient.x), hf::sim::fpx::FxToFloat(inst.base.orient.y),
+            hf::sim::fpx::FxToFloat(inst.base.orient.z), hf::sim::fpx::FxToFloat(inst.base.orient.w)});
+        // The wind LEAN: a float quaternion about the FIXED horizontal axis +X by the Q16.16 bend angle, scaled
+        // by the render-only leanGain so the lean READS at hero scale (FO5: leanGain==1.0 reproduces it exactly).
+        const float bendRad = hf::sim::fpx::FxToFloat(inst.bend) * leanGain;
+        const float hs = std::sin(bendRad * 0.5f), hc = std::cos(bendRad * 0.5f);
+        const math::Quat lean{hs, 0.0f, 0.0f, hc};   // (x,y,z,w) = rotate about +X by bendRad
+        // lean * yaw (Hamilton product; math.h has no quat operator*, render-only here):
+        const math::Quat q{
+            lean.w * yaw.x + lean.x * yaw.w + lean.y * yaw.z - lean.z * yaw.y,
+            lean.w * yaw.y - lean.x * yaw.z + lean.y * yaw.w + lean.z * yaw.x,
+            lean.w * yaw.z + lean.x * yaw.y - lean.y * yaw.x + lean.z * yaw.w,
+            lean.w * yaw.w - lean.x * yaw.x - lean.y * yaw.y - lean.z * yaw.z};
+        const float s = hf::sim::fpx::FxToFloat(inst.base.scale) * baseScale * FoliageLodScale(inst.lod);
+        // Taller-than-wide blade: a non-uniform LOCAL Y stretch (FromTRS applies scale first, in local space) so
+        // the lean of the rotated blade reads (a uniform sphere's tilt is invisible). Render-only.
+        out.push_back(math::FromTRS(t, q, math::Vec3{s, s * heightMul, s}));
+    }
+    return out;
+}
+
 }  // namespace hf::foliage

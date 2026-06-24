@@ -57394,6 +57394,329 @@ static int RunFo5ScaleShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FO6 — Deterministic FOLIAGE HERO money-shot (the CAPSTONE COMPLETING FLAGSHIP #25). Mirrors the
+// Vulkan --fo6-hero-shot path EXACTLY: the FO5 SCALE field TUNED into a cinematic wind-swept MEADOW you're standing
+// in — a CLOSER, LOWER near-ground 3/4 camera so the plants + their wind lean are the subject, BIGGER plants
+// (baseScale 0.70) + a LARGER FO6 WindField amplitude + an amplified render-only LEAN + a taller-than-wide BLADE
+// (FoliageToRenderInstancesHero leanGain=7.0/heightMul=3.2) so the small FO3 bend READS as a visible lean, and a
+// meadow receding to the horizon with LOD thinning (near plants LOD0, far LOD1/2 thin/shrink, the far edge LOD3
+// culls). The bit-exact FO2/FO3/FO4 integer pipeline is IDENTICAL in kind to FO5 (PlaceFoliage -> ApplyWind ->
+// AssignLods, a PURE FUNCTION of the seed). THE FIELD/SEED/WIND/FRAME/CAMERA/LIGHT BELOW IS IDENTICAL to the Vulkan
+// --fo6-hero-shot so the instance set is byte-identical by construction (only the GPU float raster diverges = the
+// FLOAT visresolve-bar). HONEST COLOR CAVEAT: the sky-IBL ambient tints these matte surfaces cool — size, framing,
+// the wind LEAN, and the LOD recession carry the shot, not the hue. New golden tests/golden/metal/fo6_hero.png.
+// NO new shader, NO RHI.
+static int RunFo6HeroShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace foliage = hf::foliage;
+    namespace pcg = hf::pcg;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === The DENSE foliage field (the SAME foliage.h field + seed + wind + frame + camera as the Vulkan
+    // --fo6-hero-shot — byte-identical instance set/transforms by construction). SAME field shape as FO5; the HERO
+    // is the framing/scale/wind/lean tuning. ===
+    const uint32_t kSeed = 1337u;
+    const pcg::PcgStream stream{kSeed, 0x5CA77E20u};
+    const uint32_t kFrame = 90u;
+    const float kBaseScale  = 0.70f;                       // plants sized as readable blades (not a foreground wall)
+    const float kLeanGain   = 7.0f;                        // render-only lean amplification so the FO3 bend READS
+    const float kHeightMul  = 3.2f;                        // render-only taller-than-wide BLADE so the lean is VISIBLE
+
+    foliage::FoliageField field;
+    field.graph.area.min = pcg::FxVec3{-16 * pcg::kOne, 0, -16 * pcg::kOne};  // 32x32 XZ patch centred at origin
+    field.graph.area.max = pcg::FxVec3{ 16 * pcg::kOne, 0,  16 * pcg::kOne};
+    field.graph.cellsX = 110; field.graph.cellsZ = 110;
+    field.graph.useMask = true;
+    field.graph.mask.type   = pcg::PcgMaskType::Radial;
+    field.graph.mask.center = pcg::FxVec3{0, 0, 0};
+    field.graph.mask.radius = 24 * pcg::kOne;
+    field.graph.density     = pcg::kOne;
+    field.graph.transform.randomYaw = true;
+    field.graph.transform.scaleLo   = pcg::kOne * 5 / 10;
+    field.graph.transform.scaleHi   = pcg::kOne * 15 / 10;
+    field.graph.prune       = true;
+    field.graph.pruneRadius = pcg::kOne * 18 / 100;
+
+    // The bit-exact FO1 wind field (a 3-gust WindField) — LARGER amplitudes than FO5 (== the Vulkan --fo6-hero-shot).
+    foliage::WindField wind;
+    wind.gustCount = 3;
+    wind.master    = pcg::kOne;
+    wind.gusts[0]  = foliage::Gust{ 0x01000000, 0x00400000, 0x02000000, pcg::kOne / 4 };
+    wind.gusts[1]  = foliage::Gust{ 0x00300000, 0x01200000, 0x03000000, pcg::kOne / 7 };
+    wind.gusts[2]  = foliage::Gust{ 0x00800000, 0x00900000, 0x01800000, pcg::kOne / 10 };
+
+    // The FO4 LOD camera + radii (integer thresholds; == the Vulkan --fo6-hero-shot LOD knobs). camPos at the
+    // RENDER eye XZ -> LOD rings fan out across the meadow -> LOD thinning toward the horizon.
+    const pcg::FxVec3 camPosFx{17 * pcg::kOne, 0, 17 * pcg::kOne};
+    const foliage::fx nearR = pcg::kOne * 13;
+    const foliage::fx farR  = pcg::kOne * 44;
+
+    std::vector<foliage::FoliageInstance> plants = foliage::PlaceFoliage(field, stream);
+    foliage::ApplyWind(plants, wind, kFrame);
+    foliage::AssignLods(plants, camPosFx, nearR, farR);
+
+    const std::vector<Mat4> mats = foliage::FoliageToRenderInstancesHero(plants, kBaseScale, kLeanGain, kHeightMul);
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(mats.size());
+    for (const Mat4& m : mats) {
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        // RENDER-ONLY framing lift (does NOT touch `mats` -> the provenance compare stays exact): lift the render
+        // Y by the sphere's world radius so each plant RESTS ON the ground (== the Vulkan --fo6-hero-shot lift).
+        inst.model[13] += m.m[5] * 0.5f;
+        instances.push_back(inst);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+    // === Reuse the EXISTING instanced lit pipeline (the --fo5-scale/--pcg6-field wiring). ===
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = device->Swapchain().ColorFormat();
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    // CALM ground: a solid earthy albedo (== the Vulkan --fo6-hero-shot ground; the IBL ambient cools it — caveat).
+    const uint8_t groundPx[4] = {96, 84, 64, 255};         // flat matte earth-brown ground
+    auto groundTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, groundPx, sizeof(groundPx)});
+    // Foliage GREEN albedo for the plants (== the Vulkan --fo6-hero-shot leaf color).
+    const uint8_t leafPx[4] = {90, 170, 70, 255};          // verdant leaf green (pops vs earthy floor)
+    auto leafTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, leafPx, sizeof(leafPx)});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    std::unique_ptr<rhi::IBuffer> instanceBuffer;
+    if (kInstanceCount > 0) {
+        rhi::BufferDesc instBufDesc;
+        instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+        instBufDesc.initialData = instances.data();
+        instBufDesc.usage = rhi::BufferUsage::Vertex;
+        instanceBuffer = device->CreateBuffer(instBufDesc);
+    }
+
+    Mat4 groundModel = Mat4::Scale({60.0f, 1.0f, 60.0f});  // a WIDE ground so it recedes to the horizon (== the Vulkan path)
+
+    // CINEMATIC near-ground camera (== the Vulkan --fo6-hero-shot camera): brought DOWN and IN looking ACROSS the
+    // meadow toward the far horizon so the plants + their wind lean are the subject and the field recedes with LOD.
+    const Vec3 eye{17.0f, 4.6f, 17.0f};
+    const Vec3 center{-4.0f, 1.6f, -4.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 200.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 0.0f, 0.0f};
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 42.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-32.0f, 32.0f, -32.0f, 32.0f, 1.0f, 90.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graphRg;
+    render::RgResource rgShadow = graphRg.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graphRg.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graphRg.ImportSwapchain("swapchain");
+
+    graphRg.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instShadowPipeline);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graphRg.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                // calm matte earth floor: non-metallic, fully rough (no busy specular/checker).
+                pc[16] = 0.0f; pc[17] = 0.95f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instPipeline);
+                // verdant matte FOLIAGE: non-metallic, high roughness (the dense meadow, the hero).
+                float material[4] = {0.0f, 0.9f, 0.0f, 0.0f};
+                cmd.PushConstants(material, sizeof(material));
+                cmd.BindMaterial(*leafTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graphRg.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graphRg.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    // PROOF (1) headline + provenance count. "shaded" = non-dark pixels (the lit ground + plants).
+    uint32_t shaded = 0;
+    for (size_t p = 0; p + 3 < bgra.size(); p += 4)
+        if ((int)bgra[p] + (int)bgra[p + 1] + (int)bgra[p + 2] > 60) ++shaded;
+    std::printf("fo6-hero: wind-swept foliage meadow hero (instances:%u, frame:%u)\n",
+                kInstanceCount, kFrame);
+
+    // PROOF (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graphRg.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("fo6-hero two renders DIFFER (nondeterministic)");
+    std::printf("fo6-hero: two renders BYTE-IDENTICAL\n");
+
+    // PROOF (3) coverage / coherence + provenance: shaded>0, not uniform, instances == recomputed.
+    if (shaded == 0) return fail("fo6-hero coverage 0 (nothing shaded)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("fo6-hero uniform image (no coherent field)");
+    {
+        std::vector<foliage::FoliageInstance> regen = foliage::PlaceFoliage(field, stream);
+        foliage::ApplyWind(regen, wind, kFrame);
+        foliage::AssignLods(regen, camPosFx, nearR, farR);
+        const std::vector<Mat4> rebuild = foliage::FoliageToRenderInstancesHero(regen, kBaseScale, kLeanGain, kHeightMul);
+        if (rebuild.size() != mats.size() ||
+            std::memcmp(rebuild.data(), mats.data(), mats.size() * sizeof(Mat4)) != 0)
+            return fail("fo6-hero provenance: instances != recomputed FoliageToRenderInstances(ApplyWind(PlaceFoliage))");
+        if ((uint32_t)rebuild.size() != kInstanceCount)
+            return fail("fo6-hero provenance count != rendered");
+    }
+    std::printf("fo6-hero: provenance instances == FoliageToRenderInstances(ApplyWind(PlaceFoliage(seed))) "
+                "{instances:%u, shaded:%u}\n", kInstanceCount, shaded);
+
+    // PROOF (4) empty no-op: an empty graph (cellsX<=0) -> zero plants -> the cleared base scene.
+    {
+        foliage::FoliageField emptyField = field;
+        emptyField.graph.cellsX = 0;
+        std::vector<foliage::FoliageInstance> emptyPlants = foliage::PlaceFoliage(emptyField, stream);
+        foliage::ApplyWind(emptyPlants, wind, kFrame);
+        foliage::AssignLods(emptyPlants, camPosFx, nearR, farR);
+        if (!emptyPlants.empty() ||
+            !foliage::FoliageToRenderInstancesHero(emptyPlants, kBaseScale, kLeanGain, kHeightMul).empty())
+            return fail("fo6-hero empty graph not empty");
+    }
+    std::printf("fo6-hero: empty graph -> base scene (no-op) {emptyInstances:0}\n");
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — deterministic foliage meadow hero (%u instances)\n",
+                outPath, cw, ch, kInstanceCount);
+    return 0;
+}
+
 // ===== Slice PCG6 — Deterministic PCG LIT 3D RENDER capstone (the money-shot COMPLETING FLAGSHIP #22). Mirrors
 // the Vulkan --pcg6-field-shot path EXACTLY: builds the SAME full PcgGraph (jittered-grid scatter over a 12x12 XZ
 // patch centred at the origin -> a radial density mask -> random yaw + scale [0.6,1.4] -> overlap-prune),
@@ -70783,6 +71106,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fo5-scale") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fo5_scale.png";
             try { return RunFo5ScaleShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fo6-hero <out.png>: render the Deterministic FOLIAGE HERO money-shot (Slice FO6, the CAPSTONE COMPLETING
+        // FLAGSHIP #25). Builds the SAME DENSE FoliageField + seed + wind + frame + camera as the Vulkan
+        // --fo6-hero-shot (the FO5 SCALE field TUNED into a wind-swept MEADOW: closer/lower camera, bigger plants,
+        // larger wind, an amplified render-only lean + taller-than-wide blades), runs the bit-exact FO2/FO3/FO4
+        // integer pipeline (PlaceFoliage -> ApplyWind -> AssignLods), builds one model matrix per non-culled plant
+        // (FoliageToRenderInstancesHero), and renders the meadow as lit 3D instanced spheres through the EXISTING
+        // instanced lit pipeline. The instance set + transforms are byte-identical to the Vulkan --fo6-hero-shot by
+        // construction. FLOAT visresolve-bar: Metal-render==Metal-golden DIFF 0.0000 + provenance; cross-vendor
+        // ~the float baseline. New golden tests/golden/metal/fo6_hero.png. NO new shader, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--fo6-hero") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fo6_hero.png";
+            try { return RunFo6HeroShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --couple-render <out.png>: render the Deterministic Rigid<->Fluid Coupling LIT 3D RENDER capstone
