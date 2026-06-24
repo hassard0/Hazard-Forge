@@ -123,4 +123,84 @@ std::vector<uint8_t> EncodeDemo(const Recorder<World, Input>& rec, SerWorldFn se
     return out;
 }
 
+// ============================ RP2: PLAYBACK — DecodeDemo + Replay ====================================
+// The inverse of RP1's RECORD half: decode a demo's bytes back into its CAUSAL SEED (header + initial-
+// world snapshot + input ring), then REPLAY it by re-running the EXISTING deterministic Step over the
+// decoded ring — proving the replayed world is BIT-IDENTICAL to the live session (re-derived, NOT
+// interpolated). The format is FROZEN (RP1's pinned file hash stays valid); RP2 adds Demo/DecodeDemo/
+// ReplayResult/Replay BELOW the RP1 code, append-only. Pure-CPU INTEGER, header stays self-contained.
+
+// --- Demo<World,Input> — the decoded demo (the inverse of EncodeDemo's product) ---------------------
+template <class World, class Input>
+struct Demo {
+    DemoHeader            header{};   // fields read back out of the file (magic/version/seed/tickCount/...)
+    World                 initial{};  // the deserialized initial-world snapshot
+    net::InputRing<Input> ring;       // the deserialized per-tick input stream
+};
+
+// --- DecodeDemo — parse demo bytes back into a Demo<World,Input>, hand-LE (GetU32 + driver deser) ----
+// Layout is EncodeDemo's exact inverse: magic(8) then 6 u32 fields (version, seed, tickCount,
+// keyframeInterval, worldByteLen, inputByteLen) = 8 + 6*4 = 32-byte header, then the world blob at
+// offset 32 and the input blob at 32 + worldByteLen. (Re-derived by COUNTING EncodeDemo's 6 PutU32 calls
+// after the 8-byte magic — matches the RP1 test's offset-32 header round-trip.) The driver supplies the
+// inverse serializers: deserWorld(const uint8_t* p, uint32_t len) -> World and
+// deserInputRing(const uint8_t* p, uint32_t len) -> net::InputRing<Input>. Validates magic == kDemoMagic
+// and version == kDemoVersion (RP2 only feeds valid demos; the corruption path is RP6).
+template <class World, class Input, class DeserWorldFn, class DeserInputFn>
+Demo<World, Input> DecodeDemo(const std::vector<uint8_t>& bytes, DeserWorldFn deserWorld,
+                              DeserInputFn deserInputRing) {
+    Demo<World, Input> demo;
+    const uint8_t* p = bytes.data();
+
+    // magic(8) — read back in PutBytes (address) order.
+    for (int i = 0; i < 8; ++i) demo.header.magic[i] = static_cast<char>(p[i]);
+    demo.header.version          = GetU32(p + 8);    // offset  8
+    demo.header.seed             = GetU32(p + 12);   // offset 12
+    demo.header.tickCount        = GetU32(p + 16);   // offset 16
+    demo.header.keyframeInterval = GetU32(p + 20);   // offset 20
+    demo.header.worldByteLen     = GetU32(p + 24);   // offset 24
+    demo.header.inputByteLen     = GetU32(p + 28);   // offset 28
+    // header is 8 + 6*4 = 32 bytes; the world blob starts at offset 32, the input blob at 32 + worldByteLen.
+
+    // Validate magic == kDemoMagic and version == kDemoVersion (keep it simple — RP6 owns corruption).
+    bool magicOk = true;
+    for (int i = 0; i < 8; ++i)
+        if (demo.header.magic[i] != kDemoMagic[i]) magicOk = false;
+    if (!magicOk || demo.header.version != kDemoVersion) return demo;  // empty/default Demo on mismatch
+
+    const uint32_t worldOff = 32u;
+    const uint32_t inputOff  = 32u + demo.header.worldByteLen;
+    demo.initial = deserWorld(p + worldOff, demo.header.worldByteLen);
+    demo.ring    = deserInputRing(p + inputOff, demo.header.inputByteLen);
+    return demo;
+}
+
+// --- ReplayResult — the playback product: the final digest + the re-derived per-tick trace ----------
+template <class World, class Input>
+struct ReplayResult {
+    uint64_t              finalDigest = 0;
+    std::vector<uint64_t> trace;          // digest(world) after each of header.tickCount ticks
+};
+
+// --- Replay — restore the initial snapshot and Advance for tickCount ticks over the decoded ring ----
+// Playback IS the CatchUp/RunLockstep body seeded from the initial world: net::Session s; s.world =
+// demo.initial; s.ring = demo.ring; s.tick = 0; then loop demo.header.tickCount times calling net::Advance
+// (the NS1 transition) and pushing digest(s.world) into trace; finalDigest = digest(s.world). The result
+// is BIT-IDENTICAL to a live net::RunLockstep / net::DigestTrace (re-derived, not interpolated).
+template <class World, class Input, class StepFn, class DigestFn>
+ReplayResult<World, Input> Replay(const Demo<World, Input>& demo, StepFn step, DigestFn digest) {
+    net::Session<World, Input> s;
+    s.world = demo.initial;
+    s.ring  = demo.ring;
+    s.tick  = 0;
+    ReplayResult<World, Input> r;
+    r.trace.reserve(static_cast<std::size_t>(demo.header.tickCount));
+    for (uint32_t t = 0; t < demo.header.tickCount; ++t) {
+        net::Advance(s, step);             // NS1 deterministic transition
+        r.trace.push_back(digest(s.world)); // record the digest AFTER the tick
+    }
+    r.finalDigest = digest(s.world);
+    return r;
+}
+
 }  // namespace hf::replay

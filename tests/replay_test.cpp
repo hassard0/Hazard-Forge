@@ -71,6 +71,31 @@ static std::vector<uint8_t> serRingA(const net::InputRing<InA>& ring) {
     return b;
 }
 
+// ---- RP2 inverse deserializers (the byte-exact inverse of serToyA / serRingA). ---------------------
+// deserToyA: GetU64 -> reinterpret the bit pattern as int64_t acc (the inverse of serToyA's PutU64).
+static ToyA deserToyA(const uint8_t* p, uint32_t len) {
+    (void)len;
+    ToyA w;
+    w.acc = static_cast<int64_t>(replay::GetU64(p));
+    return w;
+}
+// deserRingA: GetU32 tickCount, then per tick GetU32 count + each input GetU32 -> static_cast<int32_t>.
+static net::InputRing<InA> deserRingA(const uint8_t* p, uint32_t len) {
+    (void)len;
+    net::InputRing<InA> r;
+    std::size_t off = 0;
+    const uint32_t tickCount = replay::GetU32(p + off); off += 4;
+    r.byTick.resize(static_cast<std::size_t>(tickCount));
+    for (uint32_t t = 0; t < tickCount; ++t) {
+        const uint32_t count = replay::GetU32(p + off); off += 4;
+        for (uint32_t i = 0; i < count; ++i) {
+            const InA in = static_cast<int32_t>(replay::GetU32(p + off)); off += 4;
+            r.byTick[static_cast<std::size_t>(t)].push_back(in);
+        }
+    }
+    return r;
+}
+
 int main() {
     HF_TEST_MAIN_INIT();
     const uint32_t kTicks = 16;
@@ -135,6 +160,75 @@ int main() {
     {
         const std::vector<uint8_t> again = replay::EncodeDemo<ToyA, InA>(rec, serToyA, serRingA);
         check(again == demoFileBytes, "rp1-record: re-encoding the same Recorder is byte-identical");
+    }
+
+    // ================================ RP2: PLAYBACK assertions =====================================
+    // Decode the SAME demoFileBytes from RP1, then Replay it — proving byte-exact re-derivation.
+    {
+        const replay::Demo<ToyA, InA> demo =
+            replay::DecodeDemo<ToyA, InA>(demoFileBytes, deserToyA, deserRingA);
+        const replay::ReplayResult<ToyA, InA> rr = replay::Replay<ToyA, InA>(demo, StepA, DigestA);
+
+        std::printf("rp2-playback: replay final digest = 0x%016llx (== live RunLockstep == pinned ToyA final)\n",
+                    static_cast<unsigned long long>(rr.finalDigest));
+
+        // ---- (1) HEADER ROUND-TRIP — decoded Demo.header fields equal what was recorded. ----------
+        {
+            bool magicOk = true;
+            for (int i = 0; i < 8; ++i)
+                if (demo.header.magic[i] != replay::kDemoMagic[i]) magicOk = false;
+            const uint32_t expectWorldLen = static_cast<uint32_t>(serToyA(rec.initial).size());
+            const uint32_t expectInputLen = static_cast<uint32_t>(serRingA(rec.ring).size());
+            const bool headerOk =
+                magicOk && demo.header.version == replay::kDemoVersion && demo.header.seed == kSeed &&
+                demo.header.tickCount == kTicks && demo.header.keyframeInterval == 0u &&
+                demo.header.worldByteLen == expectWorldLen && demo.header.inputByteLen == expectInputLen;
+            check(headerOk,
+                  "rp2-playback: DecodeDemo round-trips header field-exact (magic/version/seed/tickCount/world+inputByteLen)");
+        }
+
+        // ---- (2) WORLD + RING ROUND-TRIP — decoded initial == ToyA{} (acc==0) AND ring byte-exact. -
+        {
+            const std::vector<uint8_t> decodedRingBytes  = serRingA(demo.ring);
+            const std::vector<uint8_t> originalRingBytes = serRingA(ring);
+            check(demo.initial.acc == 0 && decodedRingBytes == originalRingBytes,
+                  "rp2-playback: decoded initial world == original initial (ToyA acc == 0) AND decoded ring re-encodes byte-identical");
+        }
+
+        // ---- (3) REPLAY == LIVE == PINNED — the make-or-break re-derivation. ----------------------
+        {
+            const uint64_t live = net::RunLockstep<ToyA, InA>(ToyA{}, ring, kTicks, StepA, DigestA);
+            check(rr.finalDigest == live && rr.finalDigest == kPinnedToyA,
+                  "rp2-playback: Replay final digest == live net::RunLockstep == pinned 0x6227bc7b4046d08a");
+        }
+
+        // ---- (4) PER-TICK INTEGRITY — replay trace == recorded trace == fresh DigestTrace (every tick). -
+        {
+            const std::vector<uint64_t> fresh =
+                net::DigestTrace<ToyA, InA>(ToyA{}, ring, kTicks, StepA, DigestA);
+            bool traceOk = rr.trace.size() == static_cast<std::size_t>(kTicks) &&
+                           rec.digestTrace.size() == static_cast<std::size_t>(kTicks) &&
+                           fresh.size() == static_cast<std::size_t>(kTicks);
+            for (std::size_t t = 0; traceOk && t < rr.trace.size(); ++t)
+                if (rr.trace[t] != rec.digestTrace[t] || rr.trace[t] != fresh[t]) traceOk = false;
+            check(traceOk,
+                  "rp2-playback: replay per-tick trace == recorded digestTrace == fresh net::DigestTrace (every tick, integrity)");
+        }
+
+        // ---- (5) FULL BYTE ROUND-TRIP — rebuild a Recorder from the decoded Demo, re-encode == bytes. -
+        {
+            replay::Recorder<ToyA, InA> decodedRec;
+            decodedRec.seed        = demo.header.seed;
+            decodedRec.initial     = demo.initial;
+            decodedRec.ring        = demo.ring;
+            decodedRec.tickCount   = demo.header.tickCount;
+            decodedRec.digestTrace =
+                net::DigestTrace<ToyA, InA>(demo.initial, demo.ring, demo.header.tickCount, StepA, DigestA);
+            const std::vector<uint8_t> reBytes =
+                replay::EncodeDemo<ToyA, InA>(decodedRec, serToyA, serRingA);
+            check(reBytes == demoFileBytes,
+                  "rp2-playback: Decode(Encode(rec)) re-encoded bytes == demoFileBytes (full round-trip, byte-exact)");
+        }
     }
 
     if (g_fail == 0) std::printf("replay_test: ALL PASS\n");
