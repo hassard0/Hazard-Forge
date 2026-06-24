@@ -267,4 +267,65 @@ ReplayResult<World, Input> Replay(const Demo<World, Input>& demo, StepFn step, D
     return r;
 }
 
+// ============================ RP4: SEEK to an arbitrary tick =========================================
+// The headline timeline capability built on RP3's keyframes: SEEK(N) — jump to ANY tick N by restoring
+// the NEAREST keyframe at-or-before N and replaying the input tail [keyframeTick, N) forward. Seeking is
+// EXACT re-derivation (NOT interpolation): Seek(demo, N) is byte-identical to having run the live session
+// for N ticks. The win over replaying-from-0 is COST — from the nearest keyframe you replay at most
+// keyframeInterval-1 ticks instead of N. This IS net::CatchUp (restore a confirmed snapshot, replay the
+// tail) — the SAME primitive that proves late-join == bit-identical at NS6 — so Seek REUSES it verbatim
+// rather than hand-rolling the replay loop. Append-only below RP3; header stays self-contained.
+
+// --- SeekResult — the sought world + its digest + the seek bookkeeping (which keyframe, how far) -----
+template <class World, class Input>
+struct SeekResult {
+    World    world{};            // the world AS OF toTick (bit-identical to live-at-toTick)
+    uint64_t digest = 0;         // digest(world)
+    uint32_t keyframeTick = 0;   // the keyframe we restored from (the nearest <= toTick; 0 if none)
+    uint32_t replayedTicks = 0;  // how many ticks we replayed forward (toTick - keyframeTick) — seek cost
+};
+
+// --- NearestKeyframeAtOrBefore — index of the LAST decoded keyframe with tick <= toTick, or -1 if none.
+// demo.keyframes is sorted ascending by tick (DecodeDemo preserves EncodeDemo's 0,K,2K,... order), so a
+// linear scan keeping the last qualifying index is the simplest deterministic form. Returns -1 when the
+// table is empty or every keyframe.tick > toTick (then Seek falls back to the initial world at tick 0).
+template <class World, class Input>
+inline int NearestKeyframeAtOrBefore(const Demo<World, Input>& demo, uint32_t toTick) {
+    int best = -1;
+    for (std::size_t i = 0; i < demo.keyframes.size(); ++i)
+        if (demo.keyframes[i].tick <= toTick) best = static_cast<int>(i);
+    return best;
+}
+
+// --- Seek — restore the nearest keyframe at-or-before toTick, then CatchUp forward to toTick. ---------
+// 1. Clamp toTick to header.tickCount (seeking past the end returns the FINAL world).
+// 2. Pick the nearest keyframe at-or-before toTick (the LAST keyframes[i] with tick <= toTick). If none
+//    (empty table / keyframeInterval 0 / all > toTick), fall back to base = demo.initial, keyframeTick = 0.
+// 3. Restore + replay forward = net::CatchUp: build a JoinSnapshot{tick=keyframeTick, world=base} and
+//    CatchUp(snap, toTick, demo.ring, step) — steps every tick in [keyframeTick, toTick) over the ring.
+// 4. digest = digest(world); replayedTicks = toTick - keyframeTick. Bit-identical to live-at-toTick.
+template <class World, class Input, class StepFn, class DigestFn>
+SeekResult<World, Input> Seek(const Demo<World, Input>& demo, uint32_t toTick, StepFn step, DigestFn digest) {
+    // (1) Clamp past-the-end to the final tick — seeking beyond the demo returns the final world.
+    if (toTick > demo.header.tickCount) toTick = demo.header.tickCount;
+
+    // (2) Nearest keyframe at-or-before toTick; fall back to the initial world at tick 0 if none.
+    World    base         = demo.initial;
+    uint32_t keyframeTick = 0;
+    const int kf = NearestKeyframeAtOrBefore(demo, toTick);
+    if (kf >= 0) {
+        base         = demo.keyframes[static_cast<std::size_t>(kf)].world;
+        keyframeTick = demo.keyframes[static_cast<std::size_t>(kf)].tick;
+    }
+
+    // (3) Restore + replay the tail forward — this IS net::CatchUp (NS6), reused verbatim.
+    net::JoinSnapshot<World> snap{ keyframeTick, base };
+    SeekResult<World, Input> r;
+    r.world         = net::CatchUp(snap, toTick, demo.ring, step);
+    r.keyframeTick  = keyframeTick;
+    r.replayedTicks = toTick - keyframeTick;  // toTick >= keyframeTick always (keyframeTick <= toTick)
+    r.digest        = digest(r.world);        // (4)
+    return r;
+}
+
 }  // namespace hf::replay

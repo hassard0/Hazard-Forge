@@ -334,6 +334,126 @@ int main() {
         }
     }
 
+    // ================================ RP4: SEEK assertions =========================================
+    // SEEK(N) = restore the nearest keyframe at-or-before N and replay the tail [keyframeTick, N) forward
+    // (net::CatchUp). The make-or-break: Seek(demo, N) is BIT-IDENTICAL to the live session at N (exact
+    // re-derivation, not interpolation), and the keyframe interval is purely a COST knob (invisible to the
+    // result). Live reference at tick N: net::RunLockstep<ToyA,InA>(ToyA{}, ring, N, StepA, DigestA).
+    {
+        // Re-record the interval-4 / interval-8 demos (RP3 built these inside its own scope) and the
+        // keyframeless no-keyframe demo (decode the RP1 demoFileBytes, keyframeInterval 0).
+        const replay::Recorder<ToyA, InA> recKf4 =
+            replay::RecordSession<ToyA, InA>(kSeed, ToyA{}, ring, kTicks, /*keyframeInterval=*/4u,
+                                             StepA, DigestA, serToyA);
+        const std::vector<uint8_t> demoKf4Bytes = replay::EncodeDemo<ToyA, InA>(recKf4, serToyA, serRingA);
+        const replay::Demo<ToyA, InA> dKf4 =
+            replay::DecodeDemo<ToyA, InA>(demoKf4Bytes, deserToyA, deserRingA);
+
+        const replay::Recorder<ToyA, InA> recKf8 =
+            replay::RecordSession<ToyA, InA>(kSeed, ToyA{}, ring, kTicks, /*keyframeInterval=*/8u,
+                                             StepA, DigestA, serToyA);
+        const std::vector<uint8_t> demoKf8Bytes = replay::EncodeDemo<ToyA, InA>(recKf8, serToyA, serRingA);
+        const replay::Demo<ToyA, InA> dKf8 =
+            replay::DecodeDemo<ToyA, InA>(demoKf8Bytes, deserToyA, deserRingA);
+
+        const replay::Demo<ToyA, InA> dNoKf =
+            replay::DecodeDemo<ToyA, InA>(demoFileBytes, deserToyA, deserRingA);
+
+        // The live reference at tick N (N==0 -> DigestA(ToyA{}); the from-scratch lockstep otherwise).
+        auto liveAt = [&](uint32_t n) -> uint64_t {
+            return (n == 0u) ? DigestA(ToyA{})
+                             : net::RunLockstep<ToyA, InA>(ToyA{}, ring, n, StepA, DigestA);
+        };
+
+        // A printed sample seek line (N=10: keyframeTick=8, replayed=2).
+        {
+            const replay::SeekResult<ToyA, InA> s10 = replay::Seek<ToyA, InA>(dKf4, 10u, StepA, DigestA);
+            std::printf("rp4-seek: seek N=10 -> keyframeTick=%u replayed=%u digest=0x%016llx (== live RunLockstep(10) 0x%016llx)\n",
+                        s10.keyframeTick, s10.replayedTicks,
+                        static_cast<unsigned long long>(s10.digest),
+                        static_cast<unsigned long long>(liveAt(10u)));
+        }
+
+        // ---- (1) SEEK == LIVE (make-or-break): Seek(demoKf4, N) digest == live RunLockstep(N). --------
+        {
+            const uint32_t Ns[] = {0u, 4u, 7u, 8u, 12u, 15u, 16u};
+            bool ok = true;
+            for (const uint32_t N : Ns) {
+                const replay::SeekResult<ToyA, InA> s = replay::Seek<ToyA, InA>(dKf4, N, StepA, DigestA);
+                if (s.digest != liveAt(N)) ok = false;
+            }
+            // N=16 must equal the pinned final digest specifically.
+            const replay::SeekResult<ToyA, InA> s16 = replay::Seek<ToyA, InA>(dKf4, 16u, StepA, DigestA);
+            if (s16.digest != kPinnedToyA) ok = false;
+            check(ok,
+                  "rp4-seek: Seek(demoKf4, N) digest == live RunLockstep(N) for N in {0,4,7,8,12,15,16} (bit-identical)");
+        }
+
+        // ---- (2) NEAREST KEYFRAME bookkeeping — keyframeTick/replayedTicks correct per N. -------------
+        {
+            const replay::SeekResult<ToyA, InA> s10 = replay::Seek<ToyA, InA>(dKf4, 10u, StepA, DigestA);
+            const replay::SeekResult<ToyA, InA> s7  = replay::Seek<ToyA, InA>(dKf4,  7u, StepA, DigestA);
+            const replay::SeekResult<ToyA, InA> s4  = replay::Seek<ToyA, InA>(dKf4,  4u, StepA, DigestA);
+            const replay::SeekResult<ToyA, InA> s15 = replay::Seek<ToyA, InA>(dKf4, 15u, StepA, DigestA);
+            const bool ok =
+                s10.keyframeTick == 8u  && s10.replayedTicks == 2u &&
+                s7.keyframeTick  == 4u  && s7.replayedTicks  == 3u &&
+                s4.keyframeTick  == 4u  && s4.replayedTicks  == 0u &&
+                s15.keyframeTick == 12u && s15.replayedTicks == 3u;
+            check(ok,
+                  "rp4-seek: Seek restores the NEAREST keyframe <= N (keyframeTick/replayedTicks correct per N)");
+        }
+
+        // ---- (3) ON-KEYFRAME ZERO REPLAY — N in {0,4,8,12} restored exactly (replayedTicks==0). -------
+        {
+            const uint32_t Ns[] = {0u, 4u, 8u, 12u};
+            bool ok = true;
+            for (const uint32_t N : Ns) {
+                const replay::SeekResult<ToyA, InA> s = replay::Seek<ToyA, InA>(dKf4, N, StepA, DigestA);
+                if (s.replayedTicks != 0u || s.keyframeTick != N) ok = false;
+            }
+            check(ok,
+                  "rp4-seek: on-keyframe seek (N in {0,4,8,12}) replays ZERO ticks (keyframeTick==N, replayedTicks==0)");
+        }
+
+        // ---- (4) MAX-TAIL — N in {3,7,11} (just before the next keyframe) replays N-(N/4)*4 == 3. -----
+        {
+            const uint32_t Ns[] = {3u, 7u, 11u};
+            bool ok = true;
+            for (const uint32_t N : Ns) {
+                const replay::SeekResult<ToyA, InA> s = replay::Seek<ToyA, InA>(dKf4, N, StepA, DigestA);
+                if (s.replayedTicks != N - (N / 4u) * 4u || s.replayedTicks != 3u) ok = false;
+            }
+            check(ok,
+                  "rp4-seek: just-before-next-keyframe seek (N in {3,7,11}) replays the MAX tail (replayedTicks==N-floor(N/4)*4)");
+        }
+
+        // ---- (5) KEYFRAMELESS FALLBACK — no-keyframe demo seeks from tick 0 (full replay), == live. ---
+        {
+            const uint32_t Ns[] = {0u, 4u, 7u, 8u, 12u, 15u, 16u};
+            bool ok = dNoKf.keyframes.empty();
+            for (const uint32_t N : Ns) {
+                const replay::SeekResult<ToyA, InA> s = replay::Seek<ToyA, InA>(dNoKf, N, StepA, DigestA);
+                if (s.digest != liveAt(N) || s.keyframeTick != 0u || s.replayedTicks != N) ok = false;
+            }
+            check(ok,
+                  "rp4-seek: keyframeless demo (interval 0) seeks from tick 0 (full replay) and still == live RunLockstep(N)");
+        }
+
+        // ---- (6) INTERVAL-INVISIBLE — Seek(demoKf4,N) == Seek(demoKf8,N) == live for the same N. ------
+        {
+            const uint32_t Ns[] = {0u, 4u, 7u, 8u, 12u, 15u, 16u};
+            bool ok = true;
+            for (const uint32_t N : Ns) {
+                const replay::SeekResult<ToyA, InA> s4 = replay::Seek<ToyA, InA>(dKf4, N, StepA, DigestA);
+                const replay::SeekResult<ToyA, InA> s8 = replay::Seek<ToyA, InA>(dKf8, N, StepA, DigestA);
+                if (s4.digest != s8.digest || s4.digest != liveAt(N)) ok = false;
+            }
+            check(ok,
+                  "rp4-seek: Seek(demoKf4, N).digest == Seek(demoKf8, N).digest == live (keyframe interval is invisible to the result)");
+        }
+    }
+
     if (g_fail == 0) std::printf("replay_test: ALL PASS\n");
     else             std::printf("replay_test: %d FAIL\n", g_fail);
     return g_fail == 0 ? 0 : 1;
