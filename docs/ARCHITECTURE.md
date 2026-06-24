@@ -374,6 +374,74 @@ Slices GR1–GR6 add a **Position-Based granular (sand/soil) solver in Q16.16 fi
 - **Lockstep + rollback (Slice GR5, pure CPU — `GrainCommand`/`SimGrainTick`/`SnapshotGrain`/`RestoreGrain`/`RunGrainLockstep`/`RunGrainRollback`).** The trilogy's **4th netcode headline** (rigid FPX5 → cloth CL5 → fluid FL5 → grain GR5): a peer fed the **input command stream alone** re-derives the authority's exact grain state (with friction) bit-for-bit; `RunGrainRollback` snapshots, mispredicts, restores, re-simulates to the exact authoritative state. A CPU harness over the bit-exact `StepGrainFriction` — no new shader/RHI. **Proof:** the scenario re-simulates byte-identically on Vulkan-Windows and Metal-Mac (zero-differing-pixel); rollback corrected a mispredict to the authority exactly; snapshot round-trip + determinism; the command stream displaced the pile non-trivially. Golden `grain_lockstep` (the converged state). **The beyond-mainstream result: a deterministic, rollback-able, bit-identical-cross-platform *granular* sim — mainstream engines have no deterministic granular, let alone replayable.**
 - **Lit 3D render (Slice GR6, render-only — `GrainVertToWorld`/`GrainToRenderInstances`).** The capstone: the bit-exact sand pile rendered as lit 3D instanced spheres (a grain per particle at `pos/kOne`, scaled by the grain radius — the single host float crossing, render-only), through the **existing instanced-lit-sphere pipeline reused verbatim** from `--fpx-render-shot`/`--fluid-render-shot` (`lit_instanced.vert`+`lit.frag`, the per-instance transform buffer, the frame UBO, sky + shadow + post) — no new shader, no new RHI. The arc's one **float** slice (the visresolve-bar): Metal-baked golden, the bar is Metal-determinism (two-run DIFF 0.0000) + provenance (the instances derive from the bit-exact GR1–GR5 sim — the repose slope is identical Vulkan/Metal) + visual parity, the cross-vendor delta the documented float baseline (~46/channel). The showcase pours a grain column from height onto flat ground (no container) → a recognizable angle-of-repose **sand cone**. **Proof:** `{grains, instances, shaded}` provenance, two-render determinism, a coherent lit sand pile, an empty no-op. Golden `grain_render` (the lit 3D sand cone). **Completes flagship #10 — the tenth flagship.**
 
+### Deterministic procedural content generation (`engine/pcg/pcg.h`, namespace `hf::pcg`)
+
+Slices PCG1–PCG6 add a **declarative, seed-driven procedural scene generator** — `pcg::Generate(graph, seed)`
+makes scene authoring a **pure function of a seed**: a layered pipeline (scatter → density-mask → transform rules
+→ overlap-prune) emits an array of instance transforms via strict integer Q16.16 hash-PRNG math, so the *exact
+same scattered field* — every instance's position, yaw, scale, and prune decision — is produced **bit-identically
+on Windows/Vulkan AND macOS/Metal**, run-to-run, and is netcode-replayable from the seed alone. A mainstream PCG
+framework is float and graph-evaluated per-platform, so its "same seed" gives only *visually similar* results that
+drift across vendors; Hazard Forge makes the guarantee they cannot — **seed → byte-identical generated scene on two
+GPU backends**. It is a **CPU-side host generator that feeds the existing GPU instanced-lit render** (not a GPU
+compute pass — the moat is integer CPU math shared by both renderers, exactly as `fpx::BuildPileWorld` already
+produces a byte-identical world both backends consume), so PCG1–PCG5 carry **strict zero-differing-pixel** 2D
+goldens (a stronger bar than the render flagships' float visresolve) and only the PCG6 render capstone is float.
+It reuses `particles.h`'s integer avalanche hash + the no-trig direction table, the `fpx.h` Q16.16 toolbox, and the
+instanced-lit-sphere render path; `engine/sim/*` (reused read-only) is untouched and there is **no new RHI / no new
+shader** across the whole flagship. It replaces the engine's hand-coded `for(gx)for(gz)` instance grids with a
+declarative recipe.
+
+- **Seeded hash-PRNG primitive (Slice PCG1, beachhead — int32 MSL-native).** `PcgHash(seed,index)` (a fixed uint32
+  avalanche, the `ParticleHash` shape) plus the derived integer samplers: `PcgRand01` → a Q16.16 value in `[0,kOne)`
+  (the top 16 bits of the hash, a pure shift — NO division, NO float), `PcgRandRange`, `PcgUnitDir` (the no-trig
+  direction table), and a `PcgStream{seed,salt}` so distinct layers hash to independent streams. **Proof:** the
+  test pins replay-stability, seed-sensitivity, range bounds, salt separation, and a bucketed uniformity sanity
+  check; the `pcg1_hash` golden is a pure-integer 2D speckle of the first 4096 samples — **strict zero-diff
+  cross-backend** (Metal image checksums exactly matched Vulkan → 0 differing bytes), two-run byte-identical.
+- **Jittered-grid point scatter (Slice PCG2, int32).** `ScatterGrid(stream, area, cellsX, cellsZ)` emits one point
+  per grid cell (fixed `cz`-outer/`cx`-inner order), each offset within its cell by a `PcgRand01` jitter (`FloorDiv`
+  + one `fxmul` — no length, no int64), so every point stays strictly inside its cell — the deterministic, lattice-
+  broken answer to the hand-coded grids. **Proof:** count `== cellsX·cellsZ`, every point in its cell's integer
+  AABB, different seed → different layout same count, empty area → 0. Golden `pcg2_scatter`, strict zero-diff
+  (visibly more even than PCG1 — one point per cell, Poisson-like).
+- **Density mask + importance rejection (Slice PCG3, int64 radial mask, CPU-both).** `PcgMask` (an analytic scalar
+  field — `Uniform`/`Radial`/`HalfPlane`, `Eval → [0,kOne]`; the radial falloff is the first **int64** path via
+  `FxLength`) + `ScatterMasked` keeps a candidate iff `fxmul(mask.Eval(p), density) > PcgRand01(keepStream, idx)`
+  (a salt-separated keep draw), so density follows the mask. **Make-or-break no-op:** a `Uniform` mask + `density
+  = kOne` keeps ALL points → byte-identical to `ScatterGrid`; a zero mask keeps none; the kept count is monotone in
+  density. Golden `pcg3_mask` (a falloff disc) — strict zero-diff, and the first proof that the **int64 CPU path
+  stays bit-identical cross-backend** (Metal kept-count exactly matched Vulkan → 0 differing bytes).
+- **Per-instance transform rules (Slice PCG4, int32).** `BuildInstances(points, stream, rule)` turns points into
+  `PcgInstance{pos, orient, scale}`: a random yaw from a **baked 16-entry integer quaternion table** (host-constant
+  Q16.16 literals indexed by the hash — NOT a runtime Taylor/`cmath`, which would not be bit-identical cross-vendor;
+  the `EmitDir` baked-table precedent) + a `PcgRandRange` uniform scale, on salt-separated streams. **Proof:** every
+  orient unit-within-tolerance, every scale in range, the no-op rule (identity yaw + fixed scale) leaves positions
+  unchanged. Golden `pcg4_rules` draws each instance as an oriented, scaled cross-marker (arm offsets rotated by the
+  orient via `fpx::FxRotate`, pure-integer) — strict zero-diff, validating the integer-quaternion rotation path.
+- **Declarative pipeline + overlap-prune (Slice PCG5, int64 prune — THE DETERMINISM HEADLINE).** A `PcgGraph`
+  composes the stages into one `Generate(graph, seed)` (the integer analog of a PCG graph). The capstone stage
+  `PruneOverlaps` rejects instances whose footprint spheres interpenetrate, processed in a **canonical order
+  independent of input order** — a stable integer sort by `(pos.z, pos.x, origIndex)` then greedy first-placed-wins
+  (the `fpx::SolveContacts` Gauss-Seidel order-determinism) — giving a Poisson-like minimum-spacing guarantee
+  deterministically. **Proof:** no surviving pair interpenetrates; **shuffling the input yields the SAME survivors**
+  (order-canonicality made load-bearing and testable); and the **lockstep headline** — `Generate` is a pure function
+  of the seed, so two "peers" produce a byte-identical world from the seed alone. Golden `pcg5_graph` (255 → 54
+  well-spaced non-overlapping markers) — strict zero-diff; the full int64-prune + canonical-sort pipeline is
+  bit-identical cross-backend.
+- **Lit 3D render capstone (Slice PCG6, render-only — `PcgToRenderInstances`).** The money-shot: a full `PcgGraph`
+  rock-field (scatter → radial mask → random yaw/scale → overlap-prune) rendered as lit 3D instanced spheres through
+  the **existing instanced-lit pipeline reused verbatim** (no new shader, no new RHI). `PcgToRenderInstances` is the
+  one **float** crossing — `FromTRS(FxToFloat(pos), normalize(orient), scale·baseRadius)` per instance, using BOTH
+  the per-instance orient AND scale (the `grain::GrainToRenderInstances` twin). The arc's one float slice
+  (visresolve-bar): the bar is Metal-determinism (two-run DIFF 0.0000) + provenance (the instances derive from the
+  bit-exact `Generate`) + a documented cross-vendor mean (~32.6/channel, the float baseline). The showcase scatters
+  ~28 varied-size boulders, denser in the middle (the radial mask), on a matte ground. Golden `pcg6_field`.
+  **Completes flagship #22 — deterministic procedural content generation.** Honest scope: analytic, CPU-side
+  authoring (no runtime GPU regeneration); jittered-grid + overlap-prune (not a true blue-noise/Poisson-disk
+  sampler); analytic masks only (no painted-mask/spline UI, no biome blending); flat-ground scatter (no
+  mesh-surface projection); no instance LOD/streaming integration — all natural future extensions.
+
 ### Deterministic GPU particle system (`engine/sim/particles.h`, namespace `hf::sim::particles`)
 
 Slices PT1–PT6 add a **Niagara-class GPU particle system in Q16.16 fixed-point** — the **6th member of the deterministic-sim family**. The moat vs a float particle system (Unreal Niagara, etc.): the entire simulation — spawn slot, initial velocity, age, death, forces, collision — is a **pure function of (capacity, command stream)**, so it is BIT-IDENTICAL CPU↔Vulkan↔Metal, run-to-run reproducible, AND **lockstep/rollback-replayable** (two machines re-derive the exact same fountain, every spark, from inputs alone). Niagara is float and non-deterministic; it cannot replay bit-for-bit across machines. It reuses ~80% of the existing substrate — the `fpx.h` Q16.16 toolbox, the `grain.h` colliders + render helpers + lockstep-harness shape — with the **deterministic free-list emitter** as the one genuinely new primitive. v1 is a pure emitter (no particle-particle/SPH — the grid-hash is reuse-ready for a future slice). `engine/sim/fpx.h`/`grain.h` (reused read-only) and `engine/physics/` are untouched; **no new RHI** across the flagship.
