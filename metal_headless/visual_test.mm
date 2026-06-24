@@ -56534,22 +56534,22 @@ static int RunPcg6FieldShowcase(const char* outPath) {
     // scale [0.6,1.4] per instance, and an overlap-prune so the rocks don't interpenetrate. ===
     const uint32_t kSeed = 1337u;
     const pcg::PcgStream stream{kSeed, 0u};
-    const float kBaseRadius = 0.35f;
+    const float kBaseRadius = 1.0f;                        // CHUNKY BOULDERS (not pebbles) — the hero
 
     pcg::PcgGraph graph;
-    graph.area.min = pcg::FxVec3{-6 * pcg::kOne, 0, -6 * pcg::kOne};
+    graph.area.min = pcg::FxVec3{-6 * pcg::kOne, 0, -6 * pcg::kOne};   // a 12x12 XZ patch centred at origin
     graph.area.max = pcg::FxVec3{ 6 * pcg::kOne, 0,  6 * pcg::kOne};
-    graph.cellsX = 24; graph.cellsZ = 24;
+    graph.cellsX = 14; graph.cellsZ = 14;                  // 14x14 jittered grid (196 candidate cells)
     graph.useMask = true;
     graph.mask.type   = pcg::PcgMaskType::Radial;
     graph.mask.center = pcg::FxVec3{0, 0, 0};
-    graph.mask.radius = 7 * pcg::kOne;
+    graph.mask.radius = 13 * pcg::kOne / 2;                // falloff radius ~6.5 (a touch past the patch edge)
     graph.density     = pcg::kOne;
     graph.transform.randomYaw = true;
-    graph.transform.scaleLo   = pcg::kOne * 6 / 10;
+    graph.transform.scaleLo   = pcg::kOne * 6 / 10;        // scale [0.6, 1.4]
     graph.transform.scaleHi   = pcg::kOne * 14 / 10;
     graph.prune       = true;
-    graph.pruneRadius = pcg::kOne / 2;
+    graph.pruneRadius = pcg::kOne * 7 / 10;                // footprint ~0.7 -> a denser well-spaced field
 
     const std::vector<pcg::PcgInstance> pcgInstances = pcg::Generate(graph, stream);
     const uint32_t kGenCount = (uint32_t)pcgInstances.size();
@@ -56560,6 +56560,10 @@ static int RunPcg6FieldShowcase(const char* outPath) {
     for (const Mat4& m : mats) {
         scene::InstanceData inst;
         for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        // RENDER-ONLY framing lift (does NOT touch `mats` -> the provenance compare stays exact): lift the
+        // render Y by the sphere's world radius (yaw-only rotation leaves Y = m[5] = scale*baseRadius; sphere
+        // mesh radius 0.5) so each boulder RESTS ON the ground (== the Vulkan --pcg6-field-shot lift).
+        inst.model[13] += m.m[5] * 0.5f;
         instances.push_back(inst);
     }
     const uint32_t kInstanceCount = (uint32_t)instances.size();
@@ -56623,9 +56627,14 @@ static int RunPcg6FieldShowcase(const char* outPath) {
     auto shadowMap = device->CreateShadowMap(2048);
     device->SetShadowMap(*shadowMap);
 
-    std::vector<uint8_t> checker = MakeCheckerboard();
+    // CALM ground: a solid cool-grey albedo (NOT the busy multicolor checker) so the boulders pop.
+    const uint8_t groundPx[4] = {125, 122, 116, 255};      // flat matte neutral grey ground
     auto groundTex = device->CreateTexture(
-        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+        {1, 1, rhi::Format::RGBA8_UNorm, groundPx, sizeof(groundPx)});
+    // Warm matte STONE albedo for the rocks (sphere vertex color ~0.85 tints it toward warm grey-tan).
+    const uint8_t stonePx[4] = {220, 170, 120, 255};       // warm tan boulder stone (pops vs cool floor)
+    auto stoneTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, stonePx, sizeof(stonePx)});
     const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
     auto flatNormal = device->CreateTexture(
         {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
@@ -56641,11 +56650,13 @@ static int RunPcg6FieldShowcase(const char* outPath) {
         instanceBuffer = device->CreateBuffer(instBufDesc);
     }
 
-    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+    Mat4 groundModel = Mat4::Scale({14.0f, 1.0f, 14.0f});  // ground covers the ±6 field (no rocks off-edge)
 
-    // Fixed 3/4 camera + directional light (== the Vulkan --pcg6-field-shot camera).
-    const Vec3 eye{13.0f, 9.0f, 13.0f};
-    const Vec3 center{0.0f, 0.5f, 0.0f};
+    // Fixed 3/4 camera + directional light (== the Vulkan --pcg6-field-shot camera). A CLOSER, LOWER 3/4
+    // view so the boulders fill the frame and the calm grey floor recedes (the rocks are the subject). A LOW
+    // eye so the boulders (now resting ON the ground) read as rounded free-standing 3D spheres.
+    const Vec3 eye{10.5f, 4.2f, 10.5f};
+    const Vec3 center{0.0f, 1.0f, 0.0f};
     const float aspect = (float)W / (float)H;
     FrameData fd{};
     {
@@ -56710,7 +56721,8 @@ static int RunPcg6FieldShowcase(const char* outPath) {
             {
                 float pc[20];
                 for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
-                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                // calm matte grey floor: non-metallic, fully rough (no busy specular/checker).
+                pc[16] = 0.0f; pc[17] = 0.95f; pc[18] = 0.0f; pc[19] = 0.0f;
                 cmd.PushConstants(pc, sizeof(pc));
                 cmd.BindMaterial(*groundTex, *flatNormal);
                 cmd.BindVertexBuffer(plane.vertices());
@@ -56719,9 +56731,10 @@ static int RunPcg6FieldShowcase(const char* outPath) {
             }
             if (kInstanceCount > 0) {
                 cmd.BindPipeline(*instPipeline);
-                float material[4] = {0.55f, 0.5f, 0.45f, 0.0f};   // a warm matte ROCK-colored material
+                // warm matte STONE: non-metallic, high roughness (the scattered boulders, the hero).
+                float material[4] = {0.0f, 0.85f, 0.0f, 0.0f};
                 cmd.PushConstants(material, sizeof(material));
-                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindMaterial(*stoneTex, *flatNormal);
                 cmd.BindVertexBuffer(sphere.vertices());
                 cmd.BindInstanceBuffer(*instanceBuffer);
                 cmd.BindIndexBuffer(sphere.indices());
