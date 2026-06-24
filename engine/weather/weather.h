@@ -27,6 +27,7 @@
 
 #include "sim/fpx.h"                // fx / kOne / kFrac / fxmul / fxdiv (Q16.16 toolbox), read-only.
 #include "terrain/procterrain.h"   // terrain::IntValueNoise — the integer value-noise basis, read-only.
+#include "pcg/pcg.h"               // pcg::PcgRandRange — the deterministic seeded scatter, read-only (Slice WE2).
 
 namespace hf::weather {
 
@@ -36,6 +37,7 @@ using hf::sim::fpx::kOne;
 using hf::sim::fpx::kFrac;
 using hf::sim::fpx::fxmul;
 using hf::sim::fpx::fxdiv;
+using hf::sim::fpx::FxVec3;   // Slice WE2: the Q16.16 3-vector (a precipitation drop position).
 
 // kCloudDriftRate: the deterministic per-frame drift speed — clouds translate kCloudDriftRate world units
 // in +X per frame (a small Q16.16 offset). frame is the ONLY time input; driftX = kCloudDriftRate*frame.
@@ -110,6 +112,56 @@ inline std::vector<fx> GenCloudSlice(uint32_t seed, int n, fx worldSize, uint32_
         }
     }
     return field;
+}
+
+// ===== Slice WE2 — Deterministic integer PRECIPITATION (rain/snow) field (2nd slice of FLAGSHIP #27) ========
+// Rain/snow as a DETERMINISTIC INTEGER STREAK FIELD: each drop's position is a PURE FUNCTION of (seed, frame).
+// The drop falls and WRAPS with NO accumulator state, so two netcode peers see the byte-identical rain (UE5
+// particle precipitation is float/LCG/clock-driven — non-portable). Pure CPU, header-only, APPEND-ONLY (WE1
+// above + fpx.h + pcg.h read-only). NO <cmath>, NO float, NO clock, NO RNG, NO accumulator state.
+//
+// WHY IT IS BIT-EXACT (the cross-backend crux): the XZ scatter + the start phase are deterministic seeded
+// pcg::PcgRandRange draws (the SAME integer avalanche hash WE2 reuses read-only from pcg.h — a pure function of
+// (seed, index)). The fall is a POSITIVE integer modulo: yRaw = y0 - fallSpeed*frame (int64, frame the ONLY time
+// input), wrapped into [0, columnH) by ((yRaw % columnH) + columnH) % columnH. Every op is int32/int64 integer —
+// deterministic + identical on every compiler/vendor.
+
+// ----- PrecipField: the precipitation column descriptor ------------------------------------------------------
+// `count` drops scattered over an `areaW` x `areaD` XZ patch, falling through a vertical column of height
+// `columnH` at `fallSpeed` Q16.16 world units per frame. seed picks the deterministic scatter + start phases.
+struct PrecipField {
+    uint32_t seed      = 0;
+    int      count     = 0;
+    fx       areaW     = kOne;   // XZ scatter width  (X in [0, areaW))
+    fx       areaD     = kOne;   // XZ scatter depth  (Z in [0, areaD))
+    fx       columnH   = kOne;   // vertical column height (Y wraps in [0, columnH))
+    fx       fallSpeed = kOne;   // per-frame fall (Q16.16 world units)
+};
+
+// ----- PrecipDrop: drop i's world position at `frame` (pure integer) -----------------------------------------
+// x/z = a FIXED deterministic XZ scatter (pcg::PcgRandRange over (seed, i*3+{0,2})); y0 = the deterministic START
+// phase (pcg::PcgRandRange over (seed, i*3+1) in [0, columnH)). The Y at `frame`: yRaw = y0 - fallSpeed*frame
+// (int64 — the drop falls fallSpeed/frame), then wrap into [0, columnH) with a POSITIVE integer modulo so the
+// drop that exits the bottom re-enters at the top — frame the ONLY time input, NO accumulator. Pure integer.
+inline FxVec3 PrecipDrop(const PrecipField& p, uint32_t i, uint32_t frame) {
+    const fx x  = hf::pcg::PcgRandRange(p.seed, i * 3u + 0u, 0, p.areaW);
+    const fx z  = hf::pcg::PcgRandRange(p.seed, i * 3u + 2u, 0, p.areaD);
+    const fx y0 = hf::pcg::PcgRandRange(p.seed, i * 3u + 1u, 0, p.columnH);
+    const int64_t yRaw = static_cast<int64_t>(y0) - static_cast<int64_t>(p.fallSpeed) * static_cast<int64_t>(frame);
+    // POSITIVE integer modulo wrap into [0, columnH) (columnH > 0 assumed for a real column; guard div-by-zero).
+    const int64_t H = static_cast<int64_t>(p.columnH);
+    const fx y = (H > 0) ? static_cast<fx>(((yRaw % H) + H) % H) : 0;
+    return FxVec3{ x, y, z };
+}
+
+// ----- GenPrecip: the `count` drops at `frame`, in fixed index order -----------------------------------------
+// PrecipDrop(p, i, frame) for i in [0, count). count <= 0 -> empty (the no-op control). Pure integer.
+inline std::vector<FxVec3> GenPrecip(const PrecipField& p, uint32_t frame) {
+    std::vector<FxVec3> out;
+    if (p.count <= 0) return out;                 // no-op control
+    out.reserve(static_cast<size_t>(p.count));
+    for (uint32_t i = 0; i < static_cast<uint32_t>(p.count); ++i) out.push_back(PrecipDrop(p, i, frame));
+    return out;
 }
 
 }  // namespace hf::weather

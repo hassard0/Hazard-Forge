@@ -24,6 +24,7 @@
 namespace wx = hf::weather;
 using wx::fx;
 using wx::kOne;
+using wx::FxVec3;  // Slice WE2: the Q16.16 drop position (re-exported from pcg.h via weather.h)
 
 static int g_fail = 0;
 static void check(bool cond, const char* what) {
@@ -108,6 +109,93 @@ int main() {
               "WE1 coverage monotone: higher coverage -> a non-decreasing total density sum");
         check(sHigh > sLow,
               "WE1 coverage monotone: full coverage strictly denser than sparse (a real spread)");
+    }
+
+    // ===================================================================================================
+    // ================= Slice WE2 — Deterministic integer PRECIPITATION (rain/snow) field ===============
+    // Each drop's position is a PURE FUNCTION of (seed, frame); the drop falls fallSpeed/frame and WRAPS
+    // into [0, columnH) with no accumulator, so two peers see byte-identical rain. PrecipDrop/GenPrecip are
+    // pure integer (pcg::PcgRandRange scatter + an int64 positive-modulo fall). Checks: replay-stable; rain
+    // falls (each drop's Y at F+1 == wrapped Y(F)-fallSpeed); bounds; the no-op; wrap continuity.
+    // ===================================================================================================
+    {
+        wx::PrecipField p;
+        p.seed      = 0xDEADBEEFu;
+        p.count     = 1500;
+        p.areaW     = kOne * 32;
+        p.areaD     = kOne * 32;
+        p.columnH   = kOne * 16;
+        p.fallSpeed = kOne / 3;            // 0.333.. world units / frame
+        const uint32_t F = 40u;
+
+        // (1) replay-stable — same (p, frame) -> identical drops across calls.
+        {
+            const std::vector<wx::FxVec3> a = wx::GenPrecip(p, F);
+            const std::vector<wx::FxVec3> b = wx::GenPrecip(p, F);
+            check(a.size() == static_cast<size_t>(p.count), "WE2 GenPrecip: count drops");
+            bool same = (a.size() == b.size());
+            for (size_t i = 0; same && i < a.size(); ++i)
+                if (a[i].x != b[i].x || a[i].y != b[i].y || a[i].z != b[i].z) same = false;
+            check(same, "WE2 replay-stable: GenPrecip(p,F) reproducible across calls");
+        }
+
+        // (2) rain falls — GenPrecip(p,F) != GenPrecip(p,F+1); each drop's Y at F+1 == wrapped Y(F)-fallSpeed.
+        {
+            const std::vector<wx::FxVec3> a = wx::GenPrecip(p, F);
+            const std::vector<wx::FxVec3> b = wx::GenPrecip(p, F + 1);
+            bool differ = (a.size() != b.size());
+            const int64_t H = static_cast<int64_t>(p.columnH);
+            bool fellCorrectly = (a.size() == b.size());
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                if (a[i].x != b[i].x || a[i].y != b[i].y || a[i].z != b[i].z) differ = true;
+                // X/Z are fixed (the scatter does not move).
+                if (a[i].x != b[i].x || a[i].z != b[i].z) fellCorrectly = false;
+                // Y descended by fallSpeed, modulo-wrapped into [0, columnH).
+                const int64_t expected = (((static_cast<int64_t>(a[i].y) - static_cast<int64_t>(p.fallSpeed)) % H) + H) % H;
+                if (static_cast<int64_t>(b[i].y) != expected) fellCorrectly = false;
+            }
+            check(differ, "WE2 rain falls: GenPrecip(p,F) != GenPrecip(p,F+1) (the drops descended)");
+            check(fellCorrectly, "WE2 rain falls: each drop Y(F+1) == wrapped (Y(F) - fallSpeed); X/Z fixed");
+        }
+
+        // (3) bounds — every drop x in [0,areaW), z in [0,areaD), y in [0,columnH).
+        {
+            bool inRange = true;
+            for (uint32_t f = F; f < F + 8 && inRange; ++f) {
+                const std::vector<wx::FxVec3> d = wx::GenPrecip(p, f);
+                for (const wx::FxVec3& q : d) {
+                    if (q.x < 0 || q.x >= p.areaW || q.z < 0 || q.z >= p.areaD ||
+                        q.y < 0 || q.y >= p.columnH) { inRange = false; break; }
+                }
+            }
+            check(inRange, "WE2 bounds: every drop x in [0,areaW), z in [0,areaD), y in [0,columnH)");
+        }
+
+        // (4) no-op — count <= 0 -> 0 drops.
+        {
+            wx::PrecipField z = p;
+            z.count = 0;
+            check(wx::GenPrecip(z, F).empty(), "WE2 no-op: count == 0 -> 0 drops");
+            z.count = -5;
+            check(wx::GenPrecip(z, F).empty(), "WE2 no-op: count < 0 -> 0 drops");
+        }
+
+        // (5) wrap continuity — a drop near the bottom wraps to near the top across the frame boundary
+        //     (no negative Y, no escape past columnH). Find a drop whose Y(F) < fallSpeed (it will wrap).
+        {
+            const std::vector<wx::FxVec3> a = wx::GenPrecip(p, F);
+            const std::vector<wx::FxVec3> b = wx::GenPrecip(p, F + 1);
+            bool foundWrap = false, wrapClean = true;
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                if (a[i].y < p.fallSpeed) {                  // near the bottom -> will underflow and wrap up
+                    foundWrap = true;
+                    // After the wrap, Y must be near the top (>= columnH - fallSpeed) and strictly in [0,columnH).
+                    if (b[i].y < 0 || b[i].y >= p.columnH || b[i].y < p.columnH - p.fallSpeed) wrapClean = false;
+                }
+            }
+            check(foundWrap, "WE2 wrap continuity: at least one drop near the bottom (will wrap)");
+            check(wrapClean, "WE2 wrap continuity: a wrapping drop re-enters near the top, no negative/escape Y");
+        }
     }
 
     if (g_fail == 0) std::printf("weather_test: ALL CHECKS PASSED\n");
