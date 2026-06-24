@@ -150,6 +150,109 @@ int main() {
         check(b == hToyB, "ns1: replay-stable — ToyB two RunLockstep bit-identical");
     }
 
+    // ===================================== NS2: INPUT-DELAY BUFFER ===================================
+    // The NS2 contribution: a per-session input DELAY. Local input scheduled via SubmitLocalInput lands
+    // `s.delay` ticks in the future. We prove delay is a PURE SCHEDULING SHIFT (it changes WHEN inputs
+    // apply, not the game transition) by showing a delay-D session whose inputs are submitted D ticks
+    // EARLY is byte-identical to a delay-0 reference. ToyA folds input with the tick, so a wrong apply-
+    // tick would change the digest — making the equality load-bearing.
+    const uint32_t kNs2Ticks = 24;
+    const uint32_t kDelta    = 5;   // the input delay D
+
+    // A fixed set of (applyTick, input) events — chosen so applyTick >= kDelta for every event (so the
+    // "submitted D early" tick applyTick - kDelta is a valid non-negative tick we can advance to).
+    struct Ev { uint32_t applyTick; InA in; };
+    const Ev kEvents[] = {
+        { 5,  9}, { 6, -4}, { 6,  2},   // two events apply on tick 6 (insertion order preserved)
+        {10,  7}, {13, -3}, {18, 12},
+        {20,  1}, {23,  5},
+    };
+    const std::size_t kNev = sizeof(kEvents) / sizeof(kEvents[0]);
+
+    // ---- (NS2-1) DELAY IS A PURE SCHEDULING SHIFT (make-or-break) -----------------------------------
+    // REFERENCE: delay-0 session, events scheduled at their explicit applyTick via SubmitInputAt.
+    uint64_t hRef = 0;
+    {
+        Session<ToyA, InA> s;
+        s.world = ToyA{}; s.tick = 0; s.delay = 0;
+        for (std::size_t e = 0; e < kNev; ++e)
+            SubmitInputAt(s, kEvents[e].applyTick, kEvents[e].in);
+        for (uint32_t t = 0; t < kNs2Ticks; ++t) Advance(s, StepA);
+        hRef = DigestA(s.world);
+    }
+
+    // DELAYED: delay-DELTA session, the SAME events submitted via SubmitLocalInput at tick
+    // (applyTick - DELTA). We step the session forward and submit each event exactly when the current
+    // tick reaches its (applyTick - DELTA), so SubmitLocalInput (= AddInput(tick + delay)) lands it on
+    // applyTick. Events are pre-sorted by applyTick (the array already is).
+    uint64_t hDelayed = 0;
+    {
+        Session<ToyA, InA> s;
+        s.world = ToyA{}; s.tick = 0; s.delay = kDelta;
+        std::size_t e = 0;
+        for (uint32_t t = 0; t < kNs2Ticks; ++t) {
+            // Submit every event whose submit-tick (applyTick - delta) is the current tick.
+            while (e < kNev && (kEvents[e].applyTick - kDelta) == s.tick) {
+                SubmitLocalInput(s, kEvents[e].in);   // lands at s.tick + kDelta == applyTick
+                ++e;
+            }
+            Advance(s, StepA);
+        }
+        hDelayed = DigestA(s.world);
+        check(e == kNev, "ns2: all events were submitted in the delayed run");
+    }
+    check(hDelayed == hRef, "ns2: delay-D (submitted D early) == delay-0 BYTE-IDENTICAL (pure shift)");
+
+    // ---- (NS2-2) DELAY ACTUALLY DELAYS — no effect before applyTick, diverges at applyTick. ---------
+    // A single input submitted on tick t0 in a delay-DELTA session must NOT change the world for ticks
+    // [t0, t0+DELTA) (vs a no-input run) and MUST change it at tick t0+DELTA (the input applied).
+    bool delayActuallyDelays = true;
+    {
+        const uint32_t t0 = 3;
+        const InA      kIn = 42;
+        // Baseline: a no-input delay-DELTA session — record its per-tick digest.
+        // Delayed:   identical but we SubmitLocalInput(kIn) right after reaching tick t0.
+        Session<ToyA, InA> base, del;
+        base.world = ToyA{}; base.tick = 0; base.delay = kDelta;
+        del.world  = ToyA{}; del.tick  = 0; del.delay  = kDelta;
+        for (uint32_t t = 0; t < kNs2Ticks; ++t) {
+            if (del.tick == t0) SubmitLocalInput(del, kIn);  // lands at t0 + kDelta
+            Advance(base, StepA);
+            Advance(del,  StepA);
+            const uint32_t now = base.tick;  // == del.tick (both just advanced); world AFTER tick now-1
+            const bool eq = (DigestA(base.world) == DigestA(del.world));
+            // For every completed tick strictly before t0+kDelta, the worlds must still be EQUAL.
+            if (now <= t0 + kDelta) { if (!eq) delayActuallyDelays = false; }
+            // Once we've completed the apply-tick (t0+kDelta), the worlds must DIVERGE.
+            if (now == t0 + kDelta + 1) { if (eq) delayActuallyDelays = false; }
+        }
+    }
+    check(delayActuallyDelays, "ns2: delay actually delays (no effect before applyTick, diverges at it)");
+
+    // ---- (NS2-3) PINNED DIGEST — the reference converged digest == a hard-pinned uint64_t. ----------
+    const uint64_t kPinnedNs2 = 0x480eb38d762ace44ull; // the converged delay-0 reference digest (anchor)
+    check(hRef == kPinnedNs2, "ns2: pinned digest: delay-0 reference converged digest matches golden");
+
+    // ---- (NS2-4) DELAY=0 == NS1 — a delay-0 SubmitLocalInput at tick t lands on tick t. -------------
+    // SubmitLocalInput on a delay-0 session must be equivalent to the NS1 direct AddInput(t, ...).
+    bool delay0IsNs1 = true;
+    {
+        const uint32_t kSmall = 8;
+        // Via NS1 direct AddInput.
+        Session<ToyA, InA> a; a.world = ToyA{}; a.tick = 0; a.delay = 0;
+        a.ring.AddInput(2, 11); a.ring.AddInput(2, -3); a.ring.AddInput(5, 8);
+        for (uint32_t t = 0; t < kSmall; ++t) Advance(a, StepA);
+        // Via delay-0 SubmitLocalInput, advancing to each tick and submitting there.
+        Session<ToyA, InA> b; b.world = ToyA{}; b.tick = 0; b.delay = 0;
+        for (uint32_t t = 0; t < kSmall; ++t) {
+            if (b.tick == 2) { SubmitLocalInput(b, 11); SubmitLocalInput(b, -3); }
+            if (b.tick == 5) { SubmitLocalInput(b, 8); }
+            Advance(b, StepA);
+        }
+        if (DigestA(a.world) != DigestA(b.world)) delay0IsNs1 = false;
+    }
+    check(delay0IsNs1, "ns2: delay=0 SubmitLocalInput lands on the current tick (== NS1 AddInput)");
+
     // ---- Showcase / numeric proof (printed; no image golden). ---------------------------------------
     std::printf("ns1-session: generic lockstep session (2 peers, toy worlds A+B)\n");
     std::printf("ns1-session: 2-peer lockstep — digests equal every tick {ticks:%u}\n", kTicks);
@@ -157,6 +260,13 @@ int main() {
                 static_cast<unsigned long long>(hToyA), static_cast<unsigned long long>(hToyB));
     std::printf("ns1-session: input-order determinism {inOrder:0x%016llx, reversed:0x%016llx} H1 != H2\n",
                 static_cast<unsigned long long>(hInOrder), static_cast<unsigned long long>(hReversed));
+    std::printf("ns2-delay: input-delay buffer (local input applies `delay` ticks later)\n");
+    std::printf("ns2-delay: delay-D (submitted D early) == delay-0 BYTE-IDENTICAL {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(hDelayed));
+    std::printf("ns2-delay: delay actually delays (no effect before applyTick) {delta:%u, ok:%s}\n",
+                kDelta, delayActuallyDelays ? "true" : "false");
+    std::printf("ns2-delay: pinned converged digest {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(hRef));
 
     if (g_fail == 0) { std::printf("session_test: ALL CHECKS PASSED\n"); return 0; }
     std::printf("session_test: %d failures\n", g_fail);

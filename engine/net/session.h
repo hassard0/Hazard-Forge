@@ -64,6 +64,7 @@ struct Session {
     World            world;     // the deterministic state
     InputRing<Input> ring;      // inputs by tick
     uint32_t         tick = 0;  // the next tick to step
+    uint32_t         delay = 0; // NS2: input-delay — local input applies `delay` ticks ahead (0 = NS1)
 };
 
 // Advance one tick: apply the deterministic transition step(world, inputs-this-tick, tick), then ++tick.
@@ -86,6 +87,28 @@ uint64_t RunLockstep(World init, const InputRing<Input>& ring, uint32_t ticks,
     s.tick  = 0;
     for (uint32_t t = 0; t < ticks; ++t) Advance(s, step);
     return digest(s.world);
+}
+
+// ============================ NS2: INPUT-DELAY BUFFER ================================================
+// The production knob NS1's raw lockstep lacks: a configurable INPUT DELAY. Local input is scheduled to
+// apply `s.delay` ticks in the FUTURE instead of on the current tick. In netcode this gives the remote
+// peer's (network-travelled) input time to arrive BEFORE its apply-tick, so the common case needs no
+// rollback. The delay lives ENTIRELY in the submit->schedule mapping below — Advance is UNCHANGED (it
+// still pulls ring.At(tick)) — which is exactly why delay is a pure SCHEDULING SHIFT: it changes WHEN
+// inputs apply, never the game transition. A delay-D session whose inputs are submitted D ticks early is
+// therefore byte-identical to a delay-0 session. Pure-CPU integer (no float/<cmath>/clock/RNG).
+
+// Schedule a local input to apply `s.delay` ticks ahead of the current tick. At delay==0 this lands on
+// the current tick (NS1 "apply now"); at delay==D it lands at s.tick + D.
+template <class World, class Input>
+void SubmitLocalInput(Session<World, Input>& s, const Input& in) {
+    s.ring.AddInput(s.tick + s.delay, in);
+}
+
+// Schedule an input at an EXPLICIT apply-tick (independent of s.delay) — the reference path / tests.
+template <class World, class Input>
+void SubmitInputAt(Session<World, Input>& s, uint32_t applyTick, const Input& in) {
+    s.ring.AddInput(applyTick, in);
 }
 
 }  // namespace hf::net
