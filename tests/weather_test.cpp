@@ -198,6 +198,75 @@ int main() {
         }
     }
 
+    // ===================================================================================================
+    // ================= Slice WE3 — Deterministic integer TIME-OF-DAY sun + sky ramp ====================
+    // SunSky(frame) returns a Q16.16 sun direction (the sun arcs over the day) + a sky-color ramp
+    // (midnight->dawn->noon->dusk), a PURE FUNCTION of the frame, bit-identical cross-backend (the baked
+    // sine LUT — NO runtime trig). Checks: replay-stable; the sun MOVES; midnight vs noon distinct (noon
+    // higher elevation + the sky colors differ); every sky channel in [0,kOne]; the day is periodic.
+    // ===================================================================================================
+    {
+        // (1) replay-stable — same frame -> identical SunSky across calls.
+        {
+            bool stable = true;
+            for (uint32_t f = 0; f < 256 && stable; ++f) {
+                const wx::SunSkyState a = wx::SunSky(f * 5u);
+                const wx::SunSkyState b = wx::SunSky(f * 5u);
+                if (a.sunDir.x != b.sunDir.x || a.sunDir.y != b.sunDir.y || a.sunDir.z != b.sunDir.z ||
+                    a.skyColor.x != b.skyColor.x || a.skyColor.y != b.skyColor.y || a.skyColor.z != b.skyColor.z ||
+                    a.sunElev != b.sunElev) stable = false;
+            }
+            check(stable, "WE3 replay-stable: same frame -> identical SunSky across calls");
+        }
+
+        // (2) sun moves — SunSky(F).sunDir != SunSky(F + kDayFrames/8).sunDir (the sun arcs as the day advances).
+        {
+            const uint32_t F = 100u;
+            const wx::SunSkyState a = wx::SunSky(F);
+            const wx::SunSkyState b = wx::SunSky(F + wx::kDayFrames / 8u);
+            const bool moved = (a.sunDir.x != b.sunDir.x || a.sunDir.y != b.sunDir.y || a.sunDir.z != b.sunDir.z);
+            check(moved, "WE3 sun moves: SunSky(F).sunDir != SunSky(F + kDayFrames/8).sunDir (the sun arcs)");
+        }
+
+        // (3) midnight vs noon distinct — noon sunElev > midnight sunElev AND the sky colors differ.
+        {
+            const wx::SunSkyState mid  = wx::SunSky(0);                       // midnight (low/negative elevation)
+            const wx::SunSkyState noon = wx::SunSky(wx::kDayFrames / 2u);     // noon (high elevation)
+            check(noon.sunElev > mid.sunElev,
+                  "WE3 midnight vs noon: noon sunElev > midnight sunElev (the sun arcs up over the day)");
+            const bool skyDiffers = (mid.skyColor.x != noon.skyColor.x ||
+                                     mid.skyColor.y != noon.skyColor.y ||
+                                     mid.skyColor.z != noon.skyColor.z);
+            check(skyDiffers, "WE3 midnight vs noon: the midnight vs noon sky colors differ");
+        }
+
+        // (4) bounds — every skyColor channel in [0, kOne] across the whole day.
+        {
+            bool inRange = true;
+            for (uint32_t f = 0; f < wx::kDayFrames && inRange; ++f) {
+                const wx::SunSkyState s = wx::SunSky(f);
+                if (s.skyColor.x < 0 || s.skyColor.x > kOne ||
+                    s.skyColor.y < 0 || s.skyColor.y > kOne ||
+                    s.skyColor.z < 0 || s.skyColor.z > kOne) inRange = false;
+            }
+            check(inRange, "WE3 bounds: every skyColor channel in [0, kOne] across the day");
+        }
+
+        // (5) periodic — SunSky(frame) == SunSky(frame + kDayFrames) (the day loops).
+        {
+            bool periodic = true;
+            for (uint32_t f = 0; f < 64 && periodic; ++f) {
+                const uint32_t frame = f * 17u + 3u;
+                const wx::SunSkyState a = wx::SunSky(frame);
+                const wx::SunSkyState b = wx::SunSky(frame + wx::kDayFrames);
+                if (a.sunDir.x != b.sunDir.x || a.sunDir.y != b.sunDir.y || a.sunDir.z != b.sunDir.z ||
+                    a.skyColor.x != b.skyColor.x || a.skyColor.y != b.skyColor.y || a.skyColor.z != b.skyColor.z ||
+                    a.sunElev != b.sunElev) periodic = false;
+            }
+            check(periodic, "WE3 periodic: SunSky(frame) == SunSky(frame + kDayFrames) (the day loops)");
+        }
+    }
+
     if (g_fail == 0) std::printf("weather_test: ALL CHECKS PASSED\n");
     return g_fail == 0 ? 0 : 1;
 }

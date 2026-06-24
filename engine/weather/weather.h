@@ -28,6 +28,7 @@
 #include "sim/fpx.h"                // fx / kOne / kFrac / fxmul / fxdiv (Q16.16 toolbox), read-only.
 #include "terrain/procterrain.h"   // terrain::IntValueNoise — the integer value-noise basis, read-only.
 #include "pcg/pcg.h"               // pcg::PcgRandRange — the deterministic seeded scatter, read-only (Slice WE2).
+#include "foliage/foliage.h"       // foliage::kFoliageWind16 — the committed full-wave sine LUT, read-only (Slice WE3).
 
 namespace hf::weather {
 
@@ -162,6 +163,86 @@ inline std::vector<FxVec3> GenPrecip(const PrecipField& p, uint32_t frame) {
     out.reserve(static_cast<size_t>(p.count));
     for (uint32_t i = 0; i < static_cast<uint32_t>(p.count); ++i) out.push_back(PrecipDrop(p, i, frame));
     return out;
+}
+
+// ===== Slice WE3 — Deterministic integer TIME-OF-DAY sun + sky ramp (3rd slice of FLAGSHIP #27) ===============
+// The day cycle as a DETERMINISTIC INTEGER function of the frame counter: SunSky(frame) returns a Q16.16 sun
+// direction (the sun sweeps an arc across the sky as the frame advances) + a sky-color ramp (midnight -> dawn ->
+// noon -> dusk RGB), bit-identical CPU<->Vulkan<->Metal BY CONSTRUCTION — NO runtime trig (the baked-sine-LUT
+// discipline). The sun/sky are a PURE FUNCTION of the frame, so two netcode peers see the byte-identical golden
+// hour (UE5 time-of-day is float/clock-driven). APPEND-ONLY (WE1/WE2 above + fpx.h/pcg.h/foliage.h read-only).
+// NO <cmath>, NO float, NO clock, NO RNG.
+//
+// WHY IT IS BIT-EXACT (the cross-backend crux): the sun elevation/azimuth come from the COMMITTED full-wave sine
+// LUT foliage::kFoliageWind16[256] (reused read-only — kFoliageWind16[i] == round(32767*sin(2*pi*i/256))) indexed
+// by an integer day-phase, so there is NO runtime sin/cos. The sky color is a per-channel integer lerp (fxmul)
+// across 4 committed Q16.16 RGB key colors. Every op is int32/int64 integer — deterministic + identical on every
+// compiler/vendor. frame is the ONLY time input (NO clock, NO RNG).
+
+// kDayFrames: the number of frames in one full day cycle (the period of the sun arc + the sky ramp).
+inline constexpr uint32_t kDayFrames = 1440;
+
+// kSkyRamp[4]: the committed sky-color ramp keys (Q16.16 RGB in [0,kOne]) at day phase 0/1/2/3 quarters —
+//   [0] midnight (dark blue), [1] dawn (warm orange), [2] noon (sky blue), [3] dusk (warm orange ~= dawn).
+// The exact hues are art; the determinism is the point. Clean Q16.16 literals (kOne == 1.0).
+static const FxVec3 kSkyRamp[4] = {
+    { kOne / 16,     kOne / 12,     kOne / 6  },   // midnight — dark blue
+    { kOne * 8 / 10, kOne * 4 / 10, kOne * 3 / 10 },// dawn     — warm orange
+    { kOne * 4 / 10, kOne * 6 / 10, kOne       },   // noon     — sky blue
+    { kOne * 8 / 10, kOne * 4 / 10, kOne * 3 / 10 },// dusk     — warm orange (like dawn)
+};
+
+// SunSkyState: the time-of-day result at a frame — the Q16.16 sun direction (a unit-ish arc vector), the Q16.16
+// sky color (RGB in [0,kOne]), and the sun elevation (the Y component of sunDir — the sine over the day, + near
+// noon, - at night).
+struct SunSkyState {
+    FxVec3 sunDir;     // Q16.16 sun direction { cosE, sinE, 0 } — the east->west arc across the day.
+    FxVec3 skyColor;   // Q16.16 RGB in [0,kOne] — the midnight->dawn->noon->dusk ramp lerped at this phase.
+    fx     sunElev;    // Q16.16 sun elevation == sunDir.y (the sine over the day: + near noon, - at night).
+};
+
+// SunSky(frame): the deterministic integer time-of-day at `frame`. Pure integer — NO <cmath>, NO float, NO
+// clock/RNG. phase = frame % kDayFrames maps the frame into one day; tabIdx maps the phase to a 0..255 LUT index.
+//   * Sun direction from the LUT (a quarter-cycle phase shift so the ELEVATION troughs at midnight (phase 0)
+//     and PEAKS at noon (phase 1/2) — the day's natural arc): elevIdx = (tabIdx - 64) & 255, so sinE =
+//     kFoliageWind16[elevIdx] is -32767 at midnight, 0 at dawn, +32767 at noon, 0 at dusk (the elevation sine
+//     over the day). cosE = kFoliageWind16[tabIdx] (== the quarter-shifted cosine, the east->west azimuth
+//     sweep). sunDir = { cosE, sinE, 0 } (a Q16.16 direction arcing across the sky); sunElev = sinE. NOTE the
+//     LUT samples are int16 in [-32767, 32767]; we keep them as Q16.16 fx directly (a ~0.5-scale direction —
+//     direction, not a unit vector — which is fine: callers normalize / only the arc + sign matter).
+//   * Sky color by lerping kSkyRamp across the day: seg = phase*4/kDayFrames (0..3), t = the Q16.16 fractional
+//     position within the segment, skyColor = per-channel lerp(kSkyRamp[seg], kSkyRamp[(seg+1)&3], t) via fxmul
+//     (wrapping back to midnight after dusk). All Q16.16.
+inline SunSkyState SunSky(uint32_t frame) {
+    const uint32_t phase  = frame % kDayFrames;
+    const uint32_t tabIdx = static_cast<uint32_t>((static_cast<uint64_t>(phase) * 256u) / kDayFrames) & 255u;
+
+    // Sun direction from the committed full-wave sine LUT (read-only) — NO runtime trig. The elevation is the
+    // sine phase-shifted a quarter cycle so it troughs at midnight (phase 0) and peaks at noon (phase 1/2).
+    const uint32_t elevIdx = (tabIdx + 192u) & 255u;                                  // (tabIdx - 64) & 255
+    const fx sinE = static_cast<fx>(hf::foliage::kFoliageWind16[elevIdx]);             // elevation sine
+    const fx cosE = static_cast<fx>(hf::foliage::kFoliageWind16[tabIdx]);              // azimuth cosine (1/4 shift)
+
+    SunSkyState s;
+    s.sunDir  = FxVec3{ cosE, sinE, 0 };
+    s.sunElev = sinE;
+
+    // Sky color: lerp the kSkyRamp keys across the day. seg in [0,3], t = the Q16.16 fraction within the segment.
+    const uint32_t segLen = kDayFrames / 4u;                       // frames per quarter-day segment
+    const uint32_t seg    = (phase * 4u) / kDayFrames;             // which segment 0..3 (== phase / segLen)
+    const uint32_t inSeg  = phase - seg * segLen;                  // frames into the segment [0, segLen)
+    // t = inSeg / segLen as a Q16.16 fraction (pure integer floor division via int64): t in [0, kOne).
+    const fx t = static_cast<fx>((static_cast<int64_t>(inSeg) * static_cast<int64_t>(kOne)) /
+                                 static_cast<int64_t>(segLen));
+    const FxVec3& a = kSkyRamp[seg & 3u];
+    const FxVec3& b = kSkyRamp[(seg + 1u) & 3u];                   // wraps dusk -> midnight
+    // Per-channel lerp: a + (b - a)*t (Q16.16 via fxmul). (b-a) may be negative -> fxmul handles signed Q16.16.
+    s.skyColor = FxVec3{
+        a.x + fxmul(b.x - a.x, t),
+        a.y + fxmul(b.y - a.y, t),
+        a.z + fxmul(b.z - a.z, t),
+    };
+    return s;
 }
 
 }  // namespace hf::weather
