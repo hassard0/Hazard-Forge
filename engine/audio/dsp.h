@@ -291,4 +291,109 @@ inline void FilterBlock(BiquadNode& bq, const std::vector<int16_t>& src,
     }
 }
 
+// =====================================================================================================
+// Slice DSP4 — Declarative node-graph PATCH (Issue #26, flagship #23 DETERMINISTIC AUDIO, 4th slice, THE
+// MetaSounds-CLASS HEADLINE). APPEND-ONLY: the DSP1 osc + DSP2 env + DSP3 filter code above is untouched.
+// A whole synth voice is a FLAT node array with INTEGER-INDEX wiring (the pcg::PcgGraph / ai decision-tree
+// / nav-poly precedent — indices, NOT pointers), evaluated per block in fixed topological order. Each
+// node reuses a DSP1/2/3 stage verbatim (or the new int32-accumulate-then-clamp Mix). Node states (osc
+// phase, env t, filt delay line) mutate IN the patch so they carry across EvaluateBlock calls — so the
+// graph produces a byte-identical buffer whether rendered as one big buffer or block-by-block.
+//
+// The discipline: in0/in1 reference LOWER node indices (a fixed topo order, validated defensively — an
+// out-of-range / non-strictly-lower input is treated as a silent/zero input, never read out of bounds).
+// Pure-CPU integer. NO <cmath>, NO float. Self-contained (only <cstdint>/<vector>; no mixer/fpx include).
+// -----------------------------------------------------------------------------------------------------
+
+enum class NodeType { Osc, Env, Filter, Mix };
+
+// One node of a Patch. The `type` selects which embedded stage runs; the others are inert. in0/in1 are
+// integer indices of input nodes (MUST be < this node's own index). gain0/gain1 are Q15 mix gains.
+struct DspNode {
+    NodeType   type = NodeType::Osc;
+    int        in0 = -1;
+    int        in1 = -1;
+    OscNode    osc{};                       // type==Osc    (a source — ignores in0/in1)
+    EnvNode    env{};                       // type==Env    (shapes in0's block)
+    BiquadNode filt{};                      // type==Filter (filters in0's block)
+    int32_t    gain0 = 32767;               // type==Mix    (Q15 gain on in0)
+    int32_t    gain1 = 32767;               // type==Mix    (Q15 gain on in1)
+};
+
+// A declarative DSP graph: a flat node array (topo-ordered: a node's inputs are lower indices) plus the
+// output node index (the block whose samples are the patch output; default to the last node if -1).
+struct Patch {
+    std::vector<DspNode> nodes;
+    int outNode = -1;
+};
+
+// Evaluate `frames` of the patch, APPENDING the output node's block to `outAppend`. Each node is rendered
+// once in ascending index order into a per-node scratch block; node states mutate IN `p.nodes` so they
+// carry across calls (block-by-block == one big buffer). Defensive: an input index that is not a valid,
+// strictly-lower node yields a silent (empty/zero) contribution — never an OOB read.
+inline void EvaluateBlock(Patch& p, int sampleRate, int frames, std::vector<int16_t>& outAppend) {
+    const int n = static_cast<int>(p.nodes.size());
+    if (n <= 0 || frames <= 0) return;
+
+    std::vector<std::vector<int16_t>> blk(static_cast<size_t>(n));
+
+    // A valid input index must be in [0, i) — a lower node already evaluated this block.
+    auto validIn = [&](int idx, int self) -> bool { return idx >= 0 && idx < self; };
+
+    for (int i = 0; i < n; ++i) {
+        DspNode& nd = p.nodes[i];
+        switch (nd.type) {
+            case NodeType::Osc:
+                RenderBlock(nd.osc, sampleRate, frames, blk[static_cast<size_t>(i)]);
+                break;
+            case NodeType::Env: {
+                static const std::vector<int16_t> kEmpty;
+                const std::vector<int16_t>& src =
+                    validIn(nd.in0, i) ? blk[static_cast<size_t>(nd.in0)] : kEmpty;
+                ApplyEnvBlock(nd.env, src, blk[static_cast<size_t>(i)]);
+                break;
+            }
+            case NodeType::Filter: {
+                static const std::vector<int16_t> kEmpty;
+                const std::vector<int16_t>& src =
+                    validIn(nd.in0, i) ? blk[static_cast<size_t>(nd.in0)] : kEmpty;
+                FilterBlock(nd.filt, src, blk[static_cast<size_t>(i)]);
+                break;
+            }
+            case NodeType::Mix: {
+                const bool ok0 = validIn(nd.in0, i);
+                const bool ok1 = validIn(nd.in1, i);
+                const std::vector<int16_t>* a = ok0 ? &blk[static_cast<size_t>(nd.in0)] : nullptr;
+                const std::vector<int16_t>* b = ok1 ? &blk[static_cast<size_t>(nd.in1)] : nullptr;
+                std::vector<int16_t>& dst = blk[static_cast<size_t>(i)];
+                dst.reserve(static_cast<size_t>(frames));
+                for (int f = 0; f < frames; ++f) {
+                    const int32_t s0 = (a && static_cast<size_t>(f) < a->size())
+                        ? MulQ15((*a)[static_cast<size_t>(f)], nd.gain0) : 0;
+                    const int32_t s1 = (b && static_cast<size_t>(f) < b->size())
+                        ? MulQ15((*b)[static_cast<size_t>(f)], nd.gain1) : 0;
+                    dst.push_back(ClampI16(s0 + s1));
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    const int outIdx = (p.outNode < 0) ? (n - 1) : p.outNode;
+    if (outIdx >= 0 && outIdx < n) {
+        const std::vector<int16_t>& out = blk[static_cast<size_t>(outIdx)];
+        outAppend.insert(outAppend.end(), out.begin(), out.end());
+    }
+}
+
+// Convenience: evaluate `totalFrames` in ONE EvaluateBlock — the "one big buffer" reference the
+// block-boundary test compares the N-block render against.
+inline std::vector<int16_t> RenderPatch(Patch& p, int sampleRate, int totalFrames) {
+    std::vector<int16_t> out;
+    EvaluateBlock(p, sampleRate, totalFrames, out);
+    return out;
+}
+
 }  // namespace hf::audio::dsp

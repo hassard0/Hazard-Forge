@@ -297,6 +297,148 @@ int main() {
     std::printf("dsp3-filter: saw->lowpass pinned {hash:0x%016llx}\n",
                 static_cast<unsigned long long>(hLpOne));
 
+    // ======================================================================================
+    // DSP4 — Declarative node-graph PATCH (engine/audio/dsp.h, flagship #23, 4th slice, THE HEADLINE).
+    // ======================================================================================
+    // A flat node array with integer-index wiring evaluated per block in fixed topo order. Same INTEGER
+    // buffer-hash bar: bit-identical run-to-run AND platform-to-platform, and every node state carries
+    // across EvaluateBlock calls (so one-buffer == N-blocks).
+
+    // ---- (D4-1) SINGLE-OSC PATCH == BARE OSC (make-or-break no-op): a one-Osc patch (outNode 0) renders
+    //      byte-identical to RenderOsc with the same params (the graph adds zero overhead). --------------
+    {
+        dsp::Patch p;
+        dsp::DspNode oscN;
+        oscN.type = dsp::NodeType::Osc;
+        oscN.osc.wave = dsp::Wave::Sine;
+        oscN.osc.freqHz = kFreq;
+        oscN.osc.phase = 0;
+        p.nodes.push_back(oscN);
+        p.outNode = 0;
+        const std::vector<int16_t> patchOut = dsp::RenderPatch(p, kSR, kTotal);
+        check(patchOut == oneBuf, "dsp4: single-osc patch == bare RenderOsc (byte-identical, graph transparent)");
+        check(dsp::DigestBuffer(patchOut) == hOne, "dsp4: single-osc patch digest == bare osc digest");
+    }
+
+    // ---- (D4-2) CHAIN EQUIVALENCE: a 3-node patch Osc->Env->Filter renders byte-identical to the
+    //      hand-chained DSP1->DSP2->DSP3 on fresh nodes with the same params. ---------------------------
+    std::vector<int16_t> handChain;
+    {
+        // Hand-chained reference: RenderOsc -> ApplyEnvBlock -> FilterBlock.
+        std::vector<int16_t> oscBuf = dsp::RenderOsc(dsp::Wave::Sine, kFreq, kSR, kTotal);
+        std::vector<int16_t> envBuf;
+        { dsp::EnvNode e; e.env = kAdsr; e.durSample = kTotal; dsp::ApplyEnvBlock(e, oscBuf, envBuf); }
+        { dsp::BiquadNode bq{dsp::kBiquadLowpass2k}; dsp::FilterBlock(bq, envBuf, handChain); }
+    }
+    auto makeChainPatch = []() -> dsp::Patch {
+        dsp::Patch p;
+        dsp::DspNode o; o.type = dsp::NodeType::Osc; o.osc.wave = dsp::Wave::Sine; o.osc.freqHz = 440; o.osc.phase = 0;
+        dsp::DspNode e; e.type = dsp::NodeType::Env; e.in0 = 0;
+        dsp::DspNode f; f.type = dsp::NodeType::Filter; f.in0 = 1; f.filt.c = dsp::kBiquadLowpass2k;
+        p.nodes.push_back(o); p.nodes.push_back(e); p.nodes.push_back(f);
+        p.outNode = 2;
+        return p;
+    };
+    {
+        dsp::Patch p = makeChainPatch();
+        p.nodes[1].env.env = kAdsr; p.nodes[1].env.durSample = kTotal;
+        const std::vector<int16_t> patchChain = dsp::RenderPatch(p, kSR, kTotal);
+        check(patchChain == handChain, "dsp4: chain Osc->Env->Filter == hand-chained DSP1->DSP2->DSP3 (byte-identical)");
+    }
+
+    // ---- (D4-3) BLOCK-BOUNDARY DETERMINISM: that 3-node chain patch as ONE N*256 buffer (RenderPatch)
+    //      vs N separate 256-frame EvaluateBlock calls on ONE persistent Patch -> byte-identical. --------
+    uint64_t hChainOne = 0;
+    {
+        dsp::Patch pOne = makeChainPatch();
+        pOne.nodes[1].env.env = kAdsr; pOne.nodes[1].env.durSample = kTotal;
+        const std::vector<int16_t> chainOne = dsp::RenderPatch(pOne, kSR, kTotal);
+
+        dsp::Patch pN = makeChainPatch();
+        pN.nodes[1].env.env = kAdsr; pN.nodes[1].env.durSample = kTotal;
+        std::vector<int16_t> chainN;
+        for (int b = 0; b < kN; ++b) dsp::EvaluateBlock(pN, kSR, kBlock, chainN);
+
+        hChainOne = dsp::DigestBuffer(chainOne);
+        check(chainOne.size() == static_cast<size_t>(kTotal), "dsp4: RenderPatch chain fills totalFrames");
+        check(chainN.size()   == static_cast<size_t>(kTotal), "dsp4: N EvaluateBlock chain calls fill N*block");
+        check(chainOne == chainN, "dsp4: block-boundary: one-buffer == N-blocks (byte-identical, all states carry)");
+        check(hChainOne == dsp::DigestBuffer(chainN), "dsp4: block-boundary: DigestBuffer(one) == DigestBuffer(N-blocks)");
+    }
+
+    // ---- (D4-4) MIX NODE: a Mix of two oscillators (different freqs) == hand-mixed per frame; and
+    //      gain0=gain1=0 -> exact silence. -------------------------------------------------------------
+    uint64_t hMix = 0;
+    {
+        const uint32_t kFreqA = 440, kFreqB = 660;
+        const int32_t  kG0 = 24000, kG1 = 16000;
+        // Hand-mixed reference.
+        std::vector<int16_t> a = dsp::RenderOsc(dsp::Wave::Sine, kFreqA, kSR, kTotal);
+        std::vector<int16_t> b = dsp::RenderOsc(dsp::Wave::Sine, kFreqB, kSR, kTotal);
+        std::vector<int16_t> handMix;
+        handMix.reserve(static_cast<size_t>(kTotal));
+        for (int f = 0; f < kTotal; ++f)
+            handMix.push_back(dsp::ClampI16(dsp::MulQ15(a[f], kG0) + dsp::MulQ15(b[f], kG1)));
+
+        // Patch: osc0, osc1, mix(in0=0,in1=1).
+        auto makeMixPatch = [&](int32_t g0, int32_t g1) -> dsp::Patch {
+            dsp::Patch p;
+            dsp::DspNode o0; o0.type = dsp::NodeType::Osc; o0.osc.wave = dsp::Wave::Sine; o0.osc.freqHz = kFreqA;
+            dsp::DspNode o1; o1.type = dsp::NodeType::Osc; o1.osc.wave = dsp::Wave::Sine; o1.osc.freqHz = kFreqB;
+            dsp::DspNode m;  m.type = dsp::NodeType::Mix; m.in0 = 0; m.in1 = 1; m.gain0 = g0; m.gain1 = g1;
+            p.nodes.push_back(o0); p.nodes.push_back(o1); p.nodes.push_back(m);
+            p.outNode = 2;
+            return p;
+        };
+        dsp::Patch pMix = makeMixPatch(kG0, kG1);
+        const std::vector<int16_t> patchMix = dsp::RenderPatch(pMix, kSR, kTotal);
+        check(patchMix == handMix, "dsp4: mix node == hand-mixed ClampI16(MulQ15(a,g0)+MulQ15(b,g1)) per frame");
+        hMix = dsp::DigestBuffer(patchMix);
+
+        dsp::Patch pSilent = makeMixPatch(0, 0);
+        const std::vector<int16_t> silent = dsp::RenderPatch(pSilent, kSR, kTotal);
+        bool allZero = true;
+        for (const int16_t s : silent) if (s != 0) { allZero = false; break; }
+        check(allZero, "dsp4: mix node gain0=gain1=0 -> exact silence");
+    }
+
+    // ---- (D4-5) PINNED HASH — a representative patch (two-osc mix -> lowpass filter) digest == a hard-
+    //      pinned uint64_t; a different wiring -> a different hash. ------------------------------------
+    auto makeMixFilterPatch = [](int32_t g0, int32_t g1) -> dsp::Patch {
+        dsp::Patch p;
+        dsp::DspNode o0; o0.type = dsp::NodeType::Osc; o0.osc.wave = dsp::Wave::Sine; o0.osc.freqHz = 440;
+        dsp::DspNode o1; o1.type = dsp::NodeType::Osc; o1.osc.wave = dsp::Wave::Saw;  o1.osc.freqHz = 220;
+        dsp::DspNode m;  m.type = dsp::NodeType::Mix; m.in0 = 0; m.in1 = 1; m.gain0 = g0; m.gain1 = g1;
+        dsp::DspNode flt; flt.type = dsp::NodeType::Filter; flt.in0 = 2; flt.filt.c = dsp::kBiquadLowpass2k;
+        p.nodes.push_back(o0); p.nodes.push_back(o1); p.nodes.push_back(m); p.nodes.push_back(flt);
+        p.outNode = 3;
+        return p;
+    };
+    uint64_t hRep = 0;
+    {
+        dsp::Patch p = makeMixFilterPatch(20000, 12000);
+        const std::vector<int16_t> rep = dsp::RenderPatch(p, kSR, kTotal);
+        hRep = dsp::DigestBuffer(rep);
+        const uint64_t kPinnedMixFilter = 0x849b4f1b42d8e92eull;
+        check(hRep == kPinnedMixFilter, "dsp4: pinned hash: DigestBuffer(two-osc mix -> lowpass, 4096f) matches golden");
+
+        // A different wiring (different gains) -> a different hash.
+        dsp::Patch p2 = makeMixFilterPatch(10000, 30000);
+        const uint64_t hRep2 = dsp::DigestBuffer(dsp::RenderPatch(p2, kSR, kTotal));
+        check(hRep2 != hRep, "dsp4: different patch wiring -> different hash");
+    }
+
+    // ---- DSP4 showcase / numeric proof (printed; no image golden). ----------------------------------
+    std::printf("dsp4-patch: declarative node graph (Osc/Env/Filter/Mix, flat integer-index wiring)\n");
+    std::printf("dsp4-patch: single-osc patch == bare RenderOsc BYTE-IDENTICAL (graph overhead transparent)\n");
+    std::printf("dsp4-patch: chain Osc->Env->Filter == hand-chained DSP1->DSP2->DSP3 BYTE-IDENTICAL\n");
+    std::printf("dsp4-patch: block-boundary determinism: one-buffer == N-blocks {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(hChainOne));
+    std::printf("dsp4-patch: mix of two oscillators pinned {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(hMix));
+    std::printf("dsp4-patch: representative patch (mix->lowpass) pinned {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(hRep));
+
     if (g_fail == 0) { std::printf("dsp_test: ALL CHECKS PASSED\n"); return 0; }
     std::printf("dsp_test: %d failures\n", g_fail);
     return 1;
