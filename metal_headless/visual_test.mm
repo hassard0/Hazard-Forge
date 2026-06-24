@@ -4595,6 +4595,246 @@ static int RunTerrainShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Eroded terrain MESH showcase (Slice PT4, the FIRST FLOAT slice of FLAGSHIP #26). Mirrors the Vulkan
+// --pt4-mesh-shot path EXACTLY: the SAME bit-exact INTEGER eroded heightfield (PT1 GenHeightField -> PT2
+// ErodeHydraulic -> PT3 ErodeThermal at the IDENTICAL fixed seed/n/octaves/erosion params) is crossed to a
+// float mesh by terrain::BuildIntTerrainMesh (the SINGLE Q16.16 -> float crossing, render-only) and rendered
+// lit + shadowed from the SAME fixed 3/4 camera + directional light through the EXISTING lit mesh pipeline
+// (lit.vert + lit.frag, scene::MeshVertexLayout, FrameData UBO, sky + static-shadow + post) — no new shader /
+// RHI. The mesh (procterrain.h, hf_core) is byte-identical to the Windows build by construction; only the
+// backend NDC handling (FlipProjY) + GPU float raster differ. The PT4 arc's FIRST FLOAT golden (the
+// visresolve bar: Metal-baked, two renders BYTE-IDENTICAL + provenance + flat no-op). -----------------------
+static int RunPt4MeshShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // The bit-exact INTEGER terrain pipeline (PT1 -> PT2 -> PT3). FIXED params — IDENTICAL to the Vulkan
+    // --pt4-mesh-shot so the mesh is byte-identical cross-backend by construction.
+    const uint32_t kSeed = 0x7E44A12Bu;
+    const int      kN = 256;
+    const int      kOctaves = 5;
+    const terrain::fx kWorldSizeFx = 48 * terrain::kOne;
+    const int      kHydraulicIters = 60;
+    const int      kThermalIters = 400;
+    const terrain::fx kTalus = terrain::kOne / 32;
+    const float    kWorldSizeF = 20.0f;
+    const float    kHeightScale = 4.0f;
+
+    std::vector<terrain::fx> erodedGrid =
+        terrain::GenHeightField(kSeed, kN, kWorldSizeFx, kOctaves);
+    terrain::ErodeHydraulic(erodedGrid, kN, kHydraulicIters);
+    terrain::ErodeThermal(erodedGrid, kN, kThermalIters, kTalus);
+
+    terrain::TerrainMesh tm =
+        terrain::BuildIntTerrainMesh(erodedGrid, kN, kWorldSizeF, kHeightScale);
+    const uint32_t kVertCount = (uint32_t)tm.verts.size();
+    const uint32_t kIndexCount = (uint32_t)tm.indices.size();
+    const uint32_t kTriCount = kIndexCount / 3;
+
+    rhi::BufferDesc tvb;
+    tvb.size = (uint64_t)tm.verts.size() * sizeof(scene::Vertex);
+    tvb.initialData = tm.verts.data();
+    tvb.usage = rhi::BufferUsage::Vertex;
+    auto terrainVB = device->CreateBuffer(tvb);
+    rhi::BufferDesc tib;
+    tib.size = (uint64_t)tm.indices.size() * sizeof(uint32_t);
+    tib.initialData = tm.indices.data();
+    tib.usage = rhi::BufferUsage::Index;
+    auto terrainIB = device->CreateBuffer(tib);
+    scene::Mesh terrainMesh{std::move(terrainVB), std::move(terrainIB), kIndexCount};
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    auto whiteTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+    Mat4 terrainModel = Mat4::Identity();
+
+    const Vec3 eye{14.0f, 11.0f, 14.0f};
+    const Vec3 center{0.0f, 0.0f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 0.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 22.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-13.0f, 13.0f, -13.0f, 13.0f, 1.0f, 48.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(terrainModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(terrainMesh.vertices());
+            cmd.BindIndexBuffer(terrainMesh.indices());
+            cmd.DrawIndexed(terrainMesh.indexCount());
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = terrainModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.92f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*whiteTex, *flatNormal);
+                cmd.BindVertexBuffer(terrainMesh.vertices());
+                cmd.BindIndexBuffer(terrainMesh.indices());
+                cmd.DrawIndexed(terrainMesh.indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    auto countShaded = [](const std::vector<uint8_t>& img) -> uint32_t {
+        uint32_t n = 0;
+        for (size_t p = 0; p + 3 < img.size(); p += 4) {
+            const int b = img[p + 0], g = img[p + 1], r = img[p + 2];
+            if (b + g + r > 60) ++n;
+        }
+        return n;
+    };
+    const uint32_t shaded = countShaded(bgra);
+
+    // (1) headline.
+    std::printf("pt4-mesh: eroded terrain mesh (verts:%u, tris:%u, n:%d)\n",
+                kVertCount, kTriCount, kN);
+
+    // (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd render)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("pt4-mesh two renders DIFFER (nondeterministic)");
+    std::printf("pt4-mesh: two renders BYTE-IDENTICAL\n");
+
+    // (3) provenance + coherence.
+    if ((uint32_t)tm.verts.size() != (uint32_t)(kN * kN) ||
+        (uint32_t)tm.indices.size() != (uint32_t)((kN - 1) * (kN - 1) * 6))
+        return fail("pt4-mesh provenance: verts/indices != grid n*n");
+    if (shaded == 0) return fail("pt4-mesh coverage 0 (nothing shaded / black render)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("pt4-mesh uniform image (no coherent terrain)");
+    std::printf("pt4-mesh: provenance verts == grid n*n {verts:%u, shaded:%u}\n", kVertCount, shaded);
+
+    // (4) flat no-op: a flat (zero) grid -> a flat plane (all verts y=0).
+    {
+        std::vector<terrain::fx> flatGrid(static_cast<size_t>(kN) * static_cast<size_t>(kN), 0);
+        terrain::TerrainMesh flat =
+            terrain::BuildIntTerrainMesh(flatGrid, kN, kWorldSizeF, kHeightScale);
+        bool allZeroY = (flat.verts.size() == (size_t)(kN * kN));
+        for (const scene::Vertex& v : flat.verts) {
+            if (v.pos[1] != 0.0f) { allZeroY = false; break; }
+        }
+        if (!allZeroY) return fail("pt4-mesh flat grid did not produce a flat plane");
+        std::printf("pt4-mesh: flat grid -> flat plane (no-op) {flatVerts:%u}\n",
+                    (uint32_t)flat.verts.size());
+    }
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — eroded terrain mesh %dx%d, %u verts, %u tris\n",
+                outPath, cw, ch, kN, kN, kVertCount, kTriCount);
+    return 0;
+}
+
 // --- GPU Isosurface Meshing RENDER showcase (Slice MC5, the MC arc CAPSTONE). Mirrors the Vulkan
 // --mc-render-shot path EXACTLY: the SAME MC1-MC4 sphere field (render/mc.h::MakeSphereField, 33³
 // corners, radius 12, iso 0) is meshed on the CPU by render/mc.h::MarchCellsInterp (the PROVEN bit-exact
@@ -69948,6 +70188,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--terrain") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_terrain.png";
             try { return RunTerrainShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pt4-mesh <out.png>: render the eroded terrain MESH showcase (Slice PT4, the FIRST FLOAT slice of
+        // FLAGSHIP #26) — the bit-exact INTEGER eroded heightfield (PT1 GenHeightField -> PT2 ErodeHydraulic
+        // -> PT3 ErodeThermal) crossed to a float mesh by terrain::BuildIntTerrainMesh, lit + shadowed from a
+        // fixed 3/4 camera. Mirrors the Vulkan --pt4-mesh-shot path; new golden tests/golden/metal/pt4_mesh.png.
+        if (argc > 1 && std::strcmp(argv[1], "--pt4-mesh") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pt4_mesh.png";
+            try { return RunPt4MeshShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --terrain-stream <out.png>: render the terrain-streaming LOD showcase (Slice BJ) — the RESIDENT

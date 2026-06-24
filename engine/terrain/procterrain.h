@@ -22,9 +22,11 @@
 // shape mirrors heightmap.cpp:36-52 ValueNoise; the fBm octave loop mirrors the standard fractal sum.
 
 #include <cstdint>
+#include <cmath>      // PT4 render bridge ONLY (std::sqrt for the host-float normal). NOT on the PT1-3 integer path.
 #include <vector>
 
-#include "sim/fpx.h"  // fx / kOne / kFrac / fxmul (Q16.16 toolbox), read-only.
+#include "sim/fpx.h"  // fx / kOne / kFrac / fxmul + FxToFloat (Q16.16 toolbox), read-only.
+#include "terrain/heightmap.h"  // PT4 render bridge ONLY: scene::Vertex + TerrainMesh (read-only). BuildTerrain FROZEN.
 
 namespace hf::terrain {
 
@@ -33,6 +35,7 @@ using hf::sim::fpx::fx;
 using hf::sim::fpx::kOne;
 using hf::sim::fpx::kFrac;
 using hf::sim::fpx::fxmul;
+using hf::sim::fpx::FxToFloat;  // PT4 render bridge ONLY: the single Q16.16 -> float crossing.
 
 // IntHashLattice(ix, iz, seed): a deterministic Q16.16 corner value in [0, kOne). The SAME integer hash
 // shape as heightmap.cpp's float HashLattice (a Wang-style avalanche on a combined 32-bit key) with the
@@ -105,6 +108,124 @@ inline std::vector<fx> GenHeightField(uint32_t seed, int n, fx worldSize, int oc
         }
     }
     return field;
+}
+
+// ============================ SLICE PT4 — eroded terrain MESH (the RENDER BRIDGE) =========================
+// (APPEND-ONLY after PT1; PT1's IntHashLattice/IntValueNoise/IntHeight/GenHeightField are NOT modified.)
+//
+// THE ONE FLOAT CROSSING OF THE WHOLE FLAGSHIP. BuildIntTerrainMesh turns the bit-exact INTEGER eroded
+// heightfield (PT1 GenHeightField + PT2 ErodeHydraulic + PT3 ErodeThermal — all strict Q16.16) into a lit
+// 3D terrain MESH (scene::Vertex / uint32 indices) for the existing lit/shadow pipeline. It MIRRORS the
+// FROZEN float BuildTerrain (heightmap.cpp:66-130) — same world layout, same UVs, same height-tint color
+// ramp, same (n-1)*(n-1)*6 two-CCW-triangles-per-quad winding — but drives Y from the INTEGER grid via the
+// SINGLE FxToFloat crossing (render-only). This is the FO5/PCG6 render-bridge precedent: the DATA (the
+// grid) is bit-exact + byte-identical cross-backend; only this float mesh build + the GPU raster diverge
+// (the visresolve bar — deterministic per-run, NOT a strict zero-diff cross-vendor pixel compare). This is
+// the ONLY float code in procterrain.h; PT1-PT3 stay pure integer. NO RHI, NO backend symbols.
+//
+// grid is the n*n row-major eroded field (index gz*n + gx). Vertex (ix,iz): world x = -half + step*ix,
+// z = -half + step*iz (half = worldSize/2, step = worldSize/(n-1)); y = FxToFloat(grid[iz*n+ix]) *
+// heightScale. The central-difference normal samples the INTEGER grid neighbours (clamped at edges),
+// FxToFloat'd, finite-differenced -> N = normalize(-dHx, 1, -dHz) in host float (deterministic, NOT
+// bit-exact — the float side of the bar). An empty/degenerate grid (n < 2 or size mismatch) -> a flat
+// plane (all y=0, normals up — the no-op).
+inline TerrainMesh BuildIntTerrainMesh(const std::vector<fx>& grid, int n, float worldSize,
+                                       float heightScale) {
+    TerrainMesh out;
+    if (n < 2) return out;
+    const bool haveGrid = (grid.size() == static_cast<size_t>(n) * static_cast<size_t>(n));
+
+    const float half = worldSize * 0.5f;
+    const float step = worldSize / static_cast<float>(n - 1);
+
+    // Read a grid cell as a float height (render-only). Out-of-grid / no-grid -> 0 (flat). Clamp indices to
+    // the grid edge so the boundary central-difference uses the nearest in-grid sample (mirrors the analytic
+    // edge behaviour of BuildTerrain — no neighbour wrap).
+    auto gridH = [&](int ix, int iz) -> float {
+        if (!haveGrid) return 0.0f;
+        if (ix < 0) ix = 0; else if (ix >= n) ix = n - 1;
+        if (iz < 0) iz = 0; else if (iz >= n) iz = n - 1;
+        return FxToFloat(grid[static_cast<size_t>(iz) * static_cast<size_t>(n) + static_cast<size_t>(ix)]);
+    };
+
+    // Height band over the actual integer grid (for the color ramp normalization). For a flat/no grid the
+    // band is 0 -> the ramp falls back to the neutral mid color (matches the BuildTerrain kBand>0 guard).
+    fx minFx = 0, maxFx = 0;
+    if (haveGrid) {
+        minFx = grid[0]; maxFx = grid[0];
+        for (fx h : grid) { if (h < minFx) minFx = h; if (h > maxFx) maxFx = h; }
+    }
+    const float bandLo = FxToFloat(minFx) * heightScale;
+    const float bandHi = FxToFloat(maxFx) * heightScale;
+    const float bandSpan = bandHi - bandLo;  // 0 for a flat grid
+
+    out.verts.reserve(static_cast<size_t>(n) * static_cast<size_t>(n));
+    float peak = -1e30f;
+    for (int iz = 0; iz < n; ++iz) {
+        for (int ix = 0; ix < n; ++ix) {
+            const float x = -half + step * static_cast<float>(ix);
+            const float z = -half + step * static_cast<float>(iz);
+            const float y = gridH(ix, iz) * heightScale;   // THE SINGLE Q16.16 -> float crossing (render-only).
+            if (y > peak) peak = y;
+
+            // Central finite-difference normal from the INTEGER grid neighbours (one grid step apart),
+            // FxToFloat'd then finite-differenced. N = normalize(-dHx, 1, -dHz) — the standard heightfield
+            // normal (up-facing for a flat region). Host float -> deterministic, NOT bit-exact.
+            const float hx0 = gridH(ix - 1, iz) * heightScale;
+            const float hx1 = gridH(ix + 1, iz) * heightScale;
+            const float hz0 = gridH(ix, iz - 1) * heightScale;
+            const float hz1 = gridH(ix, iz + 1) * heightScale;
+            const float dHx = (hx1 - hx0) / (2.0f * step);
+            const float dHz = (hz1 - hz0) / (2.0f * step);
+            float nx = -dHx, ny = 1.0f, nz = -dHz;
+            const float inv = 1.0f / std::sqrt(nx * nx + ny * ny + nz * nz);
+            nx *= inv; ny *= inv; nz *= inv;
+
+            const float u = static_cast<float>(ix) / static_cast<float>(n - 1);
+            const float v = static_cast<float>(iz) / static_cast<float>(n - 1);
+
+            // Height-tint vertex color ramp (mirrors heightmap.cpp:102-120: low->grass, mid->rock, high->snow),
+            // normalized against THIS grid's height band (bandLo..bandHi). bandSpan==0 (flat) -> t=0.5 (neutral).
+            float t = (bandSpan > 0.0f) ? (y - bandLo) / bandSpan : 0.5f;
+            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+            float r, g, b;
+            if (t < 0.5f) {
+                const float k = t * 2.0f;                     // 0..1 across the low band
+                r = 0.20f + (0.45f - 0.20f) * k;
+                g = 0.45f + (0.40f - 0.45f) * k;
+                b = 0.18f + (0.28f - 0.18f) * k;
+            } else {
+                const float k = (t - 0.5f) * 2.0f;            // 0..1 across the high band
+                r = 0.45f + (0.95f - 0.45f) * k;
+                g = 0.40f + (0.95f - 0.40f) * k;
+                b = 0.28f + (1.00f - 0.28f) * k;
+            }
+
+            scene::Vertex vert{};
+            vert.pos[0] = x;  vert.pos[1] = y;  vert.pos[2] = z;
+            vert.color[0] = r; vert.color[1] = g; vert.color[2] = b;
+            vert.uv[0] = u; vert.uv[1] = v;
+            vert.normal[0] = nx; vert.normal[1] = ny; vert.normal[2] = nz;
+            vert.tangent[0] = 1.0f; vert.tangent[1] = 0.0f; vert.tangent[2] = 0.0f;
+            out.verts.push_back(vert);
+        }
+    }
+    out.peak = peak;
+
+    // Two CCW-from-above triangles per quad — IDENTICAL winding to BuildTerrain (heightmap.cpp:137-147).
+    out.indices.reserve(static_cast<size_t>(n - 1) * static_cast<size_t>(n - 1) * 6);
+    for (int iz = 0; iz < n - 1; ++iz) {
+        for (int ix = 0; ix < n - 1; ++ix) {
+            const uint32_t a = static_cast<uint32_t>(iz * n + ix);
+            const uint32_t b = static_cast<uint32_t>(iz * n + ix + 1);
+            const uint32_t c = static_cast<uint32_t>((iz + 1) * n + ix);
+            const uint32_t d = static_cast<uint32_t>((iz + 1) * n + ix + 1);
+            out.indices.push_back(c); out.indices.push_back(d); out.indices.push_back(b);
+            out.indices.push_back(c); out.indices.push_back(b); out.indices.push_back(a);
+        }
+    }
+
+    return out;
 }
 
 }  // namespace hf::terrain
