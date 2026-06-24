@@ -1194,6 +1194,15 @@ hf_add_pure_test(foliage_test)
 # procterrain.h #includes sim/fpx.h read-only.
 hf_add_pure_test(procterrain_test)
 
+# Deterministic Dynamic Weather Slice 1 (Slice WE1, the BEACHHEAD of FLAGSHIP #27): the integer DRIFTING
+# CLOUD-DENSITY field (engine/weather/weather.h) — IntCloudDensity/GenCloudSlice, a drifted integer fBm
+# value-noise (terrain::IntValueNoise basis, read-only) advected by a per-frame integer wind offset and
+# carved by coverage, bit-identical CPU<->Vulkan<->Metal BY CONSTRUCTION — NO runtime sin/frac(sin())/
+# <cmath> (unlike the FLOAT clouds.h render bridge). weather_test pins replay-stability, drift (frame F vs
+# F+1 differs), the [0,kOne] bounds, the zero-coverage clear-sky no-op, and coverage-monotone density.
+# Pure C++ (hf_core), ASan-eligible. weather.h #includes sim/fpx.h + terrain/procterrain.h read-only.
+hf_add_pure_test(weather_test)
+
 # Deterministic Integer Broadphase Slice 1 (Slice BP1, the BEACHHEAD of FLAGSHIP #23): the BODY GRID + CSR CELL
 # TABLE core (engine/sim/broad.h) the GPU shaders/broad_cell_{count,scan,emit}.comp.hlsl copy VERBATIM + prove
 # bit-identical. The grain.h GrainGrid/GrainCellTable count->scan->emit, keyed on fpx::FxBody. broad_test pins
