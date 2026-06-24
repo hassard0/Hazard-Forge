@@ -101,6 +101,7 @@
 #include "sim/particles.h"          // Slice PT1: deterministic GPU particles Q16.16 emitter + integrator (FxParticle/ParticlePool/EmitParticle/IntegrateParticles/RecycleDead/StepEmitIntegrate, free-list) — shared verbatim with particles_integrate.comp + the Vulkan --pt1-emit-shot; the Metal --pt1-emit runs the CPU StepEmitIntegrate (int64 integrator -> Vulkan-only shader)
 #include "pcg/pcg.h"                // Slice PCG1: deterministic PCG seeded hash-PRNG primitive (PcgHash/PcgRand01/PcgRandRange/PcgUnitDir/PcgStream) Q16.16 pure-int32 — reuses particles.h ParticleHash + EmitDir; the Metal --pcg1-hash runs the IDENTICAL pure-integer point-plot the Vulkan --pcg1-hash-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "foliage/foliage.h"        // Slice FO1 (FLAGSHIP #25 beachhead): deterministic integer WIND FIELD (kFoliageWind16 LUT / Gust / WindField / WindBend) Q16.16 — the audio kSineTable copied verbatim, NO runtime sin; the Metal --fo1-wind runs the IDENTICAL pure-integer wind heatmap the Vulkan --fo1-wind-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "terrain/procterrain.h"    // Slice PT1 (FLAGSHIP #26 beachhead): deterministic integer fBm HEIGHTFIELD (IntHashLattice/IntValueNoise/IntHeight/GenHeightField) Q16.16 — the strict-integer twin of the FLOAT terrain::Height, NO runtime sin/sqrt/floor; the Metal --pt1-height runs the IDENTICAL pure-integer grayscale heightmap the Vulkan --pt1-height-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/broad.h"              // Slice BP1: deterministic integer broadphase THE BODY GRID + CSR CELL TABLE (BodyGrid/MakeBodyGrid/BodyCellOf/FlatBodyCellId/BodyCellTable/BuildBodyCellTable/BodyGridMeasure, keyed on fpx::FxBody) — shared verbatim with broad_cell_{count,scan,emit}.comp (MSL-NATIVE) + the Vulkan --broad-cell-shot; Metal --broad-cell DISPATCHES the GPU shaders
 #include "sim/couple.h"             // Slice CP1: deterministic rigid<->fluid coupling unified world + body->fluid grid-hash query (CoupleWorld/GatherBodyParticles/BodyParticleAccept) — shared verbatim with couple_body_{count,scan,emit}.comp + the Vulkan --couple-query-shot
 #include "sim/couple_grain.h"       // Slice CG1: deterministic rigid<->grain coupling unified bodies+grains world + body->grain grid-hash query (CGrainWorld/GatherBodyGrains/BodyGrainAccept) — shared verbatim with cgrain_body_{count,scan,emit}.comp + the Vulkan --cgrain-query-shot
@@ -40480,6 +40481,83 @@ static int RunPcg1HashShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PT1 — Deterministic integer fBm HEIGHTFIELD showcase (--pt1-height) (the BEACHHEAD of FLAGSHIP #26,
+// DETERMINISTIC PROCEDURAL TERRAIN, hf::terrain). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
+// procterrain.h is header-only pure-integer math (IntHashLattice/IntValueNoise/IntHeight/GenHeightField, a
+// fractal sum of integer value-noise octaves — NO runtime sin/sqrt/floor), so on Metal it evaluates the IDENTICAL
+// deterministic heightfield the Vulkan --pt1-height-shot evaluates on Windows -> the 2D grayscale heightmap golden
+// is bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). Renders an n x n GenHeightField,
+// each pixel a grayscale level = the Q16.16 height mapped to [0,255] via PURE INTEGER scale/shift (g =
+// clamp((h+bias)>>shift,0,255), R=G=B=g — NO float pixel math); the proof lines (two-run identical, seed-
+// sensitivity, the zero-octaves flat no-op, provenance) match the Vulkan side EXACTLY. The fixed SEED/OCT/WORLD/IMG
+// MUST be IDENTICAL to the Vulkan --pt1-height-shot. New golden tests/golden/metal/pt1_height.png (baked on the
+// Mac by the controller); two runs DIFF 0.0000.
+static int RunPt1HeightShowcase(const char* outPath) {
+    namespace ter = hf::terrain;
+    // THE FIXED SHOWCASE PARAMS — IDENTICAL to the Vulkan --pt1-height-shot (main.cpp).
+    const uint32_t kImg   = 256u;
+    const int      kOct   = 5;
+    const uint32_t kSeedA = 0x7E44A12Bu;
+    const uint32_t kSeedB = 0x1357BDF9u;
+    const ter::fx  kWorld = ter::kOne * 48;
+    const ter::fx  kBias  = ter::kOne / 8;
+    const int      kShift = 9;
+
+    auto renderHeight = [&](uint32_t seed, int octaves, std::vector<uint8_t>& out, ter::fx& maxH) {
+        out.assign((size_t)kImg * kImg * 4, 0);
+        maxH = 0;
+        const std::vector<ter::fx> field = ter::GenHeightField(seed, (int)kImg, kWorld, octaves);
+        for (uint32_t py = 0; py < kImg; ++py) {
+            for (uint32_t px = 0; px < kImg; ++px) {
+                const ter::fx h = field[(size_t)py * kImg + px];
+                if (h > maxH) maxH = h;
+                int64_t g = ((int64_t)h + (int64_t)kBias) >> kShift;
+                if (g < 0) g = 0; else if (g > 255) g = 255;
+                const uint8_t gray = (uint8_t)g;
+                uint8_t* d = &out[((size_t)py * kImg + px) * 4];
+                d[0] = gray; d[1] = gray; d[2] = gray; d[3] = 255;
+            }
+        }
+    };
+    auto checksum = [](const std::vector<uint8_t>& img) {
+        uint32_t h = 2166136261u;
+        for (uint8_t byte : img) { h ^= byte; h *= 16777619u; }
+        return h;
+    };
+
+    std::vector<uint8_t> imgA1, imgA2;
+    ter::fx maxA1 = 0, maxA2 = 0;
+    renderHeight(kSeedA, kOct, imgA1, maxA1);
+    renderHeight(kSeedA, kOct, imgA2, maxA2);
+    const bool twoRunIdentical = (imgA1.size() == imgA2.size()) &&
+                                 (std::memcmp(imgA1.data(), imgA2.data(), imgA1.size()) == 0);
+    if (!twoRunIdentical) return fail("pt1-height: two runs differ");
+
+    std::vector<uint8_t> imgB;
+    ter::fx maxB = 0;
+    renderHeight(kSeedB, kOct, imgB, maxB);
+    const uint32_t hA = checksum(imgA1);
+    const uint32_t hB = checksum(imgB);
+
+    std::vector<uint8_t> imgZero;
+    ter::fx maxZero = 0;
+    renderHeight(kSeedA, 0, imgZero, maxZero);
+
+    if (hA == hB || maxZero != 0 || maxA1 <= 0)
+        return fail("pt1-height: seed-sensitivity / zero-octaves / coherence control failed");
+
+    std::printf("pt1-height: integer fBm heightfield (octaves=%d, n=256, seed=0x%08X)\n", kOct, kSeedA);
+    std::printf("pt1-height: two-run BYTE-IDENTICAL\n");
+    std::printf("pt1-height: different seed -> different field {seedA:0x%08X, seedB:0x%08X} Ha != Hb\n", hA, hB);
+    std::printf("pt1-height: zero-octaves -> flat (no-op) {maxH:%lld}\n", (long long)maxZero);
+    std::printf("pt1-height: provenance {octaves:%d, n:256}\n", kOct);
+
+    if (!WritePNG(outPath, imgA1, kImg, kImg)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — pt1 deterministic integer fBm heightmap (octaves=%d, seed=0x%08X)\n",
+                outPath, kImg, kImg, kOct, kSeedA);
+    return 0;
+}
+
 // ===== Slice FO1 — Deterministic integer WIND FIELD showcase (--fo1-wind) (the BEACHHEAD of FLAGSHIP #25,
 // DETERMINISTIC FOLIAGE AT SCALE, hf::foliage). PURE CPU — NO GPU compute, NO new shader, NO new RHI; foliage.h
 // is header-only pure-integer math (the kFoliageWind16 LUT = the audio kSineTable copied verbatim, indexed by an
@@ -71793,6 +71871,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fo1-wind") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fo1_wind.png";
             try { return RunFo1WindShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pt1-height <out.png>: render the Deterministic integer fBm HEIGHTFIELD showcase (Slice PT1, the BEACHHEAD
+        // of FLAGSHIP #26). PURE CPU — runs the IDENTICAL procterrain.h GenHeightField the Vulkan --pt1-height-shot
+        // runs (the 2D grayscale heightmap over a fixed seed/octaves/world/n, pure-integer pixel map) -> the
+        // heightfield is bit-identical cross-backend BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY.
+        // NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--pt1-height") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pt1_height.png";
+            try { return RunPt1HeightShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fo2-place <out.png>: render the PCG-driven foliage PLACEMENT showcase (Slice FO2, the 2nd slice of

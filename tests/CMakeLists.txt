@@ -1186,6 +1186,14 @@ hf_add_pure_test(pcg_test)
 # no-op + frame-sensitivity + LUT provenance. Pure C++ (hf_core), ASan-eligible. foliage.h #includes fpx.h read-only.
 hf_add_pure_test(foliage_test)
 
+# Deterministic Procedural Terrain Slice 1 (Slice PT1, the BEACHHEAD of FLAGSHIP #26): the integer fBm
+# HEIGHTFIELD core (engine/terrain/procterrain.h) — IntHashLattice/IntValueNoise/IntHeight/GenHeightField,
+# the strict-integer twin of the FLOAT terrain::Height (heightmap.cpp, FROZEN). procterrain_test pins
+# replay-stability, seed-sensitivity, the [0,kOne) noise + bounded-fBm bounds, the zero-octaves flat
+# no-op, and smoothness (adjacent cells bounded — the fade => no seams). Pure C++ (hf_core), ASan-eligible.
+# procterrain.h #includes sim/fpx.h read-only.
+hf_add_pure_test(procterrain_test)
+
 # Deterministic Integer Broadphase Slice 1 (Slice BP1, the BEACHHEAD of FLAGSHIP #23): the BODY GRID + CSR CELL
 # TABLE core (engine/sim/broad.h) the GPU shaders/broad_cell_{count,scan,emit}.comp.hlsl copy VERBATIM + prove
 # bit-identical. The grain.h GrainGrid/GrainCellTable count->scan->emit, keyed on fpx::FxBody. broad_test pins
