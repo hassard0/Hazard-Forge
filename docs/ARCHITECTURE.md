@@ -1326,6 +1326,59 @@ Slices DSP1–DSP6 turn the flat playback mixer into a **declarative, bit-identi
 
 ---
 
+## Networking Layer — deterministic rollback-netcode session (`engine/net/session.h`, namespace `hf::net`) — flagship #24
+
+Slices NS1–NS6 add a generic, **header-only, transport-agnostic deterministic rollback-netcode session** — the
+capstone that *productizes the determinism moat*. The engine already had ~25 per-sim lockstep/rollback harnesses
+(`RunLockstep`/`RunRollback` across `fpx`, cloth, fluid, grain, particles, vehicle, boids, ai, verdict, couple,
+…), each independently proving "two peers fed only an input stream re-derive bit-identical state" — but
+copy-pasted into every sim and structurally hardcoded. This flagship unifies them into ONE `Session<World,Input>`
+parameterized by the deterministic policy `{Step, Snapshot, Digest}`, driving true GGPO-class rollback netcode:
+input-delay buffer, prediction, snapshot ring + rollback, an **injected** transport (so a test scripts adversarial
+loss/reorder/delay with no sockets), per-tick digest exchange for desync detection, and late-join. The moat a
+float, server-authoritative replication model cannot offer: a 2-peer session re-derives the EXACT same world —
+down to a pinned FNV-1a-64 digest — from inputs alone under adversarial conditions, **bit-identical across peers
+AND across platforms**. `session.h` is header-only and **fully self-contained** (only `<cstddef>`/`<cstdint>`/
+`<vector>`), so the cross-platform proof is the cheapest in the engine: `session_test`'s pinned digests are
+identical when the same test is compiled by MSVC (Windows) and clang (Mac) — no render-bake, no image. Pure-CPU
+integer; **no RHI / no shader / no GPU / no float / no clock / no RNG** across the whole flagship. The pinned
+golden is a state-digest (the per-sim harnesses only `memcmp`; supplying the pinned `uint64_t` is the new
+contribution). Validated against two distinct toy worlds so the abstraction is provably generic, not fitted to one.
+
+- **Session core (NS1).** The generic `Session<World,Input>` + a per-tick `InputRing` + the lockstep tick loop
+  (`Advance`/`RunLockstep`, the generalized FPX5 `RunLockstep`) + `DigestBytes` (FNV-1a-64 over state bytes).
+  **Proof:** two peers fed the same inputs have byte-identical digests at EVERY tick (the lockstep invariant), a
+  hard-pinned converged digest, and order-determinism (reversing same-tick input order changes the digest — via a
+  non-commutative fold). Identical on MSVC and clang.
+- **Input-delay buffer (NS2).** `SubmitLocalInput` schedules local input `delay` ticks ahead (so remote inputs
+  usually arrive in time). **Proof:** a delay-`D` session submitting `D` ticks early is byte-identical to a delay-0
+  session — delay is a pure scheduling shift, never a semantic change — and the delay genuinely defers effect.
+- **Prediction + snapshot ring + rollback (NS3, the crux).** `RollbackSession` predicts a missing remote input
+  (reuse-last), snapshots every tick, and on a late-arriving *differing* input restores from the ring and
+  re-simulates (the generalized FPX5 `RunRollback` over a rolling window + arbitrary misprediction ticks). **Proof
+  (rollback correctness):** the predicted+rolled-back run reaches the **bit-identical** digest of a no-latency
+  authority run, WITH a real misprediction having diverged before being corrected (an order-sensitive fold so a
+  wrong prediction actually changes state).
+- **Injected transport + adversarial schedule (NS4).** A `ScriptedTransport` delivers remote inputs by a fixed
+  scripted schedule — delay (`deliverTick ≥ forTick`), reorder (non-monotonic), and loss-with-resend (duplicate
+  `forTick`) — with no sockets; `RunWithTransport` pumps it through the NS3 rollback machinery. **Proof:** under the
+  adversarial schedule the session still converges to the authority digest byte-identical (rollbacks fired), the
+  schedule is fully deterministic, and a duplicate delivery is a no-op.
+- **Desync detector (NS5).** Peers exchange a per-tick `ChecksumPacket` (the state digest); `DesyncDetector` latches
+  the first mismatch. **Proof:** a clean session reports zero desync; a deliberately-corrupted peer is caught at the
+  EXACT diverging tick with both digests, localization verified (identical before the tick, differ at it).
+- **Full 2-peer adversarial session + late-join (NS6, capstone).** Two `RollbackSession`s each predicting the other
+  over distinct adversarial transports, exchanging desync checksums, plus `CatchUp(JoinSnapshot, …)` — a late-joiner
+  restores a confirmed snapshot + replays the input tail. **Proof:** the two peers converge to `A == B == authority`
+  byte-identical (both rolled back) and stay desync-clean, and a peer joining mid-session at tick `S` catches up to
+  the **bit-identical** world the from-tick-0 peers reached. **Completes flagship #24 — deterministic rollback
+  netcode.** Honest scope: the deterministic SESSION/rollback core + an injected transport interface — NOT real
+  sockets / UDP / matchmaking / a dedicated-server binary / NAT (non-deterministic plumbing layered on top); the
+  deterministic-lockstep model only (not arbitrary float server-authoritative replication); bounded rollback
+  window; same-build peers.
+
+---
+
 ## VFX Layer — CPU particle / emitter (`engine/vfx/particles.*`)
 
 `engine/vfx/particles.*` (Slice CC) is an **authorable CPU particle / VFX emitter** — the VFX analogue of the data-driven material graph, and **distinct** from the fixed `gpu-particles` compute fountain (`shaders/particles.comp.hlsl`, one hard-coded GPU sim). Like `engine/audio` and `engine/physics` it is **pure C++ above the seam** with **zero `vk*`/`MTL*`/`mtl::`/`Backend::` symbols**, compiled into both `hf_core` (ASan-scoped, `vfx_test`) and `hf_engine` (the `--vfx-shot` showcase + the Metal `--vfx` path).
