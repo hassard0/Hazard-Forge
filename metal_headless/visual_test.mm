@@ -40875,6 +40875,181 @@ static int RunFo3SwayShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FO4 — Integer distance-LOD pick showcase (--fo4-lod) (the 4th slice of FLAGSHIP #25, DETERMINISTIC
+// FOLIAGE AT SCALE, hf::foliage). PURE CPU — NO GPU compute, NO new shader, NO new RHI; foliage.h FoliageLod is a
+// pure-integer XZ-distance bucket (reuses fpx.h FxLength read-only), so on Metal it picks the IDENTICAL LOD set
+// the Vulkan --fo4-lod-shot picks on Windows over the SAME fixed meadow (FoliageField/seed) + SAME camPos/nearR/farR
+// -> the 2D top-down LOD-tinted golden is bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel).
+// Each plant is drawn as a pure-integer marker tinted by its integer LOD bucket (LOD0 bright green / LOD1 yellow-green
+// / LOD2 dim teal / LOD3 culled = omitted), + concentric integer LOD rings around camPos by a pure-integer per-pixel
+// distance compare — NO float pixel math. The proof lines (two-run identical, monotone, per-bucket spread, all-near
+// no-op) match the Vulkan side EXACTLY. The fixed FIELD/SEED/CAMPOS/NEARR/FARR/IMG MUST be IDENTICAL to the Vulkan
+// --fo4-lod-shot. New golden tests/golden/metal/fo4_lod.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunFo4LodShowcase(const char* outPath) {
+    namespace fol = hf::foliage;
+    namespace pcg = hf::pcg;
+    using hf::sim::fpx::FxLength;   // the int64 XZ-distance path (reused read-only; pcg doesn't re-export it)
+    // THE FIXED SHOWCASE PARAMS — IDENTICAL to the Vulkan --fo4-lod-shot (main.cpp). Meadow params == FO2.
+    const uint32_t kSeed   = 1337u;
+    const uint32_t kSalt   = 0x5CA77E20u;
+    const int      kCellsX = 48;
+    const int      kCellsZ = 48;
+    const uint32_t kImg    = 256u;
+    const pcg::PcgArea kArea{ pcg::FxVec3{0, 0, 0}, pcg::FxVec3{pcg::kOne * 32, 0, pcg::kOne * 32} };
+    const pcg::fx kRadius      = pcg::kOne * 32 / 3;
+    const pcg::fx kScaleLo     = pcg::kOne / 2;
+    const pcg::fx kScaleHi     = pcg::kOne * 3 / 2;
+    const pcg::fx kPruneRadius = pcg::kOne;
+    // THE FIXED LOD PARAMS — IDENTICAL to the Vulkan --fo4-lod-shot.
+    const pcg::FxVec3 kCamPos{ pcg::kOne * 16, 0, pcg::kOne * 16 };
+    const pcg::fx     kNearR = pcg::kOne * 3;
+    const pcg::fx     kFarR  = pcg::kOne * 9;
+    const pcg::fx     kMidR  = kNearR + (kFarR - kNearR) / 2;
+
+    auto buildField = [&]() {
+        fol::FoliageField field;
+        field.graph.area = kArea; field.graph.cellsX = kCellsX; field.graph.cellsZ = kCellsZ;
+        field.graph.useMask = true;
+        field.graph.mask.type = pcg::PcgMaskType::Radial;
+        field.graph.mask.center = pcg::FxVec3{ pcg::kOne * 16, 0, pcg::kOne * 16 };
+        field.graph.mask.radius = kRadius;
+        field.graph.density = pcg::kOne;
+        field.graph.transform.randomYaw = true;
+        field.graph.transform.scaleLo = kScaleLo; field.graph.transform.scaleHi = kScaleHi;
+        field.graph.prune = true; field.graph.pruneRadius = kPruneRadius;
+        return field;
+    };
+    const fol::FoliageField kField = buildField();
+
+    const pcg::fx extX = kArea.max.x - kArea.min.x;
+    const pcg::fx extZ = kArea.max.z - kArea.min.z;
+
+    // Render the LOD-tinted meadow into an RGBA8 (BGRA) image by PURE INTEGER math. Each plant is a marker tinted
+    // by its integer LOD bucket; LOD3 (culled) is OMITTED. Concentric integer LOD rings around camPos.
+    auto renderMeadow = [&](const std::vector<fol::FoliageInstance>& plants, std::vector<uint8_t>& out) {
+        out.assign((size_t)kImg * kImg * 4, 0);
+        for (size_t pp = 0; pp < (size_t)kImg * kImg; ++pp) {
+            out[pp * 4 + 0] = 12; out[pp * 4 + 1] = 10; out[pp * 4 + 2] = 8; out[pp * 4 + 3] = 255;
+        }
+        auto putPx = [&](int ix, int iy, uint8_t b, uint8_t g, uint8_t r) {
+            if (ix < 0 || ix >= (int)kImg || iy < 0 || iy >= (int)kImg) return;
+            uint8_t* d = &out[((size_t)iy * kImg + ix) * 4];
+            d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+        };
+        auto worldToPx = [&](pcg::fx wx, pcg::fx wz, int& ox, int& oy) {
+            ox = (int)(((int64_t)(wx - kArea.min.x) * (int64_t)kImg) / (int64_t)extX);
+            oy = (int)(((int64_t)(wz - kArea.min.z) * (int64_t)kImg) / (int64_t)extZ);
+        };
+        const pcg::fx kRingTol = (extX / (pcg::fx)kImg) / 2 + 1;
+        for (uint32_t iy = 0; iy < kImg; ++iy) {
+            for (uint32_t ix = 0; ix < kImg; ++ix) {
+                const pcg::fx wx = kArea.min.x + (pcg::fx)(((int64_t)ix * (int64_t)extX) / (int64_t)kImg);
+                const pcg::fx wz = kArea.min.z + (pcg::fx)(((int64_t)iy * (int64_t)extZ) / (int64_t)kImg);
+                const pcg::fx d  = FxLength(pcg::FxVec3{ wx - kCamPos.x, 0, wz - kCamPos.z });
+                const pcg::fx dn = d - kNearR < 0 ? kNearR - d : d - kNearR;
+                const pcg::fx dm = d - kMidR  < 0 ? kMidR  - d : d - kMidR;
+                const pcg::fx df = d - kFarR  < 0 ? kFarR  - d : d - kFarR;
+                if (dn < kRingTol || dm < kRingTol || df < kRingTol) {
+                    uint8_t* px = &out[((size_t)iy * kImg + ix) * 4];
+                    px[0] = 40; px[1] = 38; px[2] = 30; px[3] = 255;
+                }
+            }
+        }
+        int cx, cy; worldToPx(kCamPos.x, kCamPos.z, cx, cy);
+        putPx(cx, cy, 200, 60, 200); putPx(cx - 1, cy, 200, 60, 200); putPx(cx + 1, cy, 200, 60, 200);
+        putPx(cx, cy - 1, 200, 60, 200); putPx(cx, cy + 1, 200, 60, 200);
+        for (size_t i = 0; i < plants.size(); ++i) {
+            const fol::FoliageInstance& pl = plants[i];
+            if (pl.lod == 3u) continue;
+            int px, py; worldToPx(pl.base.pos.x, pl.base.pos.z, px, py);
+            uint8_t b, g, r;
+            if      (pl.lod == 0u) { b = 60;  g = 230; r = 60;  }
+            else if (pl.lod == 1u) { b = 40;  g = 200; r = 180; }
+            else                   { b = 140; g = 130; r = 40;  }
+            putPx(px,     py,     b, g, r);
+            putPx(px - 1, py,     b, g, r);
+            putPx(px + 1, py,     b, g, r);
+            putPx(px,     py - 1, b, g, r);
+            putPx(px,     py + 1, b, g, r);
+        }
+    };
+    auto checksum = [](const std::vector<uint8_t>& img) {
+        uint32_t h = 2166136261u;
+        for (uint8_t byte : img) { h ^= byte; h *= 16777619u; }
+        return h;
+    };
+
+    const pcg::PcgStream st{kSeed, kSalt};
+
+    std::vector<fol::FoliageInstance> plantsA = fol::PlaceFoliage(kField, st);
+    std::vector<fol::FoliageInstance> plantsB = fol::PlaceFoliage(kField, st);
+    fol::AssignLods(plantsA, kCamPos, kNearR, kFarR);
+    fol::AssignLods(plantsB, kCamPos, kNearR, kFarR);
+    std::vector<uint8_t> imgA, imgB2;
+    renderMeadow(plantsA, imgA);
+    renderMeadow(plantsB, imgB2);
+    const uint32_t kPlants = (uint32_t)plantsA.size();
+    const bool twoRunIdentical = (imgA.size() == imgB2.size()) &&
+                                 (std::memcmp(imgA.data(), imgB2.data(), imgA.size()) == 0) &&
+                                 (plantsA.size() == plantsB.size());
+    if (!twoRunIdentical) return fail("fo4-lod: two runs differ");
+    (void)checksum;
+
+    // MONOTONE: sort plants by XZ distance to the camera; assert the LOD bucket is non-decreasing.
+    std::vector<size_t> order(plantsA.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    auto distOf = [&](size_t i) {
+        return FxLength(pcg::FxVec3{ plantsA[i].base.pos.x - kCamPos.x, 0,
+                                     plantsA[i].base.pos.z - kCamPos.z });
+    };
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return distOf(a) < distOf(b); });
+    bool monotone = true;
+    uint32_t prevLod = 0;
+    for (size_t k = 0; k < order.size(); ++k) {
+        const uint32_t lod = plantsA[order[k]].lod;
+        if (lod < prevLod) { monotone = false; break; }
+        prevLod = lod;
+    }
+
+    uint32_t cLod0 = 0, cLod1 = 0, cLod2 = 0, cCull = 0;
+    for (const fol::FoliageInstance& pl : plantsA) {
+        if      (pl.lod == 0u) ++cLod0;
+        else if (pl.lod == 1u) ++cLod1;
+        else if (pl.lod == 2u) ++cLod2;
+        else                   ++cCull;
+    }
+    const bool sumOk = (cLod0 + cLod1 + cLod2 + cCull == kPlants) && (kPlants > 0);
+    const int nonEmpty = (cLod0 > 0 ? 1 : 0) + (cLod1 > 0 ? 1 : 0) + (cLod2 > 0 ? 1 : 0) + (cCull > 0 ? 1 : 0);
+    const bool spreadOk = (nonEmpty >= 3);
+
+    // ALL-NEAR NO-OP CONTROL: huge farR (+ nearR >= the field extent) -> every plant LOD 0.
+    const pcg::fx kHugeNear = extX + extZ;
+    const pcg::fx kHugeFar  = (pcg::fx)0x40000000;
+    std::vector<fol::FoliageInstance> plantsNear = fol::PlaceFoliage(kField, st);
+    fol::AssignLods(plantsNear, kCamPos, kHugeNear, kHugeFar);
+    bool allLod0 = (kPlants > 0);
+    for (const fol::FoliageInstance& pl : plantsNear) if (pl.lod != 0u) { allLod0 = false; break; }
+
+    if (!monotone || !sumOk || !spreadOk || !allLod0)
+        return fail("fo4-lod: monotone / per-bucket spread / all-near no-op control failed");
+
+    std::printf("fo4-lod: distance LOD pick (near=%d, far=%d, plants=%u)\n",
+                (int)kNearR, (int)kFarR, kPlants);
+    std::printf("fo4-lod: two-run BYTE-IDENTICAL\n");
+    std::printf("fo4-lod: monotone — farther plant never picks a nearer LOD {ok:%s}\n",
+                monotone ? "true" : "false");
+    std::printf("fo4-lod: per-bucket counts {lod0:%u, lod1:%u, lod2:%u, culled:%u}\n",
+                cLod0, cLod1, cLod2, cCull);
+    std::printf("fo4-lod: all-near (huge farR) -> every plant LOD 0 (no-op) {allLod0:%s}\n",
+                allLod0 ? "true" : "false");
+
+    if (!WritePNG(outPath, imgA, kImg, kImg)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fo4 integer distance-LOD pick (%u plants, near=%d far=%d)\n",
+                outPath, kImg, kImg, kPlants, (int)kNearR, (int)kFarR);
+    return 0;
+}
+
 // ===== Slice PCG2 — Deterministic PCG JITTERED-GRID POINT SCATTER showcase (--pcg2-scatter) (the 2nd slice of
 // FLAGSHIP #22, hf::pcg). PURE CPU — NO GPU compute, NO new shader, NO new RHI; pcg.h is header-only pure-int32
 // math, so on Metal it runs the IDENTICAL deterministic jittered-grid scatter (ScatterGrid) the Vulkan
@@ -70967,6 +71142,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fo3-sway") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fo3_sway.png";
             try { return RunFo3SwayShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fo4-lod <out.png>: render the integer distance-LOD pick showcase (Slice FO4, the 4th slice of FLAGSHIP #25).
+        // PURE CPU — picks the IDENTICAL LOD set (the SAME fixed FoliageField/seed + SAME camPos/nearR/farR) the Vulkan
+        // --fo4-lod-shot picks via foliage.h FoliageLod (pure-integer XZ-distance bucket, reuses fpx.h FxLength); renders
+        // the 2D top-down LOD-tinted plot (per-LOD integer colors, concentric integer rings) -> bit-identical cross-
+        // backend BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--fo4-lod") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fo4_lod.png";
+            try { return RunFo4LodShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --pcg2-scatter <out.png>: render the Deterministic PCG JITTERED-GRID POINT SCATTER showcase (Slice PCG2,

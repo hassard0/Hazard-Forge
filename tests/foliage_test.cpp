@@ -152,6 +152,54 @@ int main() {
         check(frameChanged, "FO3 ApplyWind frame-sensitivity: frame F vs F+1 -> bends change (meadow sways)");
     }
 
+    // ================= FO4 FoliageLod/AssignLods: integer distance-LOD bucket (monotone + no-op) ===========
+    {
+        // A synthetic meadow on a line so XZ distance to a fixed camera spans the buckets.
+        const FxVec3 cam{ 0, 0, 0 };
+        const fx nearR = kOne * 3;
+        const fx farR  = kOne * 9;   // midR = 6
+
+        // (a) monotone: as the plant moves farther from the camera the LOD bucket is non-decreasing.
+        bool monotone = true;
+        uint32_t prev = 0;
+        for (int i = 0; i <= 200; ++i) {
+            const FxVec3 p{ (fx)((int64_t)i * kOne / 10), 0, 0 };   // distance 0 .. 20 world units
+            const uint32_t lod = fol::FoliageLod(p, cam, nearR, farR);
+            if (lod < prev) { monotone = false; break; }
+            prev = lod;
+        }
+        check(monotone, "FO4 FoliageLod monotone: farther plant never picks a nearer LOD");
+
+        // (b) bucket boundaries: pure-integer thresholds (d<nearR->0, d<midR->1, d<farR->2, else 3).
+        check(fol::FoliageLod(FxVec3{ kOne * 1, 0, 0 }, cam, nearR, farR) == 0u, "FO4 FoliageLod: d=1 -> LOD0");
+        check(fol::FoliageLod(FxVec3{ kOne * 5, 0, 0 }, cam, nearR, farR) == 1u, "FO4 FoliageLod: d=5 -> LOD1");
+        check(fol::FoliageLod(FxVec3{ kOne * 8, 0, 0 }, cam, nearR, farR) == 2u, "FO4 FoliageLod: d=8 -> LOD2");
+        check(fol::FoliageLod(FxVec3{ kOne * 20, 0, 0 }, cam, nearR, farR) == 3u, "FO4 FoliageLod: d=20 -> culled");
+
+        // (c) Y is zeroed (only XZ distance counts): a large Y component does NOT change the bucket.
+        check(fol::FoliageLod(FxVec3{ kOne * 1, kOne * 100, 0 }, cam, nearR, farR) == 0u,
+              "FO4 FoliageLod: Y zeroed (XZ distance only)");
+
+        // (d) AssignLods no-op control: a huge nearR (+ huge farR) -> every plant LOD 0.
+        std::vector<fol::FoliageInstance> plants;
+        for (int i = 0; i < 64; ++i) {
+            fol::FoliageInstance pl{};
+            pl.base.pos = FxVec3{ (fx)((i % 8) * kOne), 0, (fx)((i / 8) * kOne) };
+            plants.push_back(pl);
+        }
+        fol::AssignLods(plants, cam, kOne * 1000, (fx)0x40000000);   // nearR >= field extent, huge farR
+        bool allLod0 = true;
+        for (const auto& pl : plants) if (pl.lod != 0u) allLod0 = false;
+        check(allLod0, "FO4 AssignLods no-op: huge nearR -> every plant LOD 0");
+
+        // (e) AssignLods provenance: inst.lod == FoliageLod(base.pos, cam, nearR, farR) for every plant.
+        fol::AssignLods(plants, cam, nearR, farR);
+        bool prov = true;
+        for (const auto& pl : plants)
+            if (pl.lod != fol::FoliageLod(pl.base.pos, cam, nearR, farR)) prov = false;
+        check(prov, "FO4 AssignLods: inst.lod == FoliageLod(base.pos, cam, nearR, farR) for every plant");
+    }
+
     if (g_fail == 0) std::printf("foliage_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

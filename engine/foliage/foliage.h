@@ -130,6 +130,9 @@ struct FoliageInstance {
     hf::pcg::PcgInstance base;   // the scattered PCG instance (pos / orient / scale) — the plant's transform
     fx                   bend = 0;   // Slice FO3 (APPENDED after base): per-instance Q16.16 wind sway (0 = upright);
                                      // FO2's PlaceFoliage leaves this default-0, so FO2 stays byte-unchanged.
+    uint32_t             lod  = 0;   // Slice FO4 (APPENDED after bend): integer distance-LOD bucket [0,3]
+                                     // (0=near/full, 1=mid, 2=far billboard, 3=culled). FO2/FO3 leave this
+                                     // default-0, so FO2/FO3 stay byte-unchanged; AssignLods fills it.
 };
 
 // ----- FoliageField: the declarative meadow recipe (a PcgGraph) ----------------------------------------
@@ -168,6 +171,41 @@ inline std::vector<FoliageInstance> PlaceFoliage(const FoliageField& field, cons
 inline void ApplyWind(std::vector<FoliageInstance>& instances, const WindField& wind, uint32_t frame) {
     for (FoliageInstance& inst : instances) {
         inst.bend = WindBend(wind, inst.base.pos, frame);
+    }
+}
+
+// ===== Slice FO4 — Integer distance-LOD pick (the 4th slice of FLAGSHIP #25) ===========================
+// The SCALE primitive: each plant's LOD bucket is chosen by its INTEGER XZ distance to the camera against
+// INTEGER thresholds — so the LOD assignment is bit-identical cross-backend (NO float thresholds, NO trig).
+// Near plants render full, mid degrade, far become billboards, beyond-far are culled. The XZ distance is the
+// int64 FxLength path (fpx.h, CPU-side -> byte-identical); the thresholds are pure integer compares. The moat:
+// UE5/SpeedTree LOD selection is float/non-deterministic; this pick is a pure function of (pos, cam, radii), so
+// two netcode peers pick the byte-identical LOD set. APPEND-ONLY (FO1 WindBend + FO2 PlaceFoliage + FO3
+// ApplyWind above + fpx.h FxLength read-only). Reuses FxLength VERBATIM. NO <cmath>, NO float, NO new RHI/shader.
+
+// ----- FoliageLod: the integer distance-LOD bucket for one instance (PURE INTEGER) ---------------------
+// d = FxLength of (instPos - camPos) with Y zeroed (the XZ ground distance, the int64 path). midR =
+// nearR + (farR-nearR)/2 (the integer midpoint). Bucket against the integer thresholds: d<nearR -> 0 (near,
+// full plant); d<midR -> 1 (mid); d<farR -> 2 (far billboard); else -> 3 (culled). Pure integer compares;
+// returns the bucket in [0,3]. With nearR<=midR<=farR the pick is MONOTONE in d (a farther plant never picks
+// a nearer LOD). nearR >= the field extent (+ a huge farR) -> every plant LOD 0 (the no-op control).
+inline uint32_t FoliageLod(const FxVec3& instPos, const FxVec3& camPos, fx nearR, fx farR) {
+    const fx d    = hf::sim::fpx::FxLength(FxVec3{ instPos.x - camPos.x, 0, instPos.z - camPos.z });
+    const fx midR = nearR + (farR - nearR) / 2;
+    if (d < nearR) return 0u;
+    if (d < midR)  return 1u;
+    if (d < farR)  return 2u;
+    return 3u;
+}
+
+// ----- AssignLods: annotate each plant with its integer LOD bucket (PURE INTEGER) ----------------------
+// For each plant in FIXED order, inst.lod = FoliageLod(inst.base.pos, camPos, nearR, farR). Mutates lod in
+// place; the base placement + the FO3 bend are UNTOUCHED. Pure integer (reuses FxLength). nearR >= the field
+// extent (+ huge farR) -> every inst.lod == 0 (the upright/full no-op control). NO <cmath>, NO float, NO
+// clock/RNG — bit-identical CPU<->Vulkan<->Metal by construction.
+inline void AssignLods(std::vector<FoliageInstance>& v, const FxVec3& camPos, fx nearR, fx farR) {
+    for (FoliageInstance& inst : v) {
+        inst.lod = FoliageLod(inst.base.pos, camPos, nearR, farR);
     }
 }
 
