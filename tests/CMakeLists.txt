@@ -114,6 +114,18 @@ hf_add_pure_test(dsp_test)
 # golden is the pinned hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend
 # symbols, ASan-eligible.
 hf_add_pure_test(session_test)
+# Demo-file format + RECORDER (Slice RP1, flagship #28 REPLAY/DEMO beachhead): engine/replay/replay.h —
+# a header-only, SELF-CONTAINED (only <cstdint>/<cstddef>/<vector> + net/session.h) demo-file codec that
+# stores a deterministic session's CAUSAL SEED (seed + initial-world snapshot + per-tick InputRing +
+# per-tick DigestTrace), so a later slice re-derives the byte-identical world by re-running the EXISTING
+# Step. Hand-LE byte appenders (PutU32/PutU64/PutBytes, the wav.cpp discipline) + DemoHeader + Recorder +
+# RecordSession + EncodeDemo. Driven by the SAME self-contained integer ToyA toy world as session_test
+# (copied in, not included — the header stays standalone, compiles single-file on the Mac clang). Asserts
+# the PINNED demo-file hash (DigestBytes over the bytes — the cross-platform byte-layout proof), the
+# header field round-trip, the digest-trace provenance (len 16, last == session_test's pinned hToyA), and
+# re-encode determinism. The golden is the pinned hash IN the test (NO image, NO render-bake). Pure CPU
+# (hf_core), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(replay_test)
 # CPU particle / VFX emitter system (Slice CC): the authorable emitter (spawn rate, lifetime, init
 # velocity + spread, gravity, drag, size/color over life) simulated at a fixed timestep with a
 # fixed-seed integer LCG for the spread jitter (engine/vfx/particles.{h,cpp}) — DISTINCT from the
