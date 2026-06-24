@@ -442,6 +442,52 @@ declarative recipe.
   sampler); analytic masks only (no painted-mask/spline UI, no biome blending); flat-ground scatter (no
   mesh-surface projection); no instance LOD/streaming integration — all natural future extensions.
 
+### Deterministic foliage / vegetation at scale (`engine/foliage/foliage.h`, namespace `hf::foliage`) — flagship #25
+
+Slices FO1–FO6 add a **deterministic foliage system**: a bit-identical integer **wind field** sways a
+PCG-scattered, GPU-instanced foliage field with an integer distance-LOD. The moat: a mainstream foliage/wind
+system is float, non-deterministic, and frame-rate-dependent — two machines produce a different sway, so foliage
+motion can never be lockstep/netcode-replicated. Hazard Forge's wind is a **sum of host-baked sine "gust" waves
+evaluated in Q16.16 over `(position, frame#)`** — bit-identical CPU↔Vulkan↔Metal by construction (the audio
+`kSineTable` discipline, NO runtime `sin`/`cos`) — and the placement is **pure reuse of the deterministic PCG**
+(`pcg::Generate`), so the whole meadow is a pure function of the seed and frame: two peers grow the byte-identical
+wind-swept field. The wind/placement/LOD **data** carries strict-integer zero-diff cross-backend goldens (the
+strongest bar, the PCG-plot precedent); only the final lit render crosses to float (the visresolve-bar). Every wind
+evaluation is host-CPU (sidestepping the int64/glslc/MSL shader boundary), so the render reuses `lit_instanced.vert`
+verbatim — **no new shader, no new RHI** across the flagship.
+
+- **Integer wind field (FO1).** `WindBend(wind, pos, frame)` sums a few baked `Gust` waves (a committed `kFoliageWind16`
+  sine LUT indexed by an integer phase accumulator over position+frame) into a Q16.16 bend angle — no runtime trig.
+  **Proof:** a pure-integer 2D bend heatmap, strict zero-diff cross-backend, frame-sensitive (the wind animates),
+  zero-amplitude → zero bend (no-op). Golden `fo1_wind`.
+- **PCG-driven placement (FO2).** `PlaceFoliage(field, stream)` calls `pcg::Generate(field.graph, stream)` verbatim,
+  wrapping each scattered instance as a plant. **Proof:** the placement IS the PCG output (count matches `Generate`),
+  different seed → different meadow, empty graph → 0 plants. Golden `fo2_place`, strict zero-diff.
+- **Per-instance wind sway (FO3, the determinism headline).** `ApplyWind` evaluates the wind field at each plant
+  and stores a per-instance Q16.16 `bend`, so the meadow sways as a pure function of (seed, frame). **Proof:** a
+  pure-integer bent-stalk plot (small-angle integer lean, no trig) — strict zero-diff, frame-to-frame swept
+  differently, zero-wind → upright. Golden `fo3_sway`. The swaying *data* is bit-identical cross-platform — the
+  thing a float wind cannot make deterministic.
+- **Integer distance-LOD (FO4).** `FoliageLod` buckets each plant by its integer XZ distance to the camera against
+  integer thresholds (near/mid/far/culled) — bit-identical, no float thresholds. **Proof:** an LOD-tinted plot with
+  concentric rings, strict zero-diff; the LOD is monotone in distance (a farther plant never picks a nearer LOD),
+  a non-trivial bucket spread, all-near → all-LOD0 (no-op). Golden `fo4_lod`.
+- **The scale render (FO5, FLOAT).** `FoliageToRenderInstances` is the `pcg::PcgToRenderInstances` twin that ALSO
+  bakes the per-instance bend (a float lean) and honors the LOD (culls the far bucket), rendering **thousands** of
+  instanced plants through the existing instanced-lit pipeline. **Proof:** two renders byte-identical + provenance
+  (instances derive from the bit-exact FO2/FO3/FO4 data) + coherent; the float bar is Metal two-run DIFF 0.0000 +
+  a documented cross-vendor mean (higher for a dense field of many tiny sub-pixel instances). Golden `fo5_scale`
+  (~3.1k instances).
+- **The hero money-shot (FO6, FLOAT capstone).** A polished, cinematic wind-swept meadow — a low 3/4 camera across
+  tall blades visibly leaning in a coherent wind direction, receding to the horizon with LOD thinning. **Proof:**
+  two renders byte-identical + provenance back to the bit-exact `PlaceFoliage`+`ApplyWind` data; Metal two-run DIFF
+  0.0000, cross-vendor mean 13.96, eyeballed. Golden `fo6_hero`. **Completes flagship #25 — deterministic foliage.**
+  Honest scope: not literal billions (thousands of GPU instances); no GPU-driven streaming/virtualized foliage
+  (placement + wind are CPU-host — that is *why* they are deterministic); cards/low-poly not full SpeedTree; simple
+  integer distance LOD (hard bucket pops); wind is a baked sum-of-gusts field, not a fluid sim; matte surfaces
+  carry the sky-IBL cool tint. (The one mainstream-foliage comparison aside: where SpeedTree-class wind is
+  non-deterministic float, this meadow's motion is byte-reproducible and netcode-replayable.)
+
 ### Deterministic GPU particle system (`engine/sim/particles.h`, namespace `hf::sim::particles`)
 
 Slices PT1–PT6 add a **Niagara-class GPU particle system in Q16.16 fixed-point** — the **6th member of the deterministic-sim family**. The moat vs a float particle system (Unreal Niagara, etc.): the entire simulation — spawn slot, initial velocity, age, death, forces, collision — is a **pure function of (capacity, command stream)**, so it is BIT-IDENTICAL CPU↔Vulkan↔Metal, run-to-run reproducible, AND **lockstep/rollback-replayable** (two machines re-derive the exact same fountain, every spark, from inputs alone). Niagara is float and non-deterministic; it cannot replay bit-for-bit across machines. It reuses ~80% of the existing substrate — the `fpx.h` Q16.16 toolbox, the `grain.h` colliders + render helpers + lockstep-harness shape — with the **deterministic free-list emitter** as the one genuinely new primitive. v1 is a pure emitter (no particle-particle/SPH — the grid-hash is reuse-ready for a future slice). `engine/sim/fpx.h`/`grain.h` (reused read-only) and `engine/physics/` are untouched; **no new RHI** across the flagship.
