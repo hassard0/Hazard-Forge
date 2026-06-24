@@ -40578,6 +40578,126 @@ static int RunFo1WindShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FO2 — PCG-driven foliage PLACEMENT showcase (--fo2-place) (the 2nd slice of FLAGSHIP #25,
+// DETERMINISTIC FOLIAGE AT SCALE, hf::foliage). PURE CPU — NO GPU compute, NO new shader, NO new RHI; foliage.h
+// PlaceFoliage is pure reuse of pcg::Generate (header-only pure-integer), so on Metal it places the IDENTICAL
+// meadow (the SAME fixed FoliageField/seed) the Vulkan --fo2-place-shot places on Windows -> the 2D top-down
+// plant-plot golden is bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). Each plant's
+// base.pos (x,z) maps to INTEGER pixel coords by pure integer math (point*kImg/extent, int64 intermediate — NO
+// float pixel rounding), the cross arms tinted by the plant's base.scale BUCKET; the proof lines (two-run
+// identical, provenance count, different-seed-different-meadow, the empty-graph no-op) match the Vulkan side
+// EXACTLY. The fixed FIELD/SEED/IMG MUST be IDENTICAL to the Vulkan --fo2-place-shot. New golden
+// tests/golden/metal/fo2_place.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunFo2PlaceShowcase(const char* outPath) {
+    namespace fol = hf::foliage;
+    namespace pcg = hf::pcg;
+    // THE FIXED SHOWCASE PARAMS — IDENTICAL to the Vulkan --fo2-place-shot (main.cpp).
+    const uint32_t kSeed   = 1337u;
+    const uint32_t kSalt   = 0x5CA77E20u;
+    const int      kCellsX = 48;
+    const int      kCellsZ = 48;
+    const uint32_t kImg    = 256u;
+    const pcg::PcgArea kArea{ pcg::FxVec3{0, 0, 0}, pcg::FxVec3{pcg::kOne * 32, 0, pcg::kOne * 32} };
+    const pcg::fx kRadius      = pcg::kOne * 32 / 3;
+    const pcg::fx kScaleLo     = pcg::kOne / 2;
+    const pcg::fx kScaleHi     = pcg::kOne * 3 / 2;
+    const pcg::fx kPruneRadius = pcg::kOne;
+
+    auto buildField = [&]() {
+        fol::FoliageField field;
+        field.graph.area = kArea; field.graph.cellsX = kCellsX; field.graph.cellsZ = kCellsZ;
+        field.graph.useMask = true;
+        field.graph.mask.type = pcg::PcgMaskType::Radial;
+        field.graph.mask.center = pcg::FxVec3{ pcg::kOne * 16, 0, pcg::kOne * 16 };
+        field.graph.mask.radius = kRadius;
+        field.graph.density = pcg::kOne;
+        field.graph.transform.randomYaw = true;
+        field.graph.transform.scaleLo = kScaleLo; field.graph.transform.scaleHi = kScaleHi;
+        field.graph.prune = true; field.graph.pruneRadius = kPruneRadius;
+        return field;
+    };
+    const fol::FoliageField kField = buildField();
+
+    const pcg::fx extX = kArea.max.x - kArea.min.x;
+    const pcg::fx extZ = kArea.max.z - kArea.min.z;
+
+    auto renderMeadow = [&](const std::vector<fol::FoliageInstance>& plants, std::vector<uint8_t>& out) {
+        out.assign((size_t)kImg * kImg * 4, 0);
+        for (size_t pp = 0; pp < (size_t)kImg * kImg; ++pp) {
+            out[pp * 4 + 0] = 12; out[pp * 4 + 1] = 10; out[pp * 4 + 2] = 8; out[pp * 4 + 3] = 255;
+        }
+        auto putPx = [&](int ix, int iy, uint8_t b, uint8_t g, uint8_t r) {
+            if (ix < 0 || ix >= (int)kImg || iy < 0 || iy >= (int)kImg) return;
+            uint8_t* d = &out[((size_t)iy * kImg + ix) * 4];
+            d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+        };
+        for (size_t i = 0; i < plants.size(); ++i) {
+            const pcg::PcgInstance& in = plants[i].base;
+            const int px = (int)(((int64_t)(in.pos.x - kArea.min.x) * (int64_t)kImg) / (int64_t)extX);
+            const int py = (int)(((int64_t)(in.pos.z - kArea.min.z) * (int64_t)kImg) / (int64_t)extZ);
+            uint8_t ab, ag, ar;
+            if (in.scale < kScaleLo + (kScaleHi - kScaleLo) / 3) { ab = 90;  ag = 170; ar = 80;  }
+            else if (in.scale < kScaleLo + (kScaleHi - kScaleLo) * 2 / 3) { ab = 90; ag = 200; ar = 120; }
+            else { ab = 140; ag = 230; ar = 160; }
+            putPx(px,     py,     220, 240, 230);
+            putPx(px - 1, py,     ab, ag, ar);
+            putPx(px + 1, py,     ab, ag, ar);
+            putPx(px,     py - 1, ab, ag, ar);
+            putPx(px,     py + 1, ab, ag, ar);
+        }
+    };
+    auto checksum = [](const std::vector<uint8_t>& img) {
+        uint32_t h = 2166136261u;
+        for (uint8_t byte : img) { h ^= byte; h *= 16777619u; }
+        return h;
+    };
+
+    const pcg::PcgStream st{kSeed, kSalt};
+    const std::vector<fol::FoliageInstance> plantsA = fol::PlaceFoliage(kField, st);
+    const std::vector<fol::FoliageInstance> plantsB = fol::PlaceFoliage(kField, st);
+    std::vector<uint8_t> imgA, imgB2;
+    renderMeadow(plantsA, imgA);
+    renderMeadow(plantsB, imgB2);
+    const uint32_t kPlants = (uint32_t)plantsA.size();
+    const bool twoRunIdentical = (imgA.size() == imgB2.size()) &&
+                                 (std::memcmp(imgA.data(), imgB2.data(), imgA.size()) == 0) &&
+                                 (plantsA.size() == plantsB.size());
+    if (!twoRunIdentical) return fail("fo2-place: two runs differ");
+
+    const uint32_t kGenerated = (uint32_t)pcg::Generate(kField.graph, st).size();
+    const bool provenanceOk = (kPlants == kGenerated) && (kPlants > 0);
+
+    const uint32_t kSeedB = kSeed ^ 0xA5A5A5A5u;
+    const pcg::PcgStream stB{kSeedB, kSalt};
+    const std::vector<fol::FoliageInstance> plantsSeedB = fol::PlaceFoliage(kField, stB);
+    std::vector<uint8_t> imgSeedB;
+    renderMeadow(plantsSeedB, imgSeedB);
+    const uint32_t hA = checksum(imgA);
+    const uint32_t hB = checksum(imgSeedB);
+    const bool seedDiffers = (hA != hB) && (plantsSeedB.size() > 0);
+
+    fol::FoliageField emptyField = kField;
+    emptyField.graph.cellsX = 0;
+    const uint32_t emptyPlants = (uint32_t)fol::PlaceFoliage(emptyField, st).size();
+    const bool emptyNoop = (emptyPlants == 0);
+
+    if (!provenanceOk || !seedDiffers || !emptyNoop)
+        return fail("fo2-place: provenance / seed / empty-graph control failed");
+
+    std::printf("fo2-place: PCG-driven foliage placement (plants=%u, seed=%u)\n", kPlants, kSeed);
+    std::printf("fo2-place: two-run BYTE-IDENTICAL\n");
+    std::printf("fo2-place: provenance plants == Generate(graph,stream) count {plants:%u, generated:%u}\n",
+                kPlants, kGenerated);
+    std::printf("fo2-place: different seed -> different meadow {seedA:0x%08X, seedB:0x%08X} Ha != Hb (both valid)\n",
+                hA, hB);
+    std::printf("fo2-place: empty graph -> 0 plants (no-op) {emptyPlants:%u}\n", emptyPlants);
+
+    if (!WritePNG(outPath, imgA, kImg, kImg)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fo2 PCG-driven foliage placement (%u plants, seed=%u)\n",
+                outPath, kImg, kImg, kPlants, kSeed);
+    return 0;
+}
+
 // ===== Slice PCG2 — Deterministic PCG JITTERED-GRID POINT SCATTER showcase (--pcg2-scatter) (the 2nd slice of
 // FLAGSHIP #22, hf::pcg). PURE CPU — NO GPU compute, NO new shader, NO new RHI; pcg.h is header-only pure-int32
 // math, so on Metal it runs the IDENTICAL deterministic jittered-grid scatter (ScatterGrid) the Vulkan
@@ -70650,6 +70770,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fo1-wind") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fo1_wind.png";
             try { return RunFo1WindShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fo2-place <out.png>: render the PCG-driven foliage PLACEMENT showcase (Slice FO2, the 2nd slice of
+        // FLAGSHIP #25). PURE CPU — runs the IDENTICAL foliage.h PlaceFoliage (pure reuse of pcg::Generate over the
+        // SAME fixed FoliageField/seed) the Vulkan --fo2-place-shot runs (the 2D top-down plant plot, pure-integer
+        // pixel map, scale-bucket tinted) -> the meadow is bit-identical cross-backend BY CONSTRUCTION; the proof
+        // lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--fo2-place") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fo2_place.png";
+            try { return RunFo2PlaceShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --pcg2-scatter <out.png>: render the Deterministic PCG JITTERED-GRID POINT SCATTER showcase (Slice PCG2,

@@ -15,8 +15,10 @@
 // so foliage.h MAY freely #include "sim/fpx.h" (no clang-standalone constraint).
 
 #include <cstdint>
+#include <vector>      // Slice FO2: PlaceFoliage returns std::vector<FoliageInstance>
 
 #include "sim/fpx.h"   // Q16.16 toolbox (read-only): fx / kOne / kFrac / fxmul / FxVec3
+#include "pcg/pcg.h"   // Slice FO2 (read-only): PcgGraph / PcgStream / PcgInstance / Generate — the placement engine
 
 namespace hf::foliage {
 
@@ -110,6 +112,43 @@ inline fx WindBend(const WindField& w, const FxVec3& pos, uint32_t frame) {
         bend += (fx)(((int64_t)gu.amp * (int64_t)s) >> 15);
     }
     return fxmul(bend, w.master);
+}
+
+// ===== Slice FO2 — PCG-driven foliage PLACEMENT (the 2nd slice of FLAGSHIP #25) =======================
+// Place the meadow by REUSING the just-completed deterministic PCG (hf::pcg, FLAGSHIP #22) verbatim: a
+// FoliageField holds a pcg::PcgGraph (the declarative scatter->mask->transform->prune recipe) and
+// PlaceFoliage calls pcg::Generate, wrapping each scattered PcgInstance as a plant in the SAME order. So
+// the whole meadow is a PURE FUNCTION of the seed (every PCG stage is already proven bit-exact cross-
+// platform), and the foliage layer adds NO new placement math — it COMPOSES PCG. APPEND-ONLY (FO1 above +
+// pcg.h/fpx.h read-only). Strict integer, header-only, NO float, NO new RHI, NO shader. The moat: UE5/
+// SpeedTree foliage placement is float/non-deterministic; this meadow is the same on every netcode peer.
+
+// ----- FoliageInstance: a placed plant = a PCG instance (kept extensible, base first) ------------------
+// A plant IS a scattered pcg::PcgInstance{pos, orient, scale}. base is FIRST so later slices can APPEND a
+// bend param (FO3) and a lod field (FO4) without disturbing the placement provenance.
+struct FoliageInstance {
+    hf::pcg::PcgInstance base;   // the scattered PCG instance (pos / orient / scale) — the plant's transform
+};
+
+// ----- FoliageField: the declarative meadow recipe (a PcgGraph) ----------------------------------------
+// The PcgGraph that scatters the plants (area + cells + optional mask + transform + optional prune). Later
+// slices may add a plant-type id alongside, fine — the graph stays the source of placement truth.
+struct FoliageField {
+    hf::pcg::PcgGraph graph;     // the scatter->mask->transform->prune recipe Generate consumes
+};
+
+// ----- PlaceFoliage: Generate the meadow from the field + stream (PURE REUSE) --------------------------
+// auto pcgInstances = hf::pcg::Generate(field.graph, stream); wrap each into a FoliageInstance{inst} in the
+// SAME order; return. No new math, no float — Generate already does scatter/mask/transform/prune
+// deterministically, so PlaceFoliage(field, stream).size() == Generate(field.graph, stream).size() and the
+// meadow is bit-exact cross-platform. An empty graph (cellsX<=0 || cellsZ<=0) -> Generate returns empty ->
+// 0 plants (the no-op control).
+inline std::vector<FoliageInstance> PlaceFoliage(const FoliageField& field, const hf::pcg::PcgStream& stream) {
+    const std::vector<hf::pcg::PcgInstance> pcgInstances = hf::pcg::Generate(field.graph, stream);
+    std::vector<FoliageInstance> plants;
+    plants.reserve(pcgInstances.size());
+    for (const hf::pcg::PcgInstance& inst : pcgInstances) plants.push_back(FoliageInstance{inst});
+    return plants;
 }
 
 }  // namespace hf::foliage
