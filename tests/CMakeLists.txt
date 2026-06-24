@@ -102,6 +102,18 @@ hf_add_pure_test(audio_test)
 # pinned hash IN the test (NO image, NO render-bake) — the cross-platform proof is the SAME CPU test
 # producing the IDENTICAL hash on MSVC + Apple clang. Pure CPU (hf_core), no RHI/backend symbols, ASan.
 hf_add_pure_test(dsp_test)
+# Generic deterministic SESSION core (Slice NS1, flagship #24 NETCODE beachhead): engine/net/session.h
+# — a header-only, transport-agnostic, templated Session<World,Input> that drives N ticks of a caller-
+# supplied deterministic Step from a per-tick InputRing and exposes an FNV-1a-64 DigestBytes state
+# digest (generalizing the per-sim lockstep harnesses into ONE parameterized engine). Driven by TWO
+# self-contained integer TOY worlds (NOT fpx — the abstraction is generic; the header stays standalone,
+# only <cstdint>/<vector>/<cstddef>, so it compiles single-file on the Mac clang). Asserts 2-PEER
+# LOCKSTEP (two independent Sessions from the same init+ring have EQUAL digests at EVERY tick), the
+# PINNED converged digests (ToyA + ToyB), INPUT-ORDER DETERMINISM (reversing same-tick insertion order
+# changes the digest), replay-stability, and that both toy worlds drive the SAME session code. The
+# golden is the pinned hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend
+# symbols, ASan-eligible.
+hf_add_pure_test(session_test)
 # CPU particle / VFX emitter system (Slice CC): the authorable emitter (spawn rate, lifetime, init
 # velocity + spread, gravity, drag, size/color over life) simulated at a fixed timestep with a
 # fixed-seed integer LCG for the spread jitter (engine/vfx/particles.{h,cpp}) — DISTINCT from the
