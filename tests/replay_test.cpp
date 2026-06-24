@@ -454,6 +454,134 @@ int main() {
         }
     }
 
+    // ================================ RP5: SCRUB + variable-speed assertions =======================
+    // A Player is a TIMELINE CURSOR over a decoded demo: SCRUB forward (cheap — step the cached world via
+    // net::CatchUp, bit-identical to Seek) and backward (re-Seek, no inverse) at VARIABLE integer SPEED.
+    // The determinism rule: speed changes WHEN you observe, never WHAT the world computes — so every reachable
+    // tick equals the live RunLockstep(tick), and the PATH taken never perturbs the destination (no drift).
+    // Use demoKf4 (interval 4). Live reference at tick N: net::RunLockstep<ToyA,InA>(ToyA{}, ring, N, ...).
+    {
+        const replay::Recorder<ToyA, InA> recKf4 =
+            replay::RecordSession<ToyA, InA>(kSeed, ToyA{}, ring, kTicks, /*keyframeInterval=*/4u,
+                                             StepA, DigestA, serToyA);
+        const std::vector<uint8_t> demoKf4Bytes = replay::EncodeDemo<ToyA, InA>(recKf4, serToyA, serRingA);
+        const replay::Demo<ToyA, InA> demoKf4 =
+            replay::DecodeDemo<ToyA, InA>(demoKf4Bytes, deserToyA, deserRingA);
+
+        // The live reference at tick N (N==0 -> DigestA(ToyA{}); the from-scratch lockstep otherwise).
+        auto liveAt = [&](uint32_t n) -> uint64_t {
+            return (n == 0u) ? DigestA(ToyA{})
+                             : net::RunLockstep<ToyA, InA>(ToyA{}, ring, n, StepA, DigestA);
+        };
+
+        // ---- (1) INIT — MakePlayer at tick 0 -> world == ToyA{} (acc 0), digest == DigestA(ToyA{}). ----
+        {
+            replay::Player<ToyA, InA> p = replay::MakePlayer<ToyA, InA>(demoKf4, DigestA);
+            check(p.currentTick == 0u && p.world.acc == 0 && p.digest == DigestA(ToyA{}),
+                  "rp5-scrub: MakePlayer at tick 0 -> world == initial (acc 0), digest == DigestA(ToyA{})");
+        }
+
+        // ---- (2) FORWARD == SEEK == LIVE — fresh player ScrubTo(N) == Seek(N) == live for N in {3,7,10,16}.
+        {
+            const uint32_t Ns[] = {3u, 7u, 10u, 16u};
+            bool ok = true;
+            for (const uint32_t N : Ns) {
+                replay::Player<ToyA, InA> p = replay::MakePlayer<ToyA, InA>(demoKf4, DigestA);
+                replay::ScrubTo<ToyA, InA>(p, N, StepA, DigestA);
+                const replay::SeekResult<ToyA, InA> sk = replay::Seek<ToyA, InA>(demoKf4, N, StepA, DigestA);
+                if (p.digest != sk.digest || p.digest != liveAt(N) || p.currentTick != N) ok = false;
+            }
+            check(ok,
+                  "rp5-scrub: ScrubTo(N) (forward from 0) digest == Seek(demoKf4,N) == live RunLockstep(N) for N in {3,7,10,16}");
+        }
+
+        // ---- (3) BACKWARD RE-SEEK — scrub 16->5->11->2; after each, p.digest == live RunLockstep(target). -
+        {
+            replay::Player<ToyA, InA> p = replay::MakePlayer<ToyA, InA>(demoKf4, DigestA);
+            const uint32_t path[] = {16u, 5u, 11u, 2u};
+            bool ok = true;
+            for (const uint32_t t : path) {
+                replay::ScrubTo<ToyA, InA>(p, t, StepA, DigestA);
+                if (p.digest != liveAt(t) || p.currentTick != t) ok = false;
+            }
+            check(ok,
+                  "rp5-scrub: ScrubTo backward (16 -> 5 -> 11 -> 2) each lands == live RunLockstep(that tick) (re-seek, no drift)");
+        }
+
+        // ---- (4) PATH-INDEPENDENCE (make-or-break) — scrub 0->12->4->9 == Seek(9) == live RunLockstep(9). -
+        {
+            replay::Player<ToyA, InA> p = replay::MakePlayer<ToyA, InA>(demoKf4, DigestA);
+            replay::ScrubTo<ToyA, InA>(p, 12u, StepA, DigestA);
+            replay::ScrubTo<ToyA, InA>(p,  4u, StepA, DigestA);
+            replay::ScrubTo<ToyA, InA>(p,  9u, StepA, DigestA);
+            const replay::SeekResult<ToyA, InA> sk9 = replay::Seek<ToyA, InA>(demoKf4, 9u, StepA, DigestA);
+            std::printf("rp5-scrub: path 0->12->4->9 digest = 0x%016llx  Seek(9) = 0x%016llx  live(9) = 0x%016llx\n",
+                        static_cast<unsigned long long>(p.digest),
+                        static_cast<unsigned long long>(sk9.digest),
+                        static_cast<unsigned long long>(liveAt(9u)));
+            check(p.world.acc == sk9.world.acc && p.digest == sk9.digest && p.digest == liveAt(9u) &&
+                      p.currentTick == 9u,
+                  "rp5-scrub: PATH-INDEPENDENCE — scrub 0->12->4->9 leaves the SAME world as Seek(9) == live(9)");
+        }
+
+        // ---- (5) VARIABLE-SPEED END — 2x (ScrubBy(+2) until clamped at tickCount) ends == pinned end. ---
+        {
+            replay::Player<ToyA, InA> p = replay::MakePlayer<ToyA, InA>(demoKf4, DigestA);
+            while (p.currentTick < kTicks) replay::ScrubBy<ToyA, InA>(p, 2, StepA, DigestA);
+            check(p.currentTick == kTicks && p.digest == kPinnedToyA,
+                  "rp5-scrub: variable-speed 2x (ScrubBy(+2) from 0 to end) final digest == pinned 0x6227bc7b4046d08a");
+        }
+
+        // ---- (6) SPEED-INVARIANT — 1x / 2x / 4x from 0 to end all reach the IDENTICAL final digest. ----
+        {
+            const int64_t strides[] = {1, 2, 4};
+            bool ok = true;
+            for (const int64_t stride : strides) {
+                replay::Player<ToyA, InA> p = replay::MakePlayer<ToyA, InA>(demoKf4, DigestA);
+                while (p.currentTick < kTicks) replay::ScrubBy<ToyA, InA>(p, stride, StepA, DigestA);
+                if (p.currentTick != kTicks || p.digest != kPinnedToyA) ok = false;
+            }
+            check(ok,
+                  "rp5-scrub: variable-speed 1x and 2x and 4x all reach the IDENTICAL final 0x6227bc7b4046d08a (speed changes WHEN not WHAT)");
+        }
+
+        // ---- (7) REVERSE — ScrubBy(-1) from 16 down to 0, each step == live RunLockstep(tick), ends initial.
+        {
+            replay::Player<ToyA, InA> p = replay::MakePlayer<ToyA, InA>(demoKf4, DigestA);
+            replay::ScrubTo<ToyA, InA>(p, 16u, StepA, DigestA);   // start at the end
+            bool ok = (p.currentTick == 16u);
+            while (p.currentTick > 0u) {
+                replay::ScrubBy<ToyA, InA>(p, -1, StepA, DigestA);
+                if (p.digest != liveAt(p.currentTick)) ok = false;
+            }
+            if (p.currentTick != 0u || p.digest != DigestA(ToyA{})) ok = false;
+            check(ok,
+                  "rp5-scrub: reverse playback (ScrubBy(-1) from 16 down to 0) each step == live RunLockstep(tick), ends at initial");
+        }
+
+        // ---- (8) CLAMP — ScrubBy(+100) near the end stops at tickCount; ScrubBy(-100) near start stops at 0.
+        {
+            replay::Player<ToyA, InA> pHi = replay::MakePlayer<ToyA, InA>(demoKf4, DigestA);
+            replay::ScrubTo<ToyA, InA>(pHi, 15u, StepA, DigestA);
+            replay::ScrubBy<ToyA, InA>(pHi, 100, StepA, DigestA);  // over-scroll forward -> clamp at tickCount
+            const bool hiOk = (pHi.currentTick == kTicks && pHi.digest == liveAt(kTicks));
+
+            replay::Player<ToyA, InA> pLo = replay::MakePlayer<ToyA, InA>(demoKf4, DigestA);
+            replay::ScrubTo<ToyA, InA>(pLo, 2u, StepA, DigestA);
+            replay::ScrubBy<ToyA, InA>(pLo, -100, StepA, DigestA); // over-scroll backward -> clamp at 0
+            const bool loOk = (pLo.currentTick == 0u && pLo.digest == DigestA(ToyA{}));
+
+            // Also confirm scrubbing AT an end is a no-op (clamps, no OOB).
+            replay::Player<ToyA, InA> pEnd = replay::MakePlayer<ToyA, InA>(demoKf4, DigestA);
+            replay::ScrubTo<ToyA, InA>(pEnd, kTicks, StepA, DigestA);
+            replay::ScrubBy<ToyA, InA>(pEnd, 5, StepA, DigestA);   // no-op at tickCount
+            const bool endOk = (pEnd.currentTick == kTicks && pEnd.digest == kPinnedToyA);
+
+            check(hiOk && loOk && endOk,
+                  "rp5-scrub: ScrubBy clamps at 0 and tickCount (over-scroll is a no-op at the ends)");
+        }
+    }
+
     if (g_fail == 0) std::printf("replay_test: ALL PASS\n");
     else             std::printf("replay_test: %d FAIL\n", g_fail);
     return g_fail == 0 ? 0 : 1;

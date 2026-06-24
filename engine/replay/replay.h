@@ -328,4 +328,69 @@ SeekResult<World, Input> Seek(const Demo<World, Input>& demo, uint32_t toTick, S
     return r;
 }
 
+// ============================ RP5: SCRUB + variable-speed playback ===================================
+// The user-facing TIMELINE built on RP4's Seek: a Player with a CURRENT position you can SCRUB forward
+// and backward at VARIABLE SPEED (1x/2x/0.5x/reverse). The determinism rule: speed changes only WHEN you
+// observe the world, never WHAT the world computes. Forward scrubbing steps from the CACHED world (cheap —
+// net::CatchUp from currentTick, sharing Seek's exact replay body); backward scrubbing RE-SEEKS (the sim
+// has no inverse) so the PATH taken to reach tick N never perturbs the world AT tick N (path-independence /
+// no drift). Append-only below RP4; header stays self-contained (int64_t lives in <cstdint>). Pure-CPU
+// INTEGER — variable "speed" is an integer tick STRIDE (the caller chooses when to call ScrubBy), no
+// float/clock/RNG.
+
+// --- Player<World,Input> — a timeline cursor over a decoded demo (caches the world AT currentTick). ----
+template <class World, class Input>
+struct Player {
+    const Demo<World, Input>* demo = nullptr;  // the decoded demo (non-owning; demo outlives the player)
+    uint32_t currentTick = 0;                  // the cursor position (0 .. demo->header.tickCount)
+    World    world{};                          // the world AS OF currentTick (cached)
+    uint64_t digest = 0;                       // digest(world) at currentTick
+};
+
+// --- MakePlayer — construct a Player positioned at tick 0 (the initial world). -----------------------
+template <class World, class Input, class DigestFn>
+Player<World, Input> MakePlayer(const Demo<World, Input>& demo, DigestFn digest) {
+    Player<World, Input> p;
+    p.demo        = &demo;
+    p.currentTick = 0;
+    p.world       = demo.initial;
+    p.digest      = digest(p.world);
+    return p;
+}
+
+// --- ScrubTo — move the cursor to an ABSOLUTE target tick (forward or backward), update cache. --------
+// Clamp target to [0, demo->header.tickCount]. FORWARD (target >= currentTick): step from the CACHED
+// p.world over [currentTick, target) via net::CatchUp seeded with JoinSnapshot{currentTick, p.world} — so
+// forward-scrub shares Seek's EXACT replay body (the make-or-break: bit-identical to Seek(*demo, target)).
+// BACKWARD (target < currentTick): the sim has no inverse, so RE-SEEK — Seek(*demo, target) (restore the
+// nearest keyframe <= target + replay forward) and take its world. Updates p.currentTick/world/digest.
+template <class World, class Input, class StepFn, class DigestFn>
+void ScrubTo(Player<World, Input>& p, uint32_t target, StepFn step, DigestFn digest) {
+    if (target > p.demo->header.tickCount) target = p.demo->header.tickCount;  // clamp past-the-end
+    if (target >= p.currentTick) {
+        // FORWARD: step from the cached world — this IS net::CatchUp (Seek's tail body), seeded here.
+        net::JoinSnapshot<World> snap{ p.currentTick, p.world };
+        p.world = net::CatchUp(snap, target, p.demo->ring, step);
+    } else {
+        // BACKWARD: re-Seek (no inverse) — restore nearest keyframe + replay forward to target.
+        const SeekResult<World, Input> r = Seek(*p.demo, target, step, digest);
+        p.world = r.world;
+    }
+    p.currentTick = target;
+    p.digest      = digest(p.world);
+}
+
+// --- ScrubBy — relative scrub by a SIGNED delta (the variable-speed primitive). ----------------------
+// A 2x-forward player calls ScrubBy(+2) per UI frame; 0.5x calls ScrubBy(+1) every other frame; reverse
+// calls a negative delta. Implemented as ScrubTo with a saturating clamp at 0 and tickCount, computed in
+// int64 BEFORE the uint32 cast (so negative deltas / over-scroll at the ends saturate, never wrap = no-op).
+template <class World, class Input, class StepFn, class DigestFn>
+void ScrubBy(Player<World, Input>& p, int64_t delta, StepFn step, DigestFn digest) {
+    int64_t target = static_cast<int64_t>(p.currentTick) + delta;
+    if (target < 0) target = 0;
+    const int64_t hi = static_cast<int64_t>(p.demo->header.tickCount);
+    if (target > hi) target = hi;
+    ScrubTo(p, static_cast<uint32_t>(target), step, digest);
+}
+
 }  // namespace hf::replay
