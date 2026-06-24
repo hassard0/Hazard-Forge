@@ -582,6 +582,150 @@ int main() {
         }
     }
 
+    // ================================ RP6: CAPSTONE — end-to-end + corruption ======================
+    // (A) Run the WHOLE pipeline end-to-end on the fixed ToyA session at keyframeInterval=4 and reproduce
+    // the pinned final via EVERY capability (Replay / Seek / ScrubTo / RunLockstep). (B) THE HEADLINE: flip
+    // one byte inside an input VALUE mid-stream and prove the per-tick digest trace LOCALIZES the tamper at
+    // the exact tick — VerifyReplay + net::DesyncDetector latch the SAME divergence tick.
+    {
+        // ---- Build demoKf4 (the canonical interval-4 demo bytes) — the e2e + corruption substrate. -----
+        const replay::Recorder<ToyA, InA> recKf4 =
+            replay::RecordSession<ToyA, InA>(kSeed, ToyA{}, ring, kTicks, /*keyframeInterval=*/4u,
+                                             StepA, DigestA, serToyA);
+        const std::vector<uint8_t> cleanBytes = replay::EncodeDemo<ToyA, InA>(recKf4, serToyA, serRingA);
+
+        // -------- PART A — end-to-end pipeline (all land on the pinned final 0x6227bc7b4046d08a). --------
+        const replay::Demo<ToyA, InA> loaded =
+            replay::DecodeDemo<ToyA, InA>(cleanBytes, deserToyA, deserRingA);
+
+        // (A0) record->encode->decode round-trips: header + initial + ring + keyframes intact.
+        {
+            const uint32_t expectWorldLen = static_cast<uint32_t>(serToyA(recKf4.initial).size());
+            const uint32_t expectInputLen = static_cast<uint32_t>(serRingA(recKf4.ring).size());
+            bool magicOk = true;
+            for (int i = 0; i < 8; ++i)
+                if (loaded.header.magic[i] != replay::kDemoMagic[i]) magicOk = false;
+            bool kfOk = (loaded.keyframes.size() == 4u);
+            for (std::size_t i = 0; kfOk && i < loaded.keyframes.size(); ++i)
+                if (loaded.keyframes[i].tick != recKf4.keyframes[i].tick ||
+                    serToyA(loaded.keyframes[i].world) != recKf4.keyframes[i].worldBytes) kfOk = false;
+            const bool ok =
+                magicOk && loaded.header.version == replay::kDemoVersion && loaded.header.seed == kSeed &&
+                loaded.header.tickCount == kTicks && loaded.header.keyframeInterval == 4u &&
+                loaded.header.worldByteLen == expectWorldLen && loaded.header.inputByteLen == expectInputLen &&
+                loaded.initial.acc == 0 && serRingA(loaded.ring) == serRingA(ring) && kfOk;
+            check(ok, "rp6-e2e: record->encode->decode round-trips (header + initial + ring + keyframes intact)");
+        }
+
+        // (A1) Replay(loaded) final == Seek(loaded,16) == ScrubTo(player,16) == RunLockstep(16) == pinned.
+        {
+            const replay::ReplayResult<ToyA, InA> rr = replay::Replay<ToyA, InA>(loaded, StepA, DigestA);
+            const replay::SeekResult<ToyA, InA>   sk = replay::Seek<ToyA, InA>(loaded, 16u, StepA, DigestA);
+            replay::Player<ToyA, InA> p = replay::MakePlayer<ToyA, InA>(loaded, DigestA);
+            replay::ScrubTo<ToyA, InA>(p, 16u, StepA, DigestA);
+            const uint64_t live = net::RunLockstep<ToyA, InA>(ToyA{}, ring, 16u, StepA, DigestA);
+            check(rr.finalDigest == sk.digest && sk.digest == p.digest && p.digest == live &&
+                      live == kPinnedToyA,
+                  "rp6-e2e: Replay(loaded) final == Seek(loaded,16) == ScrubTo(player,16) == net::RunLockstep(16) == 0x6227bc7b4046d08a");
+        }
+
+        // (A2) cleanTrace = Replay(decode(cleanBytes)).trace; VerifyReplay against it is ok==true.
+        const std::vector<uint64_t> cleanTrace = replay::Replay<ToyA, InA>(loaded, StepA, DigestA).trace;
+        {
+            const replay::VerifyResult<ToyA, InA> v =
+                replay::VerifyReplay<ToyA, InA>(loaded, cleanTrace, StepA, DigestA);
+            check(v.ok, "rp6-e2e: VerifyReplay(loaded, cleanTrace) ok==true (no divergence on a clean demo)");
+        }
+
+        // -------- PART B — corruption detection (the headline). ------------------------------------------
+        // Compute the offset of tick 7's FIRST input value deterministically by walking the input region.
+        // Input region starts at 36 + worldByteLen (worldByteLen == 8 for ToyA -> offset 44). Layout:
+        // tickCount(u32) @ inputOff, then per tick: count(u32) then `count` input values (u32 each). Walk to
+        // tick 7's first input value (which is 11) and flip a byte THERE (an input VALUE, not a count).
+        const uint32_t worldByteLen = static_cast<uint32_t>(serToyA(recKf4.initial).size());
+        const std::size_t inputOff  = static_cast<std::size_t>(36u + worldByteLen);
+        std::size_t corruptOff = 0;
+        {
+            const uint8_t* p = cleanBytes.data();
+            std::size_t off = inputOff;
+            const uint32_t tickCount = replay::GetU32(p + off); off += 4;  // == byTick.size() (16)
+            for (uint32_t t = 0; t < tickCount; ++t) {
+                const uint32_t count = replay::GetU32(p + off); off += 4;  // this tick's input count
+                if (t == 7u) {
+                    // The first input value of tick 7 starts here (count > 0 for tick 7).
+                    corruptOff = off;          // a VALUE byte (low byte of the first u32 input)
+                    break;
+                }
+                off += static_cast<std::size_t>(count) * 4u;  // skip this tick's input values
+            }
+        }
+
+        // Corrupt a COPY at that input-value byte; decode + replay -> corruptTrace.
+        std::vector<uint8_t> corruptBytes = cleanBytes;            // a COPY — cleanBytes stays pristine
+        replay::CorruptByteAt(corruptBytes, corruptOff);          // flip one input VALUE byte
+        const replay::Demo<ToyA, InA> corruptDemo =
+            replay::DecodeDemo<ToyA, InA>(corruptBytes, deserToyA, deserRingA);
+        const replay::ReplayResult<ToyA, InA> corruptRR =
+            replay::Replay<ToyA, InA>(corruptDemo, StepA, DigestA);
+        const std::vector<uint64_t>& corruptTrace = corruptRR.trace;
+
+        const uint64_t cleanFileHash   = net::DigestBytes(cleanBytes.data(), cleanBytes.size());
+        const uint64_t corruptFileHash = net::DigestBytes(corruptBytes.data(), corruptBytes.size());
+
+        // The verify result + a direct DesyncDetector run (the two localizers should AGREE).
+        const replay::VerifyResult<ToyA, InA> v =
+            replay::VerifyReplay<ToyA, InA>(corruptDemo, cleanTrace, StepA, DigestA);
+
+        net::DesyncDetector d;
+        for (std::size_t t = 0; t < cleanTrace.size(); ++t)
+            net::RecordLocal(d, static_cast<uint32_t>(t), cleanTrace[t]);
+        for (std::size_t t = 0; t < corruptTrace.size(); ++t)
+            net::IngestRemote(d, net::ChecksumPacket{static_cast<uint32_t>(t), corruptTrace[t]});
+
+        std::printf("rp6-corrupt: corrupted byte at offset %zu (input tick %u); clean hash=0x%016llx corrupt hash=0x%016llx\n",
+                    corruptOff, v.divergeTick,
+                    static_cast<unsigned long long>(cleanFileHash),
+                    static_cast<unsigned long long>(corruptFileHash));
+        std::printf("rp6-corrupt: divergence first at tick %u  clean=0x%016llx  corrupt=0x%016llx\n",
+                    v.divergeTick,
+                    static_cast<unsigned long long>(v.expectedDigest),
+                    static_cast<unsigned long long>(v.actualDigest));
+
+        // The pinned divergence tick + clean/corrupt digests at it (read from the first run, PINNED here).
+        const uint32_t kDivergeTick   = 7u;                       // tick 7's input was corrupted
+        const uint64_t kCleanAtTick   = 0x996beb36f9879dd0ull;    // clean digest at the divergence tick
+        const uint64_t kCorruptAtTick = 0xba6e3d7f5a551a15ull;    // corrupt digest at the divergence tick
+
+        // (B1) HASH CONTRAST — one flipped byte changes the file hash.
+        check(cleanFileHash != corruptFileHash,
+              "rp6-corrupt: clean file hash != corrupt file hash (the tamper changed the bytes)");
+
+        // (B2) LOCALIZED DIVERGENCE (make-or-break) — VerifyReplay finds it at the pinned tick.
+        check(!v.ok && v.divergeTick == kDivergeTick &&
+                  v.expectedDigest == kCleanAtTick && v.actualDigest == kCorruptAtTick,
+              "rp6-corrupt: VerifyReplay(corrupt, cleanTrace) ok==false, divergeTick == 7 (located, not silent)");
+
+        // (B3) DESYNC DETECTOR AGREEMENT — the NS5 machinery latches the SAME tick + digests.
+        check(d.desynced && d.desyncTick == kDivergeTick &&
+                  d.localDigest == kCleanAtTick && d.remoteDigest == kCorruptAtTick,
+              "rp6-corrupt: net::DesyncDetector latches the SAME tick 7 (clean vs corrupt per-tick digest exchange)");
+
+        // (B4) WORLD REALLY DIVERGED — corrupt replay final digest != the pinned clean final.
+        check(corruptRR.finalDigest != kPinnedToyA,
+              "rp6-corrupt: corrupt replay final digest != 0x6227bc7b4046d08a (the world really diverged)");
+
+        // (B5) CLEAN STILL GOOD — the untouched cleanBytes still VerifyReplay ok AND replays to the pinned.
+        {
+            const replay::Demo<ToyA, InA> reClean =
+                replay::DecodeDemo<ToyA, InA>(cleanBytes, deserToyA, deserRingA);
+            const replay::VerifyResult<ToyA, InA> vc =
+                replay::VerifyReplay<ToyA, InA>(reClean, cleanTrace, StepA, DigestA);
+            const replay::ReplayResult<ToyA, InA> rc = replay::Replay<ToyA, InA>(reClean, StepA, DigestA);
+            check(vc.ok && rc.finalDigest == kPinnedToyA,
+                  "rp6-corrupt: a clean (uncorrupted) copy still VerifyReplay ok==true AND replays to 0x6227bc7b4046d08a");
+        }
+    }
+
     if (g_fail == 0) std::printf("replay_test: ALL PASS\n");
     else             std::printf("replay_test: %d FAIL\n", g_fail);
     return g_fail == 0 ? 0 : 1;

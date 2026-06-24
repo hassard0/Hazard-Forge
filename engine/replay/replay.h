@@ -393,4 +393,57 @@ void ScrubBy(Player<World, Input>& p, int64_t delta, StepFn step, DigestFn diges
     ScrubTo(p, static_cast<uint32_t>(target), step, digest);
 }
 
+// ============================ RP6: CAPSTONE — end-to-end + corruption detection =====================
+// The final slice of flagship #28. RP1-RP5 built record -> encode -> decode -> replay -> keyframe ->
+// seek -> scrub. RP6 adds the headline that turns determinism into a SECURITY/INTEGRITY property: a
+// demo's per-tick digest stream is a built-in TAMPER DETECTOR. Flip one byte in a demo's input region and
+// the replay's re-derived per-tick digest DIVERGES from the recorded trace at the EXACT tick the
+// corruption takes effect — located, not silently tolerated. This is `net::DesyncDetector` (NS5) applied
+// to recorded-trace-vs-replayed-trace. Append-only below RP5; header stays self-contained (no new
+// includes — reuses net::DesyncDetector / net::ChecksumPacket / RecordLocal / IngestRemote). Pure-CPU INT.
+
+// --- VerifyResult — the integrity-check product: ok + the FIRST divergence (NS5 latch semantics). ----
+template <class World, class Input>
+struct VerifyResult {
+    bool     ok             = true;  // true iff every replayed per-tick digest matched the expected trace
+    uint32_t divergeTick    = 0;     // the FIRST tick where they differ (valid iff !ok)
+    uint64_t expectedDigest = 0;     // the reference (expected) digest at divergeTick
+    uint64_t actualDigest   = 0;     // the replayed (actual) digest at divergeTick
+};
+
+// --- VerifyReplay — decode-time integrity check a player/loader runs: replay `demo`, compare its re-
+// derived per-tick digest trace against `expectedTrace` (the authoritative recorded trace), and return the
+// FIRST divergence using the SAME machinery a netcode peer uses to detect a desync (NS5 DesyncDetector).
+// Drive net::DesyncDetector: RecordLocal(d, t, expectedTrace[t]) for every tick (the authoritative record),
+// then IngestRemote(d, ChecksumPacket{t, actualTrace[t]}) for every tick (the replayed checksums). The
+// detector latches the EARLIEST diverging tick. Compare min(expected, actual) ticks defensively. Reusing
+// DesyncDetector makes the corruption story LITERALLY the netcode desync machinery.
+template <class World, class Input, class StepFn, class DigestFn>
+VerifyResult<World, Input> VerifyReplay(const Demo<World, Input>& demo,
+                                        const std::vector<uint64_t>& expectedTrace,
+                                        StepFn step, DigestFn digest) {
+    const ReplayResult<World, Input> rr = Replay(demo, step, digest);  // the ACTUAL re-derived trace
+    const std::size_t n = expectedTrace.size() < rr.trace.size() ? expectedTrace.size() : rr.trace.size();
+
+    net::DesyncDetector d;
+    for (std::size_t t = 0; t < n; ++t)
+        net::RecordLocal(d, static_cast<uint32_t>(t), expectedTrace[t]);   // authoritative (local) record
+    for (std::size_t t = 0; t < n; ++t)
+        net::IngestRemote(d, net::ChecksumPacket{static_cast<uint32_t>(t), rr.trace[t]});  // replayed (remote)
+
+    VerifyResult<World, Input> r;
+    r.ok             = !d.desynced;
+    r.divergeTick    = d.desyncTick;
+    r.expectedDigest = d.localDigest;   // local == expectedTrace at the latch
+    r.actualDigest   = d.remoteDigest;  // remote == actual replayed trace at the latch
+    return r;
+}
+
+// --- CorruptByteAt — trivial in-place single-byte flip (XOR 0xFF) for the corruption test. ------------
+// A demo "file" is just a byte vector; flipping one byte inside an input VALUE makes exactly one input
+// change so the ring stays parseable and the replay diverges from the corrupted input's tick onward.
+inline void CorruptByteAt(std::vector<uint8_t>& bytes, std::size_t off) {
+    if (off < bytes.size()) bytes[off] = static_cast<uint8_t>(bytes[off] ^ 0xFFu);
+}
+
 }  // namespace hf::replay
