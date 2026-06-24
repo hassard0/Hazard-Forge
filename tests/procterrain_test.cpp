@@ -185,6 +185,73 @@ int main() {
         }
     }
 
+    // ============================ SLICE PT3 — integer THERMAL erosion / slope-slump ===================
+    // PT3 slumps the PT1 field's TOO-STEEP slopes toward the talus (angle of repose) via a mass-conserving
+    // contractive integer flux (the PT2 crux discipline, but only where dh > talus). These checks pin:
+    // EXACT mass conservation, the angle-of-repose guarantee (max slope <= talus after a settled run), the
+    // zero-iters no-op, composes-with-hydraulic, and replay-stability.
+    {
+        // A talus a small fraction of the field's height range (kOne/32 ~= 0.031) so a real amount of the
+        // terrain is steeper than talus -> visible slumping AND the slope still exceeds talus AFTER a
+        // hydraulic pass (so the compose check has work to do); a generous iteration count so the field
+        // settles (the rounded slump brings the converged max slope to <= talus exactly).
+        const fx  kTalus       = kOne / 32;
+        const int kThermalIters = 400;     // large enough for the settle to complete (angle-of-repose holds)
+        const std::vector<fx> base = ter::GenHeightField(kSeed, kN, kWorld, kOct);
+
+        // ---- (1) EXACT MASS CONSERVATION (make-or-break): int64 sum unchanged bit-for-bit ----
+        {
+            std::vector<fx> slumped = base;
+            const int64_t sumBefore = ter::GridSum(slumped);
+            ter::ErodeThermal(slumped, kN, kThermalIters, kTalus);
+            const int64_t sumAfter = ter::GridSum(slumped);
+            check(sumBefore == sumAfter,
+                  "PT3 mass conservation: int64 grid sum bit-for-bit identical after thermal slump (delta 0)");
+        }
+
+        // ---- (2) ANGLE-OF-REPOSE (make-or-break): MaxSlope after a settled run <= talus AND dropped ----
+        {
+            const fx slopeBefore = ter::MaxSlope(base, kN);
+            std::vector<fx> slumped = base;
+            ter::ErodeThermal(slumped, kN, kThermalIters, kTalus);
+            const fx slopeAfter = ter::MaxSlope(slumped, kN);
+            check(slopeAfter <= kTalus,
+                  "PT3 angle-of-repose: max slope <= talus after a settled thermal run");
+            // Belt-and-braces: the field was brought TO the repose angle (the slope strictly dropped).
+            check(slopeAfter < slopeBefore,
+                  "PT3 angle-of-repose: the thermal slump strictly reduced the max slope");
+        }
+
+        // ---- (3) ZERO-ITERS NO-OP: iterations <= 0 -> grid unchanged ----
+        {
+            std::vector<fx> e0 = base; ter::ErodeThermal(e0, kN, 0,  kTalus);
+            std::vector<fx> eN = base; ter::ErodeThermal(eN, kN, -7, kTalus);
+            check(e0 == base, "PT3 zero-iters no-op: iterations == 0 -> grid unchanged");
+            check(eN == base, "PT3 zero-iters no-op: iterations < 0  -> grid unchanged");
+            check(ter::CountChanged(base, e0) == 0, "PT3 zero-iters no-op: changed-cell count == 0");
+        }
+
+        // ---- (4) COMPOSES WITH HYDRAULIC: hydraulic then thermal differs from hydraulic alone ----
+        {
+            std::vector<fx> hydroOnly = base;
+            ter::ErodeHydraulic(hydroOnly, kN, 60);
+            std::vector<fx> combined = hydroOnly;          // thermal acts ON the hydraulic-eroded field
+            ter::ErodeThermal(combined, kN, kThermalIters, kTalus);
+            check(combined != hydroOnly,
+                  "PT3 composes with hydraulic: thermal-after-hydraulic differs from hydraulic alone");
+            // And thermal still conserves mass on the hydraulic-eroded field.
+            check(ter::GridSum(combined) == ter::GridSum(hydroOnly),
+                  "PT3 composes with hydraulic: thermal conserves mass on the eroded field too");
+        }
+
+        // ---- (5) REPLAY-STABLE: two ErodeThermal runs from the same base are byte-equal ----
+        {
+            std::vector<fx> r1 = base; ter::ErodeThermal(r1, kN, kThermalIters, kTalus);
+            std::vector<fx> r2 = base; ter::ErodeThermal(r2, kN, kThermalIters, kTalus);
+            check(r1 == r2, "PT3 replay-stable: two thermal runs from the same base are byte-equal");
+        }
+    }
+
     if (g_fail == 0) std::printf("procterrain_test: ALL CHECKS PASSED\n");
     return g_fail == 0 ? 0 : 1;
 }

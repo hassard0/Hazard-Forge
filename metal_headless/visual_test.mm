@@ -40646,6 +40646,100 @@ static int RunPt2HydraulicShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PT3 — Deterministic integer THERMAL EROSION / slope-slump showcase (--pt3-thermal) (the 3rd
+// slice of FLAGSHIP #26, DETERMINISTIC PROCEDURAL TERRAIN, hf::terrain). PURE CPU — NO GPU compute, NO new
+// shader, NO new RHI; erosion.h is header-only pure-integer math (ErodeThermal: a mass-conserving slope-slump
+// flux — each iteration, in pinned row-major Gauss-Seidel order, where dh = h[cell]-h[lowest-4-neighbour]
+// EXCEEDS the talus angle, move fxmul(dh-talus, kOne/2) from the cell to that neighbour -> EXACT mass
+// conservation + settles to talus, no inversion), so on Metal it evaluates the IDENTICAL slumped field the
+// Vulkan --pt3-thermal-shot evaluates on Windows -> the 2D slope-slump-delta heatmap golden is bit-identical
+// cross-backend BY CONSTRUCTION (strict zero-differing-pixel). Renders the SIGNED per-cell delta d =
+// slumped[i]-base[i] via PURE INTEGER math (deposited/positive -> warm red ramp, slumped/negative -> cool blue
+// ramp, magnitude clamp(|d|>>shift,0,255) — NO float pixel math); the proof lines (two-run identical, mass
+// conserved EXACT, the angle-of-repose guarantee, the zero-iters no-op, composes with hydraulic) match the
+// Vulkan side EXACTLY. The fixed SEED/OCT/WORLD/TALUS/ITERS/IMG MUST be IDENTICAL to the Vulkan
+// --pt3-thermal-shot. New golden tests/golden/metal/pt3_thermal.png (baked on the Mac by the controller); two
+// runs DIFF 0.0000.
+static int RunPt3ThermalShowcase(const char* outPath) {
+    namespace ter = hf::terrain;
+    // THE FIXED SHOWCASE PARAMS — IDENTICAL to the Vulkan --pt3-thermal-shot (main.cpp).
+    const uint32_t kImg   = 256u;
+    const int      kOct   = 5;
+    const uint32_t kSeed  = 0x7E44A12Bu;
+    const ter::fx  kWorld = ter::kOne * 48;
+    const ter::fx  kTalus = ter::kOne / 32;
+    const int      kIters = 400;
+    const int      kShift = 4;
+
+    const int      n       = (int)kImg;
+    const std::vector<ter::fx> base = ter::GenHeightField(kSeed, n, kWorld, kOct);
+    std::vector<ter::fx> slumped = base;
+    ter::ErodeThermal(slumped, n, kIters, kTalus);
+
+    auto renderDelta = [&](const std::vector<ter::fx>& a, const std::vector<ter::fx>& b,
+                           std::vector<uint8_t>& out) {
+        out.assign((size_t)kImg * kImg * 4, 0);
+        for (uint32_t py = 0; py < kImg; ++py) {
+            for (uint32_t px = 0; px < kImg; ++px) {
+                const size_t i = (size_t)py * kImg + px;
+                const int64_t d = (int64_t)b[i] - (int64_t)a[i];   // slumped - base
+                int64_t mag = (d < 0 ? -d : d) >> kShift;
+                if (mag < 0) mag = 0; else if (mag > 255) mag = 255;
+                const uint8_t m = (uint8_t)mag;
+                uint8_t* dst = &out[i * 4];
+                if (d > 0) { dst[0] = 0; dst[1] = 0; dst[2] = m; }      // BGRA: deposited -> warm (red)
+                else if (d < 0) { dst[0] = m; dst[1] = 0; dst[2] = 0; } //       slumped   -> cool (blue)
+                else { dst[0] = 0; dst[1] = 0; dst[2] = 0; }            //       unchanged -> black
+                dst[3] = 255;
+            }
+        }
+    };
+
+    std::vector<ter::fx> slumped2 = base;
+    ter::ErodeThermal(slumped2, n, kIters, kTalus);
+    std::vector<uint8_t> imgA1, imgA2;
+    renderDelta(base, slumped,  imgA1);
+    renderDelta(base, slumped2, imgA2);
+    const bool twoRunIdentical = (imgA1.size() == imgA2.size()) &&
+                                 (std::memcmp(imgA1.data(), imgA2.data(), imgA1.size()) == 0);
+    if (!twoRunIdentical) return fail("pt3-thermal: two runs differ");
+
+    const int64_t baseSum    = ter::GridSum(base);
+    const int64_t slumpedSum = ter::GridSum(slumped);
+    const bool massConserved = (baseSum == slumpedSum);
+
+    const ter::fx slopeBefore = ter::MaxSlope(base,    n);
+    const ter::fx slopeAfter  = ter::MaxSlope(slumped, n);
+    const bool reposeHeld = (slopeAfter <= kTalus) && (slopeAfter < slopeBefore);
+
+    std::vector<ter::fx> noop = base;
+    ter::ErodeThermal(noop, n, 0, kTalus);
+    const int zeroChanged = ter::CountChanged(base, noop);
+    const bool zeroNoop = (zeroChanged == 0) && (noop == base);
+
+    std::vector<ter::fx> hydroOnly = base;
+    ter::ErodeHydraulic(hydroOnly, n, 60);
+    std::vector<ter::fx> combined = hydroOnly;
+    ter::ErodeThermal(combined, n, kIters, kTalus);
+    const bool composes = (combined != hydroOnly);
+
+    if (!massConserved || !reposeHeld || !zeroNoop || !composes)
+        return fail("pt3-thermal: mass / repose / zero-iters / composes control failed");
+
+    std::printf("pt3-thermal: integer thermal slump (talus=%d, iters=%d, n=256)\n", (int)kTalus, kIters);
+    std::printf("pt3-thermal: two-run BYTE-IDENTICAL\n");
+    std::printf("pt3-thermal: mass conserved EXACT {delta:0}\n");
+    std::printf("pt3-thermal: angle of repose -> max slope <= talus {before:%d, after:%d, talus:%d, ok:true}\n",
+                (int)slopeBefore, (int)slopeAfter, (int)kTalus);
+    std::printf("pt3-thermal: zero-iters -> unchanged (no-op) {changed:%d}\n", zeroChanged);
+    std::printf("pt3-thermal: composes with hydraulic (combined != hydraulic-alone) {ok:true}\n");
+
+    if (!WritePNG(outPath, imgA1, kImg, kImg)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — pt3 deterministic integer thermal slump-delta (talus=%d, iters=%d, seed=0x%08X)\n",
+                outPath, kImg, kImg, (int)kTalus, kIters, kSeed);
+    return 0;
+}
+
 // ===== Slice FO1 — Deterministic integer WIND FIELD showcase (--fo1-wind) (the BEACHHEAD of FLAGSHIP #25,
 // DETERMINISTIC FOLIAGE AT SCALE, hf::foliage). PURE CPU — NO GPU compute, NO new shader, NO new RHI; foliage.h
 // is header-only pure-integer math (the kFoliageWind16 LUT = the audio kSineTable copied verbatim, indexed by an
@@ -71979,6 +72073,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pt2-hydraulic") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pt2_hydraulic.png";
             try { return RunPt2HydraulicShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pt3-thermal <out.png>: render the Deterministic integer THERMAL EROSION / slope-slump showcase (Slice
+        // PT3, the 3rd slice of FLAGSHIP #26). PURE CPU — runs the IDENTICAL erosion.h ErodeThermal over the
+        // IDENTICAL procterrain.h GenHeightField the Vulkan --pt3-thermal-shot runs (the 2D slope-slump-delta
+        // heatmap over a fixed seed/octaves/world/n/talus/iters, pure-integer pixel map) -> bit-identical
+        // cross-backend BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--pt3-thermal") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pt3_thermal.png";
+            try { return RunPt3ThermalShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fo2-place <out.png>: render the PCG-driven foliage PLACEMENT showcase (Slice FO2, the 2nd slice of
