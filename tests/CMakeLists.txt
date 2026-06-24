@@ -94,6 +94,14 @@ hf_add_pure_test(streaming_test)
 # bit-identical), mix math + clamp, the linear pan law (endpoint-exact), ADSR Q15 at known offsets,
 # and the WAV header fields. Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(audio_test)
+# Deterministic wavetable oscillator NODE (Slice DSP1, flagship #23 DETERMINISTIC AUDIO beachhead):
+# engine/audio/dsp.h — a stateful 32-bit-phase oscillator (Sine/Saw/Square) whose phase carries ACROSS
+# RenderBlock calls. Asserts block-boundary determinism (one big buffer == N persistent 256-frame blocks,
+# byte-identical via the FNV-1a-64 DigestBuffer), the PINNED buffer-hash goldens (sine/saw/square), replay
+# stability, that a 440Hz Square is hard +-32767, and freq-sensitivity (220 != 440). The golden is the
+# pinned hash IN the test (NO image, NO render-bake) — the cross-platform proof is the SAME CPU test
+# producing the IDENTICAL hash on MSVC + Apple clang. Pure CPU (hf_core), no RHI/backend symbols, ASan.
+hf_add_pure_test(dsp_test)
 # CPU particle / VFX emitter system (Slice CC): the authorable emitter (spawn rate, lifetime, init
 # velocity + spread, gravity, drag, size/color over life) simulated at a fixed timestep with a
 # fixed-seed integer LCG for the spread jitter (engine/vfx/particles.{h,cpp}) — DISTINCT from the
