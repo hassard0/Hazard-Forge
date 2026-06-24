@@ -29,6 +29,7 @@
 #include "terrain/procterrain.h"   // terrain::IntValueNoise — the integer value-noise basis, read-only.
 #include "pcg/pcg.h"               // pcg::PcgRandRange — the deterministic seeded scatter, read-only (Slice WE2).
 #include "foliage/foliage.h"       // foliage::kFoliageWind16 — the committed full-wave sine LUT, read-only (Slice WE3).
+#include "math/math.h"             // math::Mat4 / Vec3 / Quat / FromTRS — Slice WE5 rain render bridge ONLY (FLOAT).
 
 namespace hf::weather {
 
@@ -266,6 +267,43 @@ inline float CloudDriftTime(uint32_t frame) {
 struct Float3 { float x, y, z; };
 inline Float3 FxToFloat3(const FxVec3& v) {
     return Float3{ hf::sim::fpx::FxToFloat(v.x), hf::sim::fpx::FxToFloat(v.y), hf::sim::fpx::FxToFloat(v.z) };
+}
+
+// ===== Slice WE5 — the RAIN FLOAT RENDER BRIDGE (5th slice of FLAGSHIP #27; composes the whole living world) =====
+// The foliage::FoliageToRenderInstances twin for rain: cross the bit-exact INTEGER precipitation drops (WE2 GenPrecip,
+// each a Q16.16 local position in the precip field's [0,areaW)x[0,columnH)x[0,areaD) space) into FLOAT world-space
+// math::Mat4 instances the EXISTING instanced-lit pipeline consumes (the scene::InstanceData / InstanceTransformLayout
+// packing, matching FoliageToRenderInstances). APPEND-ONLY + READ-ONLY over WE1-WE4 (does NOT touch GenPrecip / the
+// integer data). The ONLY new float code WE5 adds; clearly the render bridge — both backends derive the SAME integer
+// drops from GenPrecip then the SAME FxToFloat mapping, so the rain column is deterministic cross-platform.
+//
+// Mapping (pure function of the drop + the field geometry + the world placement):
+//   * local XZ [0,areaW)/[0,areaD) -> world over the terrain patch: worldX = worldMinX + (drop.x/areaW)*worldSpan,
+//     worldZ = worldMinZ + (drop.z/areaD)*worldSpan (the rain falls over the SAME XZ extent as the meadow).
+//   * local Y [0,columnH) -> a WORLD Y ABOVE the terrain: worldY = baseY + (drop.y/columnH)*columnWorldH (the rain
+//     column sits over the relief; the drop wraps top->bottom inside the column).
+//   * each drop -> FromTRS(worldPos, identity quat, {dropScale, dropScale*kStreakLen, dropScale}) — a thin TALL
+//     streak (taller in Y so it reads as a falling rain streak, not a sphere). kStreakLen == 4 (the streak look).
+// The drop->world fraction uses fxdiv (Q16.16) then ONE FxToFloat — the single host fixed-point->float crossing.
+inline std::vector<math::Mat4> RainToRenderInstances(const std::vector<FxVec3>& drops, float dropScale,
+                                                     float worldMinX, float worldMinZ, float worldSpan,
+                                                     float baseY, float columnWorldH,
+                                                     fx areaW, fx columnH, fx areaD) {
+    constexpr float kStreakLen = 4.0f;   // taller-than-wide streak (the falling-rain look)
+    std::vector<math::Mat4> out;
+    out.reserve(drops.size());
+    for (const FxVec3& d : drops) {
+        // Q16.16 local fraction within each axis (guard zero extents -> 0), then the ONE FxToFloat crossing.
+        const float fx_ = (areaW   > 0) ? FxToFloat(fxdiv(d.x, areaW))   : 0.0f;
+        const float fy_ = (columnH > 0) ? FxToFloat(fxdiv(d.y, columnH)) : 0.0f;
+        const float fz_ = (areaD   > 0) ? FxToFloat(fxdiv(d.z, areaD))   : 0.0f;
+        const math::Vec3 worldPos{ worldMinX + fx_ * worldSpan,
+                                   baseY     + fy_ * columnWorldH,
+                                   worldMinZ + fz_ * worldSpan };
+        out.push_back(math::FromTRS(worldPos, math::Quat{0.0f, 0.0f, 0.0f, 1.0f},
+                                    math::Vec3{dropScale, dropScale * kStreakLen, dropScale}));
+    }
+    return out;
 }
 
 }  // namespace hf::weather
