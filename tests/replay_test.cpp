@@ -104,7 +104,8 @@ int main() {
     // Record THE fixed ToyA session, then encode it to demo file bytes.
     const net::InputRing<InA> ring = makeRingA();
     const replay::Recorder<ToyA, InA> rec =
-        replay::RecordSession<ToyA, InA>(kSeed, ToyA{}, ring, kTicks, StepA, DigestA);
+        replay::RecordSession<ToyA, InA>(kSeed, ToyA{}, ring, kTicks, /*keyframeInterval=*/0u,
+                                         StepA, DigestA, serToyA);
     const std::vector<uint8_t> demoFileBytes = replay::EncodeDemo<ToyA, InA>(rec, serToyA, serRingA);
 
     // Print the live values so the pinned hashes are visible in test output.
@@ -116,7 +117,7 @@ int main() {
                 static_cast<unsigned long long>(rec.digestTrace.empty() ? 0u : rec.digestTrace.back()));
 
     // The pinned goldens (the regression anchor / cross-platform bar).
-    const uint64_t kPinnedFileHash = 0x2add2e0b07ffcce4ull;  // PINNED: DigestBytes over the demo file bytes
+    const uint64_t kPinnedFileHash = 0x92e4d491013137c4ull;  // RP3 RE-PIN: DigestBytes over the no-keyframe demo file (new 36-byte header)
     const uint64_t kPinnedToyA     = 0x6227bc7b4046d08aull;  // == session_test.cpp's hToyA (cross-check)
 
     // ---- (a) PINNED FILE HASH — the make-or-break cross-platform byte-layout proof. ----------------
@@ -139,16 +140,18 @@ int main() {
         const uint32_t keyframeInterval = replay::GetU32(p + 20);
         const uint32_t worldByteLen     = replay::GetU32(p + 24);
         const uint32_t inputByteLen     = replay::GetU32(p + 28);
+        const uint32_t keyframeByteLen  = replay::GetU32(p + 32);
         // Independently recompute the blob lengths to validate worldByteLen/inputByteLen.
         const uint32_t expectWorldLen = static_cast<uint32_t>(serToyA(rec.initial).size());
         const uint32_t expectInputLen = static_cast<uint32_t>(serRingA(rec.ring).size());
         const bool headerOk =
             magicOk && version == replay::kDemoVersion && seed == kSeed && tickCount == kTicks &&
             keyframeInterval == 0u && worldByteLen == expectWorldLen && inputByteLen == expectInputLen &&
-            // The header is exactly 32 bytes; the two blobs follow it.
-            demoFileBytes.size() == static_cast<std::size_t>(32u + worldByteLen + inputByteLen);
+            keyframeByteLen == 0u &&
+            // The header is now exactly 36 bytes (no keyframe section here); the two blobs follow it.
+            demoFileBytes.size() == static_cast<std::size_t>(36u + worldByteLen + inputByteLen);
         check(headerOk,
-              "rp1-record: header round-trips field-exact (magic/version/seed/tickCount/keyframeInterval/world+inputByteLen)");
+              "rp1-record: header round-trips field-exact (magic/version/seed/tickCount/keyframeInterval/world+input+keyframeByteLen)");
     }
 
     // ---- (c) DIGEST-TRACE PROVENANCE — length 16 and last == the pinned ToyA final digest. ----------
@@ -182,9 +185,10 @@ int main() {
             const bool headerOk =
                 magicOk && demo.header.version == replay::kDemoVersion && demo.header.seed == kSeed &&
                 demo.header.tickCount == kTicks && demo.header.keyframeInterval == 0u &&
-                demo.header.worldByteLen == expectWorldLen && demo.header.inputByteLen == expectInputLen;
+                demo.header.worldByteLen == expectWorldLen && demo.header.inputByteLen == expectInputLen &&
+                demo.header.keyframeByteLen == 0u && demo.keyframes.empty();
             check(headerOk,
-                  "rp2-playback: DecodeDemo round-trips header field-exact (magic/version/seed/tickCount/world+inputByteLen)");
+                  "rp2-playback: DecodeDemo round-trips header field-exact (magic/version/seed/tickCount/world+input+keyframeByteLen)");
         }
 
         // ---- (2) WORLD + RING ROUND-TRIP — decoded initial == ToyA{} (acc==0) AND ring byte-exact. -
@@ -228,6 +232,105 @@ int main() {
                 replay::EncodeDemo<ToyA, InA>(decodedRec, serToyA, serRingA);
             check(reBytes == demoFileBytes,
                   "rp2-playback: Decode(Encode(rec)) re-encoded bytes == demoFileBytes (full round-trip, byte-exact)");
+        }
+    }
+
+    // ================================ RP3: KEYFRAME assertions =====================================
+    // Record the SAME ToyA session at two keyframe intervals (4 and 8); prove each keyframe-at-tick-T is a
+    // BIT-IDENTICAL mid-session restore point (== live RunLockstep-to-T), and pin distinct file hashes.
+    {
+        // The pinned RP3 goldens (re-pin from the printed values on first run).
+        const uint64_t kPinnedKf4Hash = 0xf2ccf29305652a39ull;  // RP3: DigestBytes over the interval-4 demo file
+        const uint64_t kPinnedKf8Hash = 0xe7fb940bd0c3cc41ull;  // RP3: DigestBytes over the interval-8 demo file
+
+        // ---- interval K1 = 4 → keyframes at ticks 0,4,8,12 (ceil-free: 16/4 == 4). -------------------
+        const replay::Recorder<ToyA, InA> recKf4 =
+            replay::RecordSession<ToyA, InA>(kSeed, ToyA{}, ring, kTicks, /*keyframeInterval=*/4u,
+                                             StepA, DigestA, serToyA);
+        const std::vector<uint8_t> demoKf4 = replay::EncodeDemo<ToyA, InA>(recKf4, serToyA, serRingA);
+        const uint64_t kf4Hash = net::DigestBytes(demoKf4.data(), demoKf4.size());
+
+        // ---- interval K2 = 8 → keyframes at ticks 0,8 (16/8 == 2). ------------------------------------
+        const replay::Recorder<ToyA, InA> recKf8 =
+            replay::RecordSession<ToyA, InA>(kSeed, ToyA{}, ring, kTicks, /*keyframeInterval=*/8u,
+                                             StepA, DigestA, serToyA);
+        const std::vector<uint8_t> demoKf8 = replay::EncodeDemo<ToyA, InA>(recKf8, serToyA, serRingA);
+        const uint64_t kf8Hash = net::DigestBytes(demoKf8.data(), demoKf8.size());
+
+        std::printf("rp3-keyframe: demoKf4 size = %zu bytes, keyframes = %zu\n",
+                    demoKf4.size(), recKf4.keyframes.size());
+        std::printf("rp3-keyframe: DigestBytes(demoKf4) = 0x%016llx (pinned, distinct from no-keyframe)\n",
+                    static_cast<unsigned long long>(kf4Hash));
+        std::printf("rp3-keyframe: demoKf8 size = %zu bytes, keyframes = %zu\n",
+                    demoKf8.size(), recKf8.keyframes.size());
+        std::printf("rp3-keyframe: DigestBytes(demoKf8) = 0x%016llx (pinned, distinct + smaller)\n",
+                    static_cast<unsigned long long>(kf8Hash));
+
+        // ---- (a) pinned distinct file hashes (the tradeoff knob is real + deterministic). -------------
+        check(kf4Hash == kPinnedKf4Hash, "rp3-keyframe: DigestBytes(demoKf4) == pinned uint64 (interval 4)");
+        check(kf8Hash == kPinnedKf8Hash, "rp3-keyframe: DigestBytes(demoKf8) == pinned uint64 (interval 8)");
+        check(kf4Hash != kf8Hash && kf4Hash != fileHash && kf8Hash != fileHash,
+              "rp3-keyframe: Kf4 / Kf8 / no-keyframe hashes are all distinct (interval is a real knob)");
+
+        // ---- (b) keyframeInterval header field round-trips + keyframeCount == ceil(16/K). -------------
+        const replay::Demo<ToyA, InA> dKf4 =
+            replay::DecodeDemo<ToyA, InA>(demoKf4, deserToyA, deserRingA);
+        const replay::Demo<ToyA, InA> dKf8 =
+            replay::DecodeDemo<ToyA, InA>(demoKf8, deserToyA, deserRingA);
+        check(dKf4.header.keyframeInterval == 4u && recKf4.keyframes.size() == 4u &&
+                  dKf4.keyframes.size() == 4u &&
+                  dKf4.keyframes[0].tick == 0u && dKf4.keyframes[1].tick == 4u &&
+                  dKf4.keyframes[2].tick == 8u && dKf4.keyframes[3].tick == 12u,
+              "rp3-keyframe: keyframeInterval==4 header round-trips; keyframeCount == 4 (ticks 0,4,8,12)");
+        check(dKf8.header.keyframeInterval == 8u && recKf8.keyframes.size() == 2u &&
+                  dKf8.keyframes.size() == 2u &&
+                  dKf8.keyframes[0].tick == 0u && dKf8.keyframes[1].tick == 8u,
+              "rp3-keyframe: keyframeInterval==8 header round-trips; keyframeCount == 2 (ticks 0,8)");
+
+        // ---- (c) THE make-or-break: each keyframe-at-tick-T world digest == live world digest at T. ---
+        // Live reference: net::RunLockstep<ToyA,InA>(ToyA{}, ring, T, ...) (T==0 → DigestA(ToyA{})).
+        {
+            bool kf4Ok = true;
+            for (const auto& dk : dKf4.keyframes) {
+                const uint64_t live = (dk.tick == 0u)
+                    ? DigestA(ToyA{})
+                    : net::RunLockstep<ToyA, InA>(ToyA{}, ring, dk.tick, StepA, DigestA);
+                const uint64_t kfDig = DigestA(dk.world);
+                std::printf("rp3-keyframe: tick %2u  keyframe digest = 0x%016llx  live = 0x%016llx\n",
+                            dk.tick, static_cast<unsigned long long>(kfDig),
+                            static_cast<unsigned long long>(live));
+                if (kfDig != live) kf4Ok = false;
+            }
+            check(kf4Ok,
+                  "rp3-keyframe: each keyframe-at-tick-T world digest == live RunLockstep-to-T (bit-identical restore point)");
+        }
+        {
+            bool kf8Ok = true;
+            for (const auto& dk : dKf8.keyframes) {
+                const uint64_t live = (dk.tick == 0u)
+                    ? DigestA(ToyA{})
+                    : net::RunLockstep<ToyA, InA>(ToyA{}, ring, dk.tick, StepA, DigestA);
+                if (DigestA(dk.world) != live) kf8Ok = false;
+            }
+            check(kf8Ok, "rp3-keyframe: interval-8 keyframes also == live RunLockstep-to-T (0,8)");
+        }
+
+        // ---- (d) decoded keyframes round-trip (tick + world byte-state exact via re-serialize). -------
+        {
+            bool rtOk = recKf4.keyframes.size() == dKf4.keyframes.size();
+            for (std::size_t i = 0; rtOk && i < dKf4.keyframes.size(); ++i) {
+                if (dKf4.keyframes[i].tick != recKf4.keyframes[i].tick) rtOk = false;
+                else if (serToyA(dKf4.keyframes[i].world) != recKf4.keyframes[i].worldBytes) rtOk = false;
+            }
+            check(rtOk, "rp3-keyframe: decode(demoKf4) keyframes round-trip (tick + world byte-state exact)");
+        }
+
+        // ---- (e) keyframes don't change playback — Replay final digest STILL == pinned ToyA digest. ---
+        {
+            const replay::ReplayResult<ToyA, InA> rr4 = replay::Replay<ToyA, InA>(dKf4, StepA, DigestA);
+            const replay::ReplayResult<ToyA, InA> rr8 = replay::Replay<ToyA, InA>(dKf8, StepA, DigestA);
+            check(rr4.finalDigest == kPinnedToyA && rr8.finalDigest == kPinnedToyA,
+                  "rp3-keyframe: Replay(demoKf4)/Replay(demoKf8) final digest still == 0x6227bc7b4046d08a");
         }
     }
 

@@ -66,9 +66,10 @@ struct DemoHeader {
     uint32_t version;           // = kDemoVersion (start at 1)
     uint32_t seed;              // the session seed (RP1: a fixed constant for the ToyA demo)
     uint32_t tickCount;         // number of recorded ticks
-    uint32_t keyframeInterval;  // RP1: 0 (no keyframes yet — RP3 introduces them). A HEADER FIELD on purpose.
+    uint32_t keyframeInterval;  // ticks between keyframes (RP3); 0 = no keyframes. A HEADER FIELD on purpose.
     uint32_t worldByteLen;      // length of the initial-snapshot blob that follows
     uint32_t inputByteLen;      // length of the serialized input stream that follows
+    uint32_t keyframeByteLen;   // RP3: length of the keyframe section that follows the inputs (0 = none)
 };
 inline constexpr uint32_t kDemoVersion = 1;
 inline constexpr char     kDemoMagic[8] = {'H', 'F', 'D', 'E', 'M', 'O', '\0', '\0'};
@@ -81,27 +82,55 @@ struct Recorder {
     net::InputRing<Input> ring;           // the per-tick input stream (reuse net::InputRing)
     std::vector<uint64_t> digestTrace;    // per-tick digest trace (reuse net::DigestTrace)
     uint32_t              tickCount = 0;
+    uint32_t              keyframeInterval = 0;  // RP3: ticks between keyframes (0 = none captured)
+
+    // RP3: a full driver-serialized world snapshot AS OF `tick` (= world after [0,tick) ticks applied).
+    struct Keyframe { uint32_t tick; std::vector<uint8_t> worldBytes; };
+    std::vector<Keyframe> keyframes;      // captured at ticks 0, K, 2K, ... (driver-serialized bytes)
 };
 
-// Record `ticks` of a session: capture seed, the initial world, the input ring, and the per-tick digest
-// trace (via net::DigestTrace — the SAME confirmed-state checksum stream a peer emits). Deterministic of
-// (seed, initial, ring, ticks, step, digest) alone.
-template <class World, class Input, class StepFn, class DigestFn>
+// Record `ticks` of a session: capture seed, the initial world, the input ring, the per-tick digest trace,
+// AND (RP3) a keyframe every `keyframeInterval` ticks. Walk the session ONE tick at a time (we need the
+// intermediate worlds for keyframes) in ONE consistent loop: capture a keyframe whenever T % interval == 0
+// BEFORE stepping tick T (so keyframe@0 == initial world, keyframe@K == world after K ticks), then Advance,
+// then record digest AFTER. digestTrace stays the per-tick-AFTER trace (length == ticks), bit-identical to
+// net::DigestTrace. When keyframeInterval == 0, capture NO keyframes. Deterministic of
+// (seed, initial, ring, ticks, keyframeInterval, step, digest, serWorld) alone.
+template <class World, class Input, class StepFn, class DigestFn, class SerWorldFn>
 Recorder<World, Input> RecordSession(uint32_t seed, World initial, const net::InputRing<Input>& ring,
-                                     uint32_t ticks, StepFn step, DigestFn digest) {
+                                     uint32_t ticks, uint32_t keyframeInterval,
+                                     StepFn step, DigestFn digest, SerWorldFn serWorld) {
     Recorder<World, Input> rec;
-    rec.seed        = seed;
-    rec.initial     = initial;
-    rec.ring        = ring;
-    rec.tickCount   = ticks;
-    rec.digestTrace = net::DigestTrace<World, Input>(initial, ring, ticks, step, digest);
+    rec.seed             = seed;
+    rec.initial          = initial;
+    rec.ring             = ring;
+    rec.tickCount        = ticks;
+    rec.keyframeInterval = keyframeInterval;
+
+    net::Session<World, Input> s;
+    s.world = initial;
+    s.ring  = ring;     // a COPY — the caller's ring is untouched (matches RunLockstep / DigestTrace)
+    s.tick  = 0;
+    rec.digestTrace.reserve(static_cast<std::size_t>(ticks));
+    for (uint32_t T = 0; T < ticks; ++T) {
+        if (keyframeInterval > 0 && (T % keyframeInterval) == 0) {
+            typename Recorder<World, Input>::Keyframe kf;
+            kf.tick       = T;                 // world AS OF tick T (BEFORE stepping T)
+            kf.worldBytes = serWorld(s.world);
+            rec.keyframes.push_back(std::move(kf));
+        }
+        net::Advance(s, step);                 // NS1 deterministic transition
+        rec.digestTrace.push_back(digest(s.world));  // digest AFTER the tick
+    }
     return rec;
 }
 
 // --- EncodeDemo — serialize a Recorder to a byte buffer, hand-LE, deterministic, byte-exact ---------
 // Layout (ALL fields LE, in this exact order):
 //   magic(8) | version(u32) | seed(u32) | tickCount(u32) | keyframeInterval(u32) | worldByteLen(u32) |
-//   inputByteLen(u32) | <worldBytes> | <inputBytes>
+//   inputByteLen(u32) | keyframeByteLen(u32) | <worldBytes> | <inputBytes> | <keyframeSection>
+// Header is now 8 + 7*4 = 36 bytes. The keyframe section (only when keyframeByteLen > 0) is:
+//   keyframeCount(u32), then per keyframe: tick(u32), kfWorldByteLen(u32), <kfWorldBytes>.
 // `serWorld(const World&)` and `serInputRing(const net::InputRing<Input>&)` MUST themselves be hand-LE
 // (field-by-field, no struct memcpy) so the bytes are identical on MSVC + Apple clang.
 template <class World, class Input, class SerWorldFn, class SerInputFn>
@@ -110,16 +139,30 @@ std::vector<uint8_t> EncodeDemo(const Recorder<World, Input>& rec, SerWorldFn se
     const std::vector<uint8_t> worldBytes = serWorld(rec.initial);
     const std::vector<uint8_t> inputBytes = serInputRing(rec.ring);
 
+    // Build the keyframe section first so we know its total byte length (0 when there are no keyframes).
+    std::vector<uint8_t> kfSection;
+    if (!rec.keyframes.empty()) {
+        PutU32(kfSection, static_cast<uint32_t>(rec.keyframes.size()));    // keyframeCount
+        for (const auto& kf : rec.keyframes) {
+            PutU32(kfSection, kf.tick);                                    // tick
+            PutU32(kfSection, static_cast<uint32_t>(kf.worldBytes.size())); // kfWorldByteLen
+            PutBytes(kfSection, kf.worldBytes.data(), kf.worldBytes.size()); // <kfWorldBytes>
+        }
+    }
+    const uint32_t keyframeByteLen = static_cast<uint32_t>(kfSection.size());
+
     std::vector<uint8_t> out;
     PutBytes(out, kDemoMagic, 8);                                          // magic(8)
     PutU32(out, kDemoVersion);                                             // version
     PutU32(out, rec.seed);                                                 // seed
     PutU32(out, rec.tickCount);                                            // tickCount
-    PutU32(out, 0u);                                                       // keyframeInterval (RP1: 0)
+    PutU32(out, rec.keyframeInterval);                                     // keyframeInterval (RP3)
     PutU32(out, static_cast<uint32_t>(worldBytes.size()));                 // worldByteLen
     PutU32(out, static_cast<uint32_t>(inputBytes.size()));                 // inputByteLen
+    PutU32(out, keyframeByteLen);                                          // keyframeByteLen (RP3)
     PutBytes(out, worldBytes.data(), worldBytes.size());                   // <worldBytes>
     PutBytes(out, inputBytes.data(), inputBytes.size());                   // <inputBytes>
+    PutBytes(out, kfSection.data(), kfSection.size());                     // <keyframeSection>
     return out;
 }
 
@@ -136,14 +179,19 @@ struct Demo {
     DemoHeader            header{};   // fields read back out of the file (magic/version/seed/tickCount/...)
     World                 initial{};  // the deserialized initial-world snapshot
     net::InputRing<Input> ring;       // the deserialized per-tick input stream
+
+    // RP3: the decoded keyframe table — each is a full world snapshot AS OF `tick` (the seek substrate).
+    struct DecodedKeyframe { uint32_t tick; World world; };
+    std::vector<DecodedKeyframe> keyframes;
 };
 
 // --- DecodeDemo — parse demo bytes back into a Demo<World,Input>, hand-LE (GetU32 + driver deser) ----
-// Layout is EncodeDemo's exact inverse: magic(8) then 6 u32 fields (version, seed, tickCount,
-// keyframeInterval, worldByteLen, inputByteLen) = 8 + 6*4 = 32-byte header, then the world blob at
-// offset 32 and the input blob at 32 + worldByteLen. (Re-derived by COUNTING EncodeDemo's 6 PutU32 calls
-// after the 8-byte magic — matches the RP1 test's offset-32 header round-trip.) The driver supplies the
-// inverse serializers: deserWorld(const uint8_t* p, uint32_t len) -> World and
+// Layout is EncodeDemo's exact inverse: magic(8) then 7 u32 fields (version, seed, tickCount,
+// keyframeInterval, worldByteLen, inputByteLen, keyframeByteLen) = 8 + 7*4 = 36-byte header, then the
+// world blob at offset 36, the input blob at 36 + worldByteLen, and the keyframe section at
+// 36 + worldByteLen + inputByteLen (parsed only when keyframeByteLen > 0). (Re-derived by COUNTING
+// EncodeDemo's 7 PutU32 calls after the 8-byte magic — do NOT trust comment arithmetic.) The driver
+// supplies the inverse serializers: deserWorld(const uint8_t* p, uint32_t len) -> World and
 // deserInputRing(const uint8_t* p, uint32_t len) -> net::InputRing<Input>. Validates magic == kDemoMagic
 // and version == kDemoVersion (RP2 only feeds valid demos; the corruption path is RP6).
 template <class World, class Input, class DeserWorldFn, class DeserInputFn>
@@ -160,7 +208,8 @@ Demo<World, Input> DecodeDemo(const std::vector<uint8_t>& bytes, DeserWorldFn de
     demo.header.keyframeInterval = GetU32(p + 20);   // offset 20
     demo.header.worldByteLen     = GetU32(p + 24);   // offset 24
     demo.header.inputByteLen     = GetU32(p + 28);   // offset 28
-    // header is 8 + 6*4 = 32 bytes; the world blob starts at offset 32, the input blob at 32 + worldByteLen.
+    demo.header.keyframeByteLen  = GetU32(p + 32);   // offset 32
+    // header is 8 + 7*4 = 36 bytes; world blob @ 36, input blob @ 36+worldByteLen, kf section @ 36+world+input.
 
     // Validate magic == kDemoMagic and version == kDemoVersion (keep it simple — RP6 owns corruption).
     bool magicOk = true;
@@ -168,10 +217,25 @@ Demo<World, Input> DecodeDemo(const std::vector<uint8_t>& bytes, DeserWorldFn de
         if (demo.header.magic[i] != kDemoMagic[i]) magicOk = false;
     if (!magicOk || demo.header.version != kDemoVersion) return demo;  // empty/default Demo on mismatch
 
-    const uint32_t worldOff = 32u;
-    const uint32_t inputOff  = 32u + demo.header.worldByteLen;
+    const uint32_t worldOff = 36u;
+    const uint32_t inputOff = 36u + demo.header.worldByteLen;
     demo.initial = deserWorld(p + worldOff, demo.header.worldByteLen);
     demo.ring    = deserInputRing(p + inputOff, demo.header.inputByteLen);
+
+    // RP3: parse the keyframe section (only present when keyframeByteLen > 0).
+    if (demo.header.keyframeByteLen > 0) {
+        const uint8_t* kp = p + inputOff + demo.header.inputByteLen;  // section base @ 36+world+input
+        std::size_t off = 0;
+        const uint32_t keyframeCount = GetU32(kp + off); off += 4;
+        demo.keyframes.reserve(static_cast<std::size_t>(keyframeCount));
+        for (uint32_t i = 0; i < keyframeCount; ++i) {
+            typename Demo<World, Input>::DecodedKeyframe dk;
+            dk.tick                     = GetU32(kp + off); off += 4;
+            const uint32_t kfWorldLen   = GetU32(kp + off); off += 4;
+            dk.world                    = deserWorld(kp + off, kfWorldLen); off += kfWorldLen;
+            demo.keyframes.push_back(std::move(dk));
+        }
+    }
     return demo;
 }
 
