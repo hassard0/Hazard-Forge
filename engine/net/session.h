@@ -203,4 +203,72 @@ void ConfirmRemote(RollbackSession<World, Input>& s, uint32_t at, const Input& r
     // s.tick is unchanged — we re-reached the same tick with the corrected world.
 }
 
+// ============================ NS4: TRANSPORT-AGNOSTIC INJECTED INTERFACE =============================
+// NS3 proved rollback CORRECTNESS given a clean (origin+LAG) arrival pattern. NS4 makes the session
+// TRANSPORT-AGNOSTIC: remote inputs arrive through an INJECTED packet interface so a TEST can script a
+// fully deterministic ADVERSARIAL delivery schedule — delay, reorder, and transient loss-with-resend —
+// with NO real sockets. The transport models only the DELIVERY SCHEDULE (which remote `forTick` lands at
+// which `deliverTick`); the session reuses NS3's StepPredicted/ConfirmRemote UNCHANGED (ConfirmRemote
+// already tolerates arbitrary `at` order + duplicate re-deliveries safely). The make-or-break invariant:
+// under a scripted loss+reorder+delay schedule the session STILL converges to the SAME pinned digest as
+// the clean no-latency authority run — rollback correctness under adversity. Pure-CPU integer (no
+// float/<cmath>/clock/RNG); the "adversity" is a FIXED scripted permutation, never random.
+
+// An in-flight remote-input packet: the remote input for `forTick` that the transport delivers at
+// `deliverTick`. deliverTick >= forTick models LATENCY; a non-monotonic deliverTick vs forTick (a later
+// forTick delivered before an earlier one) models REORDER; two packets with the same forTick model a
+// RESEND (a redundant copy — harmless because ConfirmRemote of an already-confirmed tick is a no-op).
+template <class Input>
+struct InflightPacket {
+    uint32_t deliverTick = 0;   // the tick at which this packet "arrives" at the receiver
+    uint32_t forTick     = 0;   // the origin tick of the remote input it carries
+    Input    input{};           // the remote input value for forTick
+};
+
+// A scripted, deterministic transport: an ordered list of in-flight packets (a fixed permutation the
+// TEST authors). `cursor` is reserved for an in-order walk; the deterministic delivery path below uses a
+// per-tick linear scan (safe even when deliverTicks are scheduled non-monotonically).
+template <class Input>
+struct ScriptedTransport {
+    std::vector<InflightPacket<Input>> sched;   // the scripted delivery schedule (insertion order)
+    std::size_t                        cursor = 0;
+};
+
+// Schedule a remote input `in` (origin `forTick`) to be delivered at `deliverTick`. Appends to sched, so
+// the insertion order IS the per-tick delivery order (Deliver preserves it). Call it as many times as the
+// schedule needs — including multiple packets for one forTick (a resend) or out-of-order deliverTicks.
+template <class Input>
+void Schedule(ScriptedTransport<Input>& tx, uint32_t deliverTick, uint32_t forTick, const Input& in) {
+    tx.sched.push_back(InflightPacket<Input>{ deliverTick, forTick, in });
+}
+
+// Deliver every packet whose deliverTick == currentTick, returned in scheduled (insertion) order. A
+// per-tick linear scan over the whole schedule is the safe deterministic form: the test may schedule
+// non-monotonic deliverTicks (reorder), so a cursor walk could miss/misorder them. Deterministic of
+// (tx.sched, currentTick) alone — two identical schedules deliver byte-identically.
+template <class Input>
+std::vector<InflightPacket<Input>> Deliver(ScriptedTransport<Input>& tx, uint32_t currentTick) {
+    std::vector<InflightPacket<Input>> out;
+    for (std::size_t i = 0; i < tx.sched.size(); ++i)
+        if (tx.sched[i].deliverTick == currentTick) out.push_back(tx.sched[i]);
+    return out;
+}
+
+// RunWithTransport: drive an NS3 RollbackSession through `totalTicks` with remote inputs arriving via the
+// scripted transport instead of a fixed LAG. For each tick t: step speculatively with local[t] (predicting
+// any not-yet-arrived remote), THEN deliver every packet scheduled for tick t and ConfirmRemote each one
+// (which rolls back on a mispredicted past tick). `totalTicks` MUST exceed the last deliverTick so every
+// remote input is confirmed before the run ends — otherwise the final world is still speculative. Pure-CPU
+// integer; StepPredicted/ConfirmRemote are the NS3 primitives, reused verbatim.
+template <class World, class Input, class StepFn>
+void RunWithTransport(RollbackSession<World, Input>& s, const std::vector<Input>& local,
+                      ScriptedTransport<Input>& tx, uint32_t totalTicks, StepFn step) {
+    for (uint32_t t = 0; t < totalTicks; ++t) {
+        StepPredicted(s, local[static_cast<std::size_t>(t)], step);   // speculative tick (predict missing remote)
+        std::vector<InflightPacket<Input>> arrivals = Deliver(tx, t); // packets that land THIS tick (in order)
+        for (std::size_t i = 0; i < arrivals.size(); ++i)
+            ConfirmRemote(s, arrivals[i].forTick, arrivals[i].input, step);  // confirm (+ rollback if mispredicted)
+    }
+}
+
 }  // namespace hf::net

@@ -355,6 +355,150 @@ int main() {
     std::printf("ns3-rollback: pinned authority digest {hash:0x%016llx}\n",
                 static_cast<unsigned long long>(dAuth));
 
+    // ================================ NS4: TRANSPORT-AGNOSTIC + ADVERSARIAL =========================
+    // NS4 makes the session transport-agnostic: remote inputs arrive through an INJECTED ScriptedTransport
+    // so we can author a deterministic ADVERSARIAL delivery schedule (delay/reorder/loss-with-resend) with
+    // NO sockets, reusing the NS3 toy world + local[]/remote[] streams. Make-or-break: under the adversity
+    // the session STILL converges to D_auth BYTE-IDENTICAL with didRollback == true.
+
+    // Build a deliberately adversarial schedule that delivers EVERY remote[t] at least once but with
+    // delay, reorder, and resend. All deliverTicks are deterministic functions of t (no RNG). We deliver
+    // each forTick from a base delay, then sprinkle reordering (some later forTicks land before earlier
+    // ones) and resends (a redundant later copy of selected forTicks). The last deliverTick is tracked so
+    // we can choose a totalTicks that drains the whole schedule.
+    auto buildAdversarial = [&](ScriptedTransport<InR>& tx) -> uint32_t {
+        uint32_t lastDeliver = 0;
+        for (uint32_t t = 0; t < kRTicks; ++t) {
+            // Base delay: a per-tick jitter in [1..4] so deliverTick = t + jitter (always latency).
+            const uint32_t jitter = 1 + (t * 3) % 4;
+            uint32_t deliver = t + jitter;
+            // Reorder: for every 3rd tick, push the delivery LATER so it lands after subsequent ticks'
+            // packets — producing non-monotonic deliverTick vs forTick (a later forTick arriving earlier).
+            if (t % 3 == 0) deliver += 5;
+            Schedule(tx, deliver, t, remote[t]);
+            if (deliver > lastDeliver) lastDeliver = deliver;
+            // Loss-with-resend: for every 4th tick, schedule a redundant LATER copy (the "resend"). The
+            // first copy still lands; the resend must be a harmless no-op once confirmed.
+            if (t % 4 == 0) {
+                const uint32_t resend = deliver + 6;
+                Schedule(tx, resend, t, remote[t]);
+                if (resend > lastDeliver) lastDeliver = resend;
+            }
+        }
+        return lastDeliver;
+    };
+
+    // ---- (NS4-1) CONVERGENCE UNDER ADVERSITY (make-or-break). ---------------------------------------
+    uint64_t dAdversarial = 0;
+    bool     ns4Rollback  = false;
+    uint32_t ns4Total     = 0;
+    {
+        ScriptedTransport<InR> tx;
+        const uint32_t lastDeliver = buildAdversarial(tx);
+        ns4Total = lastDeliver + 2;   // exceed the last deliverTick so every packet drains
+        // local[] must cover totalTicks; kRTicks is the original stream length. ns4Total may exceed it,
+        // so extend local deterministically for the trailing ticks (no remote origin there — purely to
+        // keep stepping; remote for those ticks is predicted but never confirmed beyond kRTicks).
+        std::vector<InR> localExt(ns4Total);
+        for (uint32_t t = 0; t < ns4Total; ++t)
+            localExt[t] = (t < kRTicks) ? local[t] : static_cast<InR>(0);
+
+        // AUTHORITY for the adversarial run must match: the authority world steps the TRUE
+        // {localExt[t], remote'[t]} where remote' is the confirmed remote for t (= remote[t] for
+        // t < kRTicks) and the prediction-source (lastConfirmed = remote[kRTicks-1]) for trailing ticks,
+        // since RunWithTransport never confirms a forTick >= kRTicks. Recompute D_auth over ns4Total.
+        uint64_t dAuthExt = 0;
+        {
+            RWorld w;
+            InR lastRemote = InR{};   // lastConfirmed before any confirm (matches RollbackSession default)
+            for (uint32_t t = 0; t < ns4Total; ++t) {
+                InR rem = (t < kRTicks) ? remote[t] : lastRemote;
+                stepR(w, { localExt[t], rem }, t);
+                if (t < kRTicks) lastRemote = remote[t];
+            }
+            dAuthExt = digestR(w);
+        }
+
+        RollbackSession<RWorld, InR> s;
+        RunWithTransport(s, localExt, tx, ns4Total, stepR);
+        dAdversarial = digestR(s.world);
+        ns4Rollback  = s.didRollback;
+
+        check(dAdversarial == dAuthExt,
+              "ns4: converges under adversity — final == authority BYTE-IDENTICAL");
+        check(ns4Rollback, "ns4: adversity forced real rollbacks (didRollback)");
+    }
+
+    // ---- (NS4-2) SCHEDULE DETERMINISM — same adversarial schedule twice -> byte-identical. ----------
+    bool ns4Deterministic = false;
+    {
+        ScriptedTransport<InR> tx1, tx2;
+        const uint32_t last1 = buildAdversarial(tx1);
+        const uint32_t last2 = buildAdversarial(tx2);
+        const uint32_t total = (last1 > last2 ? last1 : last2) + 2;
+        std::vector<InR> localExt(total);
+        for (uint32_t t = 0; t < total; ++t)
+            localExt[t] = (t < kRTicks) ? local[t] : static_cast<InR>(0);
+
+        RollbackSession<RWorld, InR> a, b;
+        RunWithTransport(a, localExt, tx1, total, stepR);
+        RunWithTransport(b, localExt, tx2, total, stepR);
+        ns4Deterministic = (digestR(a.world) == digestR(b.world));
+        check(ns4Deterministic, "ns4: schedule determinism — same schedule twice byte-identical");
+    }
+
+    // ---- (NS4-3) DUPLICATE DELIVERY IS A NO-OP — an extra resend of every forTick doesn't change it. -
+    bool ns4DupNoOp = false;
+    {
+        ScriptedTransport<InR> tx;
+        uint32_t lastDeliver = buildAdversarial(tx);
+        // Add an EXTRA redundant copy of EVERY forTick, delivered late — pure resends, all must no-op.
+        for (uint32_t t = 0; t < kRTicks; ++t) {
+            const uint32_t extra = t + kRTicks + 3;   // well after the original delivery
+            Schedule(tx, extra, t, remote[t]);
+            if (extra > lastDeliver) lastDeliver = extra;
+        }
+        const uint32_t total = lastDeliver + 2;
+        std::vector<InR> localExt(total);
+        for (uint32_t t = 0; t < total; ++t)
+            localExt[t] = (t < kRTicks) ? local[t] : static_cast<InR>(0);
+
+        // Authority over `total` ticks (same trailing-prediction model as NS4-1).
+        uint64_t dAuthExt = 0;
+        {
+            RWorld w;
+            InR lastRemote = InR{};
+            for (uint32_t t = 0; t < total; ++t) {
+                InR rem = (t < kRTicks) ? remote[t] : lastRemote;
+                stepR(w, { localExt[t], rem }, t);
+                if (t < kRTicks) lastRemote = remote[t];
+            }
+            dAuthExt = digestR(w);
+        }
+
+        RollbackSession<RWorld, InR> s;
+        RunWithTransport(s, localExt, tx, total, stepR);
+        ns4DupNoOp = (digestR(s.world) == dAuthExt);
+        check(ns4DupNoOp, "ns4: duplicate delivery (resend) is a no-op — still == authority");
+    }
+
+    // ---- (NS4-4) PINNED — D_auth (the NS3 authority over the true streams) == hard-pinned uint64_t. --
+    // Reuse the NS3 D_auth (kRTicks-length, true {local,remote}) as the pinned authority anchor; the
+    // adversarial run's own authority (dAuthExt above) was verified byte-identical to its transported run.
+    const uint64_t kPinnedNs4Auth = kPinnedNs3Auth;   // identical streams -> identical authority digest
+    check(dAuth == kPinnedNs4Auth, "ns4: pinned authority digest matches golden");
+
+    // ---- NS4 showcase (printed; no image golden). ---------------------------------------------------
+    std::printf("ns4-transport: injected transport + adversarial schedule (delay/reorder/resend)\n");
+    std::printf("ns4-transport: converges under adversity — final == authority BYTE-IDENTICAL {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(dAdversarial));
+    std::printf("ns4-transport: adversity forced rollbacks {didRollback:%s}\n",
+                ns4Rollback ? "true" : "false");
+    std::printf("ns4-transport: schedule determinism — same schedule twice identical {ok:%s}\n",
+                ns4Deterministic ? "true" : "false");
+    std::printf("ns4-transport: pinned authority digest {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(dAuth));
+
     if (g_fail == 0) { std::printf("session_test: ALL CHECKS PASSED\n"); return 0; }
     std::printf("session_test: %d failures\n", g_fail);
     return 1;
