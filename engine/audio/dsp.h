@@ -147,4 +147,84 @@ inline std::vector<int16_t> RenderOsc(Wave wave, uint32_t freqHz, int sampleRate
     return out;
 }
 
+// =====================================================================================================
+// Slice DSP2 — Integer ADSR envelope NODE (Issue #26, flagship #23 DETERMINISTIC AUDIO, 2nd slice).
+// APPEND-ONLY: the DSP1 osc code above is untouched. A streaming envelope node that shapes a source
+// block sample-by-sample, carrying its elapsed-sample state (`t`) ACROSS ApplyEnvBlock calls — exactly
+// like DSP1's phase. Pure-CPU integer (Q15). NO <cmath>, NO float.
+//
+// The linear-ADSR math (Adsr fields + EnvelopeAt + MulQ15/ClampI16) is COPIED VERBATIM from
+// engine/audio/mixer.{h,cpp} (mixer.h Adsr / mixer.cpp:62-70 MulQ15+ClampI16 [already present above] /
+// mixer.cpp:95-122 EnvelopeAt) so the envelope is bit-identical to the mixer. We copy (not #include) to
+// keep dsp.h self-contained / single-translation-unit compilable (Mac clang one-file build).
+// -----------------------------------------------------------------------------------------------------
+
+// Piecewise-linear ADSR envelope. attack/decay/release in SAMPLES; sustainLevel in Q15 (0..32767).
+// Mirrors mixer.h's Adsr fields exactly.
+struct Adsr {
+    int attack = 0;            // samples
+    int decay = 0;             // samples
+    int sustainLevel = 32767;  // Q15
+    int release = 0;           // samples
+};
+
+// Evaluate the ADSR envelope at sample offset `t` within a voice of length `durSample`. Returns Q15 in
+// [0, 32767]. COPIED VERBATIM from mixer.cpp:95-122 (release-takes-precedence linear ADSR; the
+// int64-intermediate ramps); bit-identical to the mixer.
+inline int EnvelopeAt(const Adsr& env, int t, int durSample) {
+    if (t < 0 || t > durSample) return 0;
+
+    const int a = env.attack;
+    const int d = env.decay;
+    const int s = env.sustainLevel;
+    const int r = env.release;
+    const int releaseStart = durSample - r;   // sample offset where the release ramp begins
+
+    // Release region takes precedence (it runs against the END of the voice).
+    if (r > 0 && t >= releaseStart) {
+        // Level at the start of release is the sustain level; ramp sustain -> 0 over r samples.
+        const int into = t - releaseStart;             // 0..r
+        // s * (r - into) / r, integer.
+        return static_cast<int>((static_cast<int64_t>(s) * (r - into)) / r);
+    }
+    // Attack: 0 -> 32767 over [0, a).
+    if (a > 0 && t < a) {
+        return static_cast<int>((static_cast<int64_t>(32767) * t) / a);
+    }
+    // Decay: 32767 -> s over [a, a+d).
+    if (d > 0 && t < a + d) {
+        const int into = t - a;                         // 0..d
+        return static_cast<int>(32767 + (static_cast<int64_t>(s - 32767) * into) / d);
+    }
+    // Sustain: hold s.
+    return s;
+}
+
+// A STATEFUL envelope graph node. `t` is the elapsed-sample counter that carries ACROSS ApplyEnvBlock
+// calls — that is the whole point of the slice (block-boundary continuity for the envelope stage).
+struct EnvNode {
+    Adsr     env{};
+    int      durSample = 0;
+    uint32_t t         = 0;
+    bool     enabled   = true;
+};
+
+// Shape `src` sample-by-sample, APPENDING the result to `outAppend` (so N calls build one continuous
+// stream). If enabled, each sample is scaled by the envelope at the node's current `t`
+// (ClampI16(MulQ15(s, level))); if disabled, the sample is appended verbatim (bypass no-op). `node.t`
+// advances once per sample and is written back, so the envelope stage persists across calls.
+inline void ApplyEnvBlock(EnvNode& node, const std::vector<int16_t>& src,
+                          std::vector<int16_t>& outAppend) {
+    outAppend.reserve(outAppend.size() + src.size());
+    for (const int16_t s : src) {
+        if (node.enabled) {
+            const int level = EnvelopeAt(node.env, static_cast<int>(node.t), node.durSample);
+            outAppend.push_back(ClampI16(MulQ15(s, level)));
+        } else {
+            outAppend.push_back(s);
+        }
+        ++node.t;
+    }
+}
+
 }  // namespace hf::audio::dsp
