@@ -56503,6 +56503,294 @@ static int RunPt6RenderShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PCG6 — Deterministic PCG LIT 3D RENDER capstone (the money-shot COMPLETING FLAGSHIP #22). Mirrors
+// the Vulkan --pcg6-field-shot path EXACTLY: builds the SAME full PcgGraph (jittered-grid scatter over a 12x12 XZ
+// patch centred at the origin -> a radial density mask -> random yaw + scale [0.6,1.4] -> overlap-prune),
+// Generate(graph, stream) (bit-exact PCG1-PCG5 integer, a pure function of the seed), builds one per-instance
+// model matrix per instance (pcg.h::PcgToRenderInstances — the ONE float crossing, BOTH orient AND scale,
+// render-only), and renders the scattered field as lit 3D INSTANCED spheres through the EXISTING instanced lit
+// pipeline (lit_instanced.vert.gen.metal + lit.frag.gen.metal — the --pt6-render/--grain-render wiring) over the
+// ground + sky + shadow. THE GRAPH/SEED/baseRadius/CAMERA BELOW IS IDENTICAL to the Vulkan --pcg6-field-shot so
+// the instance set is byte-identical by construction (the float render then differs cross-vendor by the
+// documented baseline). The FLOAT visresolve-bar: Metal-render==Metal-golden DIFF 0.0000 (determinism, two-run)
+// + provenance (instances == recomputed PcgToRenderInstances(Generate(seed,graph))). New golden
+// tests/golden/metal/pcg6_field.png. NO new shader, NO RHI.
+static int RunPcg6FieldShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace pcg = hf::pcg;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === The bit-exact PCG1-PCG5 rock-field graph -> a scattered field (the SAME pcg.h graph + seed as the Vulkan
+    // --pcg6-field-shot — byte-identical instance set/transforms by construction). A 24x24 jittered-grid scatter
+    // over a 12x12 XZ patch centred at the origin, a RADIAL density mask centred in the patch, a random yaw +
+    // scale [0.6,1.4] per instance, and an overlap-prune so the rocks don't interpenetrate. ===
+    const uint32_t kSeed = 1337u;
+    const pcg::PcgStream stream{kSeed, 0u};
+    const float kBaseRadius = 0.35f;
+
+    pcg::PcgGraph graph;
+    graph.area.min = pcg::FxVec3{-6 * pcg::kOne, 0, -6 * pcg::kOne};
+    graph.area.max = pcg::FxVec3{ 6 * pcg::kOne, 0,  6 * pcg::kOne};
+    graph.cellsX = 24; graph.cellsZ = 24;
+    graph.useMask = true;
+    graph.mask.type   = pcg::PcgMaskType::Radial;
+    graph.mask.center = pcg::FxVec3{0, 0, 0};
+    graph.mask.radius = 7 * pcg::kOne;
+    graph.density     = pcg::kOne;
+    graph.transform.randomYaw = true;
+    graph.transform.scaleLo   = pcg::kOne * 6 / 10;
+    graph.transform.scaleHi   = pcg::kOne * 14 / 10;
+    graph.prune       = true;
+    graph.pruneRadius = pcg::kOne / 2;
+
+    const std::vector<pcg::PcgInstance> pcgInstances = pcg::Generate(graph, stream);
+    const uint32_t kGenCount = (uint32_t)pcgInstances.size();
+
+    const std::vector<Mat4> mats = pcg::PcgToRenderInstances(pcgInstances, kBaseRadius);
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(mats.size());
+    for (const Mat4& m : mats) {
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        instances.push_back(inst);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+    // === Reuse the EXISTING instanced lit pipeline (the --pt6-render/--grain-render wiring). ===
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = device->Swapchain().ColorFormat();
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    std::unique_ptr<rhi::IBuffer> instanceBuffer;
+    if (kInstanceCount > 0) {
+        rhi::BufferDesc instBufDesc;
+        instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+        instBufDesc.initialData = instances.data();
+        instBufDesc.usage = rhi::BufferUsage::Vertex;
+        instanceBuffer = device->CreateBuffer(instBufDesc);
+    }
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+    // Fixed 3/4 camera + directional light (== the Vulkan --pcg6-field-shot camera).
+    const Vec3 eye{13.0f, 9.0f, 13.0f};
+    const Vec3 center{0.0f, 0.5f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 0.0f, 0.0f};
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 22.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-16.0f, 16.0f, -16.0f, 16.0f, 1.0f, 52.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graphRg;
+    render::RgResource rgShadow = graphRg.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graphRg.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graphRg.ImportSwapchain("swapchain");
+
+    graphRg.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instShadowPipeline);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graphRg.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instPipeline);
+                float material[4] = {0.55f, 0.5f, 0.45f, 0.0f};   // a warm matte ROCK-colored material
+                cmd.PushConstants(material, sizeof(material));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graphRg.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graphRg.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    // PROOF (1) headline + provenance count. "shaded" = non-dark pixels (the lit ground + rocks).
+    uint32_t shaded = 0;
+    for (size_t p = 0; p + 3 < bgra.size(); p += 4)
+        if ((int)bgra[p] + (int)bgra[p + 1] + (int)bgra[p + 2] > 60) ++shaded;
+    std::printf("pcg6-field: procedural rock field (instances:%u, lit 3D instanced spheres, seed=%u)\n",
+                kInstanceCount, kSeed);
+    if (kInstanceCount != kGenCount) return fail("pcg6-field instances != Generate count");
+
+    // PROOF (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graphRg.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("pcg6-field two renders DIFFER (nondeterministic)");
+    std::printf("pcg6-field: two renders BYTE-IDENTICAL\n");
+
+    // PROOF (3) coverage / coherence + provenance: shaded>0, not uniform, instances == recomputed.
+    if (shaded == 0) return fail("pcg6-field coverage 0 (nothing shaded)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("pcg6-field uniform image (no coherent field)");
+    {
+        const std::vector<pcg::PcgInstance> regen = pcg::Generate(graph, stream);
+        const std::vector<Mat4> rebuild = pcg::PcgToRenderInstances(regen, kBaseRadius);
+        if (rebuild.size() != mats.size() ||
+            std::memcmp(rebuild.data(), mats.data(), mats.size() * sizeof(Mat4)) != 0)
+            return fail("pcg6-field provenance: instances != recomputed PcgToRenderInstances(Generate)");
+    }
+    std::printf("pcg6-field: provenance instances == PcgToRenderInstances(Generate(seed,graph)) "
+                "{instances:%u, shaded:%u}\n", kInstanceCount, shaded);
+
+    // PROOF (4) empty no-op: an empty graph (cellsX<=0) -> zero instances -> the cleared base scene.
+    {
+        pcg::PcgGraph emptyGraph = graph;
+        emptyGraph.cellsX = 0;
+        const std::vector<pcg::PcgInstance> emptyGen = pcg::Generate(emptyGraph, stream);
+        if (!emptyGen.empty() || !pcg::PcgToRenderInstances(emptyGen, kBaseRadius).empty())
+            return fail("pcg6-field empty graph not empty");
+    }
+    std::printf("pcg6-field: empty graph -> base scene (no-op) {emptyInstances:0}\n");
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — deterministic PCG scattered rock field lit 3D render (%u instances)\n",
+                outPath, cw, ch, kInstanceCount);
+    return 0;
+}
+
 // --- Deterministic GPU Granular/Sand LIT 3D RENDER CAPSTONE showcase (Slice GR6, the money-shot COMPLETING
 // FLAGSHIP #10 — the TENTH flagship). Mirrors the Vulkan --grain-render-shot path EXACTLY: runs the bit-exact
 // GR1-GR5 friction sim (the SAME tall/narrow 4x8x4 staggered column dropped onto FLAT ground, NO container,
@@ -69563,6 +69851,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pt6-render") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pt6_render.png";
             try { return RunPt6RenderShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pcg6-field <out.png>: render the Deterministic PCG LIT 3D RENDER capstone showcase (Slice PCG6, the
+        // money-shot COMPLETING FLAGSHIP #22). Builds the SAME full PcgGraph (jittered-grid scatter -> radial
+        // density mask -> random yaw + scale [0.6,1.4] -> overlap-prune) + seed as the Vulkan --pcg6-field-shot,
+        // Generate(graph, stream) (bit-exact PCG1-PCG5 integer), builds one model matrix per instance
+        // (PcgToRenderInstances), and renders the scattered ROCK FIELD as lit 3D instanced spheres through the
+        // EXISTING instanced lit pipeline (the --pt6-render/--grain-render wiring) over the ground/sky/shadow. The
+        // instance set + transforms are byte-identical to the Vulkan --pcg6-field-shot by construction. FLOAT
+        // visresolve-bar: Metal-render==Metal-golden DIFF 0.0000 + provenance; cross-vendor ~the float baseline.
+        // New golden tests/golden/metal/pcg6_field.png. NO new shader, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--pcg6-field") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pcg6_field.png";
+            try { return RunPcg6FieldShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --couple-render <out.png>: render the Deterministic Rigid<->Fluid Coupling LIT 3D RENDER capstone

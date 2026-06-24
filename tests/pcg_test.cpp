@@ -432,6 +432,24 @@ int main() {
         // (6) empty — cellsX<=0 -> empty.
         pcg::PcgGraph gEmpty = g; gEmpty.cellsX = 0;
         check(pcg::Generate(gEmpty, st).empty(), "PCG5 empty: cellsX<=0 -> empty graph");
+
+        // ============= PCG6 render bridge: PcgToRenderInstances provenance + count + no-op =============
+        // The render bridge is a PURE FUNCTION of the bit-exact Generate output: one Mat4 per instance,
+        // count matches, deterministic across calls, and empty-in -> empty-out (the base-scene no-op).
+        const float kBaseRadius = 0.35f;
+        const std::vector<math::Mat4> rmats = pcg::PcgToRenderInstances(survivors, kBaseRadius);
+        check(rmats.size() == survivors.size(),
+              "PCG6 render bridge: one model matrix per instance (count matches Generate)");
+        const std::vector<math::Mat4> rmats2 = pcg::PcgToRenderInstances(survivors, kBaseRadius);
+        bool rstable = (rmats.size() == rmats2.size());
+        for (size_t i = 0; i < rmats.size() && rstable; ++i)
+            for (int k = 0; k < 16 && rstable; ++k)
+                if (rmats[i].m[k] != rmats2[i].m[k]) rstable = false;
+        check(rstable, "PCG6 render bridge: deterministic (two calls byte-identical)");
+        check(pcg::PcgToRenderInstances({}, kBaseRadius).empty(),
+              "PCG6 render bridge: empty instances -> empty output (base-scene no-op)");
+        check(pcg::PcgToRenderInstances(pcg::Generate(gEmpty, st), kBaseRadius).empty(),
+              "PCG6 render bridge: empty graph -> zero render instances (no-op)");
     }
 
     if (g_fail == 0) std::printf("pcg_test: ALL CHECKS PASSED\n");

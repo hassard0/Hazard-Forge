@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "math/math.h"         // Slice PCG6 render bridge ONLY: math::Mat4 / Quat / Vec3 / FromTRS / Normalize (float)
 #include "sim/fpx.h"            // Q16.16 toolbox (read-only): fx / kOne / kFrac / fxmul / FxVec3
 #include "sim/particles.h"     // ParticleHash (the avalanche shape) + EmitDir (the no-trig direction table), read-only
 
@@ -351,6 +352,40 @@ inline std::vector<PcgInstance> Generate(const PcgGraph& g, const PcgStream& str
     std::vector<PcgInstance> instances = BuildInstances(points, stream, g.transform);
     if (g.prune) instances = PruneOverlaps(instances, g.pruneRadius);
     return instances;
+}
+
+// ===== Slice PCG6 — LIT 3D render bridge (FLOAT, render-only — the money-shot capstone of FLAGSHIP #22) ======
+// THE ONE FLOAT CROSSING of the whole flagship. PCG1-PCG5 above stay STRICT INTEGER (bit-exact cross-platform);
+// here — and ONLY here — we cross to float to build per-instance render transforms for the rasterizer. This is
+// the documented FLOAT visresolve-bar (the FPX6/GR6/PT6 precedent): the GENERATION (Generate) is bit-exact, the
+// final raster/shade is float (cross-vendor ~the engine baseline, NOT held to the integer zero-diff bar). The
+// provenance proof: every transform derives from the bit-exact PcgInstance{pos, orient, scale} that Generate
+// emits. Render-only — NOT used by PCG1-PCG5, NO sim mutation. The grain::GrainToRenderInstances /
+// particles::ParticleToRenderInstances / fpx::FxBodyTransform twin, but per-instance it uses BOTH the orient
+// AND the (Q16.16 uniform) scale — grain/particle were position + uniform-radius only.
+
+// PcgToRenderInstances(instances, baseRadius): build ONE column-major model matrix per instance —
+// translate(pos/(float)kOne) * rotate(normalize(orient/(float)kOne)) * scale(scale/(float)kOne * baseRadius).
+// The ONE host fixed-point->float conversion is fpx::FxToFloat (v / (float)kOne); the fixed-point orient is
+// converted to a float quat then renormalized in float (the integer quat drifts slightly — a clean render
+// rotation). Output is the scene::InstanceData / InstanceTransformLayout packing the EXISTING instanced lit
+// pipeline consumes (16 floats per instance, column-major), matching grain::GrainToRenderInstances EXACTLY.
+// Empty input -> empty output (the empty no-op: zero instances -> the cleared base scene). Pure deterministic
+// host float (no RNG, no clock). The ONLY float code in pcg.h.
+inline std::vector<math::Mat4> PcgToRenderInstances(const std::vector<PcgInstance>& instances, float baseRadius) {
+    std::vector<math::Mat4> out;
+    out.reserve(instances.size());
+    for (const PcgInstance& inst : instances) {
+        const math::Vec3 t{hf::sim::fpx::FxToFloat(inst.pos.x),
+                           hf::sim::fpx::FxToFloat(inst.pos.y),
+                           hf::sim::fpx::FxToFloat(inst.pos.z)};
+        const math::Quat q = math::Normalize(math::Quat{
+            hf::sim::fpx::FxToFloat(inst.orient.x), hf::sim::fpx::FxToFloat(inst.orient.y),
+            hf::sim::fpx::FxToFloat(inst.orient.z), hf::sim::fpx::FxToFloat(inst.orient.w)});
+        const float r = hf::sim::fpx::FxToFloat(inst.scale) * baseRadius;
+        out.push_back(math::FromTRS(t, q, math::Vec3{r, r, r}));
+    }
+    return out;
 }
 
 }  // namespace hf::pcg
