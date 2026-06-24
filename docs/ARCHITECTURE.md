@@ -1311,6 +1311,55 @@ It is unit-tested (`terrain_test`, which re-implements the locked formula indepe
 
 The resident tile set **and** each tile's LOD are pure functions of (camera position, radii, budget, distance→LOD bands, prior state); driven by a fixed scripted camera path (no live input/RNG/clock) the per-frame `{resident tiles + LODs}` is bit-stable run-to-run and across backends. Unit-tested (`terrain_stream_test`: tile coverage + shared-edge seamlessness, the band/hysteresis functions, the per-LOD counts, residency+LOD determinism, refine-on-approach rebuild) and golden-captured (`--terrain-stream-shot` / `--terrain-stream`, the `terrain_stream` golden); the showcase reports a fixed `frame:45, resident:22, lod0:4, lod1:8, lod2:10` line.
 
+### Deterministic procedural terrain + integer erosion (`engine/terrain/procterrain.h` + `erosion.h`, namespace `hf::terrain`) — flagship #26
+
+Slices PT1–PT6 add a **deterministic procedural landscape**: a strict-integer fBm heightfield + bit-identical
+RUNTIME integer hydraulic/thermal **erosion** + a lit terrain mesh + the wind-swept FOLIAGE meadow seated on the
+eroded surface. The float `Height`/`BuildTerrain` above are *deterministic by recompilation*; these new additive
+siblings (`procterrain.h` + `erosion.h`, the frozen `heightmap.*` untouched) are the engine's **Q16.16 integer**
+discipline applied to terrain, and they add the thing no offline tool ships: a seed + iteration count → the EXACT
+same eroded valley — the heightfield AND the erosion deltas — byte-for-byte on Vulkan/Windows and Metal/macOS, every
+run. The moat (one comparison aside): a landscape tool's erosion brushes are an OFFLINE, non-deterministic bake — you
+cannot ship the seed and reproduce the terrain on a peer; here erosion is a pure integer function of (seed, iters),
+so two peers grow the byte-identical eroded world. The heightfield/erosion **data** carries strict-integer zero-diff
+cross-backend goldens (the strongest bar — CPU-rendered integer heightmaps/erosion-delta heatmaps); only the lit 3D
+mesh + hero cross to **float** (the visresolve-bar). Erosion is CPU-host (the int64-`fxmul`/glslc-Metal shader
+boundary), so the render reuses the existing lit mesh + instanced-foliage pipelines verbatim — **no new shader, no
+new RHI** across the flagship.
+
+- **Integer fBm heightfield (PT1).** `IntHeight`/`GenHeightField` — a Q16.16 fractal sum of integer value-noise
+  octaves (a `PcgHash`-style lattice + an integer smoothstep fade), NO runtime `sin`/`sqrt`/`floor`. **Proof:** a
+  pure-integer grayscale heightmap, strict zero-diff cross-backend, seed-sensitive, zero-octaves flat no-op. Golden
+  `pt1_height`.
+- **Integer hydraulic erosion (PT2, the headline + crux).** `ErodeHydraulic` — a mass-conserving, contractive
+  integer flux: in pinned Gauss-Seidel order each cell moves `fxmul(slope, kErodeRate)` of height to its lowest
+  neighbour, carving drainage. The crux is fixed-point stability: the SAME moved value gives **EXACT mass
+  conservation** (no tolerance), and `rate ≤ kOne/4` guarantees no height inversion (no oscillation). **Proof:**
+  strict zero-diff erosion-delta heatmap, mass conserved EXACTLY (delta 0), zero-iters no-op, carves (changed cells +
+  a sampled peak drops). Golden `pt2_hydraulic`.
+- **Integer thermal erosion / slope-slump (PT3).** `ErodeThermal` — where a slope exceeds the talus angle, the
+  round-to-nearest half-excess slumps to the lowest neighbour, settling the field to the angle of repose
+  (mass-conserving, non-inverting). Complements hydraulic's channels with talus/scree. **Proof:** strict zero-diff
+  slump heatmap (active only on steep slopes), exact mass conservation, `max slope ≤ talus` after settle, composes
+  with hydraulic. Golden `pt3_thermal`.
+- **Eroded terrain mesh (PT4, FLOAT).** `BuildIntTerrainMesh` — the eroded integer grid → a lit grid mesh (per-vertex
+  `FxToFloat(height)` Y + a deterministic host-float central-difference normal — the one float crossing — + a
+  height-tint color ramp), rendered through the existing lit pipeline. **Proof:** two renders byte-identical +
+  provenance (`verts == n²`) + flat-grid → flat-plane no-op; Metal two-run 0.0000 + cross-vendor mean. Golden
+  `pt4_mesh`.
+- **Foliage-on-terrain (PT5, FLOAT, composes flagship #25).** `SampleHeight` — a pure-integer bilinear sample of the
+  eroded grid that seats every foliage plant on the surface, so the deterministic wind-swept meadow grows on the
+  eroded valley. **Proof:** every `plant.y == SampleHeight(grid, plant.xz)` (the seating is a provenance-checked pure
+  function), two renders byte-identical, empty-graph → bare terrain. Golden `pt5_meadow`.
+- **The hero (PT6, FLOAT capstone).** A cinematic low camera across an eroded valley carpeted with the wind-swept
+  meadow — carved relief, plants leaning in the deterministic wind, receding to the horizon with LOD. **Proof:** two
+  renders byte-identical + provenance; Metal two-run 0.0000, cross-vendor mean 21.81, eyeballed. Golden `pt6_hero`.
+  **Completes flagship #26 — deterministic procedural terrain.** Honest scope: a single ~256² eroded patch (not
+  infinite/streamed — the seamless multi-tile erosion is a follow-up); a simplified sediment-transport + talus model,
+  not a geomorphology sim; integer fixed-point erosion is a stable, bit-identical approximation (mass-exact, not
+  geologically exact); a fixed-resolution grid mesh with height-tint vertex color through the unchanged lit shader
+  (no tessellation/splat-map); the sky-IBL cool tint carried by framing/relief/wind.
+
 ---
 
 ## Material / Shader Graph Layer (`engine/material/`)
