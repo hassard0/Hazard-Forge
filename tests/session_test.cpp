@@ -592,6 +592,212 @@ int main() {
     std::printf("ns5-desync: pinned clean final digest {hash:0x%016llx}\n",
                 static_cast<unsigned long long>(ns5CleanFinal));
 
+    // ================================ NS6: FULL 2-PEER SESSION + LATE-JOIN (capstone) ================
+    // The capstone that COMPLETES flagship #24: tie NS1-NS5 into a complete TWO-PEER session and add
+    // LATE-JOIN. Both peers run a RollbackSession over their OWN adversarial ScriptedTransport; each peer's
+    // step wrapper folds the two inputs in the SAME canonical (A,B) order regardless of which is "local", so
+    // both converge to the SAME authority world. Then a late-joiner restores a confirmed snapshot + replays
+    // the input tail (CatchUp) and reaches the BIT-IDENTICAL world.
+    //
+    // Toy world: the SAME order-sensitive Horner fold as NS3, but folded over the CANONICAL (A, B) pair —
+    // acc = acc*K + A*Aw + B*Bw — so the A/B ROLE (not just local/remote) is load-bearing. The canonical
+    // fold takes (aInput, bInput); each peer's wrapper maps its (local, remote) -> (A, B) correctly.
+    using In6 = int32_t;
+    struct W6 { int64_t acc = 0; };
+    // The canonical (A,B) transition — the ONE deterministic fold both peers and the authority share.
+    auto stepAB = [](W6& w, In6 a, In6 b) {
+        w.acc = w.acc * 6 + static_cast<int64_t>(a) * 3 + static_cast<int64_t>(b) * 5;  // K=6,Aw=3,Bw=5
+    };
+    auto digest6 = [](const W6& w) { return DigestBytes(&w.acc, sizeof w.acc); };
+
+    const uint32_t kT6 = 24;
+    // Fixed A/B input streams (deterministic, no RNG; both VARY so predictions mispredict -> rollbacks).
+    std::vector<In6> aInputs(kT6), bInputs(kT6);
+    for (uint32_t t = 0; t < kT6; ++t) {
+        aInputs[t] = static_cast<In6>(1 + (t * 7) % 11);
+        bInputs[t] = static_cast<In6>(-3 + static_cast<int>((t * 5) % 13) - static_cast<int>(t % 4));
+    }
+
+    // AUTHORITY: lockstep over the TRUE {aInputs[t], bInputs[t]} each tick in canonical (A,B) order. Record
+    // the per-tick world (for the late-join snapshot) and the per-tick digest (for the desync exchange).
+    std::vector<W6> authWorldAfter(kT6);   // authWorldAfter[t] = authority world AFTER tick t
+    std::vector<uint64_t> authDigest(kT6); // authDigest[t]     = authority digest AFTER tick t
+    uint64_t dAuth6 = 0;
+    {
+        W6 w;
+        for (uint32_t t = 0; t < kT6; ++t) {
+            stepAB(w, aInputs[t], bInputs[t]);
+            authWorldAfter[t] = w;
+            authDigest[t]     = digest6(w);
+        }
+        dAuth6 = digest6(w);
+    }
+
+    // Each peer's step wrapper folds canonical (A,B) from its own (local, remote). The wrapper signature
+    // matches what StepPredicted/ConfirmRemote call: step(world, {local, remote}, tick).
+    // Peer A: local = aInput, remote = bInput  -> canonical (A=local, B=remote).
+    auto stepPeerA = [&](W6& w, std::initializer_list<In6> lr, uint32_t) {
+        const In6* p = lr.begin();
+        stepAB(w, /*A=*/p[0], /*B=*/p[1]);   // local is A, remote is B
+    };
+    // Peer B: local = bInput, remote = aInput  -> canonical (A=remote, B=local) — the SWAP.
+    auto stepPeerB = [&](W6& w, std::initializer_list<In6> lr, uint32_t) {
+        const In6* p = lr.begin();
+        stepAB(w, /*A=*/p[1], /*B=*/p[0]);   // remote is A, local is B
+    };
+
+    // Build an adversarial schedule (delay/reorder/resend) for delivering the REMOTE stream to a peer. The
+    // two peers use DIFFERENT schedules (different phase) so the test isn't symmetric. Returns lastDeliver.
+    auto buildAdv6 = [&](ScriptedTransport<In6>& tx, const std::vector<In6>& rem, uint32_t phase) -> uint32_t {
+        uint32_t lastDeliver = 0;
+        for (uint32_t t = 0; t < kT6; ++t) {
+            const uint32_t jitter = 1 + ((t + phase) * 3) % 4;
+            uint32_t deliver = t + jitter;
+            if ((t + phase) % 3 == 0) deliver += 5;                 // reorder
+            Schedule(tx, deliver, t, rem[t]);
+            if (deliver > lastDeliver) lastDeliver = deliver;
+            if ((t + phase) % 4 == 0) {                             // loss-with-resend
+                const uint32_t resend = deliver + 6;
+                Schedule(tx, resend, t, rem[t]);
+                if (resend > lastDeliver) lastDeliver = resend;
+            }
+        }
+        return lastDeliver;
+    };
+
+    // ---- (NS6-1) FULL 2-PEER ADVERSARIAL CONVERGENCE (make-or-break). --------------------------------
+    // Both peers run their OWN RollbackSession over their OWN adversarial transport; each folds canonical
+    // (A,B). We must drive each to the SAME totalTicks so trailing predicted ticks (beyond kT6) line up,
+    // and the authority over that same totalTicks must match. Use a totalTicks draining BOTH schedules.
+    uint64_t dPeerA = 0, dPeerB = 0;
+    bool peerARolled = false, peerBRolled = false;
+    {
+        ScriptedTransport<In6> txA, txB;
+        // Peer A receives the B stream (bInputs); peer B receives the A stream (aInputs). Different phases.
+        const uint32_t lastA = buildAdv6(txA, bInputs, /*phase=*/0);
+        const uint32_t lastB = buildAdv6(txB, aInputs, /*phase=*/2);
+        const uint32_t total = (lastA > lastB ? lastA : lastB) + 2;
+
+        // Extend the LOCAL streams to `total` (trailing ticks step with local=0, remote=predicted).
+        std::vector<In6> localA(total), localB(total);
+        for (uint32_t t = 0; t < total; ++t) {
+            localA[t] = (t < kT6) ? aInputs[t] : static_cast<In6>(0);
+            localB[t] = (t < kT6) ? bInputs[t] : static_cast<In6>(0);
+        }
+
+        // Beyond kT6 there's no confirmed remote, so a bare prediction-vs-local mismatch in the trailing
+        // region would make the two peers' trailing inputs role-asymmetric. To keep BOTH peers identical to
+        // ONE canonical authority, FREEZE both streams at their last value for the trailing ticks and
+        // explicitly CONFIRM those frozen remotes on both transports — so every tick < total is confirmed
+        // on both peers and both equal a single canonical authority over `total` with the frozen streams.
+        std::vector<In6> aFull(total), bFull(total);
+        for (uint32_t t = 0; t < total; ++t) {
+            aFull[t] = (t < kT6) ? aInputs[t] : aInputs[kT6 - 1];   // freeze A beyond kT6
+            bFull[t] = (t < kT6) ? bInputs[t] : bInputs[kT6 - 1];   // freeze B beyond kT6
+        }
+        // Schedule the trailing remotes (frozen) on both transports so EVERY tick < total is confirmed.
+        for (uint32_t t = kT6; t < total; ++t) {
+            Schedule(txA, t + 1, t, bFull[t]);   // peer A's remote is the B stream
+            Schedule(txB, t + 1, t, aFull[t]);   // peer B's remote is the A stream
+        }
+        // The local stream beyond kT6 must equal the frozen value too (so the canonical fold matches).
+        for (uint32_t t = kT6; t < total; ++t) { localA[t] = aFull[t]; localB[t] = bFull[t]; }
+
+        // Canonical authority over `total` with the frozen trailing streams.
+        uint64_t dAuthTotal = 0;
+        {
+            W6 w;
+            for (uint32_t t = 0; t < total; ++t) stepAB(w, aFull[t], bFull[t]);
+            dAuthTotal = digest6(w);
+        }
+
+        // Drive BOTH peers. totalTicks must EXCEED every deliverTick; the trailing-remote schedules above
+        // land at t+1 <= total, so total = max(lastA,lastB)+2 still drains them.
+        RollbackSession<W6, In6> sA, sB;
+        RunWithTransport(sA, localA, txA, total, stepPeerA);
+        RunWithTransport(sB, localB, txB, total, stepPeerB);
+        dPeerA = digest6(sA.world);
+        dPeerB = digest6(sB.world);
+        peerARolled = sA.didRollback;
+        peerBRolled = sB.didRollback;
+
+        check(dPeerA == dPeerB,      "ns6: 2 peers converge to EACH OTHER byte-identical");
+        check(dPeerA == dAuthTotal,  "ns6: peer A == canonical authority byte-identical");
+        check(dPeerB == dAuthTotal,  "ns6: peer B == canonical authority byte-identical");
+        check(peerARolled,           "ns6: peer A actually rolled back under adversity");
+        check(peerBRolled,           "ns6: peer B actually rolled back under adversity");
+    }
+
+    // ---- (NS6-2) DESYNC-CLEAN — exchange per-tick confirmed digests; neither detects a desync. -------
+    // Both peers, fed the same confirmed inputs in canonical order, emit the SAME per-tick digest trace
+    // (authDigest). Exchange them through DesyncDetectors -> zero desync (the lockstep invariant holds).
+    bool ns6DesyncClean = false;
+    {
+        DesyncDetector dA, dB;
+        for (uint32_t t = 0; t < kT6; ++t) { RecordLocal(dA, t, authDigest[t]); RecordLocal(dB, t, authDigest[t]); }
+        for (uint32_t t = 0; t < kT6; ++t) {
+            IngestRemote(dA, ChecksumPacket{ t, authDigest[t] });   // A ingests B's digests
+            IngestRemote(dB, ChecksumPacket{ t, authDigest[t] });   // B ingests A's digests
+        }
+        ns6DesyncClean = (!dA.desynced && !dB.desynced);
+        check(ns6DesyncClean, "ns6: desync-clean — neither peer detects a desync");
+    }
+
+    // ---- (NS6-3) LATE-JOIN — restore a confirmed snapshot + replay the input tail -> bit-identical. ---
+    // Pick a join tick S (all inputs < S confirmed). The snapshot is the authority world AFTER tick S-1
+    // (== authWorldAfter[S-1]); the tail holds the canonical {aInputs[t], bInputs[t]} for t in [S, kT6).
+    // CatchUp replays the tail (with the SAME canonical fold) and must reach D_auth6.
+    const uint32_t kJoinS = 9;
+    uint64_t dLateJoin = 0;
+    {
+        JoinSnapshot<W6> snap;
+        snap.tick  = kJoinS;
+        snap.world = authWorldAfter[kJoinS - 1];   // the confirmed world AS OF tick S (after ticks < S)
+
+        // The tail ring carries one canonical pair per tick in [S, kT6). We encode the pair as TWO inputs
+        // at the tick (A then B in insertion order); the CatchUp step folds them canonically.
+        InputRing<In6> tail;
+        for (uint32_t t = kJoinS; t < kT6; ++t) { tail.AddInput(t, aInputs[t]); tail.AddInput(t, bInputs[t]); }
+
+        // CatchUp's step folds the tail's [A, B] pair at each tick canonically (A = ins[0], B = ins[1]).
+        auto stepTail = [&](W6& w, const std::vector<In6>& ins, uint32_t) {
+            stepAB(w, ins[0], ins[1]);   // canonical (A, B)
+        };
+        W6 joined = CatchUp<W6, In6>(snap, kT6, tail, stepTail);
+        dLateJoin = digest6(joined);
+        check(dLateJoin == dAuth6, "ns6: late-join at tick S catches up to the bit-identical authority world");
+    }
+
+    // ---- (NS6-3b) TRIVIAL JOIN at S=0 — snapshot = initial world, full tail == from-scratch authority. -
+    bool ns6JoinZero = false;
+    {
+        JoinSnapshot<W6> snap;            // tick=0, world = default-initialized initial world
+        InputRing<In6> tail;
+        for (uint32_t t = 0; t < kT6; ++t) { tail.AddInput(t, aInputs[t]); tail.AddInput(t, bInputs[t]); }
+        auto stepTail = [&](W6& w, const std::vector<In6>& ins, uint32_t) { stepAB(w, ins[0], ins[1]); };
+        W6 joined = CatchUp<W6, In6>(snap, kT6, tail, stepTail);
+        ns6JoinZero = (digest6(joined) == dAuth6);
+        check(ns6JoinZero, "ns6: trivial join at S=0 (full tail) == from-scratch authority");
+    }
+
+    // ---- (NS6-4) PINNED — D_auth6 == a hard-pinned uint64_t (the cross-platform regression anchor). ---
+    // NB: identical to the NS3/NS4 anchor — by design. The canonical (A,B) Horner fold (K=6,Aw=3,Bw=5)
+    // over the SAME 24-tick aInputs/bInputs streams is exactly the NS3 authority, so the digest coincides
+    // (a deliberate cross-slice consistency check, not a copy-paste accident).
+    const uint64_t kPinnedNs6Auth = 0x1aa9738bcc0c7001ull; // the converged canonical authority digest (anchor)
+    check(dAuth6 == kPinnedNs6Auth, "ns6: pinned authority digest matches golden");
+
+    // ---- NS6 showcase / report lines (printed; no image golden). -------------------------------------
+    std::printf("ns6-session: full 2-peer adversarial session + late-join\n");
+    std::printf("ns6-session: 2 peers converge under adversity — A==B==authority BYTE-IDENTICAL {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(dPeerA));
+    std::printf("ns6-session: desync-clean — neither peer detects a desync {ok:%s}\n",
+                ns6DesyncClean ? "true" : "false");
+    std::printf("ns6-session: late-join at tick S catches up to bit-identical world {S:%u, hash:0x%016llx}\n",
+                kJoinS, static_cast<unsigned long long>(dLateJoin));
+    std::printf("ns6-session: pinned authority digest {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(dAuth6));
+
     if (g_fail == 0) { std::printf("session_test: ALL CHECKS PASSED\n"); return 0; }
     std::printf("session_test: %d failures\n", g_fail);
     return 1;

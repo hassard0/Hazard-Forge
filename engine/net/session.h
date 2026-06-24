@@ -343,4 +343,36 @@ inline void IngestRemote(DesyncDetector& d, const ChecksumPacket& pkt) {
     }
 }
 
+// ============================ NS6: LATE-JOIN CATCH-UP (the capstone) =================================
+// The final primitive that COMPLETES flagship #24. NS1-NS5 give two peers a complete rollback session
+// (predict -> snapshot -> rollback over an adversarial transport, with a per-tick desync detector). NS6
+// adds the one genuinely NEW capability: a peer can JOIN MID-SESSION. The joining peer is handed a
+// CONFIRMED snapshot (the world AS OF some tick `S`, where every input < S is confirmed) plus the input
+// TAIL for `[S, toTick)`; it restores the snapshot and REPLAYS the tail to reach the BIT-IDENTICAL world
+// the from-tick-0 peers reached. Everything else (convergence, desync exchange) is composition of NS1-5.
+// CatchUp is just deterministic replay (NS1 Advance's body) seeded from a snapshot instead of tick 0 — so
+// a join at S==0 (snapshot = the initial world, full tail) is trivially the from-scratch lockstep run.
+// Pure-CPU integer — no float, no <cmath>, no clock/RNG, no GPU.
+
+// JoinSnapshot: the confirmed-state handoff a late-joiner receives — the world AS OF `tick`, where every
+// input < `tick` is confirmed. (A real session would gossip this from an authoritative/confirmed peer.)
+template <class World>
+struct JoinSnapshot {
+    uint32_t tick = 0;   // the snapshot tick S — the world is the confirmed state AFTER ticks [0, tick)
+    World    world{};    // the confirmed world AS OF `tick`
+};
+
+// CatchUp: restore the confirmed snapshot and replay the input tail to reach `toTick`. Starting from
+// `snap.world` (the world as of `snap.tick`), step every tick in `[snap.tick, toTick)` over `tail.At(t)`,
+// returning the caught-up world. `tail` carries the inputs for `[snap.tick, toTick)` (the same per-tick
+// inputs the running peers applied). Deterministic of (snap, toTick, tail, step) alone — a late-joiner and
+// the from-tick-0 peers, fed the same confirmed inputs, reach the BIT-IDENTICAL world. Pure-CPU integer.
+template <class World, class Input, class StepFn>
+World CatchUp(const JoinSnapshot<World>& snap, uint32_t toTick, const InputRing<Input>& tail, StepFn step) {
+    World w = snap.world;                              // restore the confirmed snapshot
+    for (uint32_t t = snap.tick; t < toTick; ++t)
+        step(w, tail.At(t), t);                        // replay the tail (NS1 Advance's transition body)
+    return w;
+}
+
 }  // namespace hf::net
