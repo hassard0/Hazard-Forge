@@ -1522,6 +1522,64 @@ contribution). Validated against two distinct toy worlds so the abstraction is p
 
 ---
 
+## Replay Layer — deterministic record / playback / seek / scrub demos (`engine/replay/replay.h`, namespace `hf::replay`) — flagship #28
+
+Slices RP1–RP6 add a **header-only deterministic REPLAY / DEMO system** — the capstone that answers *what all the
+determinism is FOR*. A demo file does **not** store state-over-time; it stores the **causal seed** of a session —
+`(seed, the initial-world snapshot, the per-tick INPUT stream, the per-tick digest trace)` — and playback re-derives
+the byte-identical world by re-running the **existing deterministic Step** (`net::Advance`). This is the moat made
+into a product feature: a demo recorded on one machine replays **bit-identically** on any machine (Windows/MSVC ⇆
+Mac/clang), is freely **seekable** and **scrubbable** at variable speed, and carries a **built-in tamper detector**
+(its per-tick digest stream localizes a single flipped byte to the exact tick). The contrast with a UE5-class replay
+is the headline: that records server *state* snapshots and **interpolates** — approximate, driftable, never a
+guaranteed bit-identical re-sim — whereas an `hf::replay` demo records *inputs* and **re-simulates exactly**, so
+determinism is simultaneously the compression, the seek mechanism, and the integrity guarantee. `replay.h` is
+**fully self-contained** (only `<cstddef>`/`<cstdint>`/`<vector>` + the self-contained `net/session.h`), so the
+cross-platform proof is the cheapest in the engine — `replay_test`'s pinned demo-file hashes and replay digests are
+identical compiled by MSVC and by clang, **no render-bake, no image, no GPU**. Pure-CPU integer; **no RHI / no
+shader / no GPU / no float / no clock / no RNG** across the whole flagship. The byte-exact demo format is
+hand-serialized little-endian field-by-field (the `audio/wav.cpp` discipline — never a host-struct `memcpy`), and
+the whole stack reuses the netcode primitives read-only (`net::Session`/`Advance`/`RunLockstep`/`InputRing`/
+`DigestBytes`/`DigestTrace`/`CatchUp`/`DesyncDetector`). Validated on a self-contained toy world so the abstraction
+is provably generic over `{Step, Snapshot, Digest, serialize}`.
+
+- **Demo format + record (RP1).** `DemoHeader` (magic `"HFDEMO\0\0"`) + `Recorder<World,Input>` (seed + initial
+  snapshot + `InputRing` + the per-tick `DigestTrace`) + `EncodeDemo` → bytes, hand-LE via `PutU32`/`PutU64`/
+  `PutBytes`. **Proof:** recording a fixed toy session hashes (`DigestBytes`) to a hard-pinned `uint64_t`, header
+  round-trips field-exact, re-encoding is byte-identical — identical on MSVC and clang.
+- **Playback (RP2).** `DecodeDemo` parses bytes back to `(header, initial world, input ring)`; `Replay` restores the
+  initial snapshot and `Advance`s over the decoded ring. **Proof (re-derivation, not interpolation):** the replayed
+  final digest == a live `RunLockstep` == the pinned digest; every replayed per-tick digest == the recorded trace ==
+  a fresh `DigestTrace` (integrity); `Decode(Encode(x))` is byte-exact.
+- **Keyframes (RP3).** At record time, every `keyframeInterval` ticks a full world snapshot is captured into the
+  demo's keyframe table (the format matures by one symmetric `keyframeByteLen` field; the keyframe is a
+  `RollbackSession::snaps` entry at a coarse interval). **Proof:** each keyframe-at-tick-`T` world digest == the live
+  world digest at `T` (the bit-identical mid-session restore point — the seek substrate); two intervals pin distinct
+  file hashes (the size/seek tradeoff is a real deterministic knob).
+- **Seek (RP4).** `Seek(N)` restores the nearest keyframe at-or-before `N` and replays the input tail `[kf, N)` —
+  `net::CatchUp` verbatim. **Proof:** `Seek(N)` digest == live `RunLockstep(N)` **bit-identical** (not interpolated)
+  for many `N`; on-keyframe seeks replay zero ticks, just-before-next-keyframe seeks replay the bounded max tail; the
+  result is invisible to the keyframe interval (interval is purely a cost knob).
+- **Scrub + variable-speed (RP5).** A `Player` cursor scrubs **forward** (step from the cached world) and **backward**
+  (re-`Seek`, since the sim has no inverse) at variable integer-stride speed. **Proof (path-independence):** scrubbing
+  `0→12→4→9` leaves the **identical** world as a direct `Seek(9)` — the route never perturbs the destination, no
+  drift; and 1×/2×/4× playback all reach the identical pinned final digest (speed changes *when* you observe, never
+  *what* is computed).
+- **Capstone + corruption detection (RP6).** The whole pipeline end-to-end (record→encode→decode→replay→seek→scrub)
+  reproduces the pinned final, and a demo's per-tick digest stream becomes a **tamper detector**: flipping one byte in
+  a copy's input region makes the replayed trace diverge from the recorded trace at the **exact** tick, localized via
+  `net::DesyncDetector` (the NS5 machinery applied to recorded-vs-replayed). **Proof:** a clean demo verifies `ok`; a
+  one-byte-corrupted copy is caught at the exact mid-stream tick (pinned), the detector latches the same tick with
+  both diverging digests, the corrupt world really diverges (final ≠ the pinned digest), and the clean copy still
+  verifies — no false positives. **Completes flagship #28 — deterministic replay/demo.** Honest scope: records an
+  already-assembled local input stream (NOT a live network capture tap — recording a networked `RollbackSession`'s
+  confirmed stream is a future bridge); the driving sim MUST be deterministic + snapshot-complete (a non-deterministic
+  Step breaks replay — but the per-tick digest verifier catches exactly that, so RP6's corruption proof doubles as a
+  non-determinism detector); backward scrub is seek-based, not inverse-simulated (bounded by the keyframe interval);
+  single input stream / single world; no compression (the format is uncompressed hand-LE bytes); same-build peers.
+
+---
+
 ## VFX Layer — CPU particle / emitter (`engine/vfx/particles.*`)
 
 `engine/vfx/particles.*` (Slice CC) is an **authorable CPU particle / VFX emitter** — the VFX analogue of the data-driven material graph, and **distinct** from the fixed `gpu-particles` compute fountain (`shaders/particles.comp.hlsl`, one hard-coded GPU sim). Like `engine/audio` and `engine/physics` it is **pure C++ above the seam** with **zero `vk*`/`MTL*`/`mtl::`/`Backend::` symbols**, compiled into both `hf_core` (ASan-scoped, `vfx_test`) and `hf_engine` (the `--vfx-shot` showcase + the Metal `--vfx` path).
