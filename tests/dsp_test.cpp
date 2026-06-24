@@ -190,6 +190,113 @@ int main() {
     std::printf("dsp2-env: osc->env pinned {hash:0x%016llx}\n",
                 static_cast<unsigned long long>(hEnvOne));
 
+    // ======================================================================================
+    // DSP3 — Fixed-point biquad FILTER NODE (engine/audio/dsp.h, flagship #23, 3rd slice, THE CRUX).
+    // ======================================================================================
+    // Q14 Direct-Form-I biquad with committed integer presets. Same INTEGER buffer-hash bar: bit-identical
+    // run-to-run AND platform-to-platform, and the delay line (x1/x2/y1/y2) carries across blocks.
+
+    // A saw source spanning N*256 frames is the filter test input (the carried delay line is the crux).
+    const std::vector<int16_t> sawSrc = dsp::RenderOsc(dsp::Wave::Saw, kFreq, kSR, kTotal);
+
+    // ---- (D3-1) PASSTHROUGH NO-OP (make-or-break): kBiquadPassthrough over a source == source. --------
+    {
+        std::vector<int16_t> pass;
+        dsp::BiquadNode bq{dsp::kBiquadPassthrough};
+        dsp::FilterBlock(bq, sawSrc, pass);
+        check(pass == sawSrc, "dsp3: passthrough preset == source byte-identical (additive-identity no-op)");
+        check(dsp::DigestBuffer(pass) == dsp::DigestBuffer(sawSrc), "dsp3: passthrough digest == source digest");
+    }
+
+    // ---- (D3-2) BLOCK-BOUNDARY DETERMINISM (make-or-break): one FilterBlock over the whole saw source
+    //      == N separate 256-frame FilterBlock calls on ONE persistent BiquadNode (delay line carries). --
+    std::vector<int16_t> lpOne;
+    {
+        dsp::BiquadNode bq{dsp::kBiquadLowpass2k};
+        dsp::FilterBlock(bq, sawSrc, lpOne);
+    }
+    std::vector<int16_t> lpN;
+    {
+        dsp::BiquadNode bq{dsp::kBiquadLowpass2k};
+        for (int b = 0; b < kN; ++b) {
+            std::vector<int16_t> chunk(sawSrc.begin() + b * kBlock, sawSrc.begin() + (b + 1) * kBlock);
+            dsp::FilterBlock(bq, chunk, lpN);
+        }
+    }
+    const uint64_t hLpOne = dsp::DigestBuffer(lpOne);
+    const uint64_t hLpN   = dsp::DigestBuffer(lpN);
+    check(lpOne.size() == static_cast<size_t>(kTotal), "dsp3: FilterBlock fills totalFrames");
+    check(lpN.size()   == static_cast<size_t>(kTotal), "dsp3: N FilterBlock calls fill N*block");
+    check(lpOne == lpN, "dsp3: block-boundary: one-buffer == N-blocks (byte-identical)");
+    check(hLpOne == hLpN, "dsp3: block-boundary: DigestBuffer(one) == DigestBuffer(N-blocks)");
+
+    // ---- (D3-3) STABILITY / BOUNDED OUTPUT: a full-scale +32767 step through the lowpass for many blocks
+    //      must stay in int16 AND settle near the input level (not oscillate to the rails). --------------
+    int   stepMaxAbs   = 0;
+    int   stepSettled  = 0;
+    bool  stepRailed   = false;
+    {
+        const int kSteps   = 64;                 // 64 blocks of 256 = 16384 frames of full-scale DC
+        const int kStepLen = kSteps * kBlock;
+        std::vector<int16_t> stepSrc(static_cast<size_t>(kStepLen), 32767);
+        std::vector<int16_t> stepOut;
+        dsp::BiquadNode bq{dsp::kBiquadLowpass2k};
+        for (int b = 0; b < kSteps; ++b) {
+            std::vector<int16_t> chunk(stepSrc.begin() + b * kBlock, stepSrc.begin() + (b + 1) * kBlock);
+            dsp::FilterBlock(bq, chunk, stepOut);
+        }
+        for (const int16_t s : stepOut) {
+            const int a = s < 0 ? -static_cast<int>(s) : static_cast<int>(s);
+            if (a > stepMaxAbs) stepMaxAbs = a;
+        }
+        // Steady state: average of the last block. A unity-DC-gain lowpass settles to ~the input (32767).
+        long acc = 0;
+        for (int i = kStepLen - kBlock; i < kStepLen; ++i) acc += stepOut[static_cast<size_t>(i)];
+        stepSettled = static_cast<int>(acc / kBlock);
+        // Railed-indefinitely check: the last block must NOT be all-rails (a stable filter settles).
+        bool allRail = true;
+        for (int i = kStepLen - kBlock; i < kStepLen; ++i)
+            if (stepOut[static_cast<size_t>(i)] >= 32767 || stepOut[static_cast<size_t>(i)] <= -32768) { allRail = false; break; }
+        stepRailed = !allRail ? false : true;
+        check(stepMaxAbs <= 32767, "dsp3: stability: output stays within int16 (no overflow)");
+        check(!stepRailed, "dsp3: stability: last block not pinned to the rails (filter settles)");
+        // Unity-DC-gain lowpass settles near the input (32767). Bounded window proves no runaway/oscillation.
+        check(stepSettled > 30000 && stepSettled <= 32767, "dsp3: stability: step settles near input level (DC gain ~1)");
+    }
+
+    // ---- (D3-4) LOWPASS ATTENUATES HIGHS: a 12kHz tone and a 500Hz tone at equal amplitude through the
+    //      lowpass separately -> the high-freq output energy is materially LOWER (coarse integer compare).
+    uint64_t lowEnergy = 0, highEnergy = 0;
+    {
+        const std::vector<int16_t> loSrc = dsp::RenderOsc(dsp::Wave::Sine,   500, kSR, kTotal);
+        const std::vector<int16_t> hiSrc = dsp::RenderOsc(dsp::Wave::Sine, 12000, kSR, kTotal);
+        std::vector<int16_t> loOut, hiOut;
+        { dsp::BiquadNode bq{dsp::kBiquadLowpass2k}; dsp::FilterBlock(bq, loSrc, loOut); }
+        { dsp::BiquadNode bq{dsp::kBiquadLowpass2k}; dsp::FilterBlock(bq, hiSrc, hiOut); }
+        // Skip the first block to let the filter settle past the transient, then sum |sample|^2.
+        for (size_t i = static_cast<size_t>(kBlock); i < loOut.size(); ++i)
+            lowEnergy  += static_cast<uint64_t>(static_cast<int64_t>(loOut[i]) * loOut[i]);
+        for (size_t i = static_cast<size_t>(kBlock); i < hiOut.size(); ++i)
+            highEnergy += static_cast<uint64_t>(static_cast<int64_t>(hiOut[i]) * hiOut[i]);
+        check(highEnergy < lowEnergy, "dsp3: lowpass attenuates highs (12kHz energy < 500Hz energy)");
+    }
+
+    // ---- (D3-5) PINNED HASH — the saw->lowpass digest == a hard-pinned uint64_t (the golden anchor). ---
+    const uint64_t kPinnedSawLowpass = 0x0dd89c23d9b537d2ull;
+    check(hLpOne == kPinnedSawLowpass, "dsp3: pinned hash: DigestBuffer(saw->lowpass, 4096f) matches golden");
+
+    // ---- DSP3 showcase / numeric proof (printed; no image golden). ----------------------------------
+    std::printf("dsp3-filter: biquad filter node (Q14 Direct-Form-I, presets: passthrough/lowpass2k/highpass2k)\n");
+    std::printf("dsp3-filter: passthrough preset == source BYTE-IDENTICAL (additive-identity no-op)\n");
+    std::printf("dsp3-filter: block-boundary determinism: one-buffer == N-blocks {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(hLpOne));
+    std::printf("dsp3-filter: stable bounded output over %d blocks {maxAbs:%d, settled:%d, railed:%s}\n",
+                64, stepMaxAbs, stepSettled, stepRailed ? "true" : "false");
+    std::printf("dsp3-filter: lowpass attenuates highs {lowEnergy:%llu, highEnergy:%llu} Hh < L\n",
+                static_cast<unsigned long long>(lowEnergy), static_cast<unsigned long long>(highEnergy));
+    std::printf("dsp3-filter: saw->lowpass pinned {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(hLpOne));
+
     if (g_fail == 0) { std::printf("dsp_test: ALL CHECKS PASSED\n"); return 0; }
     std::printf("dsp_test: %d failures\n", g_fail);
     return 1;

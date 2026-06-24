@@ -227,4 +227,68 @@ inline void ApplyEnvBlock(EnvNode& node, const std::vector<int16_t>& src,
     }
 }
 
+// =====================================================================================================
+// Slice DSP3 — Fixed-point biquad FILTER NODE (Issue #26, flagship #23 DETERMINISTIC AUDIO, 3rd slice,
+// THE CRUX). APPEND-ONLY: the DSP1 osc + DSP2 env code above is untouched. A Q14 (16384 == 1.0)
+// Direct-Form-I biquad with COMMITTED integer coefficient presets (host-precomputed OFFLINE — NO runtime
+// cos/tan), int64-intermediate accumulation, and a delay line carried ACROSS FilterBlock calls — exactly
+// like DSP1's phase and DSP2's `t`. Pure-CPU integer. NO <cmath>, NO float at runtime.
+//
+// Q14 (not Q15) because the normalized a1 coefficient can reach ~±2.0, which overflows a Q15 int16 range;
+// Q14 has the headroom (a1 fits comfortably in int32, the accumulate is int64). Direct Form I, a0=1:
+//   y[n] = (b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]) >> 14   (then ClampI16)
+// The feedback taps y[n-1]/y[n-2] are the actual EMITTED (post-clamp) int16 samples, which keeps the
+// fixed-point loop bounded.
+// -----------------------------------------------------------------------------------------------------
+
+// Q14 biquad coefficients (16384 == 1.0). a0 normalized to 1 (not stored). int32 so a1 (~±2.0) fits.
+struct BiquadCoeffs {
+    int32_t b0, b1, b2, a1, a2;
+};
+
+// --- Committed presets (host-baked OFFLINE via the RBJ audio-EQ cookbook; the kSineTable LUT discipline:
+//     COMMITTED int Q14 literals, NO runtime cos/tan). The LPF/HPF were computed with a throwaway python
+//     calc (w0=2pi*fc/fs, alpha=sin(w0)/(2Q); LPF b0=(1-cos w0)/2,b1=1-cos w0,b2=(1-cos w0)/2; HPF
+//     b0=(1+cos w0)/2,b1=-(1+cos w0),b2=(1+cos w0)/2; a0=1+alpha,a1=-2cos w0,a2=1-alpha; divide all by a0,
+//     x16384 round-to-nearest) at fc=2000, fs=48000, Q=0.707.
+
+// Passthrough — the additive-identity no-op (EXACT): y = (16384*x) >> 14 = x byte-identical. Make-or-break.
+inline constexpr BiquadCoeffs kBiquadPassthrough = {16384, 0, 0, 0, 0};
+
+// Lowpass, RBJ LPF fc=2000 fs=48000 Q=0.707, quantized to Q14 round-to-nearest.
+// STABLE (poles inside the unit circle): |a2| = 11314 < 16384, and |a1| = 26754 < 16384 + a2 = 27698.
+inline constexpr BiquadCoeffs kBiquadLowpass2k = {236, 472, 236, -26754, 11314};
+
+// Highpass, RBJ HPF fc=2000 fs=48000 Q=0.707, quantized to Q14 round-to-nearest. Same denominator (a1,a2)
+// as the LPF. STABLE: |a2| = 11314 < 16384, and |a1| = 26754 < 16384 + a2 = 27698.
+inline constexpr BiquadCoeffs kBiquadHighpass2k = {13613, -27226, 13613, -26754, 11314};
+
+// A STATEFUL biquad filter graph node. The four int16 delay-line taps (x1/x2 past inputs, y1/y2 past
+// EMITTED outputs) carry ACROSS FilterBlock calls — that is the whole point of the slice (cross-block
+// state continuity for the filter stage).
+struct BiquadNode {
+    BiquadCoeffs c;
+    int16_t x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+};
+
+// Filter `src` sample-by-sample, APPENDING the result to `outAppend` (so N calls build one continuous
+// stream). Direct Form I, int64 accumulate, arithmetic >>14, ClampI16, then shift the delay line. The
+// state (x1/x2/y1/y2) persists in `bq` across calls. NO <cmath>, NO float.
+inline void FilterBlock(BiquadNode& bq, const std::vector<int16_t>& src,
+                        std::vector<int16_t>& outAppend) {
+    outAppend.reserve(outAppend.size() + src.size());
+    for (const int16_t x : src) {
+        const int64_t acc =
+            static_cast<int64_t>(bq.c.b0) * x +
+            static_cast<int64_t>(bq.c.b1) * bq.x1 +
+            static_cast<int64_t>(bq.c.b2) * bq.x2 -
+            static_cast<int64_t>(bq.c.a1) * bq.y1 -
+            static_cast<int64_t>(bq.c.a2) * bq.y2;
+        const int16_t y = ClampI16(static_cast<int32_t>(acc >> 14));  // arithmetic shift on signed int64
+        outAppend.push_back(y);
+        bq.x2 = bq.x1; bq.x1 = x;   // shift the input delay line
+        bq.y2 = bq.y1; bq.y1 = y;   // shift the (emitted) output delay line
+    }
+}
+
 }  // namespace hf::audio::dsp
