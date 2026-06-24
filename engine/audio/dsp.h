@@ -396,4 +396,144 @@ inline std::vector<int16_t> RenderPatch(Patch& p, int sampleRate, int totalFrame
     return out;
 }
 
+// =====================================================================================================
+// Slice DSP5 — Deterministic 3D spatialization NODE (Issue #26, flagship #23 DETERMINISTIC AUDIO, 5th
+// slice). APPEND-ONLY: the DSP1 osc + DSP2 env + DSP3 filter + DSP4 patch code above is untouched. A
+// mono source -> stereo spatializer: integer DISTANCE ATTENUATION + constant-power PAN (ILD) + a small
+// integer inter-aural delay (ITD), ALL derived from the normalized lateral component — NO atan2, NO
+// trig, NO float. Pure-CPU integer (Q15). Self-contained (only <cstdint>/<vector>; no mixer/fpx include).
+//
+// Listener faces +Z. The horizontal relative vector (dx,dz) = source - listener (Y ignored for azimuth).
+// dist = IsqrtU(dx*dx + dz*dz). The lateral component normX = clamp(dx*32768/max(dist,1), -32768, 32768)
+// (Q15 in [-1,1]) drives both the pan LUT index and the ITD; the sign of normX picks the near ear. NO
+// atan2 anywhere — a committed constant-power LUT replaces the trig.
+//
+// HONEST: this is a pan/ILD/ITD model, NOT true HRTF convolution (the one MetaSounds-comparison aside).
+// -----------------------------------------------------------------------------------------------------
+
+// Deterministic integer floor-sqrt for a non-negative int64 — the algorithm SHAPE is copied from
+// engine/sim/fpx.h::FxISqrt (binary digit-by-digit), but kept LOCAL here so the Mac single-file clang
+// compile of dsp.h stays clean (no fpx include). Pure integer, NO <cmath>; identical on every compiler.
+inline int32_t IsqrtU(int64_t v) {
+    if (v <= 0) return 0;
+    int64_t bit = (int64_t)1 << 62;
+    while (bit > v) bit >>= 2;
+    int64_t res = 0;
+    while (bit != 0) {
+        if (v >= res + bit) { v -= res + bit; res = (res >> 1) + bit; }
+        else { res >>= 1; }
+        bit >>= 2;
+    }
+    return static_cast<int32_t>(res);
+}
+
+// Integer world-unit position (listener / source). Y is carried but ignored for the horizontal azimuth.
+struct Vec3i { int32_t x = 0, y = 0, z = 0; };
+
+// Constant-power pan gains (Q15): gainL on the left channel, gainR on the right.
+struct PanGain { int32_t gainL, gainR; };
+
+// --- The committed constant-power pan LUT (host-baked OFFLINE — the kSineTable discipline) -----------
+// 65 entries, pan position 0..64 -> [0,1]. Baked via a throwaway calc:
+//   kPanLut[i] = { round(cos(i/64 * pi/2) * 32767), round(sin(i/64 * pi/2) * 32767) }, i = 0..64.
+// Only the rounded Q15 int literals ship (NO runtime cos/sin/float). Asserted properties (verified at
+// bake time AND in dsp_test):
+//   kPanLut[0]  == {32767,     0}  (full-left  -> R silent)
+//   kPanLut[64] == {    0, 32767}  (full-right -> L silent)
+//   kPanLut[32] == {23170, 23170}  (centre -> gainL == gainR EXACTLY; the dead-centre L==R proof anchor)
+inline constexpr PanGain kPanLut[65] = {
+    { 32767,     0}, { 32757,   804}, { 32728,  1608}, { 32678,  2410},
+    { 32609,  3212}, { 32521,  4011}, { 32412,  4808}, { 32285,  5602},
+    { 32137,  6393}, { 31971,  7179}, { 31785,  7962}, { 31580,  8739},
+    { 31356,  9512}, { 31113, 10278}, { 30852, 11039}, { 30571, 11793},
+    { 30273, 12539}, { 29956, 13279}, { 29621, 14010}, { 29268, 14732},
+    { 28898, 15446}, { 28510, 16151}, { 28105, 16846}, { 27683, 17530},
+    { 27245, 18204}, { 26790, 18868}, { 26319, 19519}, { 25832, 20159},
+    { 25329, 20787}, { 24811, 21403}, { 24279, 22005}, { 23731, 22594},
+    { 23170, 23170}, { 22594, 23731}, { 22005, 24279}, { 21403, 24811},
+    { 20787, 25329}, { 20159, 25832}, { 19519, 26319}, { 18868, 26790},
+    { 18204, 27245}, { 17530, 27683}, { 16846, 28105}, { 16151, 28510},
+    { 15446, 28898}, { 14732, 29268}, { 14010, 29621}, { 13279, 29956},
+    { 12539, 30273}, { 11793, 30571}, { 11039, 30852}, { 10278, 31113},
+    {  9512, 31356}, {  8739, 31580}, {  7962, 31785}, {  7179, 31971},
+    {  6393, 32137}, {  5602, 32285}, {  4808, 32412}, {  4011, 32521},
+    {  3212, 32609}, {  2410, 32678}, {  1608, 32728}, {   804, 32757},
+    {     0, 32767},
+};
+
+inline constexpr int kMaxItd = 32;   // max inter-aural delay in samples (~0.67 ms @ 48 kHz)
+
+// A STATEFUL spatialization graph node. The two per-channel ITD ring buffers + ringPos carry the
+// inter-aural delay-line state ACROSS SpatializeBlock calls — that is the cross-block continuity crux
+// (block-by-block == one big buffer). refDist = the unity-gain near distance.
+struct SpatialNode {
+    Vec3i   listener;
+    Vec3i   source;
+    int32_t refDist = 256;
+    int16_t ringL[kMaxItd] = {};
+    int16_t ringR[kMaxItd] = {};
+    int     ringPos = 0;
+};
+
+// Spatialize `monoSrc` into stereo, APPENDING interleaved (L,R) int16 frames to outStereoInterleaved.
+// Distance attenuation + constant-power pan (kPanLut) + integer ITD, all from the lateral component normX.
+// The ITD ring state persists in `sp` across calls (block-boundary continuity). At itd==0 the output is
+// the un-delayed sample (centre stays EXACT). NO <cmath>, NO atan2, NO float.
+inline void SpatializeBlock(SpatialNode& sp, const std::vector<int16_t>& monoSrc,
+                            std::vector<int16_t>& outStereoInterleaved) {
+    const int32_t dx = sp.source.x - sp.listener.x;
+    const int32_t dz = sp.source.z - sp.listener.z;
+    const int32_t dist = IsqrtU(static_cast<int64_t>(dx) * dx + static_cast<int64_t>(dz) * dz);
+
+    // Lateral component normX in Q15 [-32768, 32768]. dist==0 -> normX 0 (centre).
+    const int32_t denom = (dist > 1) ? dist : 1;
+    int32_t normX = static_cast<int32_t>((static_cast<int64_t>(dx) * 32768) / denom);
+    if (normX >  32768) normX =  32768;
+    if (normX < -32768) normX = -32768;
+
+    // Pan LUT index: (normX + 32768) >> 10 -> [0, 64] (1024 == 65536/64 -> 65 buckets), clamped.
+    int32_t panIdx = (normX + 32768) >> 10;
+    if (panIdx < 0)  panIdx = 0;
+    if (panIdx > 64) panIdx = 64;
+    const PanGain pg = kPanLut[panIdx];
+
+    // Distance gain (Q15): unity within refDist, inverse-ish beyond.
+    const int32_t distDenom = (dist > sp.refDist) ? dist : sp.refDist;
+    int64_t gd = (static_cast<int64_t>(sp.refDist) * 32768) / (distDenom > 0 ? distDenom : 1);
+    if (gd < 0)     gd = 0;
+    if (gd > 32768) gd = 32768;
+    const int32_t gainDist = static_cast<int32_t>(gd);
+
+    // ITD (0..kMaxItd) from |normX|; the near ear is the side normX points to:
+    //   normX<0 -> source on the LEFT -> left ear is near -> delay the RIGHT channel by itd.
+    //   normX>0 -> source on the RIGHT -> delay the LEFT channel by itd.
+    const int32_t absX = (normX < 0) ? -normX : normX;
+    int itd = static_cast<int>((kMaxItd * absX) >> 15);
+    if (itd > kMaxItd) itd = kMaxItd;
+    const bool delayLeft  = (normX > 0);   // far channel is L when the source is on the right
+    const bool delayRight = (normX < 0);   // far channel is R when the source is on the left
+
+    outStereoInterleaved.reserve(outStereoInterleaved.size() + monoSrc.size() * 2);
+    for (const int16_t s : monoSrc) {
+        const int16_t base = ClampI16(MulQ15(s, gainDist));
+        const int16_t l = ClampI16(MulQ15(base, pg.gainL));
+        const int16_t r = ClampI16(MulQ15(base, pg.gainR));
+
+        // Push the freshly-panned samples into the per-channel ring at ringPos.
+        sp.ringL[sp.ringPos] = l;
+        sp.ringR[sp.ringPos] = r;
+
+        // The far channel reads `itd` samples back; the near channel reads itd=0 (the current sample).
+        const int idxL = delayLeft  ? ((sp.ringPos - itd) % kMaxItd + kMaxItd) % kMaxItd : sp.ringPos;
+        const int idxR = delayRight ? ((sp.ringPos - itd) % kMaxItd + kMaxItd) % kMaxItd : sp.ringPos;
+        const int16_t outL = sp.ringL[idxL];
+        const int16_t outR = sp.ringR[idxR];
+
+        outStereoInterleaved.push_back(outL);
+        outStereoInterleaved.push_back(outR);
+
+        sp.ringPos = (sp.ringPos + 1) % kMaxItd;
+    }
+}
+
 }  // namespace hf::audio::dsp

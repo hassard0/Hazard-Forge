@@ -439,6 +439,154 @@ int main() {
     std::printf("dsp4-patch: representative patch (mix->lowpass) pinned {hash:0x%016llx}\n",
                 static_cast<unsigned long long>(hRep));
 
+    // ======================================================================================
+    // DSP5 — Deterministic 3D spatialization NODE (engine/audio/dsp.h, flagship #23, 5th slice).
+    // ======================================================================================
+    // mono -> stereo: integer distance attenuation + constant-power pan (kPanLut) + integer ITD, all from
+    // the lateral component normX (NO atan2/trig/float). Same INTEGER buffer-hash bar: bit-identical
+    // run-to-run AND platform-to-platform, and the ITD ring carries across SpatializeBlock calls.
+    const int32_t kRefDist = 256;
+
+    // The baked kPanLut endpoints + centre (the constant-power properties the proofs rely on).
+    check(dsp::kPanLut[0].gainL == 32767 && dsp::kPanLut[0].gainR == 0,  "dsp5: kPanLut[0]  == {32767,0} (full-left -> R silent)");
+    check(dsp::kPanLut[64].gainL == 0 && dsp::kPanLut[64].gainR == 32767, "dsp5: kPanLut[64] == {0,32767} (full-right -> L silent)");
+    check(dsp::kPanLut[32].gainL == dsp::kPanLut[32].gainR,               "dsp5: kPanLut[32] centre gainL == gainR EXACTLY");
+    check(dsp::kPanLut[32].gainL == 23170,                               "dsp5: kPanLut[32] centre == 23170");
+
+    // A mono tone source (a sine) is the spatializer input across the DSP5 checks.
+    const std::vector<int16_t> mono = dsp::RenderOsc(dsp::Wave::Sine, kFreq, kSR, kTotal);
+
+    // ---- (D5-1) DEAD-CENTRE L==R (make-or-break): source directly in front (dx=0, dz=refDist) -> normX=0,
+    //      itd=0, pg.gainL==pg.gainR -> the deinterleaved L and R channels are BYTE-IDENTICAL. -----------
+    bool centerLR = false;
+    {
+        dsp::SpatialNode sp;
+        sp.listener = {0, 0, 0};
+        sp.source   = {0, 0, kRefDist};   // straight ahead
+        sp.refDist  = kRefDist;
+        std::vector<int16_t> st;
+        dsp::SpatializeBlock(sp, mono, st);
+        check(st.size() == static_cast<size_t>(kTotal) * 2, "dsp5: stereo buffer is 2*frames interleaved");
+        std::vector<int16_t> chL, chR;
+        for (size_t i = 0; i + 1 < st.size(); i += 2) { chL.push_back(st[i]); chR.push_back(st[i + 1]); }
+        centerLR = (chL == chR);
+        check(centerLR, "dsp5: dead-centre L channel == R channel BYTE-IDENTICAL");
+    }
+
+    // ---- (D5-2) PAN EDGES: full-left source -> every R sample 0; symmetric full-right -> every L 0. -----
+    bool panEdges = false;
+    {
+        // Full-left: dx very negative, dz 0 -> normX = -32768 -> panIdx 0 -> pg = {32767,0} -> R silent.
+        dsp::SpatialNode spL;
+        spL.listener = {0, 0, 0};
+        spL.source   = {-1000000, 0, 0};
+        spL.refDist  = kRefDist;
+        std::vector<int16_t> stL;
+        dsp::SpatializeBlock(spL, mono, stL);
+        bool rSilent = true;
+        for (size_t i = 1; i < stL.size(); i += 2) if (stL[i] != 0) { rSilent = false; break; }
+
+        // Full-right: dx very positive -> normX = +32768 -> panIdx 64 -> pg = {0,32767} -> L silent.
+        dsp::SpatialNode spR;
+        spR.listener = {0, 0, 0};
+        spR.source   = {1000000, 0, 0};
+        spR.refDist  = kRefDist;
+        std::vector<int16_t> stR;
+        dsp::SpatializeBlock(spR, mono, stR);
+        bool lSilent = true;
+        for (size_t i = 0; i < stR.size(); i += 2) if (stR[i] != 0) { lSilent = false; break; }
+
+        panEdges = rSilent && lSilent;
+        check(rSilent, "dsp5: full-left -> every R sample is 0");
+        check(lSilent, "dsp5: full-right -> every L sample is 0");
+    }
+
+    // ---- (D5-3) DISTANCE ATTENUATION MONOTONE: a source at 2x refDist has lower peak energy than at
+    //      refDist (deterministic monotone falloff). ----------------------------------------------------
+    uint64_t eNear = 0, eFar = 0;
+    {
+        auto energyAt = [&](int32_t dz) -> uint64_t {
+            dsp::SpatialNode sp;
+            sp.listener = {0, 0, 0};
+            sp.source   = {0, 0, dz};   // straight ahead, varying distance
+            sp.refDist  = kRefDist;
+            std::vector<int16_t> st;
+            dsp::SpatializeBlock(sp, mono, st);
+            uint64_t e = 0;
+            for (const int16_t s : st) e += static_cast<uint64_t>(static_cast<int64_t>(s) * s);
+            return e;
+        };
+        eNear = energyAt(kRefDist);        // unity gain (within refDist)
+        eFar  = energyAt(kRefDist * 2);    // attenuated
+        check(eFar < eNear, "dsp5: distance attenuation monotone (2x refDist energy < refDist energy)");
+    }
+
+    // ---- (D5-4) BLOCK-BOUNDARY DETERMINISM (make-or-break): a fixed OFF-CENTRE source spatialized as ONE
+    //      N*256 mono buffer vs N separate 256-frame SpatializeBlock calls on ONE persistent SpatialNode
+    //      -> byte-identical (the ITD ring carries across block boundaries). ------------------------------
+    uint64_t hBlk = 0;
+    {
+        auto offCentre = []() -> dsp::SpatialNode {
+            dsp::SpatialNode sp;
+            sp.listener = {0, 0, 0};
+            sp.source   = {180, 0, 240};   // off to the right + ahead (non-zero normX -> non-zero ITD)
+            sp.refDist  = 256;
+            return sp;
+        };
+        dsp::SpatialNode spOne = offCentre();
+        std::vector<int16_t> stOne;
+        dsp::SpatializeBlock(spOne, mono, stOne);
+
+        dsp::SpatialNode spN = offCentre();
+        std::vector<int16_t> stN;
+        for (int b = 0; b < kN; ++b) {
+            std::vector<int16_t> chunk(mono.begin() + b * kBlock, mono.begin() + (b + 1) * kBlock);
+            dsp::SpatializeBlock(spN, chunk, stN);
+        }
+        hBlk = dsp::DigestBuffer(stOne);
+        check(stOne.size() == static_cast<size_t>(kTotal) * 2, "dsp5: one-buffer stereo fills 2*frames");
+        check(stN.size()   == static_cast<size_t>(kTotal) * 2, "dsp5: N-block stereo fills 2*frames");
+        check(stOne == stN, "dsp5: block-boundary: one-buffer == N-blocks BYTE-IDENTICAL (ITD ring carries)");
+        check(hBlk == dsp::DigestBuffer(stN), "dsp5: block-boundary: DigestBuffer(one) == DigestBuffer(N-blocks)");
+    }
+
+    // ---- (D5-5) PINNED HASH — osc -> spatial(off-centre) stereo digest == a hard-pinned uint64_t; moving
+    //      the source changes the hash. ------------------------------------------------------------------
+    uint64_t hSpat = 0;
+    {
+        dsp::SpatialNode sp;
+        sp.listener = {0, 0, 0};
+        sp.source   = {120, 0, 300};   // a fixed off-centre placement
+        sp.refDist  = 256;
+        std::vector<int16_t> st;
+        dsp::SpatializeBlock(sp, mono, st);
+        hSpat = dsp::DigestBuffer(st);
+        const uint64_t kPinnedSpatial = 0x3517ac94697d87caull;
+        check(hSpat == kPinnedSpatial, "dsp5: pinned hash: DigestBuffer(osc->spatial off-centre) matches golden");
+
+        // Moving the source changes the hash.
+        dsp::SpatialNode sp2;
+        sp2.listener = {0, 0, 0};
+        sp2.source   = {-200, 0, 300};   // mirrored to the left
+        sp2.refDist  = 256;
+        std::vector<int16_t> st2;
+        dsp::SpatializeBlock(sp2, mono, st2);
+        check(dsp::DigestBuffer(st2) != hSpat, "dsp5: moving the source -> different hash");
+    }
+
+    // ---- DSP5 showcase / numeric proof (printed; no image golden). ----------------------------------
+    std::printf("dsp5-spatial: spatialization node (distance atten + constant-power pan + integer ITD, kMaxItd %d)\n",
+                dsp::kMaxItd);
+    std::printf("dsp5-spatial: dead-centre L==R BYTE-IDENTICAL {center:%s}\n", centerLR ? "true" : "false");
+    std::printf("dsp5-spatial: full-left -> R silent / full-right -> L silent {panEdges:%s}\n",
+                panEdges ? "ok" : "FAIL");
+    std::printf("dsp5-spatial: distance attenuation monotone {near:%llu, far:%llu} vF < vN\n",
+                static_cast<unsigned long long>(eNear), static_cast<unsigned long long>(eFar));
+    std::printf("dsp5-spatial: block-boundary determinism: one-buffer == N-blocks {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(hBlk));
+    std::printf("dsp5-spatial: osc->spatial pinned {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(hSpat));
+
     if (g_fail == 0) { std::printf("dsp_test: ALL CHECKS PASSED\n"); return 0; }
     std::printf("dsp_test: %d failures\n", g_fail);
     return 1;
