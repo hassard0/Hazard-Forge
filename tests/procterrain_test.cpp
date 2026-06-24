@@ -14,6 +14,7 @@
 // Pure C++ (hf_core), ASan-eligible like the other sim/render-math tests. procterrain.h #includes
 // sim/fpx.h read-only.
 #include "terrain/procterrain.h"
+#include "terrain/erosion.h"  // Slice PT2: deterministic integer hydraulic erosion (read-only PT1 reuse)
 
 #include <cstdint>
 #include <cstdio>
@@ -119,6 +120,69 @@ int main() {
             }
         }
         check(maxStep < kStepBound, "PT1 smooth: adjacent cells differ by a bounded amount (no seams)");
+    }
+
+    // ============================ SLICE PT2 — integer hydraulic erosion ================================
+    // PT2 erodes the PT1 GenHeightField output via a mass-conserving, contractive integer flux. These
+    // checks pin the CRUX guarantees: EXACT mass conservation, stability/bounded, the zero-iters no-op,
+    // real carving (changed cells + a sampled peak dropped), and replay-stability.
+    {
+        const int kErodeIters = 60;
+        // A base PT1 field (same seed/octaves family the showcase uses).
+        const std::vector<fx> base = ter::GenHeightField(kSeed, kN, kWorld, kOct);
+
+        // ---- (1) EXACT MASS CONSERVATION (make-or-break): int64 sum unchanged bit-for-bit ----
+        {
+            std::vector<fx> eroded = base;
+            const int64_t sumBefore = ter::GridSum(eroded);
+            ter::ErodeHydraulic(eroded, kN, kErodeIters);
+            const int64_t sumAfter = ter::GridSum(eroded);
+            check(sumBefore == sumAfter,
+                  "PT2 mass conservation: int64 grid sum bit-for-bit identical after erosion (delta 0)");
+        }
+
+        // ---- (2) STABLE / BOUNDED: the contraction holds, grid stays well inside +-32768*kOne ----
+        {
+            std::vector<fx> eroded = base;
+            ter::ErodeHydraulic(eroded, kN, kErodeIters);
+            fx maxAbs = 0;
+            for (fx h : eroded) { const fx a = h < 0 ? -h : h; if (a > maxAbs) maxAbs = a; }
+            // The PT1 field is |h| < kOne; erosion only redistributes between neighbours so |h| stays
+            // bounded. A generous ceiling (8*kOne) catches any overflow/runaway while leaving headroom.
+            check(maxAbs < 8 * kOne, "PT2 stable: eroded grid bounded well inside the +-32768 world bound");
+        }
+
+        // ---- (3) ZERO-ITERS NO-OP: iterations <= 0 -> grid unchanged ----
+        {
+            std::vector<fx> e0 = base; ter::ErodeHydraulic(e0,  kN, 0);
+            std::vector<fx> eN = base; ter::ErodeHydraulic(eN,  kN, -7);
+            check(e0 == base, "PT2 zero-iters no-op: iterations == 0 -> grid unchanged");
+            check(eN == base, "PT2 zero-iters no-op: iterations < 0  -> grid unchanged");
+            check(ter::CountChanged(base, e0) == 0, "PT2 zero-iters no-op: changed-cell count == 0");
+        }
+
+        // ---- (4) CARVES: a real erosion DIFFERS from base (non-trivial changed cells) AND a peak drops --
+        {
+            std::vector<fx> eroded = base;
+            ter::ErodeHydraulic(eroded, kN, kErodeIters);
+            const int changed = ter::CountChanged(base, eroded);
+            check(eroded != base, "PT2 carves: a real erosion differs from the base field");
+            // Non-trivial: well over a quarter of the cells moved material.
+            check(changed > (kN * kN) / 4, "PT2 carves: a non-trivial number of cells changed");
+
+            // Find the highest cell in the base field (a peak) and assert it dropped after erosion
+            // (peaks shed material downhill — the carving is real, not noise).
+            size_t peakI = 0; fx peakH = base[0];
+            for (size_t i = 1; i < base.size(); ++i) if (base[i] > peakH) { peakH = base[i]; peakI = i; }
+            check(eroded[peakI] < base[peakI], "PT2 carves: the highest base cell (a peak) dropped");
+        }
+
+        // ---- (5) REPLAY-STABLE: two ErodeHydraulic runs from the same base are byte-equal ----
+        {
+            std::vector<fx> r1 = base; ter::ErodeHydraulic(r1, kN, kErodeIters);
+            std::vector<fx> r2 = base; ter::ErodeHydraulic(r2, kN, kErodeIters);
+            check(r1 == r2, "PT2 replay-stable: two erosion runs from the same base are byte-equal");
+        }
     }
 
     if (g_fail == 0) std::printf("procterrain_test: ALL CHECKS PASSED\n");

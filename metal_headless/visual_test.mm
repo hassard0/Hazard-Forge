@@ -102,6 +102,7 @@
 #include "pcg/pcg.h"                // Slice PCG1: deterministic PCG seeded hash-PRNG primitive (PcgHash/PcgRand01/PcgRandRange/PcgUnitDir/PcgStream) Q16.16 pure-int32 — reuses particles.h ParticleHash + EmitDir; the Metal --pcg1-hash runs the IDENTICAL pure-integer point-plot the Vulkan --pcg1-hash-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "foliage/foliage.h"        // Slice FO1 (FLAGSHIP #25 beachhead): deterministic integer WIND FIELD (kFoliageWind16 LUT / Gust / WindField / WindBend) Q16.16 — the audio kSineTable copied verbatim, NO runtime sin; the Metal --fo1-wind runs the IDENTICAL pure-integer wind heatmap the Vulkan --fo1-wind-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "terrain/procterrain.h"    // Slice PT1 (FLAGSHIP #26 beachhead): deterministic integer fBm HEIGHTFIELD (IntHashLattice/IntValueNoise/IntHeight/GenHeightField) Q16.16 — the strict-integer twin of the FLOAT terrain::Height, NO runtime sin/sqrt/floor; the Metal --pt1-height runs the IDENTICAL pure-integer grayscale heightmap the Vulkan --pt1-height-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "terrain/erosion.h"        // Slice PT2 (FLAGSHIP #26 headline+crux): deterministic integer HYDRAULIC EROSION (ErodeHydraulic/GridSum/CountChanged) Q16.16 — a mass-conserving contractive integer flux over the PT1 field; the Metal --pt2-hydraulic runs the IDENTICAL pure-integer erosion-delta heatmap the Vulkan --pt2-hydraulic-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/broad.h"              // Slice BP1: deterministic integer broadphase THE BODY GRID + CSR CELL TABLE (BodyGrid/MakeBodyGrid/BodyCellOf/FlatBodyCellId/BodyCellTable/BuildBodyCellTable/BodyGridMeasure, keyed on fpx::FxBody) — shared verbatim with broad_cell_{count,scan,emit}.comp (MSL-NATIVE) + the Vulkan --broad-cell-shot; Metal --broad-cell DISPATCHES the GPU shaders
 #include "sim/couple.h"             // Slice CP1: deterministic rigid<->fluid coupling unified world + body->fluid grid-hash query (CoupleWorld/GatherBodyParticles/BodyParticleAccept) — shared verbatim with couple_body_{count,scan,emit}.comp + the Vulkan --couple-query-shot
 #include "sim/couple_grain.h"       // Slice CG1: deterministic rigid<->grain coupling unified bodies+grains world + body->grain grid-hash query (CGrainWorld/GatherBodyGrains/BodyGrainAccept) — shared verbatim with cgrain_body_{count,scan,emit}.comp + the Vulkan --cgrain-query-shot
@@ -40558,6 +40559,93 @@ static int RunPt1HeightShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PT2 — Deterministic integer HYDRAULIC EROSION showcase (--pt2-hydraulic) (THE HEADLINE + CRUX of
+// FLAGSHIP #26, DETERMINISTIC PROCEDURAL TERRAIN, hf::terrain). PURE CPU — NO GPU compute, NO new shader, NO new
+// RHI; erosion.h is header-only pure-integer math (ErodeHydraulic: a mass-conserving contractive integer flux —
+// each iteration, in pinned row-major Gauss-Seidel order, move fxmul(dh, kOne/8) of height from each cell to its
+// lowest 4-neighbour -> EXACT mass conservation + no inversion), so on Metal it evaluates the IDENTICAL eroded
+// field the Vulkan --pt2-hydraulic-shot evaluates on Windows -> the 2D erosion-delta heatmap golden is bit-
+// identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). Renders the SIGNED per-cell delta d =
+// eroded[i]-base[i] via PURE INTEGER math (deposited/positive -> green ramp, eroded/negative -> blue ramp,
+// magnitude clamp(|d|>>shift,0,255) — NO float pixel math); the proof lines (two-run identical, mass conserved
+// EXACT, the zero-iters no-op, real carving) match the Vulkan side EXACTLY. The fixed SEED/OCT/WORLD/ITERS/IMG
+// MUST be IDENTICAL to the Vulkan --pt2-hydraulic-shot. New golden tests/golden/metal/pt2_hydraulic.png (baked on
+// the Mac by the controller); two runs DIFF 0.0000.
+static int RunPt2HydraulicShowcase(const char* outPath) {
+    namespace ter = hf::terrain;
+    // THE FIXED SHOWCASE PARAMS — IDENTICAL to the Vulkan --pt2-hydraulic-shot (main.cpp).
+    const uint32_t kImg   = 256u;
+    const int      kOct   = 5;
+    const uint32_t kSeed  = 0x7E44A12Bu;
+    const ter::fx  kWorld = ter::kOne * 48;
+    const int      kIters = 60;
+    const int      kShift = 4;
+
+    const int      n      = (int)kImg;
+    const std::vector<ter::fx> base = ter::GenHeightField(kSeed, n, kWorld, kOct);
+    std::vector<ter::fx> eroded = base;
+    ter::ErodeHydraulic(eroded, n, kIters);
+
+    auto renderDelta = [&](const std::vector<ter::fx>& a, const std::vector<ter::fx>& b,
+                           std::vector<uint8_t>& out) {
+        out.assign((size_t)kImg * kImg * 4, 0);
+        for (uint32_t py = 0; py < kImg; ++py) {
+            for (uint32_t px = 0; px < kImg; ++px) {
+                const size_t i = (size_t)py * kImg + px;
+                const int64_t d = (int64_t)b[i] - (int64_t)a[i];   // eroded - base
+                int64_t mag = (d < 0 ? -d : d) >> kShift;
+                if (mag < 0) mag = 0; else if (mag > 255) mag = 255;
+                const uint8_t m = (uint8_t)mag;
+                uint8_t* dst = &out[i * 4];
+                if (d > 0) { dst[0] = 0; dst[1] = m; dst[2] = 0; }       // BGRA: deposited -> green
+                else if (d < 0) { dst[0] = m; dst[1] = 0; dst[2] = 0; }  //       eroded   -> blue
+                else { dst[0] = 0; dst[1] = 0; dst[2] = 0; }             //       unchanged-> black
+                dst[3] = 255;
+            }
+        }
+    };
+
+    std::vector<ter::fx> eroded2 = base;
+    ter::ErodeHydraulic(eroded2, n, kIters);
+    std::vector<uint8_t> imgA1, imgA2;
+    renderDelta(base, eroded,  imgA1);
+    renderDelta(base, eroded2, imgA2);
+    const bool twoRunIdentical = (imgA1.size() == imgA2.size()) &&
+                                 (std::memcmp(imgA1.data(), imgA2.data(), imgA1.size()) == 0);
+    if (!twoRunIdentical) return fail("pt2-hydraulic: two runs differ");
+
+    const int64_t baseSum   = ter::GridSum(base);
+    const int64_t erodedSum = ter::GridSum(eroded);
+    const bool massConserved = (baseSum == erodedSum);
+
+    std::vector<ter::fx> noop = base;
+    ter::ErodeHydraulic(noop, n, 0);
+    const int zeroChanged = ter::CountChanged(base, noop);
+    const bool zeroNoop = (zeroChanged == 0) && (noop == base);
+
+    const int changedCells = ter::CountChanged(base, eroded);
+    size_t peakI = 0; ter::fx peakH = base[0];
+    for (size_t i = 1; i < base.size(); ++i) if (base[i] > peakH) { peakH = base[i]; peakI = i; }
+    const bool peakDropped = (eroded[peakI] < base[peakI]);
+    const bool carves = (changedCells > (n * n) / 4) && peakDropped && (eroded != base);
+
+    if (!massConserved || !zeroNoop || !carves)
+        return fail("pt2-hydraulic: mass / zero-iters / carving control failed");
+
+    std::printf("pt2-hydraulic: integer hydraulic erosion (iters=%d, n=256, rate=kOne/8)\n", kIters);
+    std::printf("pt2-hydraulic: two-run BYTE-IDENTICAL\n");
+    std::printf("pt2-hydraulic: mass conserved EXACT {baseSum:%lld, erodedSum:%lld, delta:0}\n",
+                (long long)baseSum, (long long)erodedSum);
+    std::printf("pt2-hydraulic: zero-iters -> unchanged (no-op) {changed:%d}\n", zeroChanged);
+    std::printf("pt2-hydraulic: carves -> material moved {changedCells:%d, peakDropped:true}\n",
+                changedCells);
+
+    if (!WritePNG(outPath, imgA1, kImg, kImg)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — pt2 deterministic integer hydraulic erosion-delta (iters=%d, seed=0x%08X)\n",
+                outPath, kImg, kImg, kIters, kSeed);
+    return 0;
+}
+
 // ===== Slice FO1 — Deterministic integer WIND FIELD showcase (--fo1-wind) (the BEACHHEAD of FLAGSHIP #25,
 // DETERMINISTIC FOLIAGE AT SCALE, hf::foliage). PURE CPU — NO GPU compute, NO new shader, NO new RHI; foliage.h
 // is header-only pure-integer math (the kFoliageWind16 LUT = the audio kSineTable copied verbatim, indexed by an
@@ -71881,6 +71969,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pt1-height") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pt1_height.png";
             try { return RunPt1HeightShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pt2-hydraulic <out.png>: render the Deterministic integer HYDRAULIC EROSION showcase (Slice PT2, THE
+        // HEADLINE + CRUX of FLAGSHIP #26). PURE CPU — runs the IDENTICAL erosion.h ErodeHydraulic over the IDENTICAL
+        // procterrain.h GenHeightField the Vulkan --pt2-hydraulic-shot runs (the 2D erosion-delta heatmap over a fixed
+        // seed/octaves/world/n/iters, pure-integer pixel map) -> bit-identical cross-backend BY CONSTRUCTION; the
+        // proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--pt2-hydraulic") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pt2_hydraulic.png";
+            try { return RunPt2HydraulicShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fo2-place <out.png>: render the PCG-driven foliage PLACEMENT showcase (Slice FO2, the 2nd slice of
