@@ -58217,6 +58217,372 @@ static int RunFo6HeroShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PT5 — Deterministic FOLIAGE-ON-TERRAIN composition (composes FLAGSHIP #25 onto FLAGSHIP #26).
+// Mirrors the Vulkan --pt5-meadow-shot path EXACTLY: the SAME bit-exact INTEGER eroded heightfield (PT1
+// GenHeightField -> PT2 ErodeHydraulic -> PT3 ErodeThermal at the IDENTICAL fixed seed/n/octaves/erosion +
+// the SAME kReliefGain grid amplify) crossed to a float terrain MESH by PT4 BuildIntTerrainMesh (heightScale=1,
+// so the mesh vertex Y == FxToFloat(gridHeight)) PLUS the wind-swept FOLIAGE meadow SEATED on it by the pure-
+// integer terrain::SampleHeight at each plant's XZ (every plant.base.pos.y == SampleHeight(grid,xz)) — rendered
+// TOGETHER (static lit terrain + instanced lit foliage + both shadow casters + sky + post). The mesh + the
+// seated instance set are byte-identical to the Windows build by construction; only the backend NDC handling
+// (FlipProjY) + GPU float raster differ (the visresolve bar: Metal-baked, two renders BYTE-IDENTICAL + the
+// pure-integer seating provenance + the empty-graph no-op). The SEED/N/OCTAVES/EROSION/FIELD/WIND/FRAME/CAMERA/
+// LIGHT below is IDENTICAL to the Vulkan --pt5-meadow-shot. NO new shader, NO new RHI. -----------------------
+static int RunPt5MeadowShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace foliage = hf::foliage;
+    namespace pcg = hf::pcg;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // ===== (1) The bit-exact INTEGER eroded terrain (PT1 -> PT2 -> PT3). FIXED params — IDENTICAL to the
+    // Vulkan --pt5-meadow-shot so the grid + mesh are byte-identical cross-backend by construction. =====
+    const uint32_t kSeed = 0x7E44A12Bu;
+    const int      kN = 256;
+    const int      kOctaves = 5;
+    const float    kWorldSizeF = 20.0f;
+    const terrain::fx kWorldSizeFx = 20 * terrain::kOne;   // Q16.16 grid world == the float mesh extent
+    const terrain::fx kHalfFx = 10 * terrain::kOne;        // render [-10,10] -> grid [0,20)
+    const int      kHydraulicIters = 60;
+    const int      kThermalIters = 400;
+    const terrain::fx kTalus = terrain::kOne / 32;
+    const float    kHeightScale = 1.0f;                    // mesh vertex Y == FxToFloat(gridHeight)
+    const terrain::fx kReliefGain = 4 * terrain::kOne;     // grid amplitude gain (relief reads at heightScale=1)
+
+    std::vector<terrain::fx> grid =
+        terrain::GenHeightField(kSeed, kN, kWorldSizeFx, kOctaves);
+    terrain::ErodeHydraulic(grid, kN, kHydraulicIters);
+    terrain::ErodeThermal(grid, kN, kThermalIters, kTalus);
+    for (terrain::fx& gv : grid) gv = terrain::fxmul(gv, kReliefGain);
+
+    terrain::TerrainMesh tm =
+        terrain::BuildIntTerrainMesh(grid, kN, kWorldSizeF, kHeightScale);
+    const uint32_t kVertCount = (uint32_t)tm.verts.size();
+    const uint32_t kIndexCount = (uint32_t)tm.indices.size();
+
+    // ===== (2) The foliage meadow over the SAME XZ extent (render world [-half,half]), SEATED on the terrain.
+    // == the Vulkan --pt5-meadow-shot field/seed/wind/frame/camera. =====
+    const pcg::PcgStream stream{0x5CA77E20u, 0x13371337u};
+    const uint32_t kFrame = 90u;
+    const float kBaseScale  = 0.32f;
+    const float kLeanGain   = 7.0f;
+    const float kHeightMul  = 3.2f;
+
+    foliage::FoliageField field;
+    field.graph.area.min = pcg::FxVec3{-10 * pcg::kOne, 0, -10 * pcg::kOne};  // SAME 20x20 XZ patch as the mesh
+    field.graph.area.max = pcg::FxVec3{ 10 * pcg::kOne, 0,  10 * pcg::kOne};
+    field.graph.cellsX = 90; field.graph.cellsZ = 90;
+    field.graph.useMask = true;
+    field.graph.mask.type   = pcg::PcgMaskType::Radial;
+    field.graph.mask.center = pcg::FxVec3{0, 0, 0};
+    field.graph.mask.radius = 16 * pcg::kOne;
+    field.graph.density     = pcg::kOne;
+    field.graph.transform.randomYaw = true;
+    field.graph.transform.scaleLo   = pcg::kOne * 5 / 10;
+    field.graph.transform.scaleHi   = pcg::kOne * 15 / 10;
+    field.graph.prune       = true;
+    field.graph.pruneRadius = pcg::kOne * 16 / 100;
+
+    foliage::WindField wind;
+    wind.gustCount = 3;
+    wind.master    = pcg::kOne;
+    wind.gusts[0]  = foliage::Gust{ 0x01000000, 0x00400000, 0x02000000, pcg::kOne / 4 };
+    wind.gusts[1]  = foliage::Gust{ 0x00300000, 0x01200000, 0x03000000, pcg::kOne / 7 };
+    wind.gusts[2]  = foliage::Gust{ 0x00800000, 0x00900000, 0x01800000, pcg::kOne / 10 };
+
+    const pcg::FxVec3 camPosFx{12 * pcg::kOne, 0, 12 * pcg::kOne};
+    const foliage::fx nearR = pcg::kOne * 12;
+    const foliage::fx farR  = pcg::kOne * 40;
+
+    // PlaceFoliage -> SEAT (SampleHeight) -> ApplyWind -> AssignLods (== the Vulkan path).
+    std::vector<foliage::FoliageInstance> plants = foliage::PlaceFoliage(field, stream);
+    for (foliage::FoliageInstance& p : plants) {
+        p.base.pos.y = terrain::SampleHeight(grid, kN, kWorldSizeFx,
+                                             p.base.pos.x + kHalfFx, p.base.pos.z + kHalfFx);
+    }
+    const uint32_t kSeated = (uint32_t)plants.size();
+    foliage::ApplyWind(plants, wind, kFrame);
+    foliage::AssignLods(plants, camPosFx, nearR, farR);
+    const uint32_t kPlantCount = (uint32_t)plants.size();
+
+    const std::vector<Mat4> mats =
+        foliage::FoliageToRenderInstancesHero(plants, kBaseScale, kLeanGain, kHeightMul);
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(mats.size());
+    for (const Mat4& m : mats) {
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        inst.model[13] += m.m[5] * 0.5f;   // RENDER-ONLY lift (== the Vulkan path; does NOT touch `mats`)
+        instances.push_back(inst);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+    // ===== Terrain mesh GPU buffers (the --pt4-mesh wiring). =====
+    rhi::BufferDesc tvb;
+    tvb.size = (uint64_t)tm.verts.size() * sizeof(scene::Vertex);
+    tvb.initialData = tm.verts.data();
+    tvb.usage = rhi::BufferUsage::Vertex;
+    auto terrainVB = device->CreateBuffer(tvb);
+    rhi::BufferDesc tib;
+    tib.size = (uint64_t)tm.indices.size() * sizeof(uint32_t);
+    tib.initialData = tm.indices.data();
+    tib.usage = rhi::BufferUsage::Index;
+    auto terrainIB = device->CreateBuffer(tib);
+    scene::Mesh terrainMesh{std::move(terrainVB), std::move(terrainIB), kIndexCount};
+
+    // ===== Pipelines (REUSED VERBATIM from --pt4-mesh + --fo6-hero; NO new shader, NO new RHI). =====
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = device->Swapchain().ColorFormat();
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    auto whiteTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    const uint8_t leafPx[4] = {90, 170, 70, 255};          // verdant leaf green for the meadow
+    auto leafTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, leafPx, sizeof(leafPx)});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    std::unique_ptr<rhi::IBuffer> instanceBuffer;
+    if (kInstanceCount > 0) {
+        rhi::BufferDesc instBufDesc;
+        instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+        instBufDesc.initialData = instances.data();
+        instBufDesc.usage = rhi::BufferUsage::Vertex;
+        instanceBuffer = device->CreateBuffer(instBufDesc);
+    }
+
+    Mat4 terrainModel = Mat4::Identity();
+
+    // CINEMATIC near-ground 3/4 camera (== the Vulkan --pt5-meadow-shot camera).
+    const Vec3 eye{15.0f, 9.0f, 15.0f};
+    const Vec3 center{-1.0f, 1.5f, -1.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 200.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 0.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 34.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-16.0f, 16.0f, -16.0f, 16.0f, 1.0f, 70.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(terrainModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(terrainMesh.vertices());
+            cmd.BindIndexBuffer(terrainMesh.indices());
+            cmd.DrawIndexed(terrainMesh.indexCount());
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instShadowPipeline);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = terrainModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.92f; pc[18] = 0.0f; pc[19] = 0.0f;  // dielectric, rough
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*whiteTex, *flatNormal);
+                cmd.BindVertexBuffer(terrainMesh.vertices());
+                cmd.BindIndexBuffer(terrainMesh.indices());
+                cmd.DrawIndexed(terrainMesh.indexCount());
+            }
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instPipeline);
+                float material[4] = {0.0f, 0.9f, 0.0f, 0.0f};   // verdant matte foliage
+                cmd.PushConstants(material, sizeof(material));
+                cmd.BindMaterial(*leafTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    auto countShaded = [](const std::vector<uint8_t>& img) -> uint32_t {
+        uint32_t n = 0;
+        for (size_t p = 0; p + 3 < img.size(); p += 4) {
+            const int b = img[p + 0], g = img[p + 1], r = img[p + 2];
+            if (b + g + r > 60) ++n;
+        }
+        return n;
+    };
+    const uint32_t shaded = countShaded(bgra);
+
+    // (1) headline.
+    std::printf("pt5-meadow: foliage seated on eroded terrain (plants:%u, verts:%u, frame:%u)\n",
+                kPlantCount, kVertCount, kFrame);
+
+    // (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd render)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("pt5-meadow two renders DIFFER (nondeterministic)");
+    std::printf("pt5-meadow: two renders BYTE-IDENTICAL\n");
+
+    // (3) SEATING PROVENANCE: for EVERY plant, plant.base.pos.y == SampleHeight(grid, n, worldSize, xz).
+    {
+        bool seatOk = true;
+        for (const foliage::FoliageInstance& p : plants) {
+            const terrain::fx expect = terrain::SampleHeight(
+                grid, kN, kWorldSizeFx, p.base.pos.x + kHalfFx, p.base.pos.z + kHalfFx);
+            if (p.base.pos.y != expect) { seatOk = false; break; }
+        }
+        if (!seatOk || kSeated != kPlantCount)
+            return fail("pt5-meadow seating provenance: plant.y != SampleHeight");
+    }
+    if (shaded == 0) return fail("pt5-meadow coverage 0 (nothing shaded / black render)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("pt5-meadow uniform image (no coherent scene)");
+    std::printf("pt5-meadow: provenance every plant.y == SampleHeight(grid, plant.xz) "
+                "{plants:%u, seated:%u}\n", kPlantCount, kSeated);
+
+    // (4) empty graph -> 0 plants -> bare terrain (the no-op control).
+    {
+        foliage::FoliageField emptyField = field;
+        emptyField.graph.cellsX = 0;
+        std::vector<foliage::FoliageInstance> emptyPlants = foliage::PlaceFoliage(emptyField, stream);
+        for (foliage::FoliageInstance& p : emptyPlants) {
+            p.base.pos.y = terrain::SampleHeight(grid, kN, kWorldSizeFx,
+                                                 p.base.pos.x + kHalfFx, p.base.pos.z + kHalfFx);
+        }
+        foliage::ApplyWind(emptyPlants, wind, kFrame);
+        foliage::AssignLods(emptyPlants, camPosFx, nearR, farR);
+        if (!emptyPlants.empty() ||
+            !foliage::FoliageToRenderInstancesHero(emptyPlants, kBaseScale, kLeanGain, kHeightMul).empty())
+            return fail("pt5-meadow empty graph not empty");
+    }
+    std::printf("pt5-meadow: empty graph -> bare terrain (no-op) {emptyPlants:0}\n");
+
+    (void)kInstanceCount;
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — foliage meadow seated on eroded terrain (%u plants, %u verts)\n",
+                outPath, cw, ch, kPlantCount, kVertCount);
+    return 0;
+}
+
 // ===== Slice PCG6 — Deterministic PCG LIT 3D RENDER capstone (the money-shot COMPLETING FLAGSHIP #22). Mirrors
 // the Vulkan --pcg6-field-shot path EXACTLY: builds the SAME full PcgGraph (jittered-grid scatter over a 12x12 XZ
 // patch centred at the origin -> a radial density mask -> random yaw + scale [0.6,1.4] -> overlap-prune),
@@ -70197,6 +70563,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pt4-mesh") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pt4_mesh.png";
             try { return RunPt4MeshShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pt5-meadow <out.png>: render the FOLIAGE-ON-TERRAIN composition (Slice PT5, composes FLAGSHIP #25
+        // onto FLAGSHIP #26) — the bit-exact eroded terrain MESH (PT1->PT4) PLUS the wind-swept foliage meadow
+        // SEATED on it by the pure-integer terrain::SampleHeight, lit + shadowed in one scene. Mirrors the
+        // Vulkan --pt5-meadow-shot path; new golden tests/golden/metal/pt5_meadow.png.
+        if (argc > 1 && std::strcmp(argv[1], "--pt5-meadow") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pt5_meadow.png";
+            try { return RunPt5MeadowShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --terrain-stream <out.png>: render the terrain-streaming LOD showcase (Slice BJ) — the RESIDENT

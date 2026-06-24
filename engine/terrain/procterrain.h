@@ -228,4 +228,55 @@ inline TerrainMesh BuildIntTerrainMesh(const std::vector<fx>& grid, int n, float
     return out;
 }
 
+// ============================ SLICE PT5 — bilinear integer height SAMPLE (the SEATING) ====================
+// (APPEND-ONLY after PT4; PT1-PT4 logic is NOT modified.) The pure-integer primitive that SEATS the foliage
+// meadow (FLAGSHIP #25) onto the eroded terrain surface: SampleHeight returns the bilinearly-interpolated
+// Q16.16 height of the eroded grid at an arbitrary world XZ (in the SAME [0, worldSize) Q16.16 units the
+// grid was generated over by GenHeightField). A plant scattered at world XZ is lifted to the terrain by
+// plant.y = SampleHeight(grid, n, worldSize, plant.x, plant.z) — a PURE FUNCTION of the grid, so the seating
+// is deterministic + provenance-checkable (recompute and compare). NO float: the four-corner bilinear blend
+// is done with fxmul (Q16.16), exactly like the PT1 IntValueNoise corner blend (linear is fine for height).
+//
+// Map x/z to fractional grid coords gfx = (fx)((int64)x*(n-1)/worldSize) (Q16.16; the (n-1)/worldSize scale
+// makes a world X of ix*worldSize/(n-1) land EXACTLY on integer grid index ix — i.e. it aligns with PT4's
+// BuildIntTerrainMesh vertex spacing step = worldSize/(n-1), so SampleHeight at a mesh vertex's world XZ
+// returns that vertex's grid height EXACTLY: the plant sits ON the mesh surface). The integer cell gx =
+// gfx>>kFrac (clamped to [0, n-2] so the +1 neighbour stays in-grid), the fractional tx = gfx - (gx<<kFrac)
+// in [0, kOne); the 4 grid corners grid[gz*n+gx{,+1}] / grid[(gz+1)*n+gx{,+1}] are blended bilinearly with
+// fxmul. A degenerate grid (n<2 or size mismatch) -> 0 (flat). Pure integer; NO <cmath>, NO float, NO RNG.
+inline fx SampleHeight(const std::vector<fx>& grid, int n, fx worldSize, fx x, fx z) {
+    if (n < 2 || worldSize <= 0) return 0;
+    if (grid.size() != static_cast<size_t>(n) * static_cast<size_t>(n)) return 0;
+
+    // Fractional grid coordinates in Q16.16 (the (n-1)/worldSize scale aligns with the PT4 mesh spacing).
+    fx gfx = static_cast<fx>((static_cast<int64_t>(x) * static_cast<int64_t>(n - 1)) /
+                             static_cast<int64_t>(worldSize));
+    fx gfz = static_cast<fx>((static_cast<int64_t>(z) * static_cast<int64_t>(n - 1)) /
+                             static_cast<int64_t>(worldSize));
+    // Clamp the fractional coords into the valid blend domain [0, (n-1)*kOne] so the integer cell stays in
+    // [0, n-2] (the +1 neighbour in-grid) and the fraction stays in [0, kOne].
+    const fx loFx = 0;
+    const fx hiFx = static_cast<fx>(n - 1) << kFrac;   // (n-1).0 in Q16.16
+    if (gfx < loFx) gfx = loFx; else if (gfx > hiFx) gfx = hiFx;
+    if (gfz < loFx) gfz = loFx; else if (gfz > hiFx) gfz = hiFx;
+
+    int gx = static_cast<int>(gfx >> kFrac);
+    int gz = static_cast<int>(gfz >> kFrac);
+    if (gx > n - 2) gx = n - 2;                         // keep gx+1 in-grid (gx already >= 0 by the clamp)
+    if (gz > n - 2) gz = n - 2;
+    const fx tx = gfx - (static_cast<fx>(gx) << kFrac); // fractional part in [0, kOne]
+    const fx tz = gfz - (static_cast<fx>(gz) << kFrac);
+
+    const size_t row0 = static_cast<size_t>(gz) * static_cast<size_t>(n);
+    const size_t row1 = static_cast<size_t>(gz + 1) * static_cast<size_t>(n);
+    const fx h00 = grid[row0 + static_cast<size_t>(gx)];
+    const fx h10 = grid[row0 + static_cast<size_t>(gx + 1)];
+    const fx h01 = grid[row1 + static_cast<size_t>(gx)];
+    const fx h11 = grid[row1 + static_cast<size_t>(gx + 1)];
+    // Bilinear blend (the PT1 IntValueNoise corner-blend shape; linear in fixed point).
+    const fx a = h00 + fxmul(h10 - h00, tx);
+    const fx b = h01 + fxmul(h11 - h01, tx);
+    return a + fxmul(b - a, tz);
+}
+
 }  // namespace hf::terrain
