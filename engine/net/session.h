@@ -111,4 +111,96 @@ void SubmitInputAt(Session<World, Input>& s, uint32_t applyTick, const Input& in
     s.ring.AddInput(applyTick, in);
 }
 
+// ============================ NS3: PREDICTION + SNAPSHOT RING + ROLLBACK =============================
+// THE CRUX of the netcode flagship — a GGPO-class rollback core. NS2's input-delay hides latency when
+// the remote input arrives in time; NS3 handles the case where it does NOT: PREDICT the missing remote
+// input (reuse the last confirmed remote), advance speculatively, and when the truth arrives for a past
+// tick that we MISPREDICTED, ROLL BACK — restore the world from a per-tick SNAPSHOT RING and re-simulate
+// forward with the corrected inputs. The make-or-break invariant: a predicted+rolled-back run reaches the
+// BIT-IDENTICAL digest of a no-latency authority run, AND a real misprediction actually fired
+// (didRollback). This generalizes fpx.h:RunRollback to a rolling snapshot window + arbitrary
+// misprediction ticks. The World is copy-restorable (the toy worlds value-copy; a real sim would plug in
+// SnapshotWorld/RestoreWorld). Pure-CPU integer — no float/<cmath>/clock/RNG. Input must be
+// equality-comparable (to detect a mispredict).
+//
+// The model: two input streams over T ticks — local[t] (known immediately) and remote[t] (the peer's
+// input, known only LAG ticks late: it "arrives" at tick t+LAG). Each tick we step with local[t] + the
+// remote we currently BELIEVE (confirmed if arrived, else a prediction = lastConfirmed remote).
+
+template <class World, class Input>
+struct RollbackSession {
+    World world;                          // current speculative world
+    uint32_t tick = 0;                    // next tick to simulate
+    uint32_t confirmedThrough = 0;        // all remote inputs < this tick are confirmed
+    std::vector<World> snaps;             // snaps[t] = world at the START of tick t (the snapshot ring/log)
+    std::vector<Input> appliedRemote;     // the remote input actually APPLIED at each past tick (pred/real)
+    std::vector<Input> appliedLocal;      // the local input applied at each past tick (for the replay)
+    std::vector<Input> confirmedRemote;   // the real remote inputs received so far (by tick)
+    std::vector<bool>  haveRemote;        // whether confirmedRemote[t] has arrived
+    Input lastConfirmed{};                // the prediction source (last confirmed remote input)
+    bool  didRollback = false;            // set true if any rollback fired (the proof flag)
+};
+
+// Grow the per-tick vectors to cover index `t` (snaps/appliedRemote/appliedLocal/confirmedRemote/haveRemote).
+template <class World, class Input>
+inline void RollbackGrow(RollbackSession<World, Input>& s, uint32_t t) {
+    const std::size_t need = static_cast<std::size_t>(t) + 1;
+    if (s.snaps.size()           < need) s.snaps.resize(need);
+    if (s.appliedRemote.size()   < need) s.appliedRemote.resize(need);
+    if (s.appliedLocal.size()    < need) s.appliedLocal.resize(need);
+    if (s.confirmedRemote.size() < need) s.confirmedRemote.resize(need);
+    if (s.haveRemote.size()      < need) s.haveRemote.resize(need, false);
+}
+
+// StepPredicted: advance ONE tick speculatively. Snapshot the world at the start of the tick, pick the
+// remote input (confirmed if it has arrived for this tick, else PREDICT = lastConfirmed), record both
+// applied inputs, step over BOTH inputs in a fixed order (local then remote), and ++tick.
+template <class World, class Input, class StepFn>
+void StepPredicted(RollbackSession<World, Input>& s, const Input& localThisTick, StepFn step) {
+    const uint32_t t = s.tick;
+    RollbackGrow(s, t);
+    s.snaps[t] = s.world;                                   // snapshot the START-of-tick world
+    Input r = s.haveRemote[t] ? s.confirmedRemote[t] : s.lastConfirmed;   // confirmed else PREDICT
+    s.appliedRemote[t] = r;
+    s.appliedLocal[t]  = localThisTick;
+    step(s.world, { localThisTick, r }, t);                // deterministic step over BOTH inputs (fixed order)
+    ++s.tick;
+}
+
+// ConfirmRemote: the real remote input for tick `at` arrives. Record it, extend the confirmed prefix
+// (advancing confirmedThrough/lastConfirmed over every contiguous arrived tick). If `at` was already
+// simulated AND we mispredicted it (applied != real), ROLL BACK: restore snaps[at] and re-simulate
+// at..tick-1 with the now-corrected remote inputs, re-snapshotting as we go. tick is unchanged after.
+template <class World, class Input, class StepFn>
+void ConfirmRemote(RollbackSession<World, Input>& s, uint32_t at, const Input& real, StepFn step) {
+    RollbackGrow(s, at);
+    s.confirmedRemote[at] = real;
+    s.haveRemote[at]      = true;
+
+    // Detect a misprediction of an ALREADY-simulated tick BEFORE we mutate lastConfirmed below.
+    const bool mispredicted =
+        (at < s.tick) && (s.appliedRemote[at] != real);
+
+    // Extend the confirmed prefix: advance confirmedThrough over every contiguous arrived tick, tracking
+    // the last confirmed remote (the prediction source for future / replayed ticks).
+    while (s.confirmedThrough < s.haveRemote.size() &&
+           s.haveRemote[s.confirmedThrough]) {
+        s.lastConfirmed = s.confirmedRemote[s.confirmedThrough];
+        ++s.confirmedThrough;
+    }
+
+    if (!mispredicted) return;
+
+    // ROLLBACK: restore the world to the start of tick `at` and re-simulate forward to the current tick.
+    s.world = s.snaps[at];
+    s.didRollback = true;
+    for (uint32_t u = at; u < s.tick; ++u) {
+        s.snaps[u] = s.world;                              // re-snapshot the corrected START-of-tick world
+        Input r = s.haveRemote[u] ? s.confirmedRemote[u] : s.lastConfirmed;
+        s.appliedRemote[u] = r;
+        step(s.world, { s.appliedLocal[u], r }, u);        // replay with the SAME local, corrected remote
+    }
+    // s.tick is unchanged — we re-reached the same tick with the corrected world.
+}
+
 }  // namespace hf::net

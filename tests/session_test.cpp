@@ -268,6 +268,93 @@ int main() {
     std::printf("ns2-delay: pinned converged digest {hash:0x%016llx}\n",
                 static_cast<unsigned long long>(hRef));
 
+    // ================================ NS3: PREDICTION + ROLLBACK =====================================
+    // THE CRUX: predict the missing remote input, advance speculatively, roll back from the snapshot ring
+    // when the truth arrives and differs. Make-or-break: a predicted+rolled-back run (LAG>0) reaches the
+    // BYTE-IDENTICAL digest of a no-latency AUTHORITY run, AND a real misprediction actually fired.
+    //
+    // Toy world: an int64 accumulator folded ORDER-SENSITIVELY over BOTH inputs (local then remote), so a
+    // wrong remote prediction changes the state: acc = acc*K + local*A + remote*B. The remote stream
+    // VARIES, so predictions (reuse last confirmed remote) are sometimes wrong -> a real rollback fires.
+    using InR = int32_t;
+    struct RWorld { int64_t acc = 0; };
+    // step over {local, remote} in fixed order — an order-sensitive Horner fold (K!=A!=B, all nonzero).
+    auto stepR = [](RWorld& w, std::initializer_list<InR> lr, uint32_t /*tick*/) {
+        const InR* p = lr.begin();
+        const int64_t local  = static_cast<int64_t>(p[0]);
+        const int64_t remote = static_cast<int64_t>(p[1]);
+        w.acc = w.acc * 6 + local * 3 + remote * 5;    // K=6, A=3, B=5 — remote is load-bearing
+    };
+    auto digestR = [](const RWorld& w) { return DigestBytes(&w.acc, sizeof w.acc); };
+
+    const uint32_t kRTicks = 24;
+    // Fixed local + remote streams. remote VARIES tick-to-tick (different from the prior confirmed value
+    // often enough that prediction-by-reuse mispredicts).
+    std::vector<InR> local(kRTicks), remote(kRTicks);
+    for (uint32_t t = 0; t < kRTicks; ++t) {
+        local[t]  = static_cast<InR>(1 + (t * 7) % 11);          // deterministic, no RNG
+        remote[t] = static_cast<InR>(-3 + static_cast<int>((t * 5) % 13) - static_cast<int>(t % 4));
+    }
+
+    // AUTHORITY: a no-latency lockstep applying the TRUE {local[t], remote[t]} every tick -> D_auth.
+    uint64_t dAuth = 0;
+    {
+        RWorld w;
+        for (uint32_t t = 0; t < kRTicks; ++t) stepR(w, { local[t], remote[t] }, t);
+        dAuth = digestR(w);
+    }
+
+    // ---- (NS3-1) ROLLBACK CORRECTNESS (make-or-break): LAG>0 predict+rollback == authority. ----------
+    const uint32_t kLag = 3;
+    uint64_t dRollback = 0;
+    bool firedRollback = false;
+    {
+        RollbackSession<RWorld, InR> s;
+        for (uint32_t t = 0; t < kRTicks; ++t) {
+            // Deliver any remote whose arrival tick (origin + LAG) is NOW, BEFORE stepping this tick.
+            // remote[u] originates at tick u and "arrives" at tick u+kLag.
+            if (t >= kLag) ConfirmRemote(s, t - kLag, remote[t - kLag], stepR);
+            StepPredicted(s, local[t], stepR);
+        }
+        // Drain the remaining in-flight confirmations (the last kLag remotes) -> final rollbacks.
+        for (uint32_t u = (kRTicks >= kLag ? kRTicks - kLag : 0); u < kRTicks; ++u)
+            ConfirmRemote(s, u, remote[u], stepR);
+        dRollback     = digestR(s.world);
+        firedRollback = s.didRollback;
+    }
+    check(dRollback == dAuth, "ns3: rollback correctness — predicted+rolled-back == authority BYTE-IDENTICAL");
+    check(firedRollback, "ns3: a real misprediction diverged then was corrected (didRollback)");
+
+    // ---- (NS3-2) LAG=0 no-rollback == authority trivially (every input confirmed immediately). -------
+    uint64_t dLag0 = 0;
+    bool lag0NoRollback = false;
+    {
+        RollbackSession<RWorld, InR> s;
+        for (uint32_t t = 0; t < kRTicks; ++t) {
+            ConfirmRemote(s, t, remote[t], stepR);   // confirm BEFORE stepping -> never a prediction
+            StepPredicted(s, local[t], stepR);
+        }
+        dLag0          = digestR(s.world);
+        lag0NoRollback = !s.didRollback;
+    }
+    check(dLag0 == dAuth, "ns3: LAG=0 no-rollback == authority byte-identical");
+    check(lag0NoRollback, "ns3: LAG=0 never rolled back (every input confirmed immediately)");
+
+    // ---- (NS3-3) PINNED — D_auth == hard-pinned uint64_t (the cross-platform regression anchor). -----
+    const uint64_t kPinnedNs3Auth = 0x1aa9738bcc0c7001ull; // the converged authority digest (anchor)
+    check(dAuth == kPinnedNs3Auth, "ns3: pinned authority digest matches golden");
+
+    // ---- NS3 showcase (printed; no image golden). ----------------------------------------------------
+    std::printf("ns3-rollback: prediction + snapshot ring + rollback on misprediction\n");
+    std::printf("ns3-rollback: rollback correctness — predicted+rolled-back == authority BYTE-IDENTICAL {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(dRollback));
+    std::printf("ns3-rollback: a real misprediction diverged then was corrected {didRollback:%s}\n",
+                firedRollback ? "true" : "false");
+    std::printf("ns3-rollback: LAG=0 no-rollback == authority {ok:%s}\n",
+                (dLag0 == dAuth && lag0NoRollback) ? "true" : "false");
+    std::printf("ns3-rollback: pinned authority digest {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(dAuth));
+
     if (g_fail == 0) { std::printf("session_test: ALL CHECKS PASSED\n"); return 0; }
     std::printf("session_test: %d failures\n", g_fail);
     return 1;
