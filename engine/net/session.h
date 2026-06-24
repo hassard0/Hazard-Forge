@@ -271,4 +271,76 @@ void RunWithTransport(RollbackSession<World, Input>& s, const std::vector<Input>
     }
 }
 
+// ============================ NS5: DESYNC DETECTOR via PER-TICK DIGEST EXCHANGE ======================
+// The safety net for the whole flagship: NS1-NS4 PROVE two peers fed the same confirmed inputs stay
+// bit-identical, but a real bug (a non-deterministic step, a missed input, a corrupted state) breaks that
+// SILENTLY — the worlds drift and nobody knows WHERE. NS5 turns silent divergence into a hard, LOCATED
+// error: each peer broadcasts its per-tick state DIGEST, and the receiver compares against its own,
+// latching the EXACT tick (and the two diverging digests) of the FIRST mismatch. In a correct session the
+// per-tick digests are identical (the NS1 lockstep invariant), so any mismatch is a true desync. This is
+// pure bookkeeping over NS1's Advance/digest — no new sim machinery. Pure-CPU integer (no float/<cmath>/
+// clock/RNG); the comparison is byte-exact on the FNV-1a-64 DigestBytes currency.
+
+// The per-tick digest a peer broadcasts — exactly what rides the transport in a real session (a tiny
+// fixed-size checksum, NOT the whole world): the origin tick + its confirmed-state digest.
+struct ChecksumPacket {
+    uint32_t tick   = 0;
+    uint64_t digest = 0;
+};
+
+// DigestTrace: run lockstep (NS1 Advance) from `init` over `ring` for `ticks` ticks and record
+// digest(world) AFTER each tick -> a per-tick digest trace of length `ticks` (the confirmed-state checksum
+// stream a peer would emit, one ChecksumPacket per tick). Deterministic of (init, ring, ticks, step,
+// digest) alone, like RunLockstep, so two peers fed the same inputs emit the IDENTICAL trace.
+template <class World, class Input, class StepFn, class DigestFn>
+std::vector<uint64_t> DigestTrace(World init, const InputRing<Input>& ring, uint32_t ticks,
+                                  StepFn step, DigestFn digest) {
+    Session<World, Input> s;
+    s.world = init;
+    s.ring  = ring;     // a COPY — the caller's ring is untouched (matches RunLockstep)
+    s.tick  = 0;
+    std::vector<uint64_t> trace;
+    trace.reserve(static_cast<std::size_t>(ticks));
+    for (uint32_t t = 0; t < ticks; ++t) {
+        Advance(s, step);                 // NS1 deterministic transition
+        trace.push_back(digest(s.world)); // record the digest AFTER the tick
+    }
+    return trace;
+}
+
+// DesyncDetector: a receiver's local per-tick digest record + the latched FIRST divergence (if any). The
+// detector is fed its OWN trace via RecordLocal, then the remote peer's ChecksumPackets via IngestRemote;
+// it latches the earliest tick whose local and remote digests disagree.
+struct DesyncDetector {
+    std::vector<uint64_t> localByTick;     // localByTick[t] = this peer's digest after tick t
+    bool                  desynced     = false;
+    uint32_t              desyncTick   = 0;
+    uint64_t              localDigest  = 0; // our digest at the desync tick
+    uint64_t              remoteDigest = 0; // the peer's digest at the desync tick
+};
+
+// RecordLocal: grow + store d.localByTick[tick] = digest (the local confirmed-state checksum for `tick`).
+inline void RecordLocal(DesyncDetector& d, uint32_t tick, uint64_t digest) {
+    if (static_cast<std::size_t>(tick) >= d.localByTick.size())
+        d.localByTick.resize(static_cast<std::size_t>(tick) + 1);
+    d.localByTick[static_cast<std::size_t>(tick)] = digest;
+}
+
+// IngestRemote: compare a remote peer's ChecksumPacket against our local record. If the tick is one we
+// have recorded AND we have NOT already latched a desync AND the digests differ, latch the FIRST mismatch
+// (tick + both diverging digests). Ingesting a tick we have not recorded yet is a deterministic no-op; the
+// detector latches only the EARLIEST divergence (a later-arriving earlier mismatch can still overwrite
+// nothing because we ingest in tick order in practice, but the !d.desynced guard keeps the first latch
+// stable regardless of arrival order once set).
+inline void IngestRemote(DesyncDetector& d, const ChecksumPacket& pkt) {
+    if (static_cast<std::size_t>(pkt.tick) < d.localByTick.size() &&
+        !d.desynced &&
+        d.localByTick[static_cast<std::size_t>(pkt.tick)] != pkt.digest) {
+        d.desynced     = true;
+        d.desyncTick   = pkt.tick;
+        d.localDigest  = d.localByTick[static_cast<std::size_t>(pkt.tick)];
+        d.remoteDigest = pkt.digest;
+    }
+}
+
 }  // namespace hf::net

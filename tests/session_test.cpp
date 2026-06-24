@@ -499,6 +499,99 @@ int main() {
     std::printf("ns4-transport: pinned authority digest {hash:0x%016llx}\n",
                 static_cast<unsigned long long>(dAuth));
 
+    // ================================ NS5: DESYNC DETECTOR via DIGEST EXCHANGE =======================
+    // The safety net: peers exchange per-tick state digests and a mismatch is caught at the EXACT tick.
+    // We reuse ToyA (folds input with the tick, so a wrong input at tick K diverges the trace at K and —
+    // because the accumulator carries forward — STAYS diverged). Make-or-break: (1) a CLEAN session (both
+    // peers same inputs) -> ZERO desync; (2) a CORRUPTED peer A (one extra input at tick K) is detected at
+    // the EXACT first diverging tick K with diverging digests; (3) localization is exact (identical < K,
+    // differ at K); (4) the clean trace's final digest is pinned.
+    const uint32_t kNs5Ticks = 16;
+    const uint32_t kK        = 7;     // the chosen corruption tick
+
+    // Peer B's (and the clean peer A's) shared input ring.
+    auto makeRingNs5 = []() -> InputRing<InA> {
+        InputRing<InA> r;
+        r.AddInput(0,  4);
+        r.AddInput(2,  9); r.AddInput(2, -1);   // two on tick 2
+        r.AddInput(5, 13);
+        r.AddInput(7,  6);                       // tick K=7 has a legitimate input in BOTH peers
+        r.AddInput(9, -8);
+        r.AddInput(12, 3);
+        r.AddInput(15, 7);
+        return r;
+    };
+
+    // Peer A's CORRUPTED ring: identical to B's PLUS one extra input at tick K (so A diverges at K).
+    auto makeRingNs5Corrupt = [&]() -> InputRing<InA> {
+        InputRing<InA> r = makeRingNs5();
+        r.AddInput(kK, 999);   // the desync seed — an extra input only peer A applies at tick K
+        return r;
+    };
+
+    // Build the two per-tick digest traces (peer B clean, peer A clean for case 1; peer A corrupt case 2).
+    const std::vector<uint64_t> traceB     = DigestTrace<ToyA, InA>(ToyA{}, makeRingNs5(),        kNs5Ticks, StepA, DigestA);
+    const std::vector<uint64_t> traceAClean= DigestTrace<ToyA, InA>(ToyA{}, makeRingNs5(),        kNs5Ticks, StepA, DigestA);
+    const std::vector<uint64_t> traceACorr = DigestTrace<ToyA, InA>(ToyA{}, makeRingNs5Corrupt(), kNs5Ticks, StepA, DigestA);
+
+    // ---- (NS5-1) CLEAN SESSION -> ZERO DESYNC (make-or-break). ---------------------------------------
+    bool ns5CleanZeroDesync = false;
+    {
+        DesyncDetector d;
+        for (uint32_t t = 0; t < kNs5Ticks; ++t) RecordLocal(d, t, traceB[t]);          // peer B records ITS trace
+        for (uint32_t t = 0; t < kNs5Ticks; ++t)                                         // ingest peer A's (clean) checksums
+            IngestRemote(d, ChecksumPacket{ t, traceAClean[t] });
+        ns5CleanZeroDesync = (d.desynced == false);
+        check(ns5CleanZeroDesync, "ns5: clean session — identical peers report ZERO desync");
+    }
+
+    // ---- (NS5-2) CORRUPTED PEER DETECTED AT THE EXACT TICK K. ----------------------------------------
+    DesyncDetector dCorr;
+    {
+        for (uint32_t t = 0; t < kNs5Ticks; ++t) RecordLocal(dCorr, t, traceB[t]);       // peer B records ITS trace
+        for (uint32_t t = 0; t < kNs5Ticks; ++t)                                         // ingest peer A's CORRUPT checksums (ascending)
+            IngestRemote(dCorr, ChecksumPacket{ t, traceACorr[t] });
+        check(dCorr.desynced == true,             "ns5: corrupted peer is detected (desynced)");
+        check(dCorr.desyncTick == kK,             "ns5: desync located at the EXACT first diverging tick K");
+        check(dCorr.localDigest != dCorr.remoteDigest, "ns5: the two diverging digests differ");
+        check(dCorr.localDigest == traceB[kK],    "ns5: latched local digest == peer B's digest at K");
+        check(dCorr.remoteDigest == traceACorr[kK],"ns5: latched remote digest == peer A's digest at K");
+    }
+
+    // ---- (NS5-3) LOCALIZATION EXACT — identical for every tick < K, differ at K. ---------------------
+    bool ns5LocalizationExact = true;
+    {
+        for (uint32_t t = 0; t < kK; ++t)
+            if (traceB[t] != traceACorr[t]) ns5LocalizationExact = false;   // must be IDENTICAL before K
+        if (traceB[kK] == traceACorr[kK]) ns5LocalizationExact = false;     // must DIFFER at K
+        check(ns5LocalizationExact, "ns5: localization exact — identical before K, differ at K");
+    }
+
+    // ---- (NS5-4) PINNED — the clean trace's final digest == a hard-pinned uint64_t. ------------------
+    const uint64_t ns5CleanFinal = traceB[kNs5Ticks - 1];
+    const uint64_t kPinnedNs5Final = 0x49aa655446b5c3a2ull; // the clean trace's final digest (anchor)
+    check(ns5CleanFinal == kPinnedNs5Final, "ns5: pinned clean final digest matches golden");
+    // Also confirm clean traces agree at EVERY tick (the lockstep invariant the detector relies on).
+    {
+        bool cleanEqualEvery = true;
+        for (uint32_t t = 0; t < kNs5Ticks; ++t)
+            if (traceB[t] != traceAClean[t]) cleanEqualEvery = false;
+        check(cleanEqualEvery, "ns5: clean traces equal at EVERY tick (lockstep invariant)");
+    }
+
+    // ---- NS5 showcase (printed; no image golden). ---------------------------------------------------
+    std::printf("ns5-desync: per-tick digest exchange desync detector\n");
+    std::printf("ns5-desync: clean session — zero desync {desynced:%s}\n",
+                ns5CleanZeroDesync ? "false" : "true");   // ns5CleanZeroDesync == (desynced==false)
+    std::printf("ns5-desync: corrupted peer detected at exact tick {desyncTick:%u, local:0x%016llx, remote:0x%016llx}\n",
+                dCorr.desyncTick,
+                static_cast<unsigned long long>(dCorr.localDigest),
+                static_cast<unsigned long long>(dCorr.remoteDigest));
+    std::printf("ns5-desync: localization exact — identical before K, differ at K {ok:%s}\n",
+                ns5LocalizationExact ? "true" : "false");
+    std::printf("ns5-desync: pinned clean final digest {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(ns5CleanFinal));
+
     if (g_fail == 0) { std::printf("session_test: ALL CHECKS PASSED\n"); return 0; }
     std::printf("session_test: %d failures\n", g_fail);
     return 1;
