@@ -39,6 +39,7 @@ using hf::sim::fpx::kFrac;
 using hf::sim::fpx::fxmul;
 using hf::sim::fpx::fxdiv;
 using hf::sim::fpx::FxVec3;   // Slice WE2: the Q16.16 3-vector (a precipitation drop position).
+using hf::sim::fpx::FxToFloat; // Slice WE4: the single Q16.16->float crossing (the render bridge), read-only.
 
 // kCloudDriftRate: the deterministic per-frame drift speed — clouds translate kCloudDriftRate world units
 // in +X per frame (a small Q16.16 offset). frame is the ONLY time input; driftX = kCloudDriftRate*frame.
@@ -243,6 +244,28 @@ inline SunSkyState SunSky(uint32_t frame) {
         a.z + fxmul(b.z - a.z, t),
     };
     return s;
+}
+
+// ===== Slice WE4 — the FLOAT RENDER BRIDGE (4th slice of FLAGSHIP #27; the arc's FIRST float crossing) =========
+// The render bridge crosses the bit-exact INTEGER weather data (WE1 drift + WE3 sun) into the FLOAT clouds raymarch
+// (engine/render/clouds.h / clouds.frag) ONCE, via the single host FxToFloat conversion. These tiny helpers are the
+// ONLY float code the flagship adds: both backends compute the SAME integer (kCloudDriftRate*frame, SunSky(frame))
+// then the SAME FxToFloat, so the cloud DRIFT + the cloud LIGHTING are deterministic cross-platform (the FO5/PT4
+// single-float-crossing precedent). WE1-WE3 stay strict-integer; this is APPEND-ONLY and READ-ONLY over them.
+
+// CloudDriftTime(frame): the float advection time the existing clouds shader consumes (cprm.time), derived from the
+// WE1 INTEGER drift offset (kCloudDriftRate*frame, the SAME int64 multiply IntCloudDensity uses for driftX) — so the
+// cloudscape advects by the bit-exact integer drift at `frame`, NOT a clock. One FxToFloat per backend => identical.
+inline float CloudDriftTime(uint32_t frame) {
+    return hf::sim::fpx::FxToFloat(static_cast<fx>(static_cast<int64_t>(kCloudDriftRate) *
+                                                   static_cast<int64_t>(frame)));
+}
+
+// FxToFloat3(v): convert a Q16.16 FxVec3 (e.g. SunSky(frame).sunDir / .skyColor) into a float xyz for the render
+// path (the sun light direction + the sky-color tint feeding the existing CloudParams). Three FxToFloat crossings.
+struct Float3 { float x, y, z; };
+inline Float3 FxToFloat3(const FxVec3& v) {
+    return Float3{ hf::sim::fpx::FxToFloat(v.x), hf::sim::fpx::FxToFloat(v.y), hf::sim::fpx::FxToFloat(v.z) };
 }
 
 }  // namespace hf::weather
