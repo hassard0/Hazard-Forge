@@ -536,4 +536,130 @@ inline void SpatializeBlock(SpatialNode& sp, const std::vector<int16_t>& monoSrc
     }
 }
 
+// =====================================================================================================
+// Slice DSP6 — Procedural-phrase CAPSTONE + lockstep/rollback (Issue #26, flagship #23 DETERMINISTIC
+// AUDIO, 6th/FINAL slice). APPEND-ONLY: the DSP1 osc + DSP2 env + DSP3 filter + DSP4 patch + DSP5
+// spatial code above is untouched. Synthesize a recognizable procedural musical PHRASE through the full
+// DSP1->DSP5 graph into a STEREO interleaved PCM buffer, and prove it is netcode-REPLAYABLE (two peers
+// synthesize the byte-identical buffer from the same note-event stream; rollback corrects a mispredicted
+// stream to the authority — the FPX5 shape, pure-CPU). Pure-CPU integer (Q15). NO <cmath>, NO float, NO
+// wav.h (the WAV write lives in the showcase, so dsp.h stays self-contained: only <cstdint>/<vector>).
+//
+// A song is an ordered list of AudioCommand note events. RenderSong is a PURE FUNCTION of
+// (notes, sampleRate, totalFrames): each note renders its Osc->Env mono signal (a fresh OscNode at
+// freqHz + a fresh EnvNode with a fixed pluck ADSR over durSample), is constant-power PANNED via the
+// kPanLut from panX, and ACCUMULATED in fixed command order into int32 L/R accumulators at startSample;
+// after all notes the summed mix runs through ONE BiquadNode lowpass (kBiquadLowpass2k), then each
+// accumulator is ClampI16'd once -> interleaved stereo. Integer-only => byte-identical run-to-run AND
+// platform-to-platform (the cross-platform DigestBuffer proof), which is exactly what makes the song
+// lockstep-deterministic + rollback-replayable.
+// -----------------------------------------------------------------------------------------------------
+
+// One note event of a song: pitch (freqHz), onset (startSample), length (durSample), and a lateral pan
+// position panX in [-32768, 32768] driving the constant-power pan (the arpeggio moves across the field).
+struct AudioCommand {
+    uint32_t freqHz;
+    int      startSample;
+    int      durSample;
+    int32_t  panX;
+};
+
+// The fixed pluck ADSR every song note uses (host-authored integer samples; a short attack + decay to a
+// mid sustain + a release tail, all scaled from the durSample so the envelope is self-contained per note).
+inline Adsr SongNoteAdsr(int durSample) {
+    Adsr e;
+    // Integer fractions of the note length (NO float): ~6% attack, ~12% decay, ~Q15*0.55 sustain, ~28% rel.
+    e.attack       = durSample * 6  / 100;
+    e.decay        = durSample * 12 / 100;
+    e.sustainLevel = 18021;            // round(0.55 * 32767)
+    e.release      = durSample * 28 / 100;
+    return e;
+}
+
+// Render a song (ordered AudioCommand stream) into a STEREO interleaved int16 buffer of `totalFrames`
+// frames (2*totalFrames int16). Pure function of (notes, sampleRate, totalFrames); integer-only.
+// Accumulation order is the COMMAND ORDER (fixed) -> deterministic. NO <cmath>, NO float, NO wav.h.
+inline std::vector<int16_t> RenderSong(const std::vector<AudioCommand>& notes,
+                                       int sampleRate, int totalFrames) {
+    if (totalFrames < 0) totalFrames = 0;
+    // Wide int32 L/R accumulators (summed before the single per-sample clamp).
+    std::vector<int32_t> accL(static_cast<size_t>(totalFrames), 0);
+    std::vector<int32_t> accR(static_cast<size_t>(totalFrames), 0);
+
+    if (sampleRate > 0) {
+        for (const AudioCommand& nc : notes) {
+            if (nc.durSample <= 0) continue;
+
+            // Osc -> Env mono signal for this note (fresh nodes; durSample-long).
+            std::vector<int16_t> oscBuf = RenderOsc(Wave::Sine, nc.freqHz, sampleRate, nc.durSample);
+            std::vector<int16_t> monoBuf;
+            {
+                EnvNode env;
+                env.env       = SongNoteAdsr(nc.durSample);
+                env.durSample = nc.durSample;
+                ApplyEnvBlock(env, oscBuf, monoBuf);
+            }
+
+            // Constant-power pan gains from panX in [-32768, 32768] -> panIdx [0, 64] via the kPanLut.
+            int32_t px = nc.panX;
+            if (px >  32768) px =  32768;
+            if (px < -32768) px = -32768;
+            int32_t panIdx = (px + 32768) >> 10;   // 1024 == 65536/64 -> 65 buckets
+            if (panIdx < 0)  panIdx = 0;
+            if (panIdx > 64) panIdx = 64;
+            const PanGain pg = kPanLut[panIdx];
+
+            // Accumulate into the L/R accumulators at startSample (clip to the buffer; never OOB).
+            for (size_t i = 0; i < monoBuf.size(); ++i) {
+                const long f = static_cast<long>(nc.startSample) + static_cast<long>(i);
+                if (f < 0 || f >= totalFrames) continue;
+                const int16_t m = monoBuf[i];
+                accL[static_cast<size_t>(f)] += MulQ15(m, pg.gainL);
+                accR[static_cast<size_t>(f)] += MulQ15(m, pg.gainR);
+            }
+        }
+    }
+
+    // Clamp each accumulator once -> a mono-per-channel pre-filter buffer.
+    std::vector<int16_t> preL(static_cast<size_t>(totalFrames));
+    std::vector<int16_t> preR(static_cast<size_t>(totalFrames));
+    for (int f = 0; f < totalFrames; ++f) {
+        preL[static_cast<size_t>(f)] = ClampI16(accL[static_cast<size_t>(f)]);
+        preR[static_cast<size_t>(f)] = ClampI16(accR[static_cast<size_t>(f)]);
+    }
+
+    // Run each channel through ONE lowpass biquad (independent delay lines per channel).
+    std::vector<int16_t> filtL, filtR;
+    { BiquadNode bq{kBiquadLowpass2k}; FilterBlock(bq, preL, filtL); }
+    { BiquadNode bq{kBiquadLowpass2k}; FilterBlock(bq, preR, filtR); }
+
+    // Interleave L,R,L,R,... .
+    std::vector<int16_t> out;
+    out.reserve(static_cast<size_t>(totalFrames) * 2);
+    for (int f = 0; f < totalFrames; ++f) {
+        out.push_back(filtL[static_cast<size_t>(f)]);
+        out.push_back(filtR[static_cast<size_t>(f)]);
+    }
+    return out;
+}
+
+// Lockstep: the "authority" peer renders the song from the authoritative note stream. A second peer fed
+// the SAME stream calls the same pure function -> a byte-identical buffer (purity == lockstep determinism).
+inline std::vector<int16_t> RunAudioLockstep(const std::vector<AudioCommand>& authority,
+                                             int sr, int frames) {
+    return RenderSong(authority, sr, frames);
+}
+
+// Rollback: a peer first renders a MISPREDICTED note stream (e.g. one note's freq guessed wrong), then
+// RE-renders from the authoritative stream into `correctedOut`. Returns true iff the corrected re-sim
+// matches the authority render AND the mispredicted buffer DIFFERED from it (a real divergence corrected).
+inline bool RunAudioRollback(const std::vector<AudioCommand>& mispredicted,
+                             const std::vector<AudioCommand>& authority,
+                             int sr, int frames, std::vector<int16_t>& correctedOut) {
+    const std::vector<int16_t> wrong = RenderSong(mispredicted, sr, frames);
+    correctedOut = RenderSong(authority, sr, frames);
+    const std::vector<int16_t> ref = RenderSong(authority, sr, frames);
+    return (correctedOut == ref) && (wrong != ref);
+}
+
 }  // namespace hf::audio::dsp

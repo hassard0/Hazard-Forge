@@ -633,6 +633,27 @@ if (-not `$audOk) {
 }
 Write-Host 'audio WAV golden: exact match'
 
+# --- DSP6 procedural-phrase WAV golden (flagship #23 CAPSTONE): an EXACT byte-for-byte match of a fresh
+# --dsp-song of the fixed 4-note arpeggio against the committed tests/golden/audio/song.wav. RenderSong
+# is INTEGER / fixed-point end to end (Q15 pan/env, int32 accumulate, int16 hard-clamp, integer biquad),
+# so the rendered WAV is bit-identical run-to-run AND across compilers (MSVC vs Apple clang) -- verified
+# once here on the Windows build (the gate). Pure CPU (hf_core), no vk*/Metal symbols, like scene.wav. ---
+Write-Host '--- DSP6 procedural-phrase WAV golden ---'
+`$songExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$songGolden = 'tests/golden/audio/song.wav'
+`$songLive = Join-Path `$env:TEMP 'hf_dspsong_live.wav'
+& `$songExe --dsp-song `$songLive 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'dsp-song run failed'; exit 24 }
+`$sgBytes = [System.IO.File]::ReadAllBytes((Resolve-Path `$songGolden).Path)
+`$slBytes = [System.IO.File]::ReadAllBytes(`$songLive)
+`$songOk = (`$sgBytes.Length -eq `$slBytes.Length)
+if (`$songOk) { for (`$si = 0; `$si -lt `$sgBytes.Length; `$si++) { if (`$sgBytes[`$si] -ne `$slBytes[`$si]) { `$songOk = `$false; break } } }
+if (-not `$songOk) {
+    Write-Host 'DSP6 song WAV golden MISMATCH (tests/golden/audio/song.wav)'
+    exit 25
+}
+Write-Host 'DSP6 song WAV golden: exact match'
+
 # --- Material-graph introspection JSON golden (Slice BI): an EXACT byte-for-byte match of a fresh
 # --material-introspect dump of assets/materials/showcase3.mat.json against the committed
 # tests/golden/material/showcase3_graph.json. DescribeGraphJson is pure CPU (hf_core, no vk*/Metal

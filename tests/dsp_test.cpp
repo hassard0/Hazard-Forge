@@ -587,6 +587,84 @@ int main() {
     std::printf("dsp5-spatial: osc->spatial pinned {hash:0x%016llx}\n",
                 static_cast<unsigned long long>(hSpat));
 
+    // ======================================================================================
+    // DSP6 — Procedural-phrase CAPSTONE + lockstep/rollback (engine/audio/dsp.h, flagship #23, 6th/FINAL
+    // slice). Synthesize a recognizable 4-note major arpeggio (262/330/392/523 Hz, staggered, panned
+    // L->R) through Osc->Env->pan->mix->lowpass into a STEREO buffer, and prove it is netcode-replayable.
+    // ======================================================================================
+    // The same INTEGER buffer-hash bar: RenderSong is bit-identical run-to-run AND platform-to-platform,
+    // so two peers fed the same note stream synthesize byte-identical audio (lockstep) and a mispredicted
+    // stream rolls back to the authority byte-for-byte.
+    const int kSongSR     = 48000;
+    const int kSongFrames = kSongSR;          // exactly 1 second
+
+    // A recognizable C-major arpeggio: C4/E4/G4/C5, each staggered by 0.2s, 0.4s long, panned across L->R.
+    auto makeArpeggio = []() -> std::vector<dsp::AudioCommand> {
+        const uint32_t kFreq[4] = {262, 330, 392, 523};   // C4 E4 G4 C5
+        const int32_t  kPan[4]  = {-24000, -8000, 8000, 24000};  // sweep left -> right
+        const int      kStep    = 48000 / 5;   // 0.2s apart
+        const int      kDur     = (48000 * 2) / 5;  // 0.4s long
+        std::vector<dsp::AudioCommand> notes;
+        for (int i = 0; i < 4; ++i)
+            notes.push_back(dsp::AudioCommand{kFreq[i], i * kStep, kDur, kPan[i]});
+        return notes;
+    };
+    const std::vector<dsp::AudioCommand> arpeggio = makeArpeggio();
+
+    // ---- (D6-1) PINNED HASH — DigestBuffer(RenderSong(arpeggio)) == a hard-pinned uint64_t. -----------
+    const std::vector<int16_t> song = dsp::RenderSong(arpeggio, kSongSR, kSongFrames);
+    const uint64_t hSong = dsp::DigestBuffer(song);
+    const uint64_t kPinnedSong = 0xdd8607daf3896582ull;
+    check(song.size() == static_cast<size_t>(kSongFrames) * 2, "dsp6: RenderSong fills 2*frames (stereo interleaved)");
+    check(hSong == kPinnedSong, "dsp6: pinned hash: DigestBuffer(RenderSong(arpeggio)) matches golden");
+
+    // ---- (D6-2) TWO-RENDER DETERMINISM — two RenderSong calls byte-identical. -------------------------
+    {
+        const std::vector<int16_t> again = dsp::RenderSong(arpeggio, kSongSR, kSongFrames);
+        check(again == song, "dsp6: two renders BYTE-IDENTICAL (purity)");
+    }
+
+    // ---- (D6-3) LOCKSTEP — RunAudioLockstep(authority) == an independent RenderSong(authority). -------
+    {
+        const std::vector<int16_t> peer      = dsp::RunAudioLockstep(arpeggio, kSongSR, kSongFrames);
+        const std::vector<int16_t> authority = dsp::RenderSong(arpeggio, kSongSR, kSongFrames);
+        check(peer == authority, "dsp6: lockstep: peer == authority from the note stream alone (byte-identical)");
+    }
+
+    // ---- (D6-4) ROLLBACK — corrected == authority AND mispredicted differed. --------------------------
+    bool rollbackOk = false;
+    {
+        // Mispredict: one note's freq guessed wrong (a real divergence).
+        std::vector<dsp::AudioCommand> mispredicted = arpeggio;
+        mispredicted[2].freqHz = 415;   // wrong guess for the G4
+        std::vector<int16_t> corrected;
+        rollbackOk = dsp::RunAudioRollback(mispredicted, arpeggio, kSongSR, kSongFrames, corrected);
+        check(rollbackOk, "dsp6: rollback returns true (corrected == authority AND mispredicted differed)");
+        check(corrected == song, "dsp6: rollback corrected == authority RenderSong (byte-identical)");
+        const std::vector<int16_t> wrong = dsp::RenderSong(mispredicted, kSongSR, kSongFrames);
+        check(wrong != song, "dsp6: rollback mispredicted buffer DIFFERED from authority");
+    }
+
+    // ---- (D6-5) COHERENT — non-silent AND stereo (L and R not all-equal given the moving pan). -------
+    {
+        bool nonSilent = false;
+        for (const int16_t s : song) if (s != 0) { nonSilent = true; break; }
+        check(nonSilent, "dsp6: song is non-silent (some |sample| > 0)");
+        bool stereo = false;
+        for (size_t i = 0; i + 1 < song.size(); i += 2) if (song[i] != song[i + 1]) { stereo = true; break; }
+        check(stereo, "dsp6: song is stereo (L != R somewhere, the pan moves across the field)");
+    }
+
+    // ---- DSP6 showcase / numeric proof (printed; the WAV byte-golden is the productized artifact). ----
+    std::printf("dsp6-song: procedural phrase (4-note arpeggio Osc->Env->pan->mix->lowpass, stereo)\n");
+    std::printf("dsp6-song: two renders BYTE-IDENTICAL {hash:0x%016llx}\n",
+                static_cast<unsigned long long>(hSong));
+    std::printf("dsp6-song: lockstep: peer == authority from the note stream alone (byte-identical) {frames:%d}\n",
+                kSongFrames);
+    std::printf("dsp6-song: rollback: corrected == authority AND mispredicted differed {ok:%s}\n",
+                rollbackOk ? "true" : "false");
+    std::printf("dsp6-song: provenance {notes:4, sampleRate:48000, stereo:true}\n");
+
     if (g_fail == 0) { std::printf("dsp_test: ALL CHECKS PASSED\n"); return 0; }
     std::printf("dsp_test: %d failures\n", g_fail);
     return 1;
