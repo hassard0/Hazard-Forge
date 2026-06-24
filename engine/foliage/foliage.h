@@ -128,6 +128,8 @@ inline fx WindBend(const WindField& w, const FxVec3& pos, uint32_t frame) {
 // bend param (FO3) and a lod field (FO4) without disturbing the placement provenance.
 struct FoliageInstance {
     hf::pcg::PcgInstance base;   // the scattered PCG instance (pos / orient / scale) — the plant's transform
+    fx                   bend = 0;   // Slice FO3 (APPENDED after base): per-instance Q16.16 wind sway (0 = upright);
+                                     // FO2's PlaceFoliage leaves this default-0, so FO2 stays byte-unchanged.
 };
 
 // ----- FoliageField: the declarative meadow recipe (a PcgGraph) ----------------------------------------
@@ -149,6 +151,24 @@ inline std::vector<FoliageInstance> PlaceFoliage(const FoliageField& field, cons
     plants.reserve(pcgInstances.size());
     for (const hf::pcg::PcgInstance& inst : pcgInstances) plants.push_back(FoliageInstance{inst});
     return plants;
+}
+
+// ===== Slice FO3 — Per-instance WIND SWAY (the 3rd slice of FLAGSHIP #25, THE DETERMINISM HEADLINE) ====
+// The bridge that ties the deterministic wind (FO1) to the placed foliage (FO2): ApplyWind evaluates the
+// integer wind field (FO1 WindBend) at each plant's base.pos and stores the per-instance Q16.16 bend — so the
+// whole meadow sways as a PURE FUNCTION of (seed, frame), bit-identical cross-platform. The swaying *data* is a
+// strict integer golden (NO float anywhere) — the thing UE5/SpeedTree float wind cannot make deterministic.
+// APPEND-ONLY (FO1 WindBend + FO2 PlaceFoliage above + pcg.h/fpx.h read-only). Reuses FO1 WindBend VERBATIM.
+
+// ----- ApplyWind: annotate each plant with its local Q16.16 wind bend (PURE INTEGER) -------------------
+// For each plant in FIXED order, inst.bend = WindBend(wind, inst.base.pos, frame). Mutates the bend in place;
+// the base placement is UNTOUCHED (wind only annotates a sway, never moves the plant). Pure integer (reuses
+// FO1 WindBend). master=0 (or all amp=0) -> every inst.bend == 0 (the upright no-op control). NO <cmath>, NO
+// float, NO clock/RNG — bit-identical CPU<->Vulkan<->Metal by construction.
+inline void ApplyWind(std::vector<FoliageInstance>& instances, const WindField& wind, uint32_t frame) {
+    for (FoliageInstance& inst : instances) {
+        inst.bend = WindBend(wind, inst.base.pos, frame);
+    }
 }
 
 }  // namespace hf::foliage

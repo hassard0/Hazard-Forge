@@ -40698,6 +40698,183 @@ static int RunFo2PlaceShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FO3 — Per-instance WIND SWAY showcase (--fo3-sway) (the 3rd slice of FLAGSHIP #25, DETERMINISTIC
+// FOLIAGE AT SCALE, hf::foliage — THE DETERMINISM HEADLINE). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
+// foliage.h ApplyWind is pure reuse of FO1 WindBend (header-only pure-integer), so on Metal it sways the IDENTICAL
+// meadow (the SAME fixed FoliageField/seed + FIXED FO1 WindField/frame) the Vulkan --fo3-sway-shot sways on Windows
+// -> the 2D top-down BENT-STALK golden is bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel).
+// Each plant is drawn as a pure-integer BENT STALK: base pixel from base.pos (point*kImg/extent, int64 intermediate),
+// a pure-integer small-angle lean leanPx = (int)(((int64_t)inst.bend * kStalkLen) >> 16) (Q16.16 bend -> pixel lean,
+// NO trig), top = (baseX+leanPx, baseY-kStalkLen), drawn via integer Bresenham + a dot at the top — NO float pixel
+// math. The proof lines (two-run identical, frame-sensitivity, zero-wind no-op, provenance) match the Vulkan side
+// EXACTLY. The fixed FIELD/SEED/WIND/FRAME/IMG MUST be IDENTICAL to the Vulkan --fo3-sway-shot. New golden
+// tests/golden/metal/fo3_sway.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunFo3SwayShowcase(const char* outPath) {
+    namespace fol = hf::foliage;
+    namespace pcg = hf::pcg;
+    // THE FIXED SHOWCASE PARAMS — IDENTICAL to the Vulkan --fo3-sway-shot (main.cpp). Meadow params == FO2.
+    const uint32_t kSeed   = 1337u;
+    const uint32_t kSalt   = 0x5CA77E20u;
+    const int      kCellsX = 48;
+    const int      kCellsZ = 48;
+    const uint32_t kImg    = 256u;
+    const int      kStalkLen = 24;       // fixed pixel stalk length (Q16.16 bend -> pixel lean via >>16)
+    const uint32_t kFrame  = 90u;        // the fixed animation frame
+    const pcg::PcgArea kArea{ pcg::FxVec3{0, 0, 0}, pcg::FxVec3{pcg::kOne * 32, 0, pcg::kOne * 32} };
+    const pcg::fx kRadius      = pcg::kOne * 32 / 3;
+    const pcg::fx kScaleLo     = pcg::kOne / 2;
+    const pcg::fx kScaleHi     = pcg::kOne * 3 / 2;
+    const pcg::fx kPruneRadius = pcg::kOne;
+
+    auto buildField = [&]() {
+        fol::FoliageField field;
+        field.graph.area = kArea; field.graph.cellsX = kCellsX; field.graph.cellsZ = kCellsZ;
+        field.graph.useMask = true;
+        field.graph.mask.type = pcg::PcgMaskType::Radial;
+        field.graph.mask.center = pcg::FxVec3{ pcg::kOne * 16, 0, pcg::kOne * 16 };
+        field.graph.mask.radius = kRadius;
+        field.graph.density = pcg::kOne;
+        field.graph.transform.randomYaw = true;
+        field.graph.transform.scaleLo = kScaleLo; field.graph.transform.scaleHi = kScaleHi;
+        field.graph.prune = true; field.graph.pruneRadius = kPruneRadius;
+        return field;
+    };
+    const fol::FoliageField kField = buildField();
+
+    // THE FIXED FO1 WIND FIELD — IDENTICAL to the Vulkan --fo3-sway-shot. A 3-gust field (master=kOne).
+    auto buildWind = [&]() {
+        fol::WindField w;
+        w.gustCount = 3;
+        w.master = fol::kOne;
+        w.gusts[0] = fol::Gust{  3,  1, 0x06000000u, fol::kOne * 2 / 3 };
+        w.gusts[1] = fol::Gust{ -1,  2, 0x08000000u, fol::kOne / 2 };
+        w.gusts[2] = fol::Gust{  2, -3, 0x05000000u, fol::kOne / 3 };
+        return w;
+    };
+    const fol::WindField kWind = buildWind();
+
+    const pcg::fx extX = kArea.max.x - kArea.min.x;
+    const pcg::fx extZ = kArea.max.z - kArea.min.z;
+
+    // Render the bent-stalk meadow into an RGBA8 (BGRA) image by PURE INTEGER math. Each plant is a BENT STALK:
+    // a pure-integer Bresenham line from the base pixel to a top that LEANS by leanPx = bend*kStalkLen>>16 (NO
+    // trig, NO float pixel math), + a bright dot at the top; the stalk tinted by the plant's base.scale BUCKET.
+    auto renderMeadow = [&](const std::vector<fol::FoliageInstance>& plants, std::vector<uint8_t>& out) {
+        out.assign((size_t)kImg * kImg * 4, 0);
+        for (size_t pp = 0; pp < (size_t)kImg * kImg; ++pp) {
+            out[pp * 4 + 0] = 12; out[pp * 4 + 1] = 10; out[pp * 4 + 2] = 8; out[pp * 4 + 3] = 255;
+        }
+        auto putPx = [&](int ix, int iy, uint8_t b, uint8_t g, uint8_t r) {
+            if (ix < 0 || ix >= (int)kImg || iy < 0 || iy >= (int)kImg) return;
+            uint8_t* d = &out[((size_t)iy * kImg + ix) * 4];
+            d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+        };
+        // Pure-integer Bresenham line (all integer; NO float).
+        auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t b, uint8_t g, uint8_t r) {
+            int dx = x1 - x0; if (dx < 0) dx = -dx;
+            int dy = y1 - y0; if (dy < 0) dy = -dy;
+            int sx = (x0 < x1) ? 1 : -1;
+            int sy = (y0 < y1) ? 1 : -1;
+            int err = dx - dy;
+            for (;;) {
+                putPx(x0, y0, b, g, r);
+                if (x0 == x1 && y0 == y1) break;
+                int e2 = 2 * err;
+                if (e2 > -dy) { err -= dy; x0 += sx; }
+                if (e2 <  dx) { err += dx; y0 += sy; }
+            }
+        };
+        for (size_t i = 0; i < plants.size(); ++i) {
+            const fol::FoliageInstance& pl = plants[i];
+            const pcg::PcgInstance& in = pl.base;
+            const int px = (int)(((int64_t)(in.pos.x - kArea.min.x) * (int64_t)kImg) / (int64_t)extX);
+            const int py = (int)(((int64_t)(in.pos.z - kArea.min.z) * (int64_t)kImg) / (int64_t)extZ);
+            // Pure-integer small-angle lean: Q16.16 bend -> pixel lean (NO trig, NO float).
+            const int leanPx = (int)(((int64_t)pl.bend * (int64_t)kStalkLen) >> 16);
+            const int topX = px + leanPx;
+            const int topY = py - kStalkLen;
+            uint8_t sb, sg, sr;
+            if (in.scale < kScaleLo + (kScaleHi - kScaleLo) / 3) { sb = 60;  sg = 130; sr = 50;  }
+            else if (in.scale < kScaleLo + (kScaleHi - kScaleLo) * 2 / 3) { sb = 70; sg = 160; sr = 80; }
+            else { sb = 100; sg = 200; sr = 120; }
+            drawLine(px, py, topX, topY, sb, sg, sr);   // the bent stalk
+            putPx(topX,     topY,     220, 240, 230);   // bright tip
+            putPx(topX - 1, topY,     sb, sg, sr);
+            putPx(topX + 1, topY,     sb, sg, sr);
+        }
+    };
+    auto checksum = [](const std::vector<uint8_t>& img) {
+        uint32_t h = 2166136261u;
+        for (uint8_t byte : img) { h ^= byte; h *= 16777619u; }
+        return h;
+    };
+
+    const pcg::PcgStream st{kSeed, kSalt};
+
+    // Two runs of the SAME (field,seed,wind,frame) -> byte-identical (peer determinism).
+    std::vector<fol::FoliageInstance> plantsA = fol::PlaceFoliage(kField, st);
+    std::vector<fol::FoliageInstance> plantsB = fol::PlaceFoliage(kField, st);
+    fol::ApplyWind(plantsA, kWind, kFrame);
+    fol::ApplyWind(plantsB, kWind, kFrame);
+    std::vector<uint8_t> imgA, imgB2;
+    renderMeadow(plantsA, imgA);
+    renderMeadow(plantsB, imgB2);
+    const uint32_t kPlants = (uint32_t)plantsA.size();
+    const bool twoRunIdentical = (imgA.size() == imgB2.size()) &&
+                                 (std::memcmp(imgA.data(), imgB2.data(), imgA.size()) == 0) &&
+                                 (plantsA.size() == plantsB.size());
+    if (!twoRunIdentical) return fail("fo3-sway: two runs differ");
+
+    // The meadow has a coherent sway (some plant bends are non-zero under real wind).
+    fol::fx maxAbsBend = 0;
+    for (const fol::FoliageInstance& pl : plantsA) {
+        fol::fx b = pl.bend < 0 ? -pl.bend : pl.bend;
+        if (b > maxAbsBend) maxAbsBend = b;
+    }
+    const bool coherentSway = (kPlants > 0) && (maxAbsBend > 0);
+
+    // FRAME SENSITIVITY: frame F vs F+1 -> a different image checksum (the meadow sways frame to frame).
+    std::vector<fol::FoliageInstance> plantsF1 = fol::PlaceFoliage(kField, st);
+    fol::ApplyWind(plantsF1, kWind, kFrame + 1u);
+    std::vector<uint8_t> imgF1;
+    renderMeadow(plantsF1, imgF1);
+    const uint32_t hFrameA = checksum(imgA);
+    const uint32_t hFrameB = checksum(imgF1);
+    const bool frameDiffers = (hFrameA != hFrameB);
+
+    // ZERO-WIND NO-OP CONTROL: master=0 -> every inst.bend == 0 (all upright). Assert maxBend 0 AND the
+    // zero-wind image is the deterministic upright field.
+    fol::WindField zeroWind = kWind;
+    zeroWind.master = 0;
+    std::vector<fol::FoliageInstance> plantsZero = fol::PlaceFoliage(kField, st);
+    fol::ApplyWind(plantsZero, zeroWind, kFrame);
+    fol::fx zeroMaxBend = 0;
+    for (const fol::FoliageInstance& pl : plantsZero) {
+        fol::fx b = pl.bend < 0 ? -pl.bend : pl.bend;
+        if (b > zeroMaxBend) zeroMaxBend = b;
+    }
+    std::vector<uint8_t> imgZero;
+    renderMeadow(plantsZero, imgZero);
+    const uint32_t hZero = checksum(imgZero);
+    const bool zeroWindNoop = (zeroMaxBend == 0) && (kPlants > 0);
+
+    if (!coherentSway || !frameDiffers || !zeroWindNoop)
+        return fail("fo3-sway: coherence / frame-sensitivity / zero-wind no-op control failed");
+
+    std::printf("fo3-sway: per-instance wind sway (plants=%u, frame=%u)\n", kPlants, kFrame);
+    std::printf("fo3-sway: two-run BYTE-IDENTICAL\n");
+    std::printf("fo3-sway: frame N vs N+1 -> swept differently {frameA:0x%08X, frameB:0x%08X} Ha != Hb\n",
+                hFrameA, hFrameB);
+    std::printf("fo3-sway: zero-wind -> all bends 0 (upright, no-op) {maxBend:%d, hash:0x%08X}\n",
+                (int)zeroMaxBend, hZero);
+    std::printf("fo3-sway: provenance {plants:%u, frame:%u}\n", kPlants, kFrame);
+
+    if (!WritePNG(outPath, imgA, kImg, kImg)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fo3 per-instance wind sway (%u plants, frame=%u)\n",
+                outPath, kImg, kImg, kPlants, kFrame);
+    return 0;
+}
+
 // ===== Slice PCG2 — Deterministic PCG JITTERED-GRID POINT SCATTER showcase (--pcg2-scatter) (the 2nd slice of
 // FLAGSHIP #22, hf::pcg). PURE CPU — NO GPU compute, NO new shader, NO new RHI; pcg.h is header-only pure-int32
 // math, so on Metal it runs the IDENTICAL deterministic jittered-grid scatter (ScatterGrid) the Vulkan
@@ -70780,6 +70957,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fo2-place") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fo2_place.png";
             try { return RunFo2PlaceShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fo3-sway <out.png>: render the per-instance WIND SWAY showcase (Slice FO3, the 3rd slice of FLAGSHIP #25,
+        // THE DETERMINISM HEADLINE). PURE CPU — sways the IDENTICAL meadow (the SAME fixed FoliageField/seed + FIXED
+        // FO1 WindField/frame) the Vulkan --fo3-sway-shot sways via foliage.h ApplyWind (pure reuse of FO1 WindBend);
+        // renders the 2D top-down BENT-STALK plot (pure-integer lean = bend*kStalkLen>>16, integer Bresenham) -> the
+        // swept meadow is bit-identical cross-backend BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY.
+        if (argc > 1 && std::strcmp(argv[1], "--fo3-sway") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fo3_sway.png";
+            try { return RunFo3SwayShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --pcg2-scatter <out.png>: render the Deterministic PCG JITTERED-GRID POINT SCATTER showcase (Slice PCG2,
