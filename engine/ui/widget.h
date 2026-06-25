@@ -43,6 +43,9 @@ enum StyleFlags : uint32_t {
     kFixedW   = 1u << 0,   // width is a fixed pixel size (else derived by layout)
     kFixedH   = 1u << 1,   // height is a fixed pixel size
     kFlexGrow = 1u << 2,   // this widget grows to fill leftover main-axis space (S2)
+    kStackH   = 1u << 3,   // S2: container stacks its children HORIZONTALLY (default = vertical). Append-only
+                           //     enum value — does NOT change the Style struct layout or S1's EncodeTree, so
+                           //     S1's pinned digest 0x53da0581a48f615e is unaffected.
 };
 
 struct Style {                              // ALL integer pixels
@@ -175,6 +178,144 @@ inline Tree MakeShowcaseTree() {
     titleS.marginL = 6; titleS.marginT = 6;
     AddWidget(t, header, titleS, /*kind=*/1);
 
+    return t;
+}
+
+// =====================================================================================================
+// Slice WIDGET-S2 — Integer layout solver (issue #30). APPEND-ONLY below S1. THE CRUX: a deterministic
+// integer top-down layout pass that computes each widget's pixel Rect from the box model (stack direction
+// + margins/padding + fixed sizes + flex-grow). The make-or-break detail is the integer flex distribution
+// with a precise remainder rule: leftover pixels that don't divide evenly across flex weights are assigned
+// +1 each to the LOWEST-INDEX flex children until exhausted, so the container is always EXACTLY filled and
+// the result is bit-identical on every compiler. Pure integer (one int64 intermediate for the flex share),
+// NO recursion (a flat ascending index scan + per-container child-chain walks), NO new include.
+// =====================================================================================================
+
+// --- The computed rect (integer pixels) --------------------------------------------------------------
+struct Rect { int32_t x = 0, y = 0, w = 0, h = 0; };
+
+// SolveLayout: ONE deterministic top-down pass (index order, NO recursion). Because AddWidget always
+// appends a child AFTER its parent, a parent's index < its children's indices — so when we visit a parent
+// (ascending) its own rect is already finalized, and it lays out its OWN children. Flat scan, no work-stack.
+inline std::vector<Rect> SolveLayout(const Tree& t, Rect viewport) {
+    const std::size_t n = t.widgets.size();
+    std::vector<Rect> rects(n);                 // all zero
+    if (n == 0) return rects;
+    rects[t.root] = viewport;
+
+    for (std::size_t pi = 0; pi < n; ++pi) {
+        const Widget& p = t.widgets[pi];
+        if (p.firstChild == kNoWidget) continue;        // leaf — rect already set by its parent
+
+        // p's content box = rect minus padding (clamp negatives to 0).
+        const Rect pr = rects[pi];
+        int32_t cx = pr.x + p.style.padL;
+        int32_t cy = pr.y + p.style.padT;
+        int32_t cw = pr.w - p.style.padL - p.style.padR; if (cw < 0) cw = 0;
+        int32_t ch = pr.h - p.style.padT - p.style.padB; if (ch < 0) ch = 0;
+
+        const bool horizontal = (p.style.flags & kStackH) != 0;
+        const int32_t mainSize = horizontal ? cw : ch;   // main axis = x/w when horizontal, y/h when vertical
+
+        // --- Pass A: accumulate used main space + total flex weight over the child chain. -------------
+        int32_t  usedMain    = 0;
+        uint32_t totalWeight = 0;
+        for (WidgetId c = p.firstChild; c != kNoWidget; c = t.widgets[c].nextSibling) {
+            const Style& cs = t.widgets[c].style;
+            usedMain += horizontal ? (cs.marginL + cs.marginR) : (cs.marginT + cs.marginB);
+            const bool fixedMain = horizontal ? ((cs.flags & kFixedW) != 0) : ((cs.flags & kFixedH) != 0);
+            const bool flex      = (cs.flags & kFlexGrow) != 0;
+            if (fixedMain) {
+                usedMain += horizontal ? cs.width : cs.height;   // fixed child main size
+            } else if (flex) {
+                totalWeight += cs.flexWeight;
+            }
+            // (a non-fixed non-flex child has main size 0 in v1 — documented)
+        }
+        int32_t leftover = mainSize - usedMain; if (leftover < 0) leftover = 0;
+
+        // --- Flex distribution: integer share + remainder rule (lowest-index flex children get +1). ---
+        // We compute each flex child's base share, sum them, then hand the remainder out in ASCENDING
+        // child order. Because the children are walked first-child->next-sibling (== ascending index),
+        // this is purely sequential — the leftover counter decrements as we place each flex child.
+        int32_t remainder = 0;
+        if (totalWeight > 0) {
+            int32_t sumShares = 0;
+            for (WidgetId c = p.firstChild; c != kNoWidget; c = t.widgets[c].nextSibling) {
+                const Style& cs = t.widgets[c].style;
+                if ((cs.flags & kFlexGrow) != 0) {
+                    const int32_t share =
+                        static_cast<int32_t>((static_cast<int64_t>(leftover) * cs.flexWeight) / totalWeight);
+                    sumShares += share;
+                }
+            }
+            remainder = leftover - sumShares;   // 0..(#flex children - 1) pixels still to hand out
+        }
+
+        // --- Pass B: place children along the main axis. ----------------------------------------------
+        const int32_t mainStart  = horizontal ? cx : cy;   // content main-axis start
+        const int32_t crossStart = horizontal ? cy : cx;   // content cross-axis start
+        const int32_t crossSize  = horizontal ? ch : cw;   // content cross-axis size
+        int32_t cursor = mainStart;
+        for (WidgetId c = p.firstChild; c != kNoWidget; c = t.widgets[c].nextSibling) {
+            const Style& cs = t.widgets[c].style;
+            const int32_t leadMainMargin  = horizontal ? cs.marginL : cs.marginT;
+            const int32_t trailMainMargin = horizontal ? cs.marginR : cs.marginB;
+            const int32_t leadCrossMargin = horizontal ? cs.marginT : cs.marginL;
+            const int32_t crossMarginSum  = horizontal ? (cs.marginT + cs.marginB) : (cs.marginL + cs.marginR);
+
+            cursor += leadMainMargin;
+
+            // main size: fixed -> style size; flex -> base share + (one remainder px if any left); else 0.
+            const bool fixedMain = horizontal ? ((cs.flags & kFixedW) != 0) : ((cs.flags & kFixedH) != 0);
+            const bool flex      = (cs.flags & kFlexGrow) != 0;
+            int32_t mainSz = 0;
+            if (fixedMain) {
+                mainSz = horizontal ? cs.width : cs.height;
+            } else if (flex && totalWeight > 0) {
+                mainSz = static_cast<int32_t>((static_cast<int64_t>(leftover) * cs.flexWeight) / totalWeight);
+                if (remainder > 0) { mainSz += 1; remainder -= 1; }   // lowest-index flex children get the extras
+            }
+            const int32_t mainPos = cursor;
+
+            // cross size: stretch to content cross size minus cross margins, unless fixed on the cross axis.
+            const bool fixedCross = horizontal ? ((cs.flags & kFixedH) != 0) : ((cs.flags & kFixedW) != 0);
+            int32_t crossSz;
+            if (fixedCross) {
+                crossSz = horizontal ? cs.height : cs.width;
+            } else {
+                crossSz = crossSize - crossMarginSum; if (crossSz < 0) crossSz = 0;
+            }
+            const int32_t crossPos = crossStart + leadCrossMargin;
+
+            // map main/cross back to x/y/w/h.
+            Rect r;
+            if (horizontal) { r.x = mainPos; r.w = mainSz; r.y = crossPos; r.h = crossSz; }
+            else            { r.y = mainPos; r.h = mainSz; r.x = crossPos; r.w = crossSz; }
+            rects[c] = r;
+
+            cursor += mainSz + trailMainMargin;
+        }
+    }
+    return rects;
+}
+
+// DigestRects: FNV-1a-64 over the rects (x,y,w,h per rect, hand-LE) — the pinned cross-platform anchor.
+inline uint64_t DigestRects(const std::vector<Rect>& rects) {
+    std::vector<uint8_t> b;
+    for (const Rect& r : rects) { PutI32(b, r.x); PutI32(b, r.y); PutI32(b, r.w); PutI32(b, r.h); }
+    return net::DigestBytes(b.data(), b.size());
+}
+
+// MakeLayoutShowcase: the S2 layout fixture (FIXED forever). The S1 MakeShowcaseTree() with the BODY
+// widget's style.flags |= kStackH so its left/right children lay out side-by-side (exercising horizontal
+// flex); the root stays vertical. Modifies a COPY — S1's MakeShowcaseTree is untouched/frozen.
+inline Tree MakeLayoutShowcase() {
+    Tree t = MakeShowcaseTree();
+    const WidgetId root   = t.root;
+    const WidgetId header = t.widgets[root].firstChild;     // root.child[0]
+    const WidgetId body   = t.widgets[header].nextSibling;  // root.child[1] = body
+    t.widgets[body].style.flags |= kStackH;                 // body stacks its left/right horizontally
     return t;
 }
 
