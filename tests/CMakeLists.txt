@@ -190,6 +190,14 @@ hf_add_pure_test(draco_test)
 hf_add_pure_test(draco_gltf_load_test)
 target_compile_definitions(draco_gltf_load_test PRIVATE
   "HF_BOX_DRACO_GLTF=\"${CMAKE_SOURCE_DIR}/assets/models/BoxDraco/Box.gltf\"")
+# Binary FBX mesh importer (issue #15 ask #2 — support FBX alongside glTF/OBJ): the SELF-CONTAINED,
+# clean-room engine/asset/fbx_loader.h loads the assimp BSD test cube assets/models/box.fbx (FBX v7400,
+# "Kaydara FBX Binary" node-tree) to correct geometry: 24 verts / 12 triangles, each axis 2 distinct
+# values (a cube), with a PINNED net::DigestBytes over positions+indices (the cross-platform moat) plus
+# a clean-room INFLATE round-trip (the encoding==1 zlib path real FBX uses). Pure CPU, ASan-eligible.
+hf_add_pure_test(fbx_loader_test)
+target_compile_definitions(fbx_loader_test PRIVATE
+  "HF_BOX_FBX=\"${CMAKE_SOURCE_DIR}/assets/models/box.fbx\"")
 # Deterministic UI widget tree + INTEGER box model (Slice WIDGET-S1, issue #30 — the DETERMINISTIC
 # UMG-CLASS UI FRAMEWORK beachhead): engine/ui/widget.h — a header-only, SELF-CONTAINED (only
 # <cstddef>/<cstdint>/<vector> + net/session.h) UI substrate. A widget hierarchy (parent/first-child/

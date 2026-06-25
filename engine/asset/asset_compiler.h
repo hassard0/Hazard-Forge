@@ -26,6 +26,7 @@
 
 #include "net/session.h"        // hf::net::DigestBytes (FNV-1a-64)
 #include "asset/obj_loader.h"   // hf::asset::ParseObj / ObjMesh / ObjVertex (S2 — pure header-only loader)
+#include "asset/fbx_loader.h"   // hf::asset::ParseFbx / FbxMesh (issue #15 — binary FBX mesh importer)
 
 namespace hf::asset {
 
@@ -183,6 +184,51 @@ inline std::vector<uint8_t> CompileObj(const char* text, std::size_t n, const Co
     }
     for (uint32_t idx : m.indices) PutU32(b, idx);
     return b;
+}
+
+// --- CompileFbx — raw binary FBX bytes -> the SAME canonical Q16.16 blob as CompileObj (issue #15) --------
+// ParseFbx (the self-contained binary-FBX importer) -> the identical fixed-field LE blob layout CompileObj
+// emits, so FBX assets flow through the SAME content-addressed cache + DecodeCompiledMesh round-trip as OBJ.
+// FBX carries positions only here (normals/UVs are LayerElement follow-ups), so uv/normal are written 0 —
+// the engine's BuildPrimitive smooth-normal pass fills them downstream exactly as it does for normal-less OBJ.
+inline std::vector<uint8_t> CompileFbx(const uint8_t* bytes, std::size_t n, const CompileParams& p) {
+    FbxMesh m = ParseFbx(bytes, n);
+    const uint32_t vcount = m.ok ? (uint32_t)(m.positions.size() / 3) : 0u;
+    std::vector<uint8_t> b;
+    PutU32(b, kCompiledMeshMagic);
+    PutU32(b, kCompiledMeshVersion);
+    PutU32(b, vcount);                         // vertexCount
+    PutU32(b, m.ok ? (uint32_t)m.indices.size() : 0u);  // indexCount
+    PutU32(b, p.recomputeNormals);
+    PutU32(b, (uint32_t)p.scale);
+    PutU32(b, p.tangentMode);
+    PutU32(b, p.flags);
+    for (uint32_t v = 0; v < vcount; ++v) {
+        for (int i = 0; i < 3; ++i) PutU32(b, (uint32_t)FxMul(FxQuantize(m.positions[(std::size_t)v * 3 + i]), p.scale));
+        for (int i = 0; i < 2; ++i) PutU32(b, 0u);   // uv (FBX LayerElementUV deferred)
+        for (int i = 0; i < 3; ++i) PutU32(b, 0u);   // normal (FBX LayerElementNormal deferred)
+    }
+    if (m.ok) for (uint32_t idx : m.indices) PutU32(b, idx);
+    return b;
+}
+
+// --- CompileMeshByExtension — dispatch by file extension (OBJ vs binary FBX) -------------------------------
+// The asset-import entry that makes FBX a first-class format alongside OBJ/glTF: given the raw bytes + a
+// lowercase-or-mixed extension (with or without a leading '.'), route ".fbx" -> CompileFbx and everything
+// else (".obj") -> CompileObj. glTF stays on its own cgltf path (gltf_loader). Returns the canonical blob.
+inline bool ExtIs(const char* ext, const char* want) {   // case-insensitive ext compare (skips a leading '.')
+    if (!ext) return false;
+    if (*ext == '.') ++ext;
+    for (; *ext && *want; ++ext, ++want) {
+        char a = *ext;  if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != *want) return false;
+    }
+    return *ext == 0 && *want == 0;
+}
+inline std::vector<uint8_t> CompileMeshByExtension(const char* ext, const uint8_t* bytes, std::size_t n,
+                                                   const CompileParams& p) {
+    if (ExtIs(ext, "fbx")) return CompileFbx(bytes, n, p);
+    return CompileObj((const char*)bytes, n, p);   // ".obj" / default
 }
 
 // --- DecodeCompiledMesh — the round-trip (false on truncation / bad magic) --------------------------------
