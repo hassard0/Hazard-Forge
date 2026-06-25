@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <bit>      // std::popcount (S2: integer set-bit entropy surrogate — std, deterministic, cross-vendor)
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -193,6 +194,109 @@ inline Grid MakeShowcaseGrid(int32_t w, int32_t h) {
     const Domain all = (tileCount < 64u) ? ((Domain{1} << tileCount) - Domain{1}) : ~Domain{0};
     g.cell.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), all);
     return g;
+}
+
+// ===================================================================================================
+// --- Slice WFC-S2: min-entropy cell selection + seeded weighted collapse (the OBSERVE half) ---------
+// ===================================================================================================
+// S1 built the domain grid + adjacency rule-set + integer AC-3 Propagate. S2 adds the OBSERVE step of
+// wave-function-collapse: pick the next cell by INTEGER min-entropy (a popcount surrogate, NOT float
+// Shannon), COLLAPSE it to one tile by a SEEDED WEIGHTED integer draw, then propagate. The three classic
+// sources of WFC non-determinism (float entropy + RNG + hash-ordered iteration) are all neutralized:
+// integer popcount entropy, the engine's proven pure-uint32 hash, and ascending-cell-id scans. APPEND-ONLY
+// below S1 — S1's types/functions are untouched. Still PURE-CPU INTEGER, self-contained, NO float/RNG.
+
+// --- WfcHash: the integer PRNG ----------------------------------------------------------------------
+// Copied VERBATIM from engine/pcg/pcg.h:42-48 (which itself copies engine/sim/particles.h::ParticleHash
+// "verbatim ops") — the SAME pure-uint32 ops + constants, so the hash STREAM is byte-identical. Kept inline
+// here on purpose to preserve wfc.h's self-containment: pcg.h transitively pulls in fpx.h/particles.h (the
+// Q16.16 / fx chain), which would break the cheap standalone-clang cross-platform proof. Pure uint32 wrapping
+// arithmetic + shifts — NO float, NO clock, NO RNG — deterministic + cross-vendor identical.
+inline uint32_t WfcHash(uint32_t seed, uint32_t index) {
+    uint32_t h = seed * 2654435761u;               // Knuth multiplicative
+    h ^= (index + 0x9E3779B9u + (h << 6) + (h >> 2));
+    h += index * 0x85EBCA6Bu;
+    h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; h *= 0x297A2D39u; h ^= h >> 15;
+    return h;
+}
+inline constexpr uint32_t kCollapseSalt = 0x57464301u;  // 'WFC\1' — the collapse stream's salt (distinct layer)
+
+// --- PopCount: the integer entropy surrogate --------------------------------------------------------
+// # of tiles still allowed in a domain. std::popcount is std (C++20 <bit>), deterministic + cross-vendor;
+// it replaces float Shannon entropy. Bit-exact on MSVC + clang.
+inline int PopCount(Domain d) { return std::popcount(d); }
+
+// --- SumWeight: the entropy tie-breaker -------------------------------------------------------------
+// Sum of weight[t] over the SET bits of d, iterated in ASCENDING tile order (the OR/sum is order-independent
+// anyway, but the discipline is the point). Pure integer.
+inline int SumWeight(const TileSet& ts, Domain d) {
+    int s = 0;
+    for (uint32_t t = 0; t < ts.tileCount; ++t)
+        if ((d >> t) & Domain{1})
+            s += ts.weight[t];
+    return s;
+}
+
+// --- SelectCell: the integer min-entropy observer ---------------------------------------------------
+// Among all UNDECIDED cells (PopCount(domain) > 1), return the cell id of MINIMUM integer entropy, with a
+// FIXED tie-order: (1) min PopCount, (2) tie -> min SumWeight, (3) tie -> lowest cell id. Decided cells
+// (PopCount == 1) and contradictions (PopCount == 0) are skipped. Returns -1 if no cell is undecided
+// (fully collapsed). Scans cell ids ASCENDING — NO float, NO hash-set iteration.
+inline int32_t SelectCell(const TileSet& ts, const Grid& g) {
+    const int32_t n = g.w * g.h;
+    int32_t bestId = -1;
+    int     bestPop = 0;
+    int     bestWeight = 0;
+    for (int32_t c = 0; c < n; ++c) {
+        const Domain d = g.cell[static_cast<std::size_t>(c)];
+        const int pop = PopCount(d);
+        if (pop <= 1) continue;  // skip decided (1) and contradictions (0)
+        const int w = SumWeight(ts, d);
+        // Ascending scan => lowest cell id wins the final tie automatically (only replace on STRICT improve).
+        if (bestId < 0 || pop < bestPop || (pop == bestPop && w < bestWeight)) {
+            bestId = c;
+            bestPop = pop;
+            bestWeight = w;
+        }
+    }
+    return bestId;
+}
+
+// --- Collapse: a seeded weighted integer draw -------------------------------------------------------
+// Decide one cell: among the tiles set in g.cell[cellId], pick one with probability proportional to
+// weight[t], deterministically from the seed. total = SumWeight; r = WfcHash(seed ^ kCollapseSalt, cellId)
+// % total; walk the SET tiles ASCENDING accumulating weight[t], choose the FIRST tile whose running sum > r.
+// Set g.cell[cellId] = Domain{1} << chosen (a single-bit domain = decided). All weights positive (tileset
+// guarantee) so total > 0. Returns the chosen tile index.
+inline uint32_t Collapse(const TileSet& ts, Grid& g, int32_t cellId, uint32_t seed) {
+    const Domain d = g.cell[static_cast<std::size_t>(cellId)];
+    const uint32_t total = static_cast<uint32_t>(SumWeight(ts, d));
+    const uint32_t r = WfcHash(seed ^ kCollapseSalt, static_cast<uint32_t>(cellId)) % total;
+    uint32_t acc = 0;
+    uint32_t chosen = 0;
+    for (uint32_t t = 0; t < ts.tileCount; ++t) {
+        if ((d >> t) & Domain{1}) {
+            acc += static_cast<uint32_t>(ts.weight[t]);
+            if (acc > r) { chosen = t; break; }
+        }
+    }
+    g.cell[static_cast<std::size_t>(cellId)] = Domain{1} << chosen;
+    return chosen;
+}
+
+// --- ObserveStep: one full observe iteration --------------------------------------------------------
+// SelectCell -> if -1 the grid is fully collapsed (kDone). Otherwise Collapse that cell, seed the worklist
+// with it, and Propagate. If Propagate returns false (an empty domain appeared) -> kContradiction; else
+// kProgressed. S2 does NOT backtrack on contradiction — that is S3.
+enum class StepResult { kProgressed, kDone, kContradiction };
+
+inline StepResult ObserveStep(const TileSet& ts, Grid& g, uint32_t seed) {
+    const int32_t c = SelectCell(ts, g);
+    if (c < 0) return StepResult::kDone;  // fully collapsed — observer terminates
+    Collapse(ts, g, c, seed);
+    std::vector<int32_t> worklist{ c };
+    if (!Propagate(ts, g, worklist)) return StepResult::kContradiction;
+    return StepResult::kProgressed;
 }
 
 }  // namespace hf::wfc

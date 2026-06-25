@@ -123,6 +123,112 @@ int main() {
               "wfc-s1: no cell domain is empty (no contradiction on the showcase) AND Propagate returned true");
     }
 
+    // ================================================================================================
+    // ---- Slice WFC-S2: min-entropy observe + seeded weighted collapse ------------------------------
+    // ================================================================================================
+    // Run a FIXED number K of ObserveStep on a fresh 16x16 showcase grid from a fixed seed, pin the
+    // resulting grid digest, and assert the six S2 properties (no contradiction, pinned/replay-stable/
+    // seed-driven digest, decided+locally-consistent collapses, observer termination).
+
+    // The S2 collapse run as a helper so we can replay it bit-for-bit. Returns the grid + how many of the K
+    // steps progressed and whether ANY contradiction occurred.
+    auto runS2 = [&](uint32_t seed, int K, int& progressedOut, bool& contradictionOut) -> Grid {
+        Grid g = MakeShowcaseGrid(16, 16);
+        progressedOut = 0;
+        contradictionOut = false;
+        for (int i = 0; i < K; ++i) {
+            const StepResult r = ObserveStep(ts, g, seed);
+            if (r == StepResult::kProgressed)      ++progressedOut;
+            else if (r == StepResult::kContradiction) { contradictionOut = true; break; }
+            else /* kDone */                       break;
+        }
+        return g;
+    };
+
+    {
+        const uint32_t kSeed = 0x1234ABCDu;
+        const int      K     = 12;  // PINNED: contradiction-free on the permissive gradient tileset
+
+        int  progressed = 0;
+        bool contradiction = false;
+        const Grid gS2 = runS2(kSeed, K, progressed, contradiction);
+        const uint64_t s2Digest = DigestGrid(gS2);
+
+        std::printf("wfc-s2: after K=%d collapses, grid digest = 0x%016llx\n",
+                    K, static_cast<unsigned long long>(s2Digest));
+
+        // PINNED on first run (the cross-platform anchor — identical MSVC + clang).
+        const uint64_t kS2PinnedDigest = 0x4c9e67d356f4b920ull;
+
+        // (1) NO CONTRADICTION — all K steps progressed.
+        check(!contradiction && progressed == K,
+              "wfc-s2: K observe steps all progressed (no contradiction on the showcase)");
+
+        // (2) PINNED DIGEST — the cross-platform proof.
+        check(s2Digest == kS2PinnedDigest,
+              "wfc-s2: collapsed grid digest == pinned uint64 (the cross-platform proof)");
+
+        // (3) REPLAY-STABLE — same seed -> identical digest.
+        {
+            int  p2 = 0;
+            bool c2 = false;
+            const Grid gS2b = runS2(kSeed, K, p2, c2);
+            check(DigestGrid(gS2b) == s2Digest,
+                  "wfc-s2: re-running the same seed is bit-identical (deterministic)");
+        }
+
+        // (4) SEED-DRIVEN — a different seed -> a DIFFERENT digest.
+        {
+            int  p3 = 0;
+            bool c3 = false;
+            const Grid gS2c = runS2(kSeed ^ 0xFFFFu, K, p3, c3);
+            check(DigestGrid(gS2c) != s2Digest,
+                  "wfc-s2: a DIFFERENT seed produces a DIFFERENT digest (the seed drives the result)");
+        }
+
+        // (5) DECIDED + CONSISTENT — every cell collapsed by the run has PopCount==1 and its tile is in the
+        // allowed mask of each in-bounds neighbor's current domain. We check ALL decided cells (PopCount==1):
+        // for each, for each in-bounds neighbor, the neighbor's domain must intersect AllowedMask(chosen,dir).
+        {
+            static const int kDirs[4] = { kRight, kUp, kLeft, kDown };
+            static const int kDx[4]   = { +1, 0, -1, 0 };
+            static const int kDz[4]   = {  0, +1, 0, -1 };
+            bool consistent = true;
+            bool anyDecided = false;
+            for (int32_t z = 0; z < gS2.h && consistent; ++z) {
+                for (int32_t x = 0; x < gS2.w && consistent; ++x) {
+                    const int32_t c = gS2.cellId(x, z);
+                    const Domain  d = gS2.cell[static_cast<std::size_t>(c)];
+                    if (popcount64(d) != 1) continue;  // only decided cells
+                    anyDecided = true;
+                    // the chosen tile index (the single set bit).
+                    uint32_t chosen = 0;
+                    for (uint32_t t = 0; t < ts.tileCount; ++t)
+                        if ((d >> t) & Domain{1}) { chosen = t; break; }
+                    for (int dd = 0; dd < 4; ++dd) {
+                        const int32_t nx = x + kDx[dd];
+                        const int32_t nz = z + kDz[dd];
+                        if (nx < 0 || nx >= gS2.w || nz < 0 || nz >= gS2.h) continue;
+                        const Domain nDom = gS2.cell[static_cast<std::size_t>(gS2.cellId(nx, nz))];
+                        // The chosen tile must permit SOME tile remaining in the neighbor on side `dir`.
+                        const Domain allow = AllowedMask(ts, chosen, kDirs[dd]);
+                        if ((nDom & allow) == 0) { consistent = false; break; }
+                    }
+                }
+            }
+            check(anyDecided && consistent,
+                  "wfc-s2: every collapsed cell has PopCount==1 (decided) and its tile is allowed by its neighbors");
+        }
+
+        // (6) OBSERVER TERMINATION — SelectCell returns -1 on a fully-decided grid.
+        {
+            Grid tiny = MakeShowcaseGrid(2, 2);
+            for (Domain& d : tiny.cell) d = Domain{1} << 0;  // collapse every cell to tile 0
+            check(SelectCell(ts, tiny) == -1,
+                  "wfc-s2: SelectCell returns -1 only when no cell has PopCount>1 (observer terminates correctly)");
+        }
+    }
+
     if (g_fail == 0) { std::printf("wfc_test: ALL PASS\n"); return 0; }
     std::printf("wfc_test: %d FAIL\n", g_fail);
     return 1;
