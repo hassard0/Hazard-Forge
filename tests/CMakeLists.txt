@@ -163,6 +163,10 @@ hf_add_pure_test(chunk_diff_test)
 # format the McGuire archive / Stanford scans / every Blender export ship. The headline is reproducibility
 # — re-importing the same OBJ is BYTE-IDENTICAL (pinned digest), identical MSVC + Windows-clang + Mac/clang.
 hf_add_pure_test(obj_loader_test)
+# fpx collision EVENTS (issue #44): the additive event API (FxHitEvent / CollectContacts / a 5-arg StepWorld
+# overload) for sample authors who drive the raw deterministic core. APPEND-ONLY to fpx.h — the test proves
+# the 5-arg StepWorld is byte-identical physics to the frozen 4-arg, so every fpx golden is invariant.
+hf_add_pure_test(fpx_events_test)
 # CPU particle / VFX emitter system (Slice CC): the authorable emitter (spawn rate, lifetime, init
 # velocity + spread, gravity, drag, size/color over life) simulated at a fixed timestep with a
 # fixed-seed integer LCG for the spread jitter (engine/vfx/particles.{h,cpp}) — DISTINCT from the

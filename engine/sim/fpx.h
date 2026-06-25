@@ -389,6 +389,54 @@ inline uint32_t CountResidualOverlaps(const FxWorld& w, std::span<const FxPair> 
     return r;
 }
 
+// ===== Issue #44 — collision EVENTS at the fpx layer (APPEND-ONLY, golden-invariant) ================
+// A sample author who drives the raw deterministic core (`StepWorld`) had no way to learn WHICH bodies
+// touched this step — `verdict::CollectHitEvents` reads the higher-level warmhull cache, not this sphere
+// world. These are PURELY ADDITIVE: a new event struct + a pure reader + a 5-arg StepWorld OVERLOAD. The
+// existing StepWorld / SolveContacts / every FPX1-FPX6 function is BYTE-UNCHANGED, so every fpx golden is
+// invariant by construction. Deterministic + bit-exact CPU/GPU (integer compares over FxLength, fixed
+// FPX2 pair order). NOTE: `depth` is the residual penetration (a positional contact-strength proxy — fpx
+// is PBD, it has no impulse); for a true contact impulse use the warmhull/persist solver + #40's
+// verdict::CollectHitEvents. `point` is the inter-centre midpoint.
+struct FxHitEvent {
+    uint32_t a = 0, b = 0;   // contacting body indices (a < b — the FPX2 pair order is ascending)
+    FxVec3   point{};        // contact point: the midpoint of the two body centres
+    fx       depth = 0;      // residual penetration > 0 (Q16.16; PBD contact-strength proxy, NOT an impulse)
+};
+
+// CollectContacts: the deterministic list of currently-overlapping pairs (penetration > 0) over `pairs`,
+// in the fixed FPX2 pair order. A PURE reader — call it AFTER StepWorld. Mirrors CountResidualOverlaps but
+// emits the events instead of just counting (so the two are guaranteed consistent: events.size() ==
+// CountResidualOverlaps).
+inline std::vector<FxHitEvent> CollectContacts(const FxWorld& w, std::span<const FxPair> pairs) {
+    const size_t n = w.bodies.size();
+    std::vector<FxHitEvent> out;
+    for (const FxPair& p : pairs) {
+        if (p.i >= n || p.j >= n) continue;
+        const FxBody& A = w.bodies[p.i];
+        const FxBody& B = w.bodies[p.j];
+        const FxVec3 d = FxSub(B.pos, A.pos);
+        const fx pen = (A.radius + B.radius) - FxLength(d);
+        if (pen > 0) {
+            FxHitEvent e;
+            e.a = p.i; e.b = p.j;
+            e.point = FxScale(FxAdd(A.pos, B.pos), kOne / 2);   // inter-centre midpoint
+            e.depth = pen;
+            out.push_back(e);
+        }
+    }
+    return out;
+}
+
+// StepWorld OVERLOAD (issue #44 ask): the full deterministic step, then collect this step's contacts into
+// `eventsOut`. Defers to the byte-unchanged 4-arg StepWorld, so the physics is IDENTICAL — `eventsOut` is
+// the only addition. Authors who want events just call this 5-arg form; everyone else is unaffected.
+inline void StepWorld(FxWorld& w, std::span<const FxPair> pairs, fx dt, int solveIters,
+                      std::vector<FxHitEvent>& eventsOut) {
+    StepWorld(w, pairs, dt, solveIters);
+    eventsOut = CollectContacts(w, pairs);
+}
+
 // ===== Slice FPX4 — fixed-point integer QUATERNION ORIENTATION (Phase 11 #4) ========================
 // Add ORIENTATION to the deterministic fixed-point sim: each body carries a Q16.16 quaternion `orient`
 // + an angular velocity `angVel`, integrated per-body from angVel as a fixed-point quaternion,
