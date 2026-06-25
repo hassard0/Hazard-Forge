@@ -251,6 +251,121 @@ int main() {
               "seq-s3: composition — a fired payload fed into a flow kInput channel yields the expected flow trace");
     }
 
+    // =============================== SEQ-S4 — transform / rotation track (THE Q16.16 CRUX) ========
+    // The headline: a transform track (translation + rotation + scale) sampled into an integer
+    // FxTransform, where the rotation is the float FQuat::Slerp that breaks UE5 Sequencer, rebuilt as a
+    // DETERMINISTIC Q16.16 integer NLERP (zero transcendentals). The transform-sweep digest is byte-stable
+    // MSVC + clang; the ~unit drift band + the shortest-arc flip are the rotation proofs. PINNED on first
+    // run (MSVC == clang), the cross-platform bar.
+    const uint64_t kPinnedTransformSweep = 0x59e3f94ce2da437dull;  // PINNED on first run (MSVC == clang)
+    // ~unit drift band: measured worst |len - kOne| == 2 LSB over the [0,2s] rotation sweep (nlerp +
+    // FxQuatNormalize integer normalize). Pinned at 4 LSB (2x headroom, the FPX4 ~unit discipline) — a
+    // ~6.1e-5 relative drift off unit, deterministic MSVC == clang.
+    const fx       kUnitBand             = 4;         // ~unit drift band in LSB (measured worst = 2)
+
+    const TransformTrack xfShowcase = MakeShowcaseTransform();
+    const std::vector<fx> xfSweep = SampleTransformSweep(xfShowcase, kOne / 30, 90);  // 3s @ 30Hz, 10 fx/tick
+    const uint64_t xfDig = DigestTrack(xfSweep);
+    std::printf("seq-s4: transform-sweep digest = 0x%016llx  (%zu fx)\n",
+                (unsigned long long)xfDig, xfSweep.size());
+
+    // ---- (1) PRIOR INVARIANT — re-assert S1 + all 4 S2 digests + S3 event-sweep, all UNCHANGED. -----
+    {
+        const bool s1ok = DigestTrack(SampleSweep(MakeShowcaseTrack(), kOne / 30, 90)) == 0xd314f17ebe3d480bull;
+        const bool s2tbl = DigestTrack(SineEaseTable()) == 0x8f13b44545cc3c97ull
+                        && DigestTrack(QuadInTable())   == 0x7ebbb0956a7f50a2ull
+                        && DigestTrack(QuadOutTable())  == 0x5289c36d8551004aull;
+        const bool s2seq = DigestTrack(SampleSequenceSweep(MakeShowcaseSequence(), kOne / 30, 90)) == 0xee44096d40ab3946ull;
+        const bool s3ev  = flow::DigestEvents(SampleEventSweep(MakeShowcaseEvents(), kOne / 30, 90)) == 0x1035f49824b6ac7aull;
+        check(s1ok && s2tbl && s2seq && s3ev,
+              "seq-s4: prior invariant — S1 + all 4 S2 + S3 event-sweep digests UNCHANGED (S4 is purely additive)");
+    }
+
+    // ---- (2) PINNED TRANSFORM SWEEP — the whole transform timeline is byte-stable MSVC + clang. ------
+    check(xfDig == kPinnedTransformSweep,
+          "seq-s4: SampleTransformSweep digest == pinned uint64 (the transform timeline is byte-stable)");
+
+    // ---- (3) REPLAY-STABLE — a second sweep reproduces the digest. -----------------------------------
+    {
+        const std::vector<fx> xfSweep2 = SampleTransformSweep(xfShowcase, kOne / 30, 90);
+        check(DigestTrack(xfSweep2) == xfDig,
+              "seq-s4: re-sampling the transform track is bit-identical (deterministic)");
+    }
+
+    // ---- (4) ~UNIT ROTATION — for several sampled t, |SampleRotation| is within the drift band of kOne.
+    // nlerp+normalize keeps the quat ≈unit; len = FxISqrt(int64 sum-of-squares) (Q32.32 -> Q16.16). Assert
+    // abs(len - kOne) <= kUnitBand (a small measured/pinned constant — the FPX4 ~unit discipline).
+    {
+        bool ok = true;
+        fx worst = 0;
+        for (int s = 0; s <= 60; ++s) {
+            const fx t = (fx)((int64_t)s * (int64_t)(2 * kOne) / 60);   // sweep [0, 2s]
+            const FxQuat q = SampleRotation(xfShowcase.rotation, t);
+            const int64_t ss = (int64_t)q.x * q.x + (int64_t)q.y * q.y
+                             + (int64_t)q.z * q.z + (int64_t)q.w * q.w;
+            const fx len = (fx)FxISqrt(ss);
+            fx d = len - kOne; if (d < 0) d = -d;
+            if (d > worst) worst = d;
+            if (d > kUnitBand) ok = false;
+        }
+        std::printf("seq-s4: ~unit rotation worst |len - kOne| = %d LSB (band = %d)\n", (int)worst, (int)kUnitBand);
+        check(ok, "seq-s4: a sampled rotation stays ~unit — |q| within the documented Q16.16 drift band of kOne");
+    }
+
+    // ---- (5) SHORTEST-ARC — prove the dot<0 flip fires and CHANGES the result. -----------------------
+    // Build a 2-key track {q(0°)=identity, q(180° about Y)={0,kOne,0,0}}. The dot of identity.w(=kOne) and
+    // q180.w(=0) plus identity.y(=0)*q180.y(=kOne) is 0 — NOT negative — so to force the flip we use the
+    // ANTIPODE of q180: q(-180°)={0,-kOne,0,0} (the SAME rotation, double-cover). Now dot(identity, -q180)
+    // computes against w=0,y=-kOne -> still 0. The decisive pair is q(90°)->q(-270°-ish). Concretely we
+    // take qa=q(90°)={0,46341,0,46341}, qb=antipode-of-q(90°)={0,-46341,0,-46341} (the SAME orientation).
+    // Without the flip, nlerp(qa,qb,0.5) = {0,0,0,0} -> normalize -> identity {0,0,0,kOne} (a WRONG,
+    // collapsed result). WITH the flip (dot = 46341*-46341*2 < 0 -> negate qb back to qa), nlerp midpoint
+    // == qa itself (a valid ≈90° quat). So: midpoint.w must be the ~46341 of qa-normalized, NOT kOne.
+    {
+        RotationTrack flipTr;
+        flipTr.times = {0, kOne};
+        flipTr.keys  = { FxQuat{0,  46341, 0,  46341},     // q(90° about Y)
+                         FxQuat{0, -46341, 0, -46341} };    // antipode (SAME rotation, opposite hemisphere)
+        const FxQuat mid = SampleRotation(flipTr, kOne / 2);  // midpoint of the segment
+
+        // WITHOUT the flip the midpoint would collapse to identity (w == kOne, y == 0). WITH the flip it
+        // equals normalized q(90°) (w ≈ 46341, y ≈ 46341). Prove the flip fired + changed the result.
+        const FxQuat qaNorm = FxQuatNormalize(FxQuat{0, 46341, 0, 46341});
+        fx dw = mid.w - qaNorm.w; if (dw < 0) dw = -dw;
+        fx dy = mid.y - qaNorm.y; if (dy < 0) dy = -dy;
+        const bool flippedResult = (dw <= kUnitBand && dy <= kUnitBand);   // == normalized q(90°)
+        const bool notCollapsed  = (mid.w < kOne - 8 * kUnitBand) && (mid.y > 8 * kUnitBand);  // NOT identity
+        std::printf("seq-s4: shortest-arc midpoint = {%d,%d,%d,%d}  (qaNorm.w=%d qaNorm.y=%d)\n",
+                    (int)mid.x, (int)mid.y, (int)mid.z, (int)mid.w, (int)qaNorm.w, (int)qaNorm.y);
+        check(flippedResult && notCollapsed,
+              "seq-s4: shortest-arc — interpolating across the antipode takes the short path (flip fires, no collapse)");
+    }
+
+    // ---- (6) ENDPOINT EXACT — SampleRotation at a key time == that key, normalized. ------------------
+    {
+        const RotationTrack rt = MakeShowcaseRotation();
+        bool ok = true;
+        for (std::size_t k = 0; k < rt.times.size(); ++k) {
+            const FxQuat got = SampleRotation(rt, rt.times[k]);
+            const FxQuat exp = FxQuatNormalize(rt.keys[k]);
+            // The last key returns keys.back() un-normalized (the hold path); the showcase 180° key
+            // {0,kOne,0,0} is already exactly unit so == its own normalize. Interior keys hit t01==0 ->
+            // nlerp returns qa, then normalize. Compare normalized both ways for robustness.
+            const FxQuat gotN = FxQuatNormalize(got);
+            if (gotN.x != exp.x || gotN.y != exp.y || gotN.z != exp.z || gotN.w != exp.w) ok = false;
+        }
+        check(ok, "seq-s4: rotation endpoints are exact — SampleRotation at a key time == that key (normalized)");
+    }
+
+    // ---- (7) LOAD-BEARING ROTATION KEY — perturb one rotation key -> a DIFFERENT transform-sweep digest.
+    {
+        TransformTrack mutated = MakeShowcaseTransform();
+        mutated.rotation.keys[1].y += kOne / 4;   // nudge the 90° key's y component (a visible amount)
+        const std::vector<fx> mutSweep = SampleTransformSweep(mutated, kOne / 30, 90);
+        check(DigestTrack(mutSweep) != xfDig,
+              "seq-s4: nudging one rotation key changes the transform-sweep digest (rotation keys are load-bearing)");
+    }
+
     if (g_fail == 0) { std::printf("seq_test: ALL PASS\n"); return 0; }
     std::printf("seq_test: %d FAIL\n", g_fail);
     return 1;

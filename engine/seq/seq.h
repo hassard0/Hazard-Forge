@@ -327,4 +327,171 @@ inline EventTrack MakeShowcaseEvents() {
     return tr;
 }
 
+// ============================ S4 — transform / rotation track (THE Q16.16 ROTATION CRUX) ===========
+// The HEADLINE: a transform track (translation + rotation + scale) sampled at a tick into an integer
+// FxTransform — where the rotation is the float that breaks UE5 Sequencer (FQuat::Slerp via acos/sin,
+// float playback timing → two machines diverge in the low bits) rebuilt as a DETERMINISTIC Q16.16
+// integer NLERP: zero runtime transcendentals, bit-identical cross-platform. v1 is normalized-lerp
+// (nlerp), NOT true constant-velocity slerp — the documented fidelity tradeoff (LUT-slerp via ik.h's
+// FxAcosLut is the later upgrade; nlerp is correct, deterministic, and standard for cutscenes).
+// APPEND-ONLY — S1–S3 types/semantics untouched + golden-invariant. NO new include: this reuses fpx.h's
+// quaternion/vector substrate (already pulled in by "sim/fpx.h"). STILL NO <cmath>/<algorithm>/float.
+
+// Reuse the fpx quaternion/vector substrate (read-only).
+using hf::sim::fpx::FxVec3;          // {fx x,y,z}
+using hf::sim::fpx::FxQuat;          // {fx x,y,z,w}  (w defaults to kOne = identity)
+using hf::sim::fpx::FxQuatMul;       // Hamilton product (int64 fxmul terms) — pulled in for completeness
+using hf::sim::fpx::FxQuatNormalize; // integer unit-normalize via FxISqrt (NO <cmath>)
+using hf::sim::fpx::FxISqrt;         // integer floor-sqrt on int64 (for the ~unit length proof)
+
+// FxTransform — the integer twin of a TRS pose (translation + unit-quat rotation + scale).
+struct FxTransform {
+    FxVec3 t;                            // translation (Q16.16 world units)
+    FxQuat r = FxQuat{0, 0, 0, kOne};    // rotation (unit quaternion, identity default)
+    FxVec3 s = FxVec3{kOne, kOne, kOne}; // scale (Q16.16, identity default)
+};
+
+// Vec3Track — three independent scalar tracks sampled into an FxVec3 (translation/scale channels).
+struct Vec3Track { ScalarTrack x, y, z; };
+inline FxVec3 SampleVec3(const Vec3Track& tr, fx t) {
+    return FxVec3{ SampleScalar(tr.x, t), SampleScalar(tr.y, t), SampleScalar(tr.z, t) };
+}
+
+// RotationTrack — keyframe unit quaternions + integer nlerp (THE CRUX). The INVARIANT: `times` is
+// STRICTLY ASCENDING (sorted, no dupes) and keys.size() == times.size().
+struct RotationTrack {
+    std::vector<fx>     times;   // Q16.16 seconds, STRICTLY ASCENDING
+    std::vector<FxQuat> keys;    // unit quaternions; keys.size() == times.size()
+};
+
+// SampleRotation(tr, t): the deterministic integer quaternion sample.
+//   - empty -> identity {0,0,0,kOne}. Single key -> keys[0].
+//   - clamp t to [times.front(), times.back()]; at/past the last key -> keys.back().
+//   - find segment k (the S1 FindSegment integer binary-search pattern, inline over tr.times — NO
+//     <algorithm>); den = times[k+1]-times[k]; t01 = (den==0)?0:fxdiv(t-times[k], den) in [0,kOne].
+//   - SHORTEST-ARC FLIP: int64 dot of qa,qb (Q32.32); if dot<0 negate every component of qb (the
+//     double-cover convention — without it a 0->large-angle interp takes the long way around).
+//   - INTEGER NLERP: m.c = qa.c + fxmul(t01, qb.c-qa.c) per component, then FxQuatNormalize(m). NO
+//     transcendental, NO acos/sin — that is the determinism win. (nlerp is NOT constant angular
+//     velocity; LUT-slerp via FxAcosLut is the future fidelity slice.)
+inline FxQuat SampleRotation(const RotationTrack& tr, fx t) {
+    const std::size_t n = tr.times.size();
+    if (n == 0) return FxQuat{0, 0, 0, kOne};   // empty -> identity
+    if (n == 1) return tr.keys[0];              // single key -> hold it
+
+    // Clamp t to the keyed range.
+    if (t < tr.times[0])     t = tr.times[0];
+    if (t > tr.times[n - 1]) t = tr.times[n - 1];
+
+    // FindSegment over tr.times (inline — the S1 hand-written integer binary search, NO <algorithm>).
+    std::size_t k;
+    if (t <= tr.times[0])          k = 0;
+    else if (t >= tr.times[n - 1]) k = n - 1;
+    else {
+        std::size_t lo = 0, hi = n - 1;
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo + 1) / 2;   // ceil-mid so lo advances
+            if (tr.times[mid] <= t) lo = mid;
+            else                    hi = mid - 1;
+        }
+        k = lo;
+    }
+    if (k == n - 1) return tr.keys[k];          // at/past the last key -> hold it (normalize-free hold)
+
+    const fx den = tr.times[k + 1] - tr.times[k];
+    const fx t01 = (den == 0) ? 0 : fxdiv(t - tr.times[k], den);   // Q16.16 in [0, kOne]
+
+    FxQuat qa = tr.keys[k];
+    FxQuat qb = tr.keys[k + 1];
+
+    // SHORTEST-ARC FLIP — int64 dot (Q32.32). If negative, negate qb (quaternions double-cover SO(3)).
+    const int64_t dot = (int64_t)qa.x * (int64_t)qb.x + (int64_t)qa.y * (int64_t)qb.y
+                      + (int64_t)qa.z * (int64_t)qb.z + (int64_t)qa.w * (int64_t)qb.w;
+    if (dot < 0) { qb.x = -qb.x; qb.y = -qb.y; qb.z = -qb.z; qb.w = -qb.w; }
+
+    // INTEGER NLERP — component-wise a + t01*(b-a), then integer normalize.
+    FxQuat m{
+        qa.x + fxmul(t01, qb.x - qa.x),
+        qa.y + fxmul(t01, qb.y - qa.y),
+        qa.z + fxmul(t01, qb.z - qa.z),
+        qa.w + fxmul(t01, qb.w - qa.w),
+    };
+    return FxQuatNormalize(m);
+}
+
+// TransformTrack — the TRS bundle: translation Vec3Track + RotationTrack + scale Vec3Track.
+struct TransformTrack { Vec3Track translation; RotationTrack rotation; Vec3Track scale; };
+inline FxTransform SampleTransform(const TransformTrack& tr, fx t) {
+    return FxTransform{ SampleVec3(tr.translation, t), SampleRotation(tr.rotation, t), SampleVec3(tr.scale, t) };
+}
+
+// SampleTransformSweep(tr, dt, n): sample tr at n fixed ticks t=(fx)((int64)i*dt) -> a contiguous fx
+// buffer (10 fx per tick: t.xyz, r.xyzw, s.xyz). FxTransform is 10 fx but the STRUCT may carry padding —
+// NEVER DigestBytes a vector of structs. Serialize FIELD-BY-FIELD (the replay.h / S1 discipline) so the
+// digest input is contiguous + byte-stable. The i*dt product is int64 to avoid overflow.
+inline std::vector<fx> SampleTransformSweep(const TransformTrack& tr, fx dt, uint32_t n) {
+    std::vector<fx> out;
+    out.reserve((std::size_t)n * 10u);
+    for (uint32_t i = 0; i < n; ++i) {
+        const fx t = (fx)((int64_t)i * (int64_t)dt);
+        const FxTransform x = SampleTransform(tr, t);
+        out.push_back(x.t.x); out.push_back(x.t.y); out.push_back(x.t.z);
+        out.push_back(x.r.x); out.push_back(x.r.y); out.push_back(x.r.z); out.push_back(x.r.w);
+        out.push_back(x.s.x); out.push_back(x.s.y); out.push_back(x.s.z);
+    }
+    return out;   // contiguous fx -> DigestTrack() (net::DigestBytes) is padding-safe + byte-stable
+}
+
+// MakeShowcaseRotation(): the FIXED golden fixture — 3 unit quaternions about the +Y axis at 0°, 90°,
+// 180° as COMMITTED Q16.16 literals (the 180° crossing exercises the shortest-arc flip — the dot of
+// q(90°) and q(180°) about Y stays positive, but a direct q(0°)->q(180°) interp is where the
+// double-cover flip matters; the S4 shortest-arc test builds that pair explicitly). The literals were
+// baked ONCE with a throwaway program computing {y=sin(θ/2), w=cos(θ/2)} * 65536, snapped to Q16.16,
+// pasted here, and the generator DELETED — seq.h stays <cmath>-free:
+//   0°   -> {0,     0, 0, 65536}     (cos0=1,             sin0=0)
+//   90°  -> {0, 46341, 0, 46341}     (cos45=sin45=0.70710678... * 65536 = 46340.95 -> 46341)
+//   180° -> {0, 65536, 0,     0}     (cos90=0,            sin90=1)
+// Each is ≈ unit (FxQuatNormalize-stable: |{0,46341,0,46341}|=65536±1). Keep FIXED forever.
+inline RotationTrack MakeShowcaseRotation() {
+    RotationTrack tr;
+    tr.times = {0, kOne, 2 * kOne};                         // 0s, 1s, 2s
+    tr.keys  = { FxQuat{0,     0, 0, kOne},                 // 0°   about +Y (identity)
+                 FxQuat{0, 46341, 0, 46341},                // 90°  about +Y
+                 FxQuat{0, kOne,  0, 0} };                  // 180° about +Y  (kOne == 65536)
+    return tr;
+}
+
+// MakeShowcaseTransform(): the FIXED golden fixture — translation = a Vec3Track (distinct simple ramps
+// per axis), rotation = MakeShowcaseRotation(), scale = a gentle Vec3Track (constant unit on x/z, a small
+// ramp on y). Keep FIXED forever — the pinned golden hashes its transform sweep.
+inline TransformTrack MakeShowcaseTransform() {
+    TransformTrack tr;
+
+    // Translation: x rises 0->2, y is a small dip-and-rise, z falls 0->-1, all over [0,2]s (Linear).
+    tr.translation.x.times  = {0, kOne, 2 * kOne};
+    tr.translation.x.values = {0, kOne, 2 * kOne};
+    tr.translation.x.easing = Easing::Linear;
+    tr.translation.y.times  = {0, kOne, 2 * kOne};
+    tr.translation.y.values = {0, kOne / 2, 0};
+    tr.translation.y.easing = Easing::Linear;
+    tr.translation.z.times  = {0, kOne, 2 * kOne};
+    tr.translation.z.values = {0, -kOne / 2, -kOne};
+    tr.translation.z.easing = Easing::Linear;
+
+    tr.rotation = MakeShowcaseRotation();
+
+    // Scale: gentle — x/z held at unit, y a small ramp 1.0 -> 1.5 -> 1.0 (a subtle pulse).
+    tr.scale.x.times  = {0, 2 * kOne};
+    tr.scale.x.values = {kOne, kOne};
+    tr.scale.x.easing = Easing::Linear;
+    tr.scale.y.times  = {0, kOne, 2 * kOne};
+    tr.scale.y.values = {kOne, kOne + kOne / 2, kOne};
+    tr.scale.y.easing = Easing::Linear;
+    tr.scale.z.times  = {0, 2 * kOne};
+    tr.scale.z.values = {kOne, kOne};
+    tr.scale.z.easing = Easing::Linear;
+
+    return tr;
+}
+
 }  // namespace hf::seq
