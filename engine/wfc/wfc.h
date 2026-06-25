@@ -550,4 +550,42 @@ inline bool ApplyConstraints(const TileSet& ts, Grid& g) {
     return Propagate(ts, g, worklist);
 }
 
+// ===================================================================================================
+// --- Slice WFC-S5: seed-deterministic lockstep + desync localization (THE BANNER SLICE) ------------
+// ===================================================================================================
+// S1-S4 built a complete deterministic WFC solver. S5 PROVES the moat: a WFC level is a PURE FUNCTION
+// of the seed, so two peers fed only the seed re-derive the BYTE-IDENTICAL level, and a STREAM of
+// seed-driven generations runs on the existing net::Session engine — lockstep-identical at every step,
+// replay-able, with a divergence LOCATED at the exact step. The whole header change is three thin
+// helpers; the lockstep/desync proof reuses the netcode machinery VERBATIM in the TEST (no solver
+// duplication). APPEND-ONLY below S4 — S1-S4 types/functions untouched. Still PURE-CPU INTEGER,
+// self-contained (only <bit>/<cstddef>/<cstdint>/<vector> + net/session.h), NO float/RNG/hash.
+
+// --- MakeFullGrid: the generic all-superposed grid for an arbitrary tile count ---------------------
+// The generic twin of S1's hardcoded-4-tile MakeShowcaseGrid (which is NOT modified). Every cell starts
+// with all `tileCount` tiles allowed (the maximal superposition the solver collapses from).
+inline Grid MakeFullGrid(int32_t w, int32_t h, uint32_t tileCount) {
+    Grid g;
+    g.w = w;
+    g.h = h;
+    const Domain all = (tileCount < 64u) ? ((Domain{1} << tileCount) - Domain{1}) : ~Domain{0};
+    g.cell.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), all);
+    return g;
+}
+
+// --- Generate: the pure seed->level function (the headline API) ------------------------------------
+// Build a full grid for ts.tileCount, Solve it (S3), return the solved grid. Deterministic of
+// (ts, seed, w, h, maxSteps) ALONE — no hidden state, no clock, no global RNG. Returns the grid whether
+// or not Solve fully collapsed (callers needing the status call Solve directly).
+inline Grid Generate(const TileSet& ts, uint32_t seed, int32_t w, int32_t h, uint32_t maxSteps) {
+    Grid g = MakeFullGrid(w, h, ts.tileCount);
+    Solve(ts, g, seed, maxSteps);  // S3 — fills g (or leaves a partial grid if unsolvable)
+    return g;
+}
+
+// --- GenerateDigest: the pinned-golden currency over a generated level -----------------------------
+inline uint64_t GenerateDigest(const TileSet& ts, uint32_t seed, int32_t w, int32_t h, uint32_t maxSteps) {
+    return DigestGrid(Generate(ts, seed, w, h, maxSteps));
+}
+
 }  // namespace hf::wfc

@@ -632,6 +632,143 @@ int main() {
         }
     }
 
+    // ================================================================================================
+    // ---- Slice WFC-S5: seed-deterministic lockstep + desync localization (THE BANNER SLICE) --------
+    // ================================================================================================
+    // PART A — a WFC level is a PURE FUNCTION of the seed (Generate). PART B — a STREAM of seed-driven
+    // generations runs on the existing net::Session engine (World=Grid, Input=uint32_t seed): lockstep-
+    // identical at every tick + replay-stable. PART C — a one-tick seed divergence is LOCATED at the
+    // exact tick by net::DesyncDetector. All pure-CPU integer, so every digest + the latched tick are
+    // bit-identical run-to-run AND MSVC-vs-clang. The tileset/grid/seed/T/maxSteps are FIXED below.
+    {
+        const TileSet     s5ts      = MakeShowcaseTileSet();  // FIXED: the S1 showcase 4-tile gradient
+        const int32_t     W         = 12;
+        const int32_t     H         = 12;
+        const uint32_t    MAXSTEPS  = 100000u;
+        const uint32_t    baseSeed  = 0x1234ABCDu;
+        const uint32_t    T         = 6u;   // the seed-stream length (T levels)
+
+        // ---- PART A — pure-seed determinism (the core headline) ------------------------------------
+        const Grid     s5g      = Generate(s5ts, baseSeed, W, H, MAXSTEPS);
+        const uint64_t s5Digest = DigestGrid(s5g);
+
+        std::printf("wfc-s5: Generate(seed) digest = 0x%016llx\n",
+                    static_cast<unsigned long long>(s5Digest));
+
+        // (1) PINNED DIGEST — a peer re-derives the level from the seed alone (cross-platform anchor).
+        const uint64_t kS5GenDigest = 0xe668dbdf242ed4e5ull;  // PINNED on first run
+        check(s5Digest == kS5GenDigest,
+              "wfc-s5: Generate(ts, seed) digest == pinned uint64 (cross-platform: a peer re-derives the level)");
+
+        // (2) PURE FUNCTION — two independent Generate calls are byte-identical.
+        {
+            const Grid s5g2 = Generate(s5ts, baseSeed, W, H, MAXSTEPS);
+            check(DigestGrid(s5g2) == s5Digest,
+                  "wfc-s5: two independent Generate(ts, seed) calls are byte-identical (pure function of the seed)");
+        }
+
+        // (3) DIFFERENT SEED — a different (still fully-collapsed + globally-consistent) level.
+        {
+            const Grid s5gAlt = Generate(s5ts, baseSeed ^ 0xFFFFu, W, H, MAXSTEPS);
+            const uint64_t altDigest = DigestGrid(s5gAlt);
+            bool allDecided = true;
+            for (const Domain d : s5gAlt.cell) if (popcount64(d) != 1) { allDecided = false; break; }
+            check(altDigest != s5Digest && allDecided && globallyConsistent(s5ts, s5gAlt),
+                  "wfc-s5: a different seed generates a different (still fully-collapsed, globally-consistent) level");
+        }
+
+        // (4) RULES LOAD-BEARING — a one-adjacency-bit-flipped tileset generates a DIFFERENT level.
+        {
+            TileSet flipped = s5ts;
+            // Toggle bit 1 (sand) in grass's (tile 2) right-side rule — a load-bearing adjacency bit.
+            flipped.allowed[static_cast<std::size_t>(2) * 4u + static_cast<std::size_t>(kRight)] ^=
+                (Domain{1} << 1);
+            check(DigestGrid(Generate(flipped, baseSeed, W, H, MAXSTEPS)) != s5Digest,
+                  "wfc-s5: a one-bit tileset rule change generates a DIFFERENT level (rules are load-bearing at generation)");
+        }
+
+        // ---- PART B — lockstep over the netcode session engine (THE COMPOSITION) -------------------
+        // Model a STREAM of seed-driven generations as a net::Session<Grid, uint32_t>: the per-tick
+        // input is one seed, the step regenerates the world's grid from it, the digest is DigestGrid.
+        auto step = [&](Grid& world, const std::vector<uint32_t>& seeds, uint32_t /*tick*/) {
+            if (!seeds.empty()) world = hf::wfc::Generate(s5ts, seeds.back(), W, H, MAXSTEPS);
+        };
+        auto digest = [&](const Grid& world) { return hf::wfc::DigestGrid(world); };
+
+        // Build an InputRing<uint32_t> with one seed per tick: baseSeed + t for t in [0, T).
+        hf::net::InputRing<uint32_t> ring;
+        for (uint32_t t = 0; t < T; ++t) ring.AddInput(t, baseSeed + t);
+
+        const uint64_t streamFinal =
+            hf::net::RunLockstep<Grid, uint32_t>(Grid{}, ring, T, step, digest);
+
+        std::printf("wfc-s5: lockstep stream final digest = 0x%016llx (T=%u levels)\n",
+                    static_cast<unsigned long long>(streamFinal), T);
+
+        // (5) PINNED LOCKSTEP FINAL — the stream's final digest over the netcode session engine.
+        const uint64_t kS5StreamDigest = 0x45908edf3675c9e6ull;  // PINNED on first run
+        check(streamFinal == kS5StreamDigest,
+              "wfc-s5: net::RunLockstep over a T-seed generation stream == pinned uint64");
+
+        // (6) LOCKSTEP INVARIANT — two peers' DigestTrace match at EVERY tick.
+        const std::vector<uint64_t> traceA = hf::net::DigestTrace(Grid{}, ring, T, step, digest);
+        {
+            const std::vector<uint64_t> traceB = hf::net::DigestTrace(Grid{}, ring, T, step, digest);
+            check(traceA == traceB && traceA.size() == static_cast<std::size_t>(T),
+                  "wfc-s5: two peers running the same seed stream produce IDENTICAL net::DigestTrace at EVERY tick (lockstep invariant)");
+        }
+
+        // (7) REPLAY-STABLE — a second RunLockstep over the same ring reproduces the final digest.
+        check(hf::net::RunLockstep<Grid, uint32_t>(Grid{}, ring, T, step, digest) == streamFinal,
+              "wfc-s5: a replay of the same stream reproduces the identical final digest (replay-able)");
+
+        // ---- PART C — desync localization (the NS5 detector applied to WFC generation) -------------
+        // ringB is identical to ringA EXCEPT tick K uses a tampered seed -> traces match for t<K and
+        // diverge at K; net::DesyncDetector latches the EXACT tick.
+        const uint32_t K = 3u;  // PINNED: the injected-divergence tick
+        hf::net::InputRing<uint32_t> ringB;
+        for (uint32_t t = 0; t < T; ++t)
+            ringB.AddInput(t, (t == K) ? ((baseSeed + K) ^ 0x9999u) : (baseSeed + t));
+        const std::vector<uint64_t> traceB = hf::net::DigestTrace(Grid{}, ringB, T, step, digest);
+
+        // (8) CLEAN — identical seed streams report NO desync.
+        {
+            hf::net::DesyncDetector dClean;
+            for (uint32_t t = 0; t < T; ++t) hf::net::RecordLocal(dClean, t, traceA[t]);
+            for (uint32_t t = 0; t < T; ++t)
+                hf::net::IngestRemote(dClean, hf::net::ChecksumPacket{t, traceA[t]});
+            check(!dClean.desynced,
+                  "wfc-s5: identical seed streams report NO desync (clean)");
+        }
+
+        // (9) LOCATED — the one-tick divergence is located at the exact tick K; traces match for t<K.
+        hf::net::DesyncDetector d;
+        for (uint32_t t = 0; t < T; ++t) hf::net::RecordLocal(d, t, traceA[t]);
+        for (uint32_t t = 0; t < T; ++t)
+            hf::net::IngestRemote(d, hf::net::ChecksumPacket{t, traceB[t]});
+
+        std::printf("wfc-s5: desync injected at tick K=%u; detector latched tick=%u\n",
+                    K, d.desyncTick);
+
+        {
+            bool matchBeforeK = true;
+            for (uint32_t t = 0; t < K; ++t) if (traceA[t] != traceB[t]) { matchBeforeK = false; break; }
+            check(d.desynced && d.desyncTick == K && matchBeforeK,
+                  "wfc-s5: a one-tick seed divergence is LOCATED at the exact tick K (net::DesyncDetector), traces match for t<K");
+        }
+
+        // (10) DETERMINISTIC — re-running the desync check reproduces the identical latched tick + digests.
+        {
+            hf::net::DesyncDetector d2;
+            for (uint32_t t = 0; t < T; ++t) hf::net::RecordLocal(d2, t, traceA[t]);
+            for (uint32_t t = 0; t < T; ++t)
+                hf::net::IngestRemote(d2, hf::net::ChecksumPacket{t, traceB[t]});
+            check(d2.desynced == d.desynced && d2.desyncTick == d.desyncTick &&
+                  d2.localDigest == d.localDigest && d2.remoteDigest == d.remoteDigest,
+                  "wfc-s5: the located divergence is deterministic on re-run (same tick + digests)");
+        }
+    }
+
     if (g_fail == 0) { std::printf("wfc_test: ALL PASS\n"); return 0; }
     std::printf("wfc_test: %d FAIL\n", g_fail);
     return 1;
