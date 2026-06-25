@@ -319,4 +319,88 @@ inline Tree MakeLayoutShowcase() {
     return t;
 }
 
+// =====================================================================================================
+// Slice WIDGET-S3 — Data binding (issue #30). APPEND-ONLY below S2. A model (a vector of integer values)
+// drives widget properties through a set of bindings, applied in a DETERMINISTIC order (ascending binding
+// index, last-write-wins), so the post-binding tree + layout are byte-identical cross-platform. This is
+// UMG's "bind a property to a data source" made deterministic. Bindings target EXISTING integer Style
+// fields (width/height/flexWeight) — all already in EncodeTree + all affecting layout — so NO new Style
+// field is added (S1's struct + digest 0x53da0581a48f615e stay frozen; S2 rects 0x95da64c52733eb16 too).
+// Pure integer, NO new include, NO recursion (a flat ascending-index scan; the InputRing discipline, no
+// hash-map). Opacity/visibility are render-side concerns deferred to S6.
+// =====================================================================================================
+
+// --- Bindable properties + the binding ---------------------------------------------------------------
+// Selects a writable integer Style field. FROZEN values (the wire contract; S4 animation reuses them).
+enum WidgetProp : uint32_t {
+    kPropWidth      = 0,   // -> Style::width      (a fixed-size widget's pixel width)
+    kPropHeight     = 1,   // -> Style::height     (a fixed-size widget's pixel height)
+    kPropFlexWeight = 2,   // -> Style::flexWeight (a flex child's grow weight)
+};
+
+struct Binding {
+    uint32_t srcModelIdx = 0;   // index into the model vector (the source value)
+    WidgetId dstWidget   = 0;   // the widget whose property is written
+    uint32_t dstProp     = 0;   // a WidgetProp value (the destination field)
+};
+
+// --- SetProp / GetProp — write/read a widget property by id -------------------------------------------
+// Write `value` into the WidgetProp-selected Style field of widget `w`. Out-of-range widget OR prop = a
+// deterministic no-op. flexWeight is uint32 — clamp negative `value` to 0 before the cast.
+inline void SetProp(Tree& t, WidgetId w, uint32_t prop, int32_t value) {
+    if (w >= t.widgets.size()) return;                 // out-of-range widget = no-op
+    Style& s = t.widgets[w].style;
+    switch (prop) {
+        case kPropWidth:      s.width  = value; break;
+        case kPropHeight:     s.height = value; break;
+        case kPropFlexWeight: s.flexWeight = static_cast<uint32_t>(value < 0 ? 0 : value); break;
+        default: break;                                // out-of-range prop = no-op
+    }
+}
+
+inline int32_t GetProp(const Tree& t, WidgetId w, uint32_t prop) {
+    if (w >= t.widgets.size()) return 0;
+    const Style& s = t.widgets[w].style;
+    switch (prop) {
+        case kPropWidth:      return s.width;
+        case kPropHeight:     return s.height;
+        case kPropFlexWeight: return static_cast<int32_t>(s.flexWeight);
+        default:              return 0;
+    }
+}
+
+// --- Propagate — apply the bindings in deterministic order --------------------------------------------
+// Apply each binding IN ASCENDING BINDING-INDEX ORDER (a flat ordered scan — the InputRing insertion-order
+// discipline; NO hash-map). For each binding: if srcModelIdx and dstWidget are in range,
+// SetProp(t, b.dstWidget, b.dstProp, model[b.srcModelIdx]). Two bindings to the same (widget,prop) →
+// LAST-WRITE-WINS (the higher binding index wins — deterministic). Pure integer.
+inline void Propagate(Tree& t, const std::vector<int32_t>& model, const std::vector<Binding>& bindings) {
+    for (std::size_t i = 0; i < bindings.size(); ++i) {
+        const Binding& b = bindings[i];
+        if (b.srcModelIdx >= model.size()) continue;   // source out of range — skip
+        if (b.dstWidget   >= t.widgets.size()) continue;
+        SetProp(t, b.dstWidget, b.dstProp, model[b.srcModelIdx]);
+    }
+}
+
+// --- Fixtures (FIXED forever — the golden pins them) -------------------------------------------------
+// MakeShowcaseModel: a fixed model. index 0 = a header height, 1 = left flex weight, 2 = footer height,
+// 3 = right flex weight, 4 = an unused value (shows some model entries can be unbound). Keep FIXED.
+inline std::vector<int32_t> MakeShowcaseModel() {
+    return std::vector<int32_t>{ 80, 3, 48, 2, 99 };
+}
+
+// MakeShowcaseBindings: a fixed set binding model values to MakeLayoutShowcase's widgets (root=0, header=1,
+// body=2, footer=3, left=4, right=5, title=6). The LAST binding to header.kPropHeight (model[4]=99) must
+// win the last-write-wins pair over the earlier one (model[0]=80). Keep FIXED.
+inline std::vector<Binding> MakeShowcaseBindings() {
+    return std::vector<Binding>{
+        Binding{ /*src*/0, /*dst header*/1, kPropHeight     },  // header.height <- model[0]=80 (overwritten below)
+        Binding{ /*src*/1, /*dst left*/  4, kPropFlexWeight },  // left.flexWeight  <- model[1]=3
+        Binding{ /*src*/3, /*dst right*/ 5, kPropFlexWeight },  // right.flexWeight <- model[3]=2
+        Binding{ /*src*/2, /*dst footer*/3, kPropHeight     },  // footer.height    <- model[2]=48
+        Binding{ /*src*/4, /*dst header*/1, kPropHeight     },  // header.height <- model[4]=99 — LAST-WRITE-WINS
+    };
+}
+
 }  // namespace hf::ui

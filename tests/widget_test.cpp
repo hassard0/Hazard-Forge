@@ -207,6 +207,85 @@ int main() {
               "widget-s2: re-solving is bit-identical (deterministic)");
     }
 
+    // =================================================================================================
+    // Slice WIDGET-S3 — Data binding (model -> view). Seven assertions (spec). A model (vector of int32)
+    // drives EXISTING integer Style fields (width/height/flexWeight) through bindings applied in ascending
+    // binding-index order, last-write-wins. The bound tree = MakeLayoutShowcase() then Propagate.
+    // =================================================================================================
+
+    // Bound tree: MakeLayoutShowcase() then Propagate(model, bindings). Same topology / indices as S2.
+    const std::vector<int32_t> model    = MakeShowcaseModel();
+    const std::vector<Binding> bindings = MakeShowcaseBindings();
+    Tree boundTree = MakeLayoutShowcase();
+    Propagate(boundTree, model, bindings);
+
+    const WidgetId B_header = boundTree.widgets[boundTree.root].firstChild;        // 1
+    const WidgetId B_body   = boundTree.widgets[B_header].nextSibling;             // 2
+    const WidgetId B_footer = boundTree.widgets[B_body].nextSibling;              // 3
+    const WidgetId B_left   = boundTree.widgets[B_body].firstChild;               // 4
+    const WidgetId B_right  = boundTree.widgets[B_left].nextSibling;              // 5
+
+    const uint64_t boundTreeDigest = DigestTree(boundTree);
+    const std::vector<Rect> boundSolved = SolveLayout(boundTree, kViewport);
+    const uint64_t boundRectsDigest = DigestRects(boundSolved);
+
+    std::printf("widget-s3: bound tree digest = 0x%016llx   bound rects digest = 0x%016llx\n",
+                static_cast<unsigned long long>(boundTreeDigest),
+                static_cast<unsigned long long>(boundRectsDigest));
+
+    // ---- (S3-1) PRIOR INVARIANT — S1 tree digest + S2 rects digest UNCHANGED (append-only). ----------
+    check(DigestTree(MakeShowcaseTree()) == 0x53da0581a48f615eull
+       && DigestRects(SolveLayout(MakeLayoutShowcase(), kViewport)) == 0x95da64c52733eb16ull,
+          "widget-s1/s2: prior digests STILL green — 0x53da0581a48f615e + 0x95da64c52733eb16 UNCHANGED");
+
+    // ---- (S3-2) BOUND PROPERTIES — the model values landed in the widget properties. -----------------
+    {
+        const bool landed =
+            GetProp(boundTree, B_left,   kPropFlexWeight) == model[1]   // left.flexWeight  == 3
+         && GetProp(boundTree, B_right,  kPropFlexWeight) == model[3]   // right.flexWeight == 2
+         && GetProp(boundTree, B_footer, kPropHeight)     == model[2]   // footer.height    == 48
+         && GetProp(boundTree, B_header, kPropHeight)     == model[4];  // header.height    == 99 (LWW)
+        check(landed,
+              "widget-s3: after Propagate, the bound widget properties hold the model values (header.height == model[...])");
+    }
+
+    // ---- (S3-3) PINNED BOUND TREE — DigestTree AFTER Propagate == pinned uint64, DIFFERS from unbound.
+    const uint64_t kPinnedBoundTree = 0xbb31678bf35c1a37ull;  // PINNED on first run (MSVC == clang)
+    check(boundTreeDigest == kPinnedBoundTree && boundTreeDigest != 0x53da0581a48f615eull,
+          "widget-s3: DigestTree after Propagate == pinned uint64 (binding changed the tree, byte-stable)");
+
+    // ---- (S3-4) PINNED BOUND RECTS — the binding flowed through to the computed layout. ---------------
+    const uint64_t kPinnedBoundRects = 0xc93bdcf2c0b473a3ull;  // PINNED on first run (MSVC == clang)
+    check(boundRectsDigest == kPinnedBoundRects,
+          "widget-s3: DigestRects(SolveLayout(bound tree)) == pinned uint64 (the binding flowed through to layout)");
+
+    // ---- (S3-5) LAST-WRITE-WINS — the two bindings to header.kPropHeight resolve to the HIGHER index.
+    {
+        // binding[0] = model[0]=80 -> header.height; binding[4] = model[4]=99 -> header.height. The later
+        // (index 4) must win, so header.height == 99 (NOT 80).
+        check(GetProp(boundTree, B_header, kPropHeight) == model[4]
+           && GetProp(boundTree, B_header, kPropHeight) != model[0],
+              "widget-s3: last-write-wins — two bindings to the same (widget,prop) resolve to the HIGHER-index binding");
+    }
+
+    // ---- (S3-6) LOAD-BEARING — change one bound model value, re-Propagate (fresh tree) -> different digest.
+    {
+        std::vector<int32_t> model2 = MakeShowcaseModel();
+        model2[1] += 1;                                  // nudge left's flex weight
+        Tree boundTree2 = MakeLayoutShowcase();
+        Propagate(boundTree2, model2, bindings);
+        check(DigestTree(boundTree2) != boundTreeDigest,
+              "widget-s3: binding is load-bearing — changing a model value changes the bound digest");
+    }
+
+    // ---- (S3-7) DETERMINISTIC — Propagate twice (fresh trees) -> identical bound digest. --------------
+    {
+        Tree boundTreeAgain = MakeLayoutShowcase();
+        Propagate(boundTreeAgain, model, bindings);
+        check(DigestTree(boundTreeAgain) == boundTreeDigest,
+              "widget-s3: Propagate is deterministic — re-applying yields the identical digest");
+    }
+
     if (g_fail == 0) { std::printf("widget_test: ALL PASS\n"); return 0; }
     std::printf("widget_test: %d FAIL\n", g_fail);
     return 1;
