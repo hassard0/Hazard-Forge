@@ -75,6 +75,76 @@ int main() {
         check(kTex != key, "asset-s1: a different AssetKind -> a DIFFERENT key (kind is load-bearing)");
     }
 
+    // =====================================================================================================
+    // Slice ASSET-S2 — the deterministic compiled-artifact format. The OBJ fixture -> a canonical Q16.16
+    // blob whose pinned DigestBytes is bit-identical MSVC / Windows-clang / Mac-clang.
+    // =====================================================================================================
+
+    // The compiled artifact over the SAME fixture + showcase params (scale = 2.0 in Q16.16).
+    const std::vector<uint8_t> blob = CompileObj(raw, len, params);
+    const CacheKey artifact = DigestArtifact(blob);
+    std::printf("asset-s2: compiled-artifact digest = 0x%016llx  (%zu bytes)\n",
+                (unsigned long long)artifact, blob.size());
+
+    // (S2-1) S1 INVARIANT re-assertion — the showcase key is STILL the pinned uint64 (S2 is additive).
+    check(key == 0x7fb6a48b4b99f1b7ULL,
+          "asset-s2: S1 showcase key STILL == 0x7fb6a48b4b99f1b7 (S2 additive, S1 unchanged)");
+
+    // (S2-2) HEADER — the blob decodes to magic == kCompiledMeshMagic, version == 1.
+    {
+        CompiledMesh out;
+        const bool ok = DecodeCompiledMesh(blob, out);
+        check(ok && out.magic == kCompiledMeshMagic && out.version == kCompiledMeshVersion,
+              "asset-s2: CompileObj(fixture, showcase) magic/version == kCompiledMeshMagic / 1");
+    }
+
+    // (S2-3) PINNED ARTIFACT DIGEST — the cross-compiler anchor (identical MSVC + clang).
+    const CacheKey kPinnedArtifact = 0xf7ee13c169dc0464ULL;
+    check(artifact == kPinnedArtifact,
+          "asset-s2: the compiled-artifact digest == pinned uint64 (Q16.16 blob, byte-stable cross-platform)");
+
+    // (S2-4) ROUND-TRIP — DecodeCompiledMesh recovers vertexCount/indexCount/verts/indices; re-encode matches.
+    {
+        CompiledMesh out;
+        const bool ok = DecodeCompiledMesh(blob, out);
+        bool recoded = ok && out.vertexCount == 3 && out.indexCount == 3 &&
+                       out.verts.size() == 24 && out.indices.size() == 3;
+        // re-encode the recovered params + raw fixture must reproduce the SAME blob (canonical).
+        if (recoded) {
+            const std::vector<uint8_t> blob2 = CompileObj(raw, len, out.params);
+            recoded = (blob2 == blob);
+        }
+        check(recoded,
+              "asset-s2: DecodeCompiledMesh(blob) round-trips — vertexCount/indexCount/verts/indices recovered");
+    }
+
+    // (S2-5) PARAM LOAD-BEARING — change `scale` -> a DIFFERENT artifact digest.
+    {
+        CompileParams p2 = params;
+        p2.scale = 3 * 65536;   // 3.0 instead of 2.0
+        const CacheKey a2 = DigestArtifact(CompileObj(raw, len, p2));
+        check(a2 != artifact, "asset-s2: a changed compile param (scale) changes the artifact digest (params are load-bearing)");
+    }
+
+    // (S2-6) CONTENT LOAD-BEARING — a different OBJ text -> a DIFFERENT artifact digest.
+    {
+        const char* raw2 = "v 0 0 0\nv 1 0 0\nv 0 2 0\nf 1 2 3\n";   // moved one vertex
+        std::size_t len2 = 0; while (raw2[len2] != '\0') ++len2;
+        const CacheKey a2 = DigestArtifact(CompileObj(raw2, len2, params));
+        check(a2 != artifact, "asset-s2: different raw bytes -> a different artifact digest (content is load-bearing)");
+    }
+
+    // (S2-7) PURE-INTEGER EXACTNESS — the fixture vertex (1,0,0) with scale=2.0 decodes to EXACTLY 131072.
+    // pos.x = FxMul(FxQuantize(1.0), 2*65536) = FxMul(65536, 131072) = (65536*131072)>>16 = 131072 (= 2.0).
+    {
+        CompiledMesh out;
+        const bool ok = DecodeCompiledMesh(blob, out);
+        // The fixture parses (0,0,0),(1,0,0),(0,1,0) in order; vertex 1 is (1,0,0) -> verts[8] is its pos.x.
+        bool exact = ok && out.verts.size() >= 9 && out.verts[8] == 131072;
+        check(exact,
+              "asset-s2: the artifact is pure-integer Q16.16 — the showcase positions decode to exact integer values");
+    }
+
     if (g_fail == 0) std::printf("asset_compiler_test: ALL PASS\n");
     else             std::printf("asset_compiler_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

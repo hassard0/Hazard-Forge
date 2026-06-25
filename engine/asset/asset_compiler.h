@@ -24,7 +24,8 @@
 #include <cstdint>
 #include <vector>
 
-#include "net/session.h"   // hf::net::DigestBytes (FNV-1a-64)
+#include "net/session.h"        // hf::net::DigestBytes (FNV-1a-64)
+#include "asset/obj_loader.h"   // hf::asset::ParseObj / ObjMesh / ObjVertex (S2 — pure header-only loader)
 
 namespace hf::asset {
 
@@ -112,6 +113,112 @@ inline CompileParams ShowcaseParams() {
     p.tangentMode      = 1;
     p.flags            = 0;
     return p;
+}
+
+// =========================================================================================================
+// Slice ASSET-S2 — Deterministic compiled-artifact format (issue #16). APPEND-ONLY below S1; S1's symbols
+// (incl. the key 0x7fb6a48b4b99f1b7) are UNCHANGED. Turns a raw OBJ -> a canonical, versioned, hand-LE
+// binary blob whose geometry is quantized to Q16.16 INTEGERS (NOT raw float bits) so the artifact is
+// bit-identical across MSVC / Windows-clang / Mac-clang. The golden is the artifact's pinned DigestBytes.
+// =========================================================================================================
+
+// --- The Q16.16 quantizer + integer multiply (inline, self-contained) ------------------------------------
+// Exact float->Q16.16: 65536 is a power of two, so f*65536.0f shifts the exponent with NO rounding (exact
+// for |f| < 32768), and the truncation is identical on every compiler. The ONE float op in the compile step;
+// the artifact it produces is pure integer. (No <cmath>: a bare multiply + cast.)
+inline int32_t FxQuantize(float f) { return (int32_t)(f * 65536.0f); }
+// Q16.16 fixed-point multiply (integer): (a*b) >> 16 via int64 intermediate (the fpx convention).
+inline int32_t FxMul(int32_t a, int32_t b) { return (int32_t)(((int64_t)a * (int64_t)b) >> 16); }
+
+// --- Additional inline LE appenders/readers (self-contained; mirror replay.h, still NOT including it) -----
+inline void PutBytes(std::vector<uint8_t>& b, const uint8_t* p, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) b.push_back(p[i]);
+}
+inline uint32_t GetU32(const std::vector<uint8_t>& b, std::size_t& off) {   // 4 bytes LE
+    uint32_t v = (uint32_t)b[off] | ((uint32_t)b[off + 1] << 8) |
+                 ((uint32_t)b[off + 2] << 16) | ((uint32_t)b[off + 3] << 24);
+    off += 4;
+    return v;
+}
+inline uint64_t GetU64(const std::vector<uint8_t>& b, std::size_t& off) {   // 8 bytes LE
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= (uint64_t)b[off + (std::size_t)i] << (8 * i);
+    off += 8;
+    return v;
+}
+
+// --- The compiled-mesh artifact (canonical, versioned, hand-LE) ------------------------------------------
+constexpr uint32_t kCompiledMeshMagic   = 0x484D4D31;  // 'HMM1' (Hazard Mesh, v-tagged by `version`)
+constexpr uint32_t kCompiledMeshVersion = 1;           // bump if the Q16.16 grid / layout changes
+
+struct CompiledMesh {                     // the DECODED view (S2 round-trip target)
+    uint32_t magic = 0, version = 0;
+    uint32_t vertexCount = 0, indexCount = 0;
+    CompileParams params;                 // the options baked in (echoed in the header so they're load-bearing)
+    std::vector<int32_t>  verts;          // vertexCount * 8 Q16.16 ints: pos.xyz, uv.xy, normal.xyz (fixed stride)
+    std::vector<uint32_t> indices;        // indexCount triangle-list indices
+};
+
+// --- CompileObj — raw OBJ text -> the canonical Q16.16 blob ----------------------------------------------
+// ParseObj -> hand-LE blob in FIXED field order. v1 applies `scale` geometrically (an exact integer Q16.16
+// multiply on each position component); `recomputeNormals`/`tangentMode`/`flags` are recorded in the header
+// (load-bearing on the digest) but their geometry effect is a documented v1-deferred refinement.
+inline std::vector<uint8_t> CompileObj(const char* text, std::size_t n, const CompileParams& p) {
+    ObjMesh m = ParseObj(text, n);
+    std::vector<uint8_t> b;
+    PutU32(b, kCompiledMeshMagic);
+    PutU32(b, kCompiledMeshVersion);
+    PutU32(b, (uint32_t)m.vertices.size());   // vertexCount
+    PutU32(b, (uint32_t)m.indices.size());    // indexCount
+    // params header (any param change re-digests the artifact)
+    PutU32(b, p.recomputeNormals);
+    PutU32(b, (uint32_t)p.scale);
+    PutU32(b, p.tangentMode);
+    PutU32(b, p.flags);
+    // per vertex: 8 Q16.16 components in fixed order (pos.xyz scaled, uv.xy, normal.xyz)
+    for (const ObjVertex& v : m.vertices) {
+        for (int i = 0; i < 3; ++i) PutU32(b, (uint32_t)FxMul(FxQuantize(v.pos[i]), p.scale));
+        for (int i = 0; i < 2; ++i) PutU32(b, (uint32_t)FxQuantize(v.uv[i]));
+        for (int i = 0; i < 3; ++i) PutU32(b, (uint32_t)FxQuantize(v.normal[i]));
+    }
+    for (uint32_t idx : m.indices) PutU32(b, idx);
+    return b;
+}
+
+// --- DecodeCompiledMesh — the round-trip (false on truncation / bad magic) --------------------------------
+// Reads the fixed-order fields back hand-LE (NEVER a struct memcpy), validates magic + the exact byte length
+// (header + 8*vertexCount*4 + indexCount*4).
+inline bool DecodeCompiledMesh(const std::vector<uint8_t>& blob, CompiledMesh& out) {
+    const std::size_t kHeaderBytes = 8 * 4;   // magic,version,vertexCount,indexCount + 4 params words
+    if (blob.size() < kHeaderBytes) return false;
+    std::size_t off = 0;
+    uint32_t magic       = GetU32(blob, off);
+    uint32_t version     = GetU32(blob, off);
+    uint32_t vertexCount = GetU32(blob, off);
+    uint32_t indexCount  = GetU32(blob, off);
+    if (magic != kCompiledMeshMagic) return false;
+    const std::size_t expect = kHeaderBytes +
+                               (std::size_t)vertexCount * 8 * 4 +
+                               (std::size_t)indexCount * 4;
+    if (blob.size() != expect) return false;
+    CompileParams params;
+    params.recomputeNormals = GetU32(blob, off);
+    params.scale            = (int32_t)GetU32(blob, off);
+    params.tangentMode      = GetU32(blob, off);
+    params.flags            = GetU32(blob, off);
+    out.magic = magic; out.version = version;
+    out.vertexCount = vertexCount; out.indexCount = indexCount;
+    out.params = params;
+    out.verts.clear();   out.verts.reserve((std::size_t)vertexCount * 8);
+    out.indices.clear(); out.indices.reserve((std::size_t)indexCount);
+    for (uint32_t i = 0; i < vertexCount * 8; ++i) out.verts.push_back((int32_t)GetU32(blob, off));
+    for (uint32_t i = 0; i < indexCount; ++i)      out.indices.push_back(GetU32(blob, off));
+    return true;
+}
+
+// The artifact's content-address — a pure FNV over the canonical Q16.16 blob (pure integer, mtime-free).
+inline CacheKey DigestArtifact(const std::vector<uint8_t>& blob) {
+    return net::DigestBytes(blob.data(), blob.size());
 }
 
 }  // namespace hf::asset
