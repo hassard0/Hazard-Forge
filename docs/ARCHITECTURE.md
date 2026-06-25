@@ -1410,6 +1410,74 @@ push-constant — the FO5/PT4 single-crossing precedent).
 
 ---
 
+## Procedural-Generation Layer — deterministic Wave-Function-Collapse / constraint solver (`engine/wfc/wfc.h`, namespace `hf::wfc`) — flagship #29
+
+Slices S1–S6 add a **deterministic Wave-Function-Collapse / constraint-based procedural generator** — the
+first CONSTRAINT-SOLVER paradigm in the engine (the existing `pcg` layer is generative-feed-forward only;
+nothing else does constraint satisfaction or backtracking search). Given an adjacency rule-set, WFC
+collapses a grid of superposed tiles (each a `uint64` domain bitmask) to a globally-consistent tilemap —
+dungeons, towns, biome layouts. The moat is the marquee fit: real WFC is **infamous for
+non-reproducibility** (`mt19937` + floating-point Shannon entropy + hash-set-ordered cell iteration give
+different output per compiler/platform and cannot be lockstepped or replayed). HF makes the entire
+backtracking search **bit-identical CPU/Vulkan/Metal and lockstep-replayable from the seed alone**, which
+UE5's PCG framework and every float-entropy WFC plugin structurally cannot do. It is also the cheapest
+proof — pure-integer set-logic (`uint64` domains, `popcount` entropy surrogate, fixed cell/tile/worklist
+ordering, byte-exact value-copy snapshots), so S1–S5 are pinned-FNV-1a-64 goldens proven identical by
+compiling the SAME `wfc_test.cpp` under MSVC (Windows) and clang (Mac) — **no render-bake** until the S6
+capstone. `wfc.h` is header-only and **fully self-contained** (only `<bit>`/`<cstddef>`/`<cstdint>`/
+`<vector>` + the self-contained `net/session.h`); **no RHI / no shader / no GPU / no float / no clock / no
+RNG** across the solver core. The determinism discipline is explicit: no `std::hash`, no `std::unordered_*`,
+no float, no pointer-/hash-ordered iteration anywhere in the solve path.
+
+- **Domain grid + adjacency + integer AC-3 propagation (S1).** `TileSet` (per-direction adjacency bitmasks
+  + integer weights) + a `Grid` of `uint64` domains + `Propagate` — an AC-3 worklist that, when a cell's
+  domain shrinks, intersects each neighbor's domain with the union of allowed tiles (fixed worklist + dir
+  order; contradiction = an empty domain). **Proof:** a pinned `DigestBytes` over the propagated grid,
+  re-run stable, a flipped adjacency bit changes it, propagation provably shrank neighbors — identical
+  MSVC/clang.
+- **Min-entropy selection + weighted collapse (S2).** `SelectCell` picks the undecided cell of minimum
+  INTEGER entropy (`popcount`, tie-broken by summed weight then lowest cell id — NO float Shannon, the
+  classic non-determinism source); `Collapse` picks a tile by a seeded weighted integer draw (`WfcHash`, the
+  `pcg::PcgHash` ops copied verbatim to keep `wfc.h` self-contained). **Proof:** a pinned digest after K
+  collapses, seed-driven (different seed → different digest), re-run bit-identical, every collapsed cell
+  decided + neighbor-consistent.
+- **Full Solve with deterministic backtracking (S3, the make-or-break).** `Solve` observes → propagates,
+  and on a contradiction **backtracks** to the last decision via a LIFO decision stack with byte-exact
+  value-copy domain snapshots (the `fpx::SnapshotWorld`/`RestoreWorld` + `RollbackSession::didRollback`
+  pattern), removing the just-tried tile and retrying, bounded by `maxSteps` (a deterministic "unsolvable"
+  rather than a hang). **Proof:** a pinned digest of a fully-collapsed, GLOBALLY-consistent tilemap (a full
+  adjacency sweep); the whole backtracking PATH is replay-identical (same solved/steps/backtracks/digest);
+  backtracking demonstrably fires (a pipes/circuit tileset that traps greedy collapse); an unsolvable setup
+  returns deterministically.
+- **Wang/overlapping model + region constraints (S4).** `LearnTileSet` derives the adjacency rule-set
+  AUTOMATICALLY from a sample tilemap (every adjacent pair → allowed masks; weight = occurrence count —
+  the "feed an example, generate more like it" capability), and `PinCell`/`ConstrainCell`/`ApplyConstraints`
+  let the caller pin entrance/exit/border cells before solving. **Proof:** the learned rules are symmetric +
+  pin to a deterministic digest; a solve honors the pins exactly; contradictory pins fail deterministically.
+- **Seed-deterministic lockstep + desync localization (S5, the banner slice).** `Generate(ts, seed)` is a
+  pure function — two peers fed only the seed re-derive the BYTE-IDENTICAL level — and a STREAM of
+  seed-driven generations runs on the existing `net::Session` engine: lockstep-identical at every tick
+  (`net::DigestTrace`), replay-able (`net::RunLockstep`), and a one-tick divergence LOCATED at the exact
+  step (`net::DesyncDetector`, the NS5 machinery reused verbatim, no solver duplication). **Proof:** pinned
+  level + stream digests, traces identical at every tick, the injected desync latched at the exact tick.
+- **Lit 3D render capstone (S6, the money-shot).** The ONE float crossing: a collapsed integer tilemap →
+  lit 3D instanced cubes at per-tile heights (water low, rock tall), drawn one-per-kind with biome albedo
+  through the EXISTING instanced-lit pipeline (`lit_instanced.vert` + `lit.frag`, the `pcg6-field` twin) —
+  NO new shader/RHI. The render bridge `WfcToRenderInstances` lives in a SEPARATE `engine/wfc/wfc_render.h`
+  so `wfc.h`'s self-contained clang-hash proof stays intact (S1–S5 byte-unchanged). **Proof (FLOAT
+  visresolve-bar):** the generation is bit-exact + byte-identical cross-backend; the render gate is two
+  renders BYTE-IDENTICAL per vendor + provenance (instances == recomputed `WfcToRenderInstances(Generate)`)
+  + solved/globally-consistent + a Metal-baked golden (Metal two-run DIFF 0.0000, cross-vendor mean ~40 —
+  the documented float baseline) + eyeball: a coherent WFC-generated voxel terrain. **Completes flagship
+  #29 — deterministic procedural generation.** Honest scope: 2D grid tilemaps only (W×H, 4-cardinal,
+  tile count ≤ 64); caller supplies pre-rotated tile variants (no auto symmetry expansion); serial
+  single-thread backtracking (that's WHY it's bit-exact — a GPU-parallel observe/propagate is out of
+  scope); bounded sizes guarded by a step cap (pathological super-exponential backtracking returns a
+  deterministic "unsolvable", not a hang); one fixed-extent grid per `Generate` (no streamed/infinite
+  generation); the render capstone's tile color/height is an authoring table, the generation is the moat.
+
+---
+
 ## Material / Shader Graph Layer (`engine/material/`)
 
 Phase 4 adds a **data-driven material system** that authors shaders as node graphs instead of hand-written HLSL, while preserving the "shaders are generated, not hand-written" and golden-stability invariants. It is pure host logic above the seam — no `vk*`/`MTL*`/`Backend` symbols — and is split into five concerns plus a build-time tool:
