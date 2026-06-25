@@ -179,6 +179,17 @@ hf_add_pure_test(seq_test)
 # varint round-trip sweep + parsing the REAL embedded Box-Draco header (NO image, NO render-bake). Pure CPU
 # (hf_core), no RHI/backend symbols, ASan-eligible, bit-identical MSVC == Windows-clang == Mac-clang.
 hf_add_pure_test(draco_test)
+# ACCEPTANCE test that CLOSES issue #36 (Slice DRACO-DR5): a REAL KHR_draco_mesh_compression glTF that
+# was silently DROPPED before now LOADS. Parses the committed assets/models/BoxDraco/Box.gltf (cgltf —
+# the IMPLEMENTATION is in hf_core's gltf_loader.cpp, so this test includes ONLY the declarations to
+# avoid a duplicate-symbol clash) + cgltf_load_buffers, finds the Draco primitive, and runs the
+# device-free BuildPrimitiveCPU seam (which wires in the self-contained hf::asset::draco decoder) +
+# DecodeDracoMesh directly. Asserts the decoded Box is a valid cube: 12 faces / 36 indices / 8 corner
+# positions at {-0.5,+0.5}^3, plus a deterministic digest over the decoded geometry. Pure CPU (hf_core),
+# no RHI/device, ASan-eligible.
+hf_add_pure_test(draco_gltf_load_test)
+target_compile_definitions(draco_gltf_load_test PRIVATE
+  "HF_BOX_DRACO_GLTF=\"${CMAKE_SOURCE_DIR}/assets/models/BoxDraco/Box.gltf\"")
 # Deterministic UI widget tree + INTEGER box model (Slice WIDGET-S1, issue #30 — the DETERMINISTIC
 # UMG-CLASS UI FRAMEWORK beachhead): engine/ui/widget.h — a header-only, SELF-CONTAINED (only
 # <cstddef>/<cstdint>/<vector> + net/session.h) UI substrate. A widget hierarchy (parent/first-child/

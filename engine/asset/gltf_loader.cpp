@@ -1,5 +1,6 @@
 #include "asset/gltf_loader.h"
 #include "asset/gltf_ext.h"   // issue #36: unsupported-extension diagnostics (pure, unit-tested)
+#include "asset/draco_decode.h"  // issue #36: self-contained KHR_draco_mesh_compression decoder
 #include "scene/vertex.h"
 #include "anim/skeleton.h"
 #include "anim/animation.h"
@@ -34,7 +35,9 @@ const cgltf_accessor* FindAttr(const cgltf_primitive& prim, cgltf_attribute_type
     return nullptr;
 }
 
-// Build a scene::Mesh from an arbitrary glTF primitive.
+} // namespace
+
+// Build the engine's CPU vertex/index arrays from a glTF primitive (DEVICE-FREE — issue #36 seam).
 //
 //  * recentre — when true, the geometry is recentred so its bbox centre sits at the origin (the
 //               legacy single-mesh behaviour for LoadGltfMesh/LoadGltfModel/LoadPbrGltfModel). When
@@ -45,38 +48,121 @@ const cgltf_accessor* FindAttr(const cgltf_primitive& prim, cgltf_attribute_type
 //
 // Reads POSITION / NORMAL / TEXCOORD_0 into scene::Vertex, widens indices to u32, and fills tangents
 // (authored TANGENT preferred, else Lengyel from POSITION/UV/NORMAL, else default (1,0,0)).
-scene::Mesh BuildPrimitive(rhi::IRHIDevice& device, const cgltf_primitive& prim, const char* path,
-                           bool recentre, float* outBbMin = nullptr, float* outBbMax = nullptr) {
-    const cgltf_accessor* posAcc = FindAttr(prim, cgltf_attribute_type_position);
-    if (!posAcc)
-        throw std::runtime_error(std::string("glTF primitive has no POSITION: ") + path);
-    const cgltf_accessor* nrmAcc = FindAttr(prim, cgltf_attribute_type_normal);
-    const cgltf_accessor* uvAcc  = FindAttr(prim, cgltf_attribute_type_texcoord);
-    const cgltf_accessor* tanAcc = FindAttr(prim, cgltf_attribute_type_tangent);
-
-    const cgltf_size vertCount = posAcc->count;
-
-    // --- Read positions, compute bbox so we can recentre on the origin. ---
-    std::vector<scene::Vertex> verts(vertCount);
+//
+// KHR_draco_mesh_compression (issue #36): when the primitive carries a Draco blob the geometry lives
+// ENTIRELY in the compressed bufferView (the uncompressed POSITION/NORMAL accessors have no backing
+// buffer). We decode the blob with the self-contained hf::asset::draco decoder into positions + indices
+// (+ normals if the decoder recovered them), then fall through to the SHARED downstream (recentre,
+// tangents) unchanged. The non-Draco path is byte-for-byte the legacy behaviour.
+CpuPrimitive BuildPrimitiveCPU(const cgltf_primitive& prim, const char* path, bool recentre,
+                               float* outBbMin, float* outBbMax) {
+    std::vector<scene::Vertex> verts;
+    std::vector<uint32_t> indices;
     float bbMin[3] = { 1e30f,  1e30f,  1e30f};
     float bbMax[3] = {-1e30f, -1e30f, -1e30f};
-    for (cgltf_size i = 0; i < vertCount; ++i) {
-        float p[3] = {0, 0, 0};
-        cgltf_accessor_read_float(posAcc, i, p, 3);
-        scene::Vertex& v = verts[i];
-        v.pos[0] = p[0]; v.pos[1] = p[1]; v.pos[2] = p[2];
-        for (int k = 0; k < 3; ++k) {
-            if (p[k] < bbMin[k]) bbMin[k] = p[k];
-            if (p[k] > bbMax[k]) bbMax[k] = p[k];
+
+    // Did the Draco decode already populate normals? (When false the no-NORMAL-accessor / Draco-without-
+    // normals case falls back to the default up-normal, exactly like an uncompressed normal-less prim.)
+    bool haveNormals = false;
+
+    if (prim.has_draco_mesh_compression) {
+        // The compressed blob: the Draco bufferView's bytes. cgltf_buffer_view_data resolves
+        // buffer->data + offset (and any meshopt-decoded staging); size is the blob length.
+        const cgltf_buffer_view* bv = prim.draco_mesh_compression.buffer_view;
+        const uint8_t* bytes = bv ? cgltf_buffer_view_data(bv) : nullptr;
+        if (!bytes)
+            throw std::runtime_error(std::string("glTF Draco primitive has no buffer data: ") + path);
+        draco::DecodedMesh dm = draco::DecodeDracoMesh(bytes, static_cast<std::size_t>(bv->size));
+        if (!dm.ok)
+            throw std::runtime_error(std::string("KHR_draco_mesh_compression decode failed: ") + path);
+
+        const std::size_t pts = dm.num_points;
+        const bool dracoNormals = (dm.normals.size() >= pts * 3u);
+        verts.resize(pts);
+        for (std::size_t i = 0; i < pts; ++i) {
+            scene::Vertex& v = verts[i];
+            v.pos[0] = dm.positions[i * 3 + 0];
+            v.pos[1] = dm.positions[i * 3 + 1];
+            v.pos[2] = dm.positions[i * 3 + 2];
+            for (int k = 0; k < 3; ++k) {
+                if (v.pos[k] < bbMin[k]) bbMin[k] = v.pos[k];
+                if (v.pos[k] > bbMax[k]) bbMax[k] = v.pos[k];
+            }
+            v.color[0] = 1.0f; v.color[1] = 1.0f; v.color[2] = 1.0f;
+            v.uv[0] = 0.0f; v.uv[1] = 0.0f;
+            if (dracoNormals) {
+                v.normal[0] = dm.normals[i * 3 + 0];
+                v.normal[1] = dm.normals[i * 3 + 1];
+                v.normal[2] = dm.normals[i * 3 + 2];
+            } else {
+                v.normal[0] = 0.0f; v.normal[1] = 1.0f; v.normal[2] = 0.0f;
+            }
+            v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
         }
-        // Neutral tint; the textured pipeline multiplies base colour by this vertex colour.
-        v.color[0] = 1.0f; v.color[1] = 1.0f; v.color[2] = 1.0f;
-        // Defaults; overwritten below if the accessors exist.
-        v.uv[0] = 0.0f; v.uv[1] = 0.0f;
-        v.normal[0] = 0.0f; v.normal[1] = 1.0f; v.normal[2] = 0.0f;
-        v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+        haveNormals = dracoNormals;
+        indices.assign(dm.indices.begin(), dm.indices.end());
+    } else {
+        const cgltf_accessor* posAcc = FindAttr(prim, cgltf_attribute_type_position);
+        if (!posAcc)
+            throw std::runtime_error(std::string("glTF primitive has no POSITION: ") + path);
+        const cgltf_accessor* nrmAcc = FindAttr(prim, cgltf_attribute_type_normal);
+        const cgltf_accessor* uvAcc  = FindAttr(prim, cgltf_attribute_type_texcoord);
+
+        const cgltf_size vertCount = posAcc->count;
+
+        // --- Read positions, compute bbox so we can recentre on the origin. ---
+        verts.resize(vertCount);
+        for (cgltf_size i = 0; i < vertCount; ++i) {
+            float p[3] = {0, 0, 0};
+            cgltf_accessor_read_float(posAcc, i, p, 3);
+            scene::Vertex& v = verts[i];
+            v.pos[0] = p[0]; v.pos[1] = p[1]; v.pos[2] = p[2];
+            for (int k = 0; k < 3; ++k) {
+                if (p[k] < bbMin[k]) bbMin[k] = p[k];
+                if (p[k] > bbMax[k]) bbMax[k] = p[k];
+            }
+            // Neutral tint; the textured pipeline multiplies base colour by this vertex colour.
+            v.color[0] = 1.0f; v.color[1] = 1.0f; v.color[2] = 1.0f;
+            // Defaults; overwritten below if the accessors exist.
+            v.uv[0] = 0.0f; v.uv[1] = 0.0f;
+            v.normal[0] = 0.0f; v.normal[1] = 1.0f; v.normal[2] = 0.0f;
+            v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+        }
+
+        if (nrmAcc) {
+            for (cgltf_size i = 0; i < vertCount; ++i) {
+                float n[3] = {0, 1, 0};
+                cgltf_accessor_read_float(nrmAcc, i, n, 3);
+                verts[i].normal[0] = n[0]; verts[i].normal[1] = n[1]; verts[i].normal[2] = n[2];
+            }
+            haveNormals = true;
+        }
+        if (uvAcc) {
+            for (cgltf_size i = 0; i < vertCount; ++i) {
+                float uv[2] = {0, 0};
+                cgltf_accessor_read_float(uvAcc, i, uv, 2);
+                verts[i].uv[0] = uv[0]; verts[i].uv[1] = uv[1];
+            }
+        }
+
+        // --- Indices (u16/u32 -> u32). If the primitive is non-indexed, build a trivial index list. ---
+        if (prim.indices) {
+            const cgltf_size n = prim.indices->count;
+            indices.resize(n);
+            for (cgltf_size i = 0; i < n; ++i)
+                indices[i] = static_cast<uint32_t>(cgltf_accessor_read_index(prim.indices, i));
+        } else {
+            indices.resize(vertCount);
+            for (cgltf_size i = 0; i < vertCount; ++i) indices[i] = static_cast<uint32_t>(i);
+        }
     }
 
+    const cgltf_size vertCount = verts.size();
+    const cgltf_accessor* uvAcc  = FindAttr(prim, cgltf_attribute_type_texcoord);
+    const cgltf_accessor* tanAcc = FindAttr(prim, cgltf_attribute_type_tangent);
+    (void)haveNormals;
+
+    // --- Recentre on the origin (shared by both paths). ---
     const float center[3] = {recentre ? 0.5f * (bbMin[0] + bbMax[0]) : 0.0f,
                              recentre ? 0.5f * (bbMin[1] + bbMax[1]) : 0.0f,
                              recentre ? 0.5f * (bbMin[2] + bbMax[2]) : 0.0f};
@@ -90,33 +176,6 @@ scene::Mesh BuildPrimitive(rhi::IRHIDevice& device, const cgltf_primitive& prim,
     // Report the (post-recentre) model-space bbox for scene-level fitting.
     if (outBbMin) { for (int k = 0; k < 3; ++k) outBbMin[k] = bbMin[k] - center[k]; }
     if (outBbMax) { for (int k = 0; k < 3; ++k) outBbMax[k] = bbMax[k] - center[k]; }
-
-    if (nrmAcc) {
-        for (cgltf_size i = 0; i < vertCount; ++i) {
-            float n[3] = {0, 1, 0};
-            cgltf_accessor_read_float(nrmAcc, i, n, 3);
-            verts[i].normal[0] = n[0]; verts[i].normal[1] = n[1]; verts[i].normal[2] = n[2];
-        }
-    }
-    if (uvAcc) {
-        for (cgltf_size i = 0; i < vertCount; ++i) {
-            float uv[2] = {0, 0};
-            cgltf_accessor_read_float(uvAcc, i, uv, 2);
-            verts[i].uv[0] = uv[0]; verts[i].uv[1] = uv[1];
-        }
-    }
-
-    // --- Indices (u16/u32 -> u32). If the primitive is non-indexed, build a trivial index list. ---
-    std::vector<uint32_t> indices;
-    if (prim.indices) {
-        const cgltf_size n = prim.indices->count;
-        indices.resize(n);
-        for (cgltf_size i = 0; i < n; ++i)
-            indices[i] = static_cast<uint32_t>(cgltf_accessor_read_index(prim.indices, i));
-    } else {
-        indices.resize(vertCount);
-        for (cgltf_size i = 0; i < vertCount; ++i) indices[i] = static_cast<uint32_t>(i);
-    }
 
     // --- Tangents (location 4). Prefer the authored TANGENT accessor (VEC4: xyz + w handedness);
     // otherwise accumulate per-triangle tangents from positions+UVs (Lengyel's method) and
@@ -166,21 +225,35 @@ scene::Mesh BuildPrimitive(rhi::IRHIDevice& device, const cgltf_primitive& prim,
         }
     }
 
+    CpuPrimitive out;
+    out.verts = std::move(verts);
+    out.indices = std::move(indices);
+    return out;
+}
+
+namespace {
+
+// Build a scene::Mesh from an arbitrary glTF primitive: extract CPU geometry (BuildPrimitiveCPU —
+// handles both the uncompressed and the KHR_draco_mesh_compression paths) then upload to GPU buffers.
+scene::Mesh BuildPrimitive(rhi::IRHIDevice& device, const cgltf_primitive& prim, const char* path,
+                           bool recentre, float* outBbMin = nullptr, float* outBbMax = nullptr) {
+    CpuPrimitive cpu = BuildPrimitiveCPU(prim, path, recentre, outBbMin, outBbMax);
+
     // --- Upload to GPU buffers via the RHI. ---
     rhi::BufferDesc vbdesc;
-    vbdesc.size = verts.size() * sizeof(scene::Vertex);
-    vbdesc.initialData = verts.data();
+    vbdesc.size = cpu.verts.size() * sizeof(scene::Vertex);
+    vbdesc.initialData = cpu.verts.data();
     vbdesc.usage = rhi::BufferUsage::Vertex;
     auto vbuffer = device.CreateBuffer(vbdesc);
 
     rhi::BufferDesc ibdesc;
-    ibdesc.size = indices.size() * sizeof(uint32_t);
-    ibdesc.initialData = indices.data();
+    ibdesc.size = cpu.indices.size() * sizeof(uint32_t);
+    ibdesc.initialData = cpu.indices.data();
     ibdesc.usage = rhi::BufferUsage::Index;
     auto ibuffer = device.CreateBuffer(ibdesc);
 
     return scene::Mesh{std::move(vbuffer), std::move(ibuffer),
-                       static_cast<uint32_t>(indices.size())};
+                       static_cast<uint32_t>(cpu.indices.size())};
 }
 
 // Legacy single-mesh helper: the first primitive of the first mesh, recentred on origin.

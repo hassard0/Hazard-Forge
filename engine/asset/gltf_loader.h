@@ -4,11 +4,36 @@
 #include "anim/skeleton.h"
 #include "anim/animation.h"
 #include "math/math.h"
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <vector>
 
+// Forward declaration so the CPU geometry-extraction helper can take a cgltf primitive without pulling
+// the whole cgltf.h into this header (the .cpp / the test TU define CGLTF_IMPLEMENTATION).
+struct cgltf_primitive;
+
 namespace hf::asset {
+
+// ---------------------------------------------------------------------------------------------------
+// DEVICE-FREE CPU geometry extraction for a single glTF primitive (issue #36 — the Draco seam).
+//
+// Builds the engine's scene::Vertex array + the u32 index list for a primitive, handling BOTH the
+// uncompressed path (cgltf accessors) AND the KHR_draco_mesh_compression path (the self-contained
+// hf::asset::draco decoder in asset/draco_decode.h). No RHI device is touched, so the Draco decode is
+// unit-testable without a GPU. BuildPrimitive() calls this, then uploads the result to GPU buffers.
+//
+//  * recentre — when true, recentre the geometry so its bbox centre sits at the origin (legacy
+//               single-mesh behaviour); when false keep authored model-space positions (scene import).
+//  * outBbMin/outBbMax — optional: the primitive's (post-recentre) model-space bbox.
+//
+// Throws std::runtime_error on missing POSITION or a Draco primitive whose blob fails to decode.
+struct CpuPrimitive {
+    std::vector<scene::Vertex> verts;
+    std::vector<uint32_t>      indices;
+};
+CpuPrimitive BuildPrimitiveCPU(const cgltf_primitive& prim, const char* path, bool recentre,
+                               float* outBbMin = nullptr, float* outBbMax = nullptr);
 
 // ---------------------------------------------------------------------------------------------------
 // Pure scene-graph hierarchy composition (no device, no cgltf) — factored out so it can be unit

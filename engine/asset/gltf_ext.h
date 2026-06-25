@@ -3,12 +3,17 @@
 // glTF extension diagnostics — the PURE decision logic for "can this build load this file?", split out
 // of gltf_loader.cpp so it is unit-testable WITHOUT a device, cgltf, or a real glb (issue #36).
 //
-// The bug it fixes: when a glb declares `extensionsRequired: ["KHR_draco_mesh_compression"]` (true of the
-// three.js Ferrari and >50% of real-world CC0 glbs), the engine has no Draco decompressor, so the loader
-// produced empty/garbage geometry and rendered "0 instances" with NO error — leaving sample authors
-// guessing for 45 minutes. Per the glTF spec a loader that cannot honor a REQUIRED extension must not
-// silently pretend success; this makes the failure LOUD and ACTIONABLE. Full Draco/meshopt decode (a new
-// third-party dependency) is deferred; this is the documented "honest fallback".
+// ISSUE #36 IS FIXED (DRACO LOADS): the engine now ships a self-contained, clean-room
+// KHR_draco_mesh_compression decoder (engine/asset/draco_decode.h), wired into the glTF loader, so a glb
+// that declares `extensionsRequired: ["KHR_draco_mesh_compression"]` (the three.js Ferrari and >50% of
+// real-world CC0 glbs) LOADS — the compressed geometry is decoded to a real mesh instead of silently
+// dropping it. Draco is therefore NO LONGER an unsupported geometry extension.
+//
+// What remains genuinely unsupported is EXT_meshopt_compression (a different codec, no decoder shipped):
+// a file that REQUIRES it still cannot be loaded — its mesh geometry lives entirely in a compressed buffer
+// the engine can't read — so we keep that failure LOUD and ACTIONABLE rather than rendering "0 instances"
+// with no error. (Material/texture/light extensions are never here: cgltf reads through them transparently,
+// so they never block geometry.)
 //
 // Self-contained: only <string>/<vector>. No engine/RHI/cgltf includes, so it compiles standalone.
 
@@ -17,12 +22,12 @@
 
 namespace hf::asset {
 
-// The geometry-compression extensions this build CANNOT decode (no Draco / no meshopt decompressor). A
-// file that REQUIRES one of these cannot be loaded — its mesh geometry lives entirely in the compressed
-// buffer the engine can't read. (Material/texture/light extensions are NOT here: cgltf reads through them
-// transparently, so they never block geometry.)
+// The geometry-compression extensions this build CANNOT decode. KHR_draco_mesh_compression is NO LONGER
+// here (issue #36: it now decodes + loads); only EXT_meshopt_compression remains genuinely unsupported (a
+// different codec, no decoder shipped). A file that REQUIRES one of these still cannot be loaded — its mesh
+// geometry lives entirely in the compressed buffer the engine can't read.
 inline bool IsUnsupportedGeometryExt(const std::string& ext) {
-    return ext == "KHR_draco_mesh_compression" || ext == "EXT_meshopt_compression";
+    return ext == "EXT_meshopt_compression";
 }
 
 struct ExtDiagnostic {
@@ -35,10 +40,13 @@ struct ExtDiagnostic {
 //   * dracoPrims    — count of primitives flagged has_draco_mesh_compression.
 //   * totalPrims    — total primitive count (for an actionable "<N>/<M>" message).
 //   * path          — the file path, echoed into the message so the author knows WHICH file.
-// FATAL when any required extension is an unsupported geometry compression (the Ferrari case): the file
-// genuinely cannot be loaded, so refuse it loudly. WARNING when Draco primitives exist but the extension
-// is only `used`, not `required` (a spec-compliant uncompressed fallback may still render): load proceeds,
-// but the author is told some primitives may be empty. Otherwise both empty (a normal file — load silently).
+// FATAL when any required extension is an unsupported geometry compression (an EXT_meshopt_compression-
+// required file): it genuinely cannot be loaded, so refuse it loudly. Otherwise both empty — a normal file
+// (including a Draco-compressed one, now that the engine decodes Draco) loads silently.
+//
+// NOTE: Draco is no longer surfaced here at all (neither fatal nor warning) — the loader decodes it
+// directly (issue #36). The `dracoPrims`/`totalPrims` parameters are retained for ABI/message stability
+// but a Draco primitive count alone never produces a diagnostic now.
 inline ExtDiagnostic DiagnoseExtensions(const std::vector<std::string>& requiredExts,
                                         int dracoPrims, int totalPrims, const std::string& path) {
     ExtDiagnostic d;
@@ -62,13 +70,10 @@ inline ExtDiagnostic DiagnoseExtensions(const std::vector<std::string>& required
         return d;   // fatal dominates — no need for the softer warning
     }
 
-    if (dracoPrims > 0) {
-        d.warning = "[gltf] " + path + ": " + std::to_string(dracoPrims) + "/" +
-                    std::to_string(totalPrims) +
-                    " primitives use KHR_draco_mesh_compression (not required); this build has no Draco "
-                    "decoder, so those primitives render only from an uncompressed fallback if present, "
-                    "else empty. See issue #36.";
-    }
+    // Draco primitives are decoded by the loader now (issue #36), so a Draco count alone is NOT a
+    // diagnostic. (dracoPrims/totalPrims are kept in the signature only for message stability.)
+    (void)dracoPrims;
+    (void)totalPrims;
     return d;
 }
 

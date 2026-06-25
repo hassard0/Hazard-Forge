@@ -1,9 +1,11 @@
 // Unit test for the glTF unsupported-extension diagnostics (engine/asset/gltf_ext.h, issue #36).
 //
-// The fixed bug: a glb that REQUIRES KHR_draco_mesh_compression (the three.js Ferrari and >50% of CC0
-// glbs) used to load empty geometry and render "0 instances" with NO error. DiagnoseExtensions() is the
-// pure decision the loader now uses to FAIL LOUDLY + actionably. This test exercises that logic directly
-// with synthetic inputs — no device, no cgltf, no glb file — so it is a fast standalone pure test:
+// Issue #36 is now FIXED: the engine ships a self-contained KHR_draco_mesh_compression decoder, so a
+// Draco glb LOADS (the compressed geometry is decoded) — Draco is NO LONGER fatal/unsupported. What
+// remains genuinely unsupported is EXT_meshopt_compression (a different codec): a file that REQUIRES it
+// must still FAIL LOUDLY rather than render "0 instances" silently. DiagnoseExtensions() is the pure
+// decision the loader uses; this test exercises it directly with synthetic inputs — no device, no cgltf,
+// no glb file — so it is a fast standalone pure test:
 //   clang++ -std=c++20 -I engine -I tests tests/gltf_ext_test.cpp
 
 #include "asset/gltf_ext.h"
@@ -27,15 +29,12 @@ static bool contains(const std::string& hay, const char* needle) {
 int main() {
     HF_TEST_MAIN_INIT();
 
-    // (1) The Ferrari case: REQUIRES Draco -> FATAL, actionable (names the ext, the N/M, the path, issue #36).
+    // (1) The Ferrari case: REQUIRES Draco -> now LOADS (issue #36 fixed). Draco is no longer fatal or
+    // a warning — the loader decodes it directly, so DiagnoseExtensions stays silent for it.
     {
         ExtDiagnostic d = DiagnoseExtensions({"KHR_draco_mesh_compression"}, 51, 51, "ferrari.glb");
-        check(!d.fatal.empty(), "gltf-ext: required Draco is FATAL (no longer silent)");
-        check(contains(d.fatal, "KHR_draco_mesh_compression"), "gltf-ext: fatal names the extension");
-        check(contains(d.fatal, "51/51"), "gltf-ext: fatal reports compressed primitive count");
-        check(contains(d.fatal, "ferrari.glb"), "gltf-ext: fatal names the file");
-        check(contains(d.fatal, "#36"), "gltf-ext: fatal points at the actionable issue");
-        check(d.warning.empty(), "gltf-ext: fatal dominates (no separate warning)");
+        check(d.fatal.empty(), "gltf-ext: required Draco is NO LONGER fatal (it now decodes + loads)");
+        check(d.warning.empty(), "gltf-ext: required Draco produces no warning either (loads cleanly)");
     }
 
     // (2) A normal Khronos asset (no required compression, no Draco prims) -> both empty -> loads silently.
@@ -50,11 +49,11 @@ int main() {
         check(d.fatal.empty() && d.warning.empty(), "gltf-ext: a required MATERIAL extension is not a false alarm");
     }
 
-    // (4) Draco USED but not REQUIRED -> non-fatal WARNING (a fallback may render), load proceeds.
+    // (4) Draco USED but not REQUIRED -> loads silently (issue #36: Draco decodes, no warning needed).
     {
         ExtDiagnostic d = DiagnoseExtensions({}, 3, 10, "partial.glb");
-        check(d.fatal.empty(), "gltf-ext: Draco used-but-not-required is NOT fatal (fallback may render)");
-        check(!d.warning.empty() && contains(d.warning, "3/10"), "gltf-ext: used-Draco emits an actionable warning");
+        check(d.fatal.empty(), "gltf-ext: Draco-used is NOT fatal (it decodes)");
+        check(d.warning.empty(), "gltf-ext: Draco-used emits no warning (the loader decodes it)");
     }
 
     // (5) EXT_meshopt_compression required -> also FATAL (the modern compression alternative).
@@ -63,9 +62,10 @@ int main() {
         check(!d.fatal.empty() && contains(d.fatal, "EXT_meshopt_compression"), "gltf-ext: required meshopt is FATAL");
     }
 
-    // (6) The predicate is precise.
+    // (6) The predicate is precise: meshopt is still unsupported; Draco is NOT (it decodes now, #36).
     {
-        check(IsUnsupportedGeometryExt("KHR_draco_mesh_compression"), "gltf-ext: Draco is flagged unsupported");
+        check(IsUnsupportedGeometryExt("EXT_meshopt_compression"), "gltf-ext: meshopt is flagged unsupported");
+        check(!IsUnsupportedGeometryExt("KHR_draco_mesh_compression"), "gltf-ext: Draco is NO LONGER flagged unsupported (it loads)");
         check(!IsUnsupportedGeometryExt("KHR_texture_transform"), "gltf-ext: a texture extension is NOT flagged");
     }
 
