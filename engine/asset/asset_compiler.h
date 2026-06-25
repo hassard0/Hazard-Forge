@@ -221,4 +221,130 @@ inline CacheKey DigestArtifact(const std::vector<uint8_t>& blob) {
     return net::DigestBytes(blob.data(), blob.size());
 }
 
+// =========================================================================================================
+// Slice ASSET-S3 — The content-addressed cache (issue #16). APPEND-ONLY below S2; S1's key
+// 0x7fb6a48b4b99f1b7 and S2's artifact digest 0xf7ee13c169dc0464 are UNCHANGED. A key->artifact store
+// (sorted-unique vector + hand binary search — the chunk_diff.h ChunkDiffStore mold), GetOrCompile
+// (compile-on-miss), hand-LE serialize/deserialize round-trip, and a store digest INDEPENDENT of insertion
+// order (the content-addressed property: two machines that compiled the same assets in any order have the
+// byte-identical cache). Pure integer; only GetOrCompile's miss path reaches S2's CompileObj.
+//
+// LE helpers PutBytes/GetU32/GetU64 were already added by S2 above — REUSED here, not redefined.
+// =========================================================================================================
+
+// --- The cache (sorted-unique vector, the ChunkDiffStore mold) -------------------------------------------
+struct CacheEntry { CacheKey key = 0; std::vector<uint8_t> blob; };
+
+struct AssetCache {
+    std::vector<CacheEntry> entries;   // SORTED-UNIQUE by key (binary-search insert/lookup) — order-stable
+};
+
+// Binary-search for `key`; return its blob or nullptr. Hand-written (mirrors chunk_diff.h's Find/
+// InsertSortedUnique loop) — NO std::lower_bound, NO <algorithm>. A pure const lookup, no mutation.
+inline const std::vector<uint8_t>* Lookup(const AssetCache& c, CacheKey key) {
+    std::size_t lo = 0, hi = c.entries.size();
+    while (lo < hi) { std::size_t mid = (lo + hi) / 2; if (c.entries[mid].key < key) lo = mid + 1; else hi = mid; }
+    return (lo < c.entries.size() && c.entries[lo].key == key) ? &c.entries[lo].blob : nullptr;
+}
+
+// Insert (or overwrite) the blob for `key`, keeping `entries` sorted-unique by key (the InsertSortedUnique
+// binary-search pattern from chunk_diff.h:67). A re-insert of an existing key overwrites its blob.
+inline void Insert(AssetCache& c, CacheKey key, const std::vector<uint8_t>& blob) {
+    std::size_t lo = 0, hi = c.entries.size();
+    while (lo < hi) { std::size_t mid = (lo + hi) / 2; if (c.entries[mid].key < key) lo = mid + 1; else hi = mid; }
+    if (lo < c.entries.size() && c.entries[lo].key == key) { c.entries[lo].blob = blob; return; }  // overwrite
+    c.entries.insert(c.entries.begin() + (std::ptrdiff_t)lo, CacheEntry{ key, blob });
+}
+
+// --- GetOrCompile — the cache's reason to exist ----------------------------------------------------------
+struct CompileResult { std::vector<uint8_t> blob; bool wasHit = false; };
+
+// key = MakeKey(Mesh, HashRawAsset(bytes,n), HashParams(p)); on a HIT return the stored blob + wasHit=true;
+// on a MISS, CompileObj -> Insert -> return blob + wasHit=false. The hit blob is byte-identical to a cold
+// CompileObj of the same inputs. `wasHit` is a RETURN flag ONLY — NEVER serialized, NEVER in the blob bytes.
+inline CompileResult GetOrCompile(AssetCache& c, const void* bytes, std::size_t n, const CompileParams& p) {
+    const CacheKey key = MakeKey((uint32_t)AssetKind::Mesh, HashRawAsset(bytes, n), HashParams(p));
+    if (const std::vector<uint8_t>* hit = Lookup(c, key)) return CompileResult{ *hit, true };
+    std::vector<uint8_t> blob = CompileObj((const char*)bytes, n, p);
+    Insert(c, key, blob);
+    return CompileResult{ blob, false };
+}
+
+// --- Serialize / Deserialize / Digest (hand-LE, order-stable) --------------------------------------------
+// Layout: PutU32(entryCount), then per entry IN SORTED-KEY ORDER: PutU64(key), PutU32(blobLen), PutBytes(blob).
+// (entries is kept sorted by key, so the byte stream is identical regardless of insertion order — the
+// content-addressed property.) wasHit / mtime NEVER appear.
+inline std::vector<uint8_t> SerializeCache(const AssetCache& c) {
+    std::vector<uint8_t> b;
+    PutU32(b, (uint32_t)c.entries.size());
+    for (const CacheEntry& e : c.entries) {
+        PutU64(b, e.key);
+        PutU32(b, (uint32_t)e.blob.size());
+        PutBytes(b, e.blob.data(), e.blob.size());
+    }
+    return b;
+}
+
+// Reads the fixed-order stream back hand-LE (NEVER a struct memcpy). Returns false on ANY truncation
+// (a short header, a missing key/len, or a blob that runs past the buffer). Entries are read in stored
+// (sorted-key) order, so `out.entries` stays sorted-unique.
+inline bool DeserializeCache(const std::vector<uint8_t>& bytes, AssetCache& out) {
+    out.entries.clear();
+    if (bytes.size() < 4) return false;
+    std::size_t off = 0;
+    const uint32_t count = GetU32(bytes, off);
+    out.entries.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (off + 8 + 4 > bytes.size()) return false;          // key + blobLen header
+        const CacheKey key  = GetU64(bytes, off);
+        const uint32_t blen = GetU32(bytes, off);
+        if (off + (std::size_t)blen > bytes.size()) return false;   // blob runs past the buffer
+        CacheEntry e;
+        e.key = key;
+        e.blob.assign(bytes.begin() + (std::ptrdiff_t)off, bytes.begin() + (std::ptrdiff_t)(off + blen));
+        off += blen;
+        out.entries.push_back(std::move(e));
+    }
+    return true;
+}
+
+inline CacheKey DigestCache(const AssetCache& c) {
+    std::vector<uint8_t> b = SerializeCache(c);
+    return net::DigestBytes(b.data(), b.size());
+}
+
+// --- Fixtures (FIXED forever — the golden pins a cache built from all three) ------------------------------
+// Two MORE distinct tiny OBJ texts beyond S1's ShowcaseRawBytes() (a quad and a different triangle), each
+// with its own byte length. Keep FIXED.
+inline const char* ShowcaseRawBytesB() {
+    // A unit quad (4 verts, 2 tris) — distinct from S1's fixture.
+    return "hf-asset-fixture-B\nv 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3\nf 1 3 4\n";
+}
+inline std::size_t ShowcaseRawLenB() {
+    const char* s = ShowcaseRawBytesB();
+    std::size_t n = 0;
+    while (s[n] != '\0') ++n;
+    return n;
+}
+inline const char* ShowcaseRawBytesC() {
+    // A different triangle (a shifted apex) — distinct from S1 + B.
+    return "hf-asset-fixture-C\nv 0 0 0\nv 2 0 0\nv 1 3 0\nf 1 2 3\n";
+}
+inline std::size_t ShowcaseRawLenC() {
+    const char* s = ShowcaseRawBytesC();
+    std::size_t n = 0;
+    while (s[n] != '\0') ++n;
+    return n;
+}
+
+// Build a fresh cache by GetOrCompile-ing all three fixtures with ShowcaseParams(). FIXED — the golden pins
+// its DigestCache (order-independent, so insertion order here does not change the digest).
+inline AssetCache MakeShowcaseCache() {
+    AssetCache c;
+    GetOrCompile(c, ShowcaseRawBytes(),  ShowcaseRawLen(),  ShowcaseParams());
+    GetOrCompile(c, ShowcaseRawBytesB(), ShowcaseRawLenB(), ShowcaseParams());
+    GetOrCompile(c, ShowcaseRawBytesC(), ShowcaseRawLenC(), ShowcaseParams());
+    return c;
+}
+
 }  // namespace hf::asset

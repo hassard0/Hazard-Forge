@@ -145,6 +145,81 @@ int main() {
               "asset-s2: the artifact is pure-integer Q16.16 — the showcase positions decode to exact integer values");
     }
 
+    // =====================================================================================================
+    // Slice ASSET-S3 — the content-addressed cache. A key->artifact store with miss/hit GetOrCompile, hand-LE
+    // serialize round-trip, and a store digest INDEPENDENT of insertion order (the content-address property).
+    // =====================================================================================================
+
+    const AssetCache showcaseCache = MakeShowcaseCache();
+    const CacheKey cacheDigest = DigestCache(showcaseCache);
+    std::printf("asset-s3: cache digest = 0x%016llx  (%zu entries)\n",
+                (unsigned long long)cacheDigest, showcaseCache.entries.size());
+
+    // (S3-1) PRIOR INVARIANT — S1 key + S2 artifact digest STILL pinned (S3 is additive).
+    check(key == 0x7fb6a48b4b99f1b7ULL && artifact == 0xf7ee13c169dc0464ULL,
+          "asset-s3: S1 key 0x7fb6a48b4b99f1b7 + S2 artifact 0xf7ee13c169dc0464 UNCHANGED (S3 additive)");
+
+    // (S3-2) PINNED CACHE DIGEST — the cross-platform anchor (identical MSVC + clang).
+    const CacheKey kPinnedCache = 0x029174f13e64c9f1ULL;
+    check(cacheDigest == kPinnedCache,
+          "asset-s3: DigestCache(MakeShowcaseCache()) == pinned uint64 (content-addressed store, byte-stable)");
+
+    // (S3-3) MISS THEN HIT — a fresh cache; first GetOrCompile is a MISS, the second of the same asset a HIT.
+    {
+        AssetCache c;
+        const CompileResult r1 = GetOrCompile(c, raw, len, params);
+        const CompileResult r2 = GetOrCompile(c, raw, len, params);
+        check(r1.wasHit == false && r2.wasHit == true,
+              "asset-s3: cold GetOrCompile is a MISS, a second GetOrCompile of the same asset is a HIT");
+    }
+
+    // (S3-4) NO WASHIT LEAK — the HIT blob is byte-identical to a cold CompileObj of the same inputs.
+    {
+        AssetCache c;
+        GetOrCompile(c, raw, len, params);                       // prime
+        const CompileResult hit = GetOrCompile(c, raw, len, params);
+        const std::vector<uint8_t> cold = CompileObj(raw, len, params);
+        check(hit.wasHit == true && hit.blob == cold,
+              "asset-s3: the HIT blob is byte-identical to a cold CompileObj of the same inputs (no wasHit leak)");
+    }
+
+    // (S3-5) ROUND-TRIP — DeserializeCache(SerializeCache(c)) succeeds, same DigestCache + same entries.
+    {
+        AssetCache out;
+        const bool ok = DeserializeCache(SerializeCache(showcaseCache), out);
+        bool same = ok && DigestCache(out) == cacheDigest &&
+                    out.entries.size() == showcaseCache.entries.size();
+        if (same) {
+            for (std::size_t i = 0; i < out.entries.size(); ++i) {
+                if (out.entries[i].key != showcaseCache.entries[i].key ||
+                    out.entries[i].blob != showcaseCache.entries[i].blob) { same = false; break; }
+            }
+        }
+        check(same, "asset-s3: DeserializeCache(SerializeCache(c)) round-trips — same DigestCache");
+    }
+
+    // (S3-6) ORDER-INDEPENDENT — insert A,B,C vs C,B,A -> the SAME digest (sorted-by-key store).
+    {
+        AssetCache x;
+        GetOrCompile(x, ShowcaseRawBytes(),  ShowcaseRawLen(),  params);
+        GetOrCompile(x, ShowcaseRawBytesB(), ShowcaseRawLenB(), params);
+        GetOrCompile(x, ShowcaseRawBytesC(), ShowcaseRawLenC(), params);
+        AssetCache y;
+        GetOrCompile(y, ShowcaseRawBytesC(), ShowcaseRawLenC(), params);
+        GetOrCompile(y, ShowcaseRawBytesB(), ShowcaseRawLenB(), params);
+        GetOrCompile(y, ShowcaseRawBytes(),  ShowcaseRawLen(),  params);
+        check(DigestCache(x) == DigestCache(y),
+              "asset-s3: the cache digest is INDEPENDENT of insertion order (insert A,B,C vs C,B,A -> same digest)");
+    }
+
+    // (S3-7) CLEAN MISS — Lookup of an absent key returns nullptr.
+    {
+        // A key that is not any of the three fixtures' (flip a bit on the showcase key).
+        const CacheKey absent = key ^ 0xDEADBEEFULL;
+        check(Lookup(showcaseCache, absent) == nullptr,
+              "asset-s3: Lookup of an absent key returns nullptr (clean miss)");
+    }
+
     if (g_fail == 0) std::printf("asset_compiler_test: ALL PASS\n");
     else             std::printf("asset_compiler_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
