@@ -519,4 +519,228 @@ inline RenderStructInput MakeShowcaseRenderInput() {
     return in;
 }
 
+// ============================ SLICE PROFILE-S5 — THE SCRUB: serializable .capture + seek ============
+// APPEND-ONLY below S4 (do NOT modify S1/S2/S3/S4 — 0xedc7791443141dfd / 0xb41eb67a1d13443e /
+// 0xc68ff46e1ab25f37 / 0x9b75187d6a4c3bf1 stay pinned). S5 is THE HEADLINE: a serializable `.capture`
+// artifact whose STRUCTURE is byte-stable, plus a SCRUB — seek to frame N reproduces the BIT-IDENTICAL
+// structural state a from-frame-0 playback reaches at N — built on net::CatchUp (the SAME primitive seq's
+// SCRUB==SEEK used). The `.capture` puts the STRUCTURAL bytes FIRST (verbatim S1 EncodeStructural) and the
+// TIMING overlay LAST in a SEPARATE length-prefixed section, so the structural digest covers ONLY the
+// structural section bytes: corrupting a timing byte leaves the structural digest UNCHANGED; corrupting a
+// structural byte diverges at the exact frame. NO new include (net/session.h present — CatchUp/JoinSnapshot/
+// DesyncDetector reused read-only). NO recursion, NO <string>/<cmath>/clock/RNG/<unordered_*>/<map>/<algorithm>.
+
+// --- Little-endian byte readers (the inverse of PutU32/PutU64 — pure of side effects, LE) ------------
+inline uint32_t GetU32(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+inline uint64_t GetU64(const uint8_t* p) {
+    return static_cast<uint64_t>(p[0]) | (static_cast<uint64_t>(p[1]) << 8) |
+           (static_cast<uint64_t>(p[2]) << 16) | (static_cast<uint64_t>(p[3]) << 24) |
+           (static_cast<uint64_t>(p[4]) << 32) | (static_cast<uint64_t>(p[5]) << 40) |
+           (static_cast<uint64_t>(p[6]) << 48) | (static_cast<uint64_t>(p[7]) << 56);
+}
+
+// --- The .capture file header (fixed-layout, serialized field-by-field LE, NEVER memcpy'd) ----------
+// File magic "HFCAPF1\0" (8) is DISTINCT from S1's structural-section magic "HFCAP1\0\0".
+struct CaptureHeader {
+    uint32_t version          = 1;
+    uint32_t frameCount       = 0;   // BuildFrameIndex(c).size()
+    uint32_t nameCount        = 0;
+    uint32_t eventCount       = 0;
+    uint32_t structuralByteLen = 0;  // == EncodeStructural(c).size()  (the structural section length)
+    uint32_t timingByteLen    = 0;   // == eventCount * 16  (cpuNanos u64 + gpuNanos u64 per event)
+    uint32_t keyframeInterval = 0;   // frames between seek keyframes (>=1)
+};
+constexpr std::size_t kCaptureHeaderLen = 8 /*magic*/ + 7 * 4 /*u32 fields*/;  // = 36
+inline constexpr char kCaptureMagic[8] = { 'H', 'F', 'C', 'A', 'P', 'F', '1', '\0' };
+
+// --- EncodeCapture: [magic+header][structuralSection = EncodeStructural(c) VERBATIM][timingSection] ---
+// The structural section IS S1's EncodeStructural output, so CaptureStructuralDigest == StructuralDigest(c).
+// The timing section starts at offset kCaptureHeaderLen + structuralByteLen, PROVABLY outside the structural
+// digest's byte range — per event PutU64(cpuNanos), PutU64(gpuNanos).
+inline std::vector<uint8_t> EncodeCapture(const Capture& c, uint32_t keyframeInterval = 1) {
+    const std::vector<uint8_t>    structural = EncodeStructural(c);   // S1's encoding, verbatim
+    const std::vector<FrameIndex> frames     = BuildFrameIndex(c);
+    if (keyframeInterval < 1u) keyframeInterval = 1u;
+
+    CaptureHeader h;
+    h.version           = 1u;
+    h.frameCount        = static_cast<uint32_t>(frames.size());
+    h.nameCount         = static_cast<uint32_t>(c.names.names.size());
+    h.eventCount        = static_cast<uint32_t>(c.events.size());
+    h.structuralByteLen = static_cast<uint32_t>(structural.size());
+    h.timingByteLen     = static_cast<uint32_t>(c.timings.size()) * 16u;
+    h.keyframeInterval  = keyframeInterval;
+
+    std::vector<uint8_t> out;
+    PutBytes(out, kCaptureMagic, 8);                   // file magic(8)
+    PutU32(out, h.version);
+    PutU32(out, h.frameCount);
+    PutU32(out, h.nameCount);
+    PutU32(out, h.eventCount);
+    PutU32(out, h.structuralByteLen);
+    PutU32(out, h.timingByteLen);
+    PutU32(out, h.keyframeInterval);
+    PutBytes(out, structural.data(), structural.size());   // STRUCTURAL section (verbatim S1 encoding)
+    for (std::size_t i = 0; i < c.timings.size(); ++i) {   // TIMING section (separate, last)
+        PutU64(out, c.timings[i].cpuNanos);
+        PutU64(out, c.timings[i].gpuNanos);
+    }
+    return out;
+}
+
+// --- DecodeStructural: the inverse of S1's EncodeStructural over bytes[off, off+len) -----------------
+// Parses magic "HFCAP1\0\0" + version + nameCount + per name [len, bytes] + eventCount + per event
+// [kind, nameId, a, b] into `out.names` + `out.events` (timings are restored separately by DecodeCapture).
+// Returns false on truncation / bad magic. NO recursion — a flat offset walk.
+inline bool DecodeStructural(const std::vector<uint8_t>& bytes, std::size_t off, std::size_t len,
+                             Capture& out) {
+    if (off + len > bytes.size()) return false;
+    const uint8_t* base = bytes.data() + off;
+    std::size_t p = 0;
+    if (len < 12u) return false;                                 // magic(8) + version(4)
+    const char structMagic[8] = { 'H', 'F', 'C', 'A', 'P', '1', '\0', '\0' };
+    for (int i = 0; i < 8; ++i) if (base[i] != static_cast<uint8_t>(structMagic[i])) return false;
+    p += 8;
+    const uint32_t version = GetU32(base + p); p += 4;
+    if (version != 1u) return false;
+
+    if (p + 4 > len) return false;
+    const uint32_t nameCount = GetU32(base + p); p += 4;
+    out.names.names.clear();
+    out.names.names.reserve(static_cast<std::size_t>(nameCount));
+    for (uint32_t i = 0; i < nameCount; ++i) {
+        if (p + 4 > len) return false;
+        const uint32_t nlen = GetU32(base + p); p += 4;
+        if (p + nlen > len) return false;
+        std::vector<uint8_t> nm(base + p, base + p + nlen);
+        out.names.names.push_back(nm);
+        p += nlen;
+    }
+    if (p + 4 > len) return false;
+    const uint32_t eventCount = GetU32(base + p); p += 4;
+    out.events.clear();
+    out.events.reserve(static_cast<std::size_t>(eventCount));
+    for (uint32_t i = 0; i < eventCount; ++i) {
+        if (p + 16 > len) return false;
+        CaptureEvent e;
+        e.kind   = static_cast<EvKind>(GetU32(base + p)); p += 4;
+        e.nameId = GetU32(base + p); p += 4;
+        e.a      = GetU32(base + p); p += 4;
+        e.b      = GetU32(base + p); p += 4;
+        out.events.push_back(e);
+    }
+    return true;
+}
+
+// --- DecodeCapture: the inverse of EncodeCapture — header + structural section + timing section -------
+// Returns false on truncation / bad file magic / bad version / structural-parse failure.
+inline bool DecodeCapture(const std::vector<uint8_t>& bytes, Capture& out) {
+    if (bytes.size() < kCaptureHeaderLen) return false;
+    const uint8_t* p = bytes.data();
+    for (int i = 0; i < 8; ++i) if (p[i] != static_cast<uint8_t>(kCaptureMagic[i])) return false;
+    CaptureHeader h;
+    h.version           = GetU32(p + 8);
+    h.frameCount        = GetU32(p + 12);
+    h.nameCount         = GetU32(p + 16);
+    h.eventCount        = GetU32(p + 20);
+    h.structuralByteLen = GetU32(p + 24);
+    h.timingByteLen     = GetU32(p + 28);
+    h.keyframeInterval  = GetU32(p + 32);
+    if (h.version != 1u) return false;
+
+    const std::size_t structOff = kCaptureHeaderLen;
+    const std::size_t timingOff = structOff + h.structuralByteLen;
+    if (timingOff + h.timingByteLen > bytes.size()) return false;
+    if (h.timingByteLen != h.eventCount * 16u) return false;
+
+    Capture c;
+    if (!DecodeStructural(bytes, structOff, h.structuralByteLen, c)) return false;
+    if (c.events.size() != h.eventCount) return false;
+
+    c.timings.clear();
+    c.timings.reserve(static_cast<std::size_t>(h.eventCount));
+    for (uint32_t i = 0; i < h.eventCount; ++i) {
+        const std::size_t to = timingOff + static_cast<std::size_t>(i) * 16u;
+        TimingSample ts;
+        ts.cpuNanos = GetU64(bytes.data() + to);
+        ts.gpuNanos = GetU64(bytes.data() + to + 8);
+        c.timings.push_back(ts);
+    }
+    out = c;
+    return true;
+}
+
+// --- CaptureStructuralDigest: DigestBytes over ONLY the structural section bytes ---------------------
+// [kCaptureHeaderLen .. kCaptureHeaderLen + structuralByteLen) — equals StructuralDigest(c) by construction
+// (the section IS the S1 encoding). Timing lives at >= kCaptureHeaderLen + structuralByteLen, PROVABLY
+// excluded by byte offset.
+inline uint64_t CaptureStructuralDigest(const std::vector<uint8_t>& bytes) {
+    if (bytes.size() < kCaptureHeaderLen + 4u) return net::DigestBytes(nullptr, 0);
+    const uint32_t structuralByteLen = GetU32(bytes.data() + 24);
+    const std::size_t off = kCaptureHeaderLen;
+    if (off + structuralByteLen > bytes.size()) return net::DigestBytes(nullptr, 0);
+    return net::DigestBytes(bytes.data() + off, structuralByteLen);
+}
+
+// --- The scrub playback world: the current frame + a running fold of every frame's structural digest --
+// Flat + value-copyable so net::Session's snapshot is complete by construction (the seq.h discipline).
+struct CaptureWorld { uint32_t currentFrame = 0; uint64_t acc = 0; };
+
+// --- Mix: an FNV-step fold (acc * FNV-prime) ^ digest — deterministic, integer ----------------------
+inline uint64_t Mix(uint64_t acc, uint64_t digest) { return (acc * 1099511628211ull) ^ digest; }
+
+// --- DigestCaptureWorld: hand-LE (currentFrame, acc) -> DigestBytes (the per-frame replay checksum) --
+inline uint64_t DigestCaptureWorld(const CaptureWorld& w) {
+    std::vector<uint8_t> b;
+    PutU32(b, w.currentFrame);
+    PutU64(b, w.acc);
+    return net::DigestBytes(b.data(), b.size());
+}
+
+// --- SeekToFrame: restore the nearest keyframe <= N and replay forward to N via net::CatchUp ----------
+// A thin wrapper over net::CatchUp(JoinSnapshot{keyframeFrame, keyframeWorld}, toFrame, tail, step) — the
+// structural state at toFrame is BIT-IDENTICAL to a from-0 playback. The composition IS the point.
+template <class StepFn>
+inline CaptureWorld SeekToFrame(const std::vector<FrameIndex>& /*frames*/, uint32_t toFrame,
+                                const CaptureWorld& keyframeWorld, uint32_t keyframeFrame,
+                                const hf::net::InputRing<uint32_t>& tail, StepFn step) {
+    const hf::net::JoinSnapshot<CaptureWorld> snap{ keyframeFrame, keyframeWorld };
+    return hf::net::CatchUp(snap, toFrame, tail, step);
+}
+
+// --- VerifyCapture — structural integrity via net::DesyncDetector (the replay.h VerifyReplay pattern) -
+// Replay the decoded capture's BuildFrameIndex per-frame digests as the "local" trace; compare against the
+// expected per-frame digest vector (the authority). A structural corruption diverges at the EXACT frame; a
+// timing corruption does NOT (the per-frame digest is over structural events only).
+struct VerifyResult { bool ok = true; uint32_t firstBadFrame = 0; };
+inline VerifyResult VerifyCapture(const Capture& decoded, const std::vector<uint64_t>& expectedFrameDigests) {
+    const std::vector<FrameIndex> frames = BuildFrameIndex(decoded);
+    const std::size_t n = frames.size() < expectedFrameDigests.size()
+                              ? frames.size() : expectedFrameDigests.size();
+    net::DesyncDetector d;
+    for (std::size_t t = 0; t < n; ++t)
+        net::RecordLocal(d, static_cast<uint32_t>(t), frames[t].structuralDigest);  // local = the decoded capture
+    for (std::size_t t = 0; t < n; ++t)
+        net::IngestRemote(d, net::ChecksumPacket{ static_cast<uint32_t>(t), expectedFrameDigests[t] });  // expected
+    VerifyResult r;
+    r.ok            = !d.desynced;
+    r.firstBadFrame = d.desyncTick;
+    return r;
+}
+
+// --- The deterministic FIXED timeline fixture WITH nonzero timings (so the timing section is corruptible)
+// MakeTimelineCapture() but timings[i] = { (i+1)*1000, (i+1)*7 } (nonzero, FIXED). The structural content is
+// identical to MakeTimelineCapture so StructuralDigest is UNCHANGED (timings never enter the structural path).
+inline Capture MakeTimelineCaptureTimed() {
+    Capture c = MakeTimelineCapture();
+    for (std::size_t i = 0; i < c.timings.size(); ++i) {
+        c.timings[i].cpuNanos = (static_cast<uint64_t>(i) + 1ull) * 1000ull;
+        c.timings[i].gpuNanos = (static_cast<uint64_t>(i) + 1ull) * 7ull;
+    }
+    return c;
+}
+
 }  // namespace hf::profile

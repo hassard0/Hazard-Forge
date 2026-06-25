@@ -366,6 +366,167 @@ int main() {
               "profile-s4: a changed pipelineId changes the digest (pipeline binding is load-bearing)");
     }
 
+    // ================================ SLICE PROFILE-S5 — THE SCRUB: serializable .capture + seek =====
+    // S5 serializes the capture to a `.capture` artifact (structural section FIRST, timing overlay LAST in a
+    // separate length-prefixed section) and SCRUBS it: seek to frame N via net::CatchUp == from-0 playback
+    // at N (bit-identical). The structural digest covers ONLY the structural section -> corrupting a timing
+    // byte is harmless; corrupting a structural byte diverges at the exact frame.
+
+    namespace net = hf::net;
+
+    // ---- Build the timed timeline capture + encode it to .capture bytes. -----------------------------
+    const Capture s5cap = MakeTimelineCaptureTimed();
+    const std::vector<uint8_t> captureBytes = EncodeCapture(s5cap, 1u);
+    const uint64_t captureStructuralDigest = CaptureStructuralDigest(captureBytes);
+    std::printf("profile-s5: capture file bytes = %zu, structural-section digest = 0x%016llx\n",
+                captureBytes.size(), static_cast<unsigned long long>(captureStructuralDigest));
+
+    const uint64_t kPinnedCaptureStructuralDigest = 0x9830afc651699a70ull;  // PINNED on first run (== StructuralDigest(MakeTimelineCaptureTimed()))
+
+    // ---- (S5-1) PRIOR INVARIANT — S1/S2/S3/S4 digests ALL UNCHANGED (append-only). -------------------
+    {
+        const bool s1Same = (StructuralDigest(MakeShowcaseCapture()) == 0xedc7791443141dfdull);
+        const bool s2Same = (DigestTree(BuildScopeTree(MakeShowcaseCapture())) == 0xb41eb67a1d13443eull);
+        const bool s3Same = (DigestTimeline(BuildFrameIndex(MakeTimelineCapture())) == 0xc68ff46e1ab25f37ull);
+        const bool s4Same = (DigestRenderStructure(IngestRenderStructure(MakeShowcaseRenderInput())) == 0x9b75187d6a4c3bf1ull);
+        check(s1Same && s2Same && s3Same && s4Same,
+              "profile-s1/s2/s3/s4: prior digests 0xedc7791443141dfd + 0xb41eb67a1d13443e + 0xc68ff46e1ab25f37 + 0x9b75187d6a4c3bf1 UNCHANGED (append-only)");
+    }
+
+    // ---- (S5-2) ROUND-TRIP — DecodeCapture(EncodeCapture(c)) recovers structure + the timing overlay. -
+    {
+        Capture decoded;
+        const bool ok = DecodeCapture(captureBytes, decoded);
+        const bool structuralSame = ok && (StructuralDigest(decoded) == StructuralDigest(s5cap));
+        const bool timingsSame    = ok && (decoded.timings.size() == s5cap.timings.size());
+        bool tsame = timingsSame;
+        for (std::size_t i = 0; tsame && i < decoded.timings.size(); ++i) {
+            tsame = tsame && (decoded.timings[i].cpuNanos == s5cap.timings[i].cpuNanos)
+                          && (decoded.timings[i].gpuNanos == s5cap.timings[i].gpuNanos);
+        }
+        check(ok && structuralSame && tsame,
+              "profile-s5: DecodeCapture(EncodeCapture(c)) round-trips -- StructuralDigest + timings recovered");
+    }
+
+    // ---- (S5-3) STRUCTURAL SECTION == S1 — the .capture structural bytes ARE the S1 encoding. ---------
+    check(captureStructuralDigest == StructuralDigest(s5cap)
+              && captureStructuralDigest == kPinnedCaptureStructuralDigest,
+          "profile-s5: the .capture structural-section digest == StructuralDigest(c) (the section IS S1's encoding)");
+
+    // ---- (S5-4) SCRUB == SEEK (THE HEADLINE) — CatchUp(keyframe@K, N) == from-0 playback at N. --------
+    // Build frames; wrap the per-frame fold as a net::Session StepFn capturing `frames`. The from-0 world at
+    // N and the keyframe world at K are both computed by stepping a Session; SeekToFrame (== net::CatchUp)
+    // from worldAtK to N must reach the BIT-IDENTICAL world (full-digest equality -- seek == play).
+    {
+        const std::vector<FrameIndex> s5frames = BuildFrameIndex(s5cap);
+
+        // The deterministic per-frame fold: currentFrame = t; acc folds in frame t's structuralDigest.
+        auto step = [&s5frames](CaptureWorld& w, const std::vector<uint32_t>& /*inputs*/, uint32_t t) {
+            w.currentFrame = t;
+            if (t < s5frames.size()) w.acc = Mix(w.acc, s5frames[static_cast<std::size_t>(t)].structuralDigest);
+        };
+
+        // The tail ring carries every frame's inputs (empty here -- the step folds from `s5frames` directly).
+        net::InputRing<uint32_t> tail;   // At(t) returns an empty vector for every t (deterministic)
+
+        // A helper that steps a fresh Session from frame 0 to `toFrame` and returns the world AS OF toFrame.
+        auto worldAt = [&](uint32_t toFrame) -> CaptureWorld {
+            net::Session<CaptureWorld, uint32_t> s;
+            s.world = CaptureWorld{};
+            s.ring  = tail;
+            s.tick  = 0;
+            for (uint32_t t = 0; t < toFrame; ++t) net::Advance(s, step);
+            return s.world;
+        };
+
+        // Several (K, N) pairs: seek to a keyframe@K then play forward to N == play-from-0 at N.
+        const uint32_t pairsK[3] = { 0u, 1u, 2u };
+        const uint32_t pairsN[3] = { 3u, 3u, 2u };
+        bool allOk = true;
+        for (int i = 0; i < 3; ++i) {
+            const uint32_t K = pairsK[i];
+            const uint32_t N = pairsN[i];
+            const CaptureWorld worldAtK   = worldAt(K);
+            const CaptureWorld fromZeroAtN = worldAt(N);
+            const CaptureWorld seeked      = SeekToFrame(s5frames, N, worldAtK, K, tail, step);
+            // Full seek==play equality: the seeked world is BIT-IDENTICAL to the from-0 world at N (the whole
+            // CaptureWorld -- both currentFrame and acc -- matches, the SCRUB==SEEK headline).
+            allOk = allOk && (DigestCaptureWorld(seeked) == DigestCaptureWorld(fromZeroAtN))
+                          && (seeked.currentFrame == fromZeroAtN.currentFrame)
+                          && (seeked.acc == fromZeroAtN.acc);
+            // Also drive net::CatchUp DIRECTLY (prove the composition is literally CatchUp).
+            const net::JoinSnapshot<CaptureWorld> snap{ K, worldAtK };
+            const CaptureWorld direct = net::CatchUp(snap, N, tail, step);
+            allOk = allOk && (DigestCaptureWorld(direct) == DigestCaptureWorld(fromZeroAtN));
+        }
+        check(allOk,
+              "profile-s5: SCRUB==SEEK -- CatchUp(keyframe@K, N) world == from-0 playback world at N (bit-identical), several (K,N)");
+    }
+
+    // ---- (S5-5) MOAT — TIMING CORRUPTION IS HARMLESS — flip the first timing byte; structure UNCHANGED.
+    {
+        std::vector<uint8_t> bytes = EncodeCapture(s5cap, 1u);
+        const uint32_t structuralByteLen = GetU32(bytes.data() + 24);
+        const std::size_t timingOff = kCaptureHeaderLen + structuralByteLen;  // the first timing byte
+        bytes[timingOff] = static_cast<uint8_t>(bytes[timingOff] ^ 0xFFu);    // corrupt one TIMING byte
+
+        const bool structuralUnchanged = (CaptureStructuralDigest(bytes) == kPinnedCaptureStructuralDigest);
+
+        Capture decoded;
+        const bool decodeOk = DecodeCapture(bytes, decoded);
+        const bool structureSame = decodeOk && (StructuralDigest(decoded) == StructuralDigest(s5cap));
+
+        // The expected per-frame digests are the AUTHORITY (from the clean capture).
+        const std::vector<FrameIndex> expectedFrames = BuildFrameIndex(s5cap);
+        std::vector<uint64_t> expected;
+        for (std::size_t i = 0; i < expectedFrames.size(); ++i) expected.push_back(expectedFrames[i].structuralDigest);
+        const VerifyResult vr = VerifyCapture(decoded, expected);
+
+        check(structuralUnchanged && structureSame && vr.ok,
+              "profile-s5: corrupting a TIMING byte leaves the structural digest UNCHANGED (the moat, made testable)");
+    }
+
+    // ---- (S5-6) STRUCTURAL CORRUPTION DIVERGES — flip a byte inside the structural section. -----------
+    {
+        std::vector<uint8_t> bytes = EncodeCapture(s5cap, 1u);
+        // Flip a byte INSIDE the structural section, PAST the magic(8)+version(4)+nameCount(4)+name data so
+        // it lands in the event records (which BuildFrameIndex reads). Choose an offset within frame 1's
+        // events region so a specific frame diverges. We target the event stream by jumping well past the
+        // header+names: corrupt a byte deep enough to mutate an event field but keep the stream parseable.
+        const std::vector<uint8_t> structural = EncodeStructural(s5cap);
+        // Locate the eventCount field: magic(8)+version(4)+nameCount(4)+[per name len(4)+bytes]. Then events.
+        std::size_t p = 8 + 4;
+        const uint32_t nameCount = GetU32(structural.data() + p); p += 4;
+        for (uint32_t i = 0; i < nameCount; ++i) { const uint32_t nlen = GetU32(structural.data() + p); p += 4 + nlen; }
+        p += 4;  // skip eventCount -> now p == offset of event[0] within the structural section
+        // Each event is 16 bytes [kind,nameId,a,b]. Frame 1 = FrameBegin(1),Enter,Draw,Exit,FrameEnd =
+        // events[5..9]. Corrupt the `a` field (offset +8) of event 7 (the Draw in frame 1) so frame 1 diverges.
+        const std::size_t eventInStruct = p + 7u * 16u + 8u;          // event[7].a within the structural section
+        const std::size_t fileOff = kCaptureHeaderLen + eventInStruct; // -> the file offset
+        bytes[fileOff] = static_cast<uint8_t>(bytes[fileOff] ^ 0x01u); // flip one structural byte
+
+        const bool structuralChanged = (CaptureStructuralDigest(bytes) != kPinnedCaptureStructuralDigest);
+
+        Capture decoded;
+        const bool decodeOk = DecodeCapture(bytes, decoded);
+
+        const std::vector<FrameIndex> expectedFrames = BuildFrameIndex(s5cap);
+        std::vector<uint64_t> expected;
+        for (std::size_t i = 0; i < expectedFrames.size(); ++i) expected.push_back(expectedFrames[i].structuralDigest);
+        const VerifyResult vr = VerifyCapture(decoded, expected);
+
+        check(structuralChanged && decodeOk && !vr.ok && vr.firstBadFrame == 1u,
+              "profile-s5: corrupting a STRUCTURAL byte changes the digest AND VerifyCapture diverges at the exact frame");
+    }
+
+    // ---- (S5-7) DETERMINISTIC — two EncodeCapture(c) calls are byte-identical. ------------------------
+    {
+        const std::vector<uint8_t> enc1 = EncodeCapture(s5cap, 1u);
+        const std::vector<uint8_t> enc2 = EncodeCapture(s5cap, 1u);
+        check(enc1 == enc2,
+              "profile-s5: EncodeCapture is deterministic -- two encodes are byte-identical");
+    }
+
     if (g_fail == 0) { std::printf("profile_test: ALL PASS\n"); return 0; }
     std::printf("profile_test: %d FAIL\n", g_fail);
     return 1;
