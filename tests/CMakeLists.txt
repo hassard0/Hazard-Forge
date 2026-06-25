@@ -331,6 +331,14 @@ hf_add_pure_test(obj_loader_test)
 # at different addresses -> the same key). The golden is the pinned hash IN the test (NO image, NO
 # render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(asset_compiler_test)
+# LIVE asset hot-reload bridge (issue #16): engine/asset/asset_hotreload_live.h — wires the deterministic
+# Slice-S6 AssetWatcher + HotReload to the REAL filesystem (std::filesystem::last_write_time real mtimes +
+# re-reading changed file bytes off disk), the non-pure sibling of the bit-exact asset_compiler.h. This test
+# does REAL file IO: it writes a temp OBJ, registers it, OVERWRITES it with different geometry on disk, and
+# proves PollAndReload detects the edit (real mtime bump) -> re-reads -> recompiles EXACTLY the dirty node
+# with a CHANGED manifestDigest, while an unedited poll does NOT recompile. Asserts the STRUCTURE (not a
+# pinned hash — wall-clock mtimes vary), so it stays deterministic. asset_compiler.h is UNTOUCHED. hf_core.
+hf_add_pure_test(asset_hotreload_live_test)
 # glTF FORMAT-COVERAGE closer (issue #16): engine/asset/gltf_compile.h — CompileGltf parses a glTF / glb
 # from memory via cgltf and emits the EXACT SAME canonical Q16.16 CompiledMesh blob CompileObj produces, so
 # a glTF and an OBJ of equivalent geometry compile to the byte-identical artifact (the format-parity
