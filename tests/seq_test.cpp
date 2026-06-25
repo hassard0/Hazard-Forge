@@ -1,0 +1,95 @@
+// Unit test for the deterministic Q16.16 scalar keyframe track (engine/seq/seq.h, Slice SEQ-S1,
+// issue #25 — the DETERMINISTIC CINEMATIC SEQUENCER beachhead). Pure CPU (hf_core), ASan-eligible
+// like the other pure tests.
+//
+// SELF-CONTAINED: the test scaffolding (check() + HF_TEST_MAIN_INIT()) is copied from flow_test.cpp /
+// econ_test.cpp (NOT included) so this compiles STANDALONE with
+// `clang++ -std=c++20 -I engine -I tests tests/seq_test.cpp` on the Mac — the cheap cross-platform
+// proof. Everything is INTEGER keyframe interpolation in Q16.16 (fxmul/fxdiv), so the sampled sweep —
+// and hence seq::DigestTrack (FNV-1a-64) over it — is bit-identical run-to-run AND platform-to-platform
+// (MSVC vs Apple clang). The golden is a PINNED FNV-1a-64 DigestTrack value IN the test (NO image, NO
+// render-bake — UE5's float Sequencer cannot pin this cross-platform).
+//
+// What this pins (the six SEQ-S1 assertions):
+//   (a) DigestTrack(SampleSweep(showcase, kOne/30, 90)) == a hard-pinned uint64 (the cross-platform proof);
+//   (b) re-sweeping the same track is bit-identical (deterministic / replay-stable);
+//   (c) cloning the showcase + nudging one keyframe value changes the digest (keys are load-bearing);
+//   (d) a linear-segment midpoint is exact — SampleScalar at t=0.5s of a 0->kOne key == kOne/2;
+//   (e) clamp-low — sampling before the first key holds values.front();
+//   (f) clamp-high — sampling after the last key holds values.back().
+
+#include "seq/seq.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
+
+using namespace hf::seq;
+
+static int g_fail = 0;
+static void check(bool cond, const char* what) {
+    if (!cond) { std::printf("FAIL: %s\n", what); ++g_fail; }
+    else       { std::printf("PASS %s\n", what); }
+}
+
+int main() {
+    HF_TEST_MAIN_INIT();
+
+    // ---- Build the showcase track + sweep it (3 seconds at 30 Hz = 90 samples). ---------------------
+    const ScalarTrack showcase = MakeShowcaseTrack();
+    const std::vector<fx> sweep = SampleSweep(showcase, kOne / 30, 90);
+    const uint64_t digest = DigestTrack(sweep);
+
+    std::printf("seq-s1: showcase sweep digest = 0x%016llx\n",
+                static_cast<unsigned long long>(digest));
+
+    // The pinned golden (computed on first run, hardcoded — the regression anchor / cross-platform bar).
+    const uint64_t kPinnedDigest = 0xd314f17ebe3d480bull;  // PINNED on first run (MSVC == clang)
+
+    // ---- (a) PINNED DIGEST — the cross-platform make-or-break (identical on MSVC + clang). ----------
+    check(digest == kPinnedDigest,
+          "seq-s1: DigestTrack(SampleSweep(showcase, kOne/30, 90)) == pinned uint64 (the cross-platform proof)");
+
+    // ---- (b) REPLAY-STABLE — re-sampling the same track reproduces the digest. ----------------------
+    {
+        const std::vector<fx> sweep2 = SampleSweep(showcase, kOne / 30, 90);
+        check(DigestTrack(sweep2) == digest,
+              "seq-s1: re-sampling the same track is bit-identical (deterministic)");
+    }
+
+    // ---- (c) LOAD-BEARING — clone the showcase, nudge one keyframe value -> differs. -----------------
+    // A full 1.0 Q16.16 unit (kOne) on key 1's value: a single-LSB (+1) nudge is below the fixed-point
+    // truncation floor at these 30Hz sample points (the lerp's >>16 swallows it), so we nudge by a
+    // visible amount — the point is that a keyframe VALUE is load-bearing for the sampled output.
+    {
+        ScalarTrack mutated = MakeShowcaseTrack();
+        mutated.values[1] += kOne;   // nudge key 1's value by 1.0 (Q16.16)
+        const std::vector<fx> mutSweep = SampleSweep(mutated, kOne / 30, 90);
+        check(DigestTrack(mutSweep) != digest,
+              "seq-s1: nudging one keyframe value changes the digest (keys are load-bearing)");
+    }
+
+    // ---- (d) LINEAR MIDPOINT — on the segment times[0..1] (values 0 -> kOne), t=0.5s -> kOne/2. ------
+    // t01 = fxdiv(kOne/2, kOne) = kOne/2; value = 0 + fxmul(kOne/2, kOne) = kOne/2 (0.5 is exact in Q16.16).
+    {
+        check(SampleScalar(showcase, kOne / 2) == kOne / 2,
+              "seq-s1: a linear-segment midpoint is exact — SampleScalar at t=0.5s of a 0->kOne key == kOne/2");
+    }
+
+    // ---- (e) CLAMP LOW — sampling before the first key holds values.front(). ------------------------
+    {
+        check(SampleScalar(showcase, -kOne) == showcase.values.front(),
+              "seq-s1: clamp-low — sampling before the first key holds values.front()");
+    }
+
+    // ---- (f) CLAMP HIGH — sampling after the last key holds values.back(). ---------------------------
+    {
+        check(SampleScalar(showcase, 100 * kOne) == showcase.values.back(),
+              "seq-s1: clamp-high — sampling after the last key holds values.back()");
+    }
+
+    if (g_fail == 0) { std::printf("seq_test: ALL PASS\n"); return 0; }
+    std::printf("seq_test: %d FAIL\n", g_fail);
+    return 1;
+}

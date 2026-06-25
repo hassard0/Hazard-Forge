@@ -159,6 +159,18 @@ hf_add_pure_test(econ_test)
 # -clang. The golden is the pinned hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no
 # RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(flow_test)
+# Deterministic Q16.16 scalar keyframe track + integer lerp (Slice SEQ-S1, issue #25 — the
+# DETERMINISTIC CINEMATIC SEQUENCER beachhead): engine/seq/seq.h — a header-only, SELF-CONTAINED
+# (only <cstddef>/<cstdint>/<vector> + sim/fpx.h + net/session.h) timeline-evaluation core. A scalar
+# keyframe track (parallel Q16.16 times/values, strictly-ascending) sampled by a hand-written integer
+# binary search (NO <algorithm>) + the load-bearing a + t*(b-a) integer lerp (fxmul/fxdiv) — the float
+# keyframe interpolation that breaks UE5 Sequencer (float curves + FQuat::Slerp), rebuilt in fixed
+# point so the sampled sweep + its FNV-1a-64 DigestTrack are bit-identical run-to-run AND MSVC-vs-Apple
+# -clang. Step + Linear only (S2 appends the easing-curve LUT). Asserts the pinned showcase-sweep digest
+# (3s at 30Hz), replay-stability, that nudging one keyframe value changes the digest (keys are
+# load-bearing), an exact linear midpoint, and the clamp-low/clamp-high holds. The golden is the pinned
+# hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(seq_test)
 # glTF unsupported-extension diagnostics (issue #36): the PURE decision the loader uses to FAIL LOUDLY
 # (not silently) when a glb REQUIRES a compression extension this build can't decode (Draco / meshopt) —
 # e.g. the three.js Ferrari. Synthetic inputs only (no device/cgltf/glb), so it stays a pure hf_core test.
