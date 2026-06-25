@@ -334,6 +334,119 @@ int main() {
               "econ-s3: the economy reaches a STEADY STATE (digest at tick N == digest at tick N+1, EconTick idempotent at rest)");
     }
 
+    // =================================================================================================
+    // ECON-S4 — Pricing / market clearing + deterministic rolls (APPEND-ONLY below S3).
+    // =================================================================================================
+    // The market: integer supply/demand pricing, deterministic order clearing (trades at the current price
+    // paid in a currency item), and deterministic rolls (a copied PcgHash). The 4x4 showcase world is
+    // coin-seeded so buyers can pay; currency = item0. We clear the showcase order book at the showcase
+    // prices, THEN reprice item1/2/3 from the showcase demand/supply, and pin DigestState over the result.
+
+    // ---- Build the coin-seeded world + the fixed market, clear the order book, then reprice. ---------
+    World wm4 = MakeShowcaseWorld(kEntities, kItems);
+    SeedShowcaseCoin(wm4);                                  // +500 coin (item0) per entity so trades can pay
+    Market market = MakeShowcaseMarket(wm4);
+    ClearMarket(wm4, market, MakeShowcaseTrades());          // execute the order book at the showcase prices
+    UpdatePrices(market, MakeShowcaseDemand(wm4), MakeShowcaseSupply(wm4), /*elastNum=*/1, /*elastDen=*/4);
+    const uint64_t s4Digest = DigestState(wm4, market);
+
+    std::printf("econ-s4: state digest after trades + repricing = 0x%016llx\n",
+                static_cast<unsigned long long>(s4Digest));
+
+    // The pinned S4 golden (computed on first run, hardcoded — the cross-platform anchor; MSVC == clang).
+    const uint64_t kPinnedS4Digest = 0x087296381931e8b0ull;  // PINNED on first run (MSVC == clang)
+
+    // ---- (1) PINNED DIGEST — the cross-platform make-or-break (identical on MSVC + clang). -----------
+    check(s4Digest == kPinnedS4Digest,
+          "econ-s4: DigestState after ClearMarket + UpdatePrices == pinned uint64 (the cross-platform proof)");
+
+    // ---- (2) REPLAY-STABLE — fresh world + market + same inputs reproduces the digest. --------------
+    {
+        World wm2 = MakeShowcaseWorld(kEntities, kItems);
+        SeedShowcaseCoin(wm2);
+        Market market2 = MakeShowcaseMarket(wm2);
+        ClearMarket(wm2, market2, MakeShowcaseTrades());
+        UpdatePrices(market2, MakeShowcaseDemand(wm2), MakeShowcaseSupply(wm2), 1, 4);
+        check(DigestState(wm2, market2) == s4Digest,
+              "econ-s4: re-running the same trades + repricing is bit-identical (deterministic)");
+    }
+
+    // ---- (3) MONOTONICITY — excess demand raises, excess supply lowers, balanced holds (clamped). ----
+    {
+        const Qty p = 100, num = 1, den = 1, lo = 1, hi = 1000000;
+        const Qty up   = UpdatePrice(p, /*demand=*/200, /*supply=*/50,  num, den, lo, hi);  // delta +150
+        const Qty down = UpdatePrice(p, /*demand=*/50,  /*supply=*/200, num, den, lo, hi);  // delta -150
+        const Qty hold = UpdatePrice(p, /*demand=*/77,  /*supply=*/77,  num, den, lo, hi);  // delta 0
+        const bool mono =
+            (up   >  p) &&   // strictly rises (step +150 nonzero, not clamped)
+            (down <  p) &&   // strictly falls (step -150 nonzero, not clamped)
+            (hold == p);     // balanced -> holds exactly
+        check(mono,
+              "econ-s4: MONOTONIC pricing — excess demand raises, excess supply lowers, balanced holds (clamped)");
+    }
+
+    // ---- (4) CLAMP — extreme demand -> exactly maxPrice; extreme supply -> exactly minPrice. ---------
+    {
+        const Qty p = 500, num = 1000, den = 1, lo = 1, hi = 1000000;
+        const Qty hi2 = UpdatePrice(p, /*demand=*/2000000, /*supply=*/0,       num, den, lo, hi);  // huge +step
+        const Qty lo2 = UpdatePrice(p, /*demand=*/0,       /*supply=*/2000000, num, den, lo, hi);  // huge -step
+        check(hi2 == hi && lo2 == lo,
+              "econ-s4: prices clamp to [minPrice, maxPrice] (no runaway)");
+    }
+
+    // ---- (5) TRADE CONSERVATION — a successful trade conserves total currency + total item across the
+    // two parties (goods + money exchanged, nothing minted/burned). -----------------------------------
+    {
+        World wt = MakeShowcaseWorld(kEntities, kItems);
+        SeedShowcaseCoin(wt);
+        Market mt = MakeShowcaseMarket(wt);
+        const TradeOrder o{ /*buyer=*/0, /*seller=*/1, /*item=*/2, /*qty=*/3 };  // affordable
+        const Qty curBefore = wt.At(o.buyer, mt.currency) + wt.At(o.seller, mt.currency);
+        const Qty itmBefore = wt.At(o.buyer, o.item)      + wt.At(o.seller, o.item);
+        const bool ok = ExecuteTrade(wt, mt, o);
+        const Qty curAfter = wt.At(o.buyer, mt.currency) + wt.At(o.seller, mt.currency);
+        const Qty itmAfter = wt.At(o.buyer, o.item)      + wt.At(o.seller, o.item);
+        check(ok && curBefore == curAfter && itmBefore == itmAfter,
+              "econ-s4: a trade conserves total currency + total goods (buyer/seller exchange, nothing minted/burned)");
+    }
+
+    // ---- (6) TRADE GATES — unaffordable / currency-as-item / out-of-range each return false + leave the
+    // digest unchanged. -------------------------------------------------------------------------------
+    {
+        World wg = MakeShowcaseWorld(kEntities, kItems);
+        SeedShowcaseCoin(wg);
+        Market mg = MakeShowcaseMarket(wg);
+        const uint64_t before = DigestState(wg, mg);
+        const bool a = ExecuteTrade(wg, mg, TradeOrder{ 0, 2, 2, 100000 });  // UNAFFORDABLE (1.2M coin)
+        const bool b = ExecuteTrade(wg, mg, TradeOrder{ 0, 1, 0, 5 });       // CURRENCY-AS-ITEM (item0)
+        const bool c = ExecuteTrade(wg, mg, TradeOrder{ 0, 99, 1, 1 });      // OUT-OF-RANGE seller
+        const uint64_t after = DigestState(wg, mg);
+        check(!a && !b && !c && before == after,
+              "econ-s4: an unaffordable / currency-as-item / out-of-range order is a no-op (returns false, digest unchanged)");
+    }
+
+    // ---- (7) ROLLS — RollRange is reproducible + in [lo,hi]; a fixed roll sequence digests to a pinned
+    // uint64. ----------------------------------------------------------------------------------------
+    {
+        const uint32_t seed = 0x1234ABCDu;
+        const Qty lo = 7, hi = 42;
+        bool reproducible = true, inRange = true;
+        std::vector<Qty> rolls;
+        for (uint32_t i = 0; i < 64; ++i) {
+            const Qty r1 = RollRange(seed, i, lo, hi);
+            const Qty r2 = RollRange(seed, i, lo, hi);  // same args -> same value
+            if (r1 != r2) reproducible = false;
+            if (r1 < lo || r1 > hi) inRange = false;
+            rolls.push_back(r1);
+        }
+        const uint64_t rollDigest = hf::net::DigestBytes(rolls.data(), rolls.size() * sizeof(Qty));
+        std::printf("econ-s4: fixed roll sequence digest = 0x%016llx\n",
+                    static_cast<unsigned long long>(rollDigest));
+        const uint64_t kPinnedRollDigest = 0x57a1cd074f19817aull;  // PINNED on first run (MSVC == clang)
+        check(reproducible && inRange && rollDigest == kPinnedRollDigest,
+              "econ-s4: RollRange is reproducible (same seed+index -> same value; a fixed roll sequence digests to a pinned uint64) and stays in [lo,hi]");
+    }
+
     if (g_fail == 0) { std::printf("econ_test: ALL PASS\n"); return 0; }
     std::printf("econ_test: %d FAIL\n", g_fail);
     return 1;

@@ -370,4 +370,198 @@ inline EconRules MakeShowcaseRules(const World& w) {
     return r;
 }
 
+// =====================================================================================================
+// ECON-S4 — Pricing / market clearing + deterministic rolls (APPEND-ONLY below S3).
+// =====================================================================================================
+// The MARKET layer: integer supply/demand pricing (integer-ratio elasticity, NO fxmul/fpx — keeps econ.h
+// self-contained), deterministic order clearing (trades at the current price, paid in a designated
+// currency item, reusing the S1 transfer primitive), and DETERMINISTIC ROLLS (a copied PcgHash — the
+// engine.h stays self-contained; pcg.h would pull the fx/particles chain). Pure-CPU INTEGER, the same
+// fixed-iteration-order / no-map / no-float discipline as S1-S3 -> bit-identical CPU/Vulkan/Metal AND
+// lockstep/replay-able. A deterministic, reproducible market + loot system is exactly what a float-RNG
+// UE5 economy cannot lockstep/replay.
+
+// --- EconHash: copied VERBATIM from engine/pcg/pcg.h:42-48 (the canonical PcgHash) -------------------
+// pcg.h pulls the fx/particles include chain, which would break this header's self-containment, so we
+// COPY the pure-uint32 ops (the wfc::WfcHash precedent) — same constants -> same stream -> bit-exact
+// cross-platform. NO RNG, NO clock, NO float; pure uint32 wrapping arithmetic + shifts.
+inline uint32_t EconHash(uint32_t seed, uint32_t index) {
+    uint32_t h = seed * 2654435761u;               // Knuth multiplicative
+    h ^= (index + 0x9E3779B9u + (h << 6) + (h >> 2));
+    h += index * 0x85EBCA6Bu;
+    h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; h *= 0x297A2D39u; h ^= h >> 15;
+    return h;
+}
+inline constexpr uint32_t kRollSalt = 0x45434F4Eu;  // 'ECON' — the roll stream's salt
+
+// --- RollRange: a deterministic integer in [lo, hi] INCLUSIVE from (seed, index). Requires hi >= lo. --
+// lo + (EconHash(seed ^ kRollSalt, index) mod (hi - lo + 1)). Pure uint32 (the modulus is unsigned) ->
+// bit-exact cross-platform. Used for seeded loot/yield rolls; replay-stable by (seed, index) alone.
+inline Qty RollRange(uint32_t seed, uint32_t index, Qty lo, Qty hi) {
+    const uint32_t span = static_cast<uint32_t>(hi - lo + 1);  // hi >= lo by contract -> span >= 1
+    return lo + static_cast<Qty>(EconHash(seed ^ kRollSalt, index) % span);
+}
+
+// --- Market: per-item integer prices + bounds + the designated currency item. -------------------------
+// `price` is a dense [itemCount] array (the same fixed-order / no-map discipline as World::stock). The
+// `currency` item is money — excluded from its own pricing and rejected as a tradeable good.
+struct Market {
+    std::vector<Qty> price;            // [itemCount] current unit price per item id
+    Qty              minPrice = 1;
+    Qty              maxPrice = 1000000;
+    uint32_t         currency = 0;     // the item id used as money (excluded from its own pricing)
+};
+
+// --- UpdatePrice: the integer-ratio elasticity update, MONOTONIC + clamped. ----------------------------
+// delta = demand - supply (>0 excess demand, <0 excess supply); step = (int64)delta * elastNum / elastDen
+// with an int64 multiply (avoids overflow) and truncating division toward zero (the C++ `/` default —
+// PINNED). newP = clamp(price + step, minP, maxP) via integer ternaries (no <algorithm>). Excess demand
+// raises the price, excess supply lowers it, balanced (or a step truncated to 0) holds it (within clamp).
+inline Qty UpdatePrice(Qty price, Qty demand, Qty supply, Qty elastNum, Qty elastDen,
+                       Qty minP, Qty maxP) {
+    const Qty delta = demand - supply;
+    const int64_t step = static_cast<int64_t>(delta) * elastNum / elastDen;  // truncating toward zero (PINNED)
+    int64_t newP = static_cast<int64_t>(price) + step;
+    if (newP < minP) newP = minP;     // clamp DOWN to minPrice (integer ternary, no <algorithm>)
+    if (newP > maxP) newP = maxP;     // clamp UP to maxPrice
+    return static_cast<Qty>(newP);
+}
+
+// --- UpdatePrices: apply UpdatePrice to every item in FIXED id order, SKIPPING the currency item. ------
+// `demand`/`supply` are dense [itemCount] arrays parallel to m.price. The currency item's price is never
+// repriced (it is the unit of account). Deterministic of (m, demand, supply, elastNum, elastDen) alone.
+inline void UpdatePrices(Market& m, const std::vector<Qty>& demand, const std::vector<Qty>& supply,
+                         Qty elastNum, Qty elastDen) {
+    for (uint32_t i = 0; i < m.price.size(); ++i) {
+        if (i == m.currency) continue;                 // the currency item is never repriced
+        m.price[i] = UpdatePrice(m.price[i], demand[i], supply[i], elastNum, elastDen,
+                                 m.minPrice, m.maxPrice);
+    }
+}
+
+// --- TradeOrder: a buy/sell at the current price, paid in the currency item. qty > 0 by construction. --
+struct TradeOrder {
+    uint32_t buyer;   // entity receiving `qty` of `item`, paying currency
+    uint32_t seller;  // entity giving up `qty` of `item`, receiving currency
+    uint32_t item;    // the good traded (must NOT be the currency item)
+    Qty      qty;     // quantity of `item` (> 0)
+};
+
+// --- ExecuteTrade: execute a single order at the price IN `m`. Returns true IFF applied (else false +
+// NO mutation). Execute IFF: qty > 0, item != currency, buyer/seller/item all in range, the seller holds
+// `qty` of `item`, AND the buyer holds `cost = (int64)qty * price[item]` currency (fixtures keep cost
+// bounded within Qty). Then atomically transfer `qty` of `item` seller->buyer and `cost` currency
+// buyer->seller (reusing the S1 kTransfer primitive, so each leg is itself atomic/validated). An invalid
+// or unaffordable order is a deterministic no-op. ------------------------------------------------------
+inline bool ExecuteTrade(World& w, const Market& m, const TradeOrder& o) {
+    if (o.qty <= 0) return false;                              // non-positive qty -> no-op
+    if (o.item == m.currency) return false;                   // a good cannot be the currency item
+    if (!InRange(w, o.buyer, o.item)) return false;           // buyer/item in range
+    if (!InRange(w, o.seller, o.item)) return false;          // seller/item in range
+    if (o.item >= m.price.size()) return false;               // price defined for this item
+    if (!InRange(w, o.buyer, m.currency)) return false;       // currency slot in range for both
+    if (!InRange(w, o.seller, m.currency)) return false;
+    const int64_t cost = static_cast<int64_t>(o.qty) * m.price[o.item];  // total currency price
+    // Validate FULLY before any mutation (atomic): seller has the goods, buyer can pay.
+    if (!Affordable(w, o.seller, o.item, o.qty)) return false;          // seller has qty of item
+    if (cost > w.At(o.buyer, m.currency)) return false;                 // buyer can pay the cost
+    if (cost <= 0) return false;                                        // price 0 / overflow guard -> no-op
+    const Qty cost32 = static_cast<Qty>(cost);
+    // Two S1 transfers (each validated again internally; both endpoints are already in range + affordable).
+    ApplyCommand(w, Command{ kTransfer, o.seller, o.buyer, o.item,     o.qty  });  // goods seller->buyer
+    ApplyCommand(w, Command{ kTransfer, o.buyer,  o.seller, m.currency, cost32 }); // money buyer->seller
+    return true;
+}
+
+// --- ClearMarket: execute every order in ARRAY ORDER at the price IN `m` at call time. S4 does NOT
+// auto-reprice mid-batch (UpdatePrices is a separate explicit step), keeping the two concerns
+// independently pinnable. Invalid/unaffordable orders are deterministic no-ops (the RunScript precedent).
+inline void ClearMarket(World& w, const Market& m, const std::vector<TradeOrder>& orders) {
+    for (const TradeOrder& o : orders) ExecuteTrade(w, m, o);
+}
+
+// --- DigestState: the combined market+ledger golden currency. Combine DigestWorld(w) with a
+// net::DigestBytes over m.price + the bounds/currency, in FIXED order. Continues the SAME FNV-1a-64 fold
+// (the DigestWorld precedent): seed with DigestWorld, then fold the price bytes, then the bounds/currency
+// header. Bit-identical run-to-run AND platform-to-platform (fixed byte layout + iteration order). ------
+inline uint64_t DigestState(const World& w, const Market& m) {
+    uint64_t h = DigestWorld(w);  // start from the ledger digest (fixed-order FNV-1a-64 fold)
+    // Fold the price array bytes (fixed order: item 0..itemCount-1).
+    const auto* p = reinterpret_cast<const unsigned char*>(m.price.data());
+    const std::size_t n = m.price.size() * sizeof(Qty);
+    for (std::size_t i = 0; i < n; ++i) { h ^= static_cast<uint64_t>(p[i]); h *= 1099511628211ull; }
+    // Fold the fixed-order {minPrice, maxPrice, currency} trailer.
+    const Qty bounds[2] = { m.minPrice, m.maxPrice };
+    const auto* bp = reinterpret_cast<const unsigned char*>(bounds);
+    for (std::size_t i = 0; i < sizeof bounds; ++i) { h ^= static_cast<uint64_t>(bp[i]); h *= 1099511628211ull; }
+    const auto* cp = reinterpret_cast<const unsigned char*>(&m.currency);
+    for (std::size_t i = 0; i < sizeof m.currency; ++i) { h ^= static_cast<uint64_t>(cp[i]); h *= 1099511628211ull; }
+    return h;
+}
+
+// --- MakeShowcaseMarket: a FIXED market over the 4x4 showcase world. FIXED forever (the S4 golden pins
+// a clearing+repricing over it). The showcase world is 4 items so currency = item0 (money). Seeds every
+// entity with extra item0 (coin) so trades can pay. Recall the seed: stock(e,t) = 10 + 7*e + 3*t -> with
+// itemCount 4 every entity starts with 10+7e of item0; we ADD a fixed coin reserve so the affordable
+// trades clear and an unaffordable one still has a buyer who simply can't cover that particular cost. ---
+// NOTE: this MUTATES `w` is NOT desired — instead the test seeds coin into the world separately. To keep
+// MakeShowcaseMarket a pure function of the world's itemCount, it only builds the price/bounds/currency.
+inline Market MakeShowcaseMarket(const World& w) {
+    Market m;
+    m.minPrice = 1;
+    m.maxPrice = 1000000;
+    m.currency = 0;  // item0 is money (the 4x4 showcase has items 0..3)
+    // Fixed integer prices per item (currency item0's price is unused but seeded for a stable digest).
+    m.price.assign(w.itemCount, Qty{1});
+    if (w.itemCount > 0) m.price[0] = 1;    // currency item — price never used (skipped by UpdatePrices)
+    if (w.itemCount > 1) m.price[1] = 5;    // item1 costs 5 coin each
+    if (w.itemCount > 2) m.price[2] = 12;   // item2 costs 12 coin each
+    if (w.itemCount > 3) m.price[3] = 3;    // item3 costs 3 coin each
+    return m;
+}
+
+// --- SeedShowcaseCoin: top up every entity's currency (item0) reserve so the showcase trades can pay.
+// FIXED forever. Adds a fixed +500 coin to every entity's item0 slot (well within int32). Called by the
+// test after MakeShowcaseWorld so buyers can afford the affordable trades (and an unaffordable order
+// targets a buyer/cost that still cannot cover). Pure integer, fixed order. ----------------------------
+inline void SeedShowcaseCoin(World& w) {
+    for (uint32_t e = 0; e < w.entityCount; ++e)
+        if (InRange(w, e, 0)) w.Set(e, 0, w.At(e, 0) + 500);  // +500 coin (item0) per entity
+}
+
+// --- MakeShowcaseTrades: a FIXED order book exercising affordable trades + the three reject gates. -----
+// FIXED forever. Designed for the 4x4 coin-seeded showcase world (currency = item0). Includes affordable
+// buy/sells, an UNAFFORDABLE order (cost exceeds the buyer's coin), a CURRENCY-AS-ITEM order (item ==
+// currency -> rejected), and an OUT-OF-RANGE order (entity 99). ----------------------------------------
+inline std::vector<TradeOrder> MakeShowcaseTrades() {
+    return std::vector<TradeOrder>{
+        // buyer, seller, item, qty
+        { 0, 1, 2, 3 },        // e0 buys 3x item2 from e1 @12 = 36 coin (affordable: e0 has 510 coin)
+        { 2, 3, 1, 4 },        // e2 buys 4x item1 from e3 @5  = 20 coin (affordable)
+        { 1, 0, 3, 5 },        // e1 buys 5x item3 from e0 @3  = 15 coin (affordable)
+        { 3, 2, 1, 2 },        // e3 buys 2x item1 from e2 @5  = 10 coin (affordable; e2 has the item1 it bought)
+        { 0, 2, 2, 100000 },   // UNAFFORDABLE: 100000x item2 @12 = 1.2M coin > buyer's reserve -> no-op
+        { 0, 1, 0, 5 },        // CURRENCY-AS-ITEM: item == currency (item0) -> rejected no-op
+        { 0, 99, 1, 1 },       // OUT-OF-RANGE seller (99 >= entityCount) -> no-op
+    };
+}
+
+// --- MakeShowcaseDemand / MakeShowcaseSupply: FIXED demand/supply vectors for the pricing test. -------
+// FIXED forever. Parallel to m.price ([itemCount]). Item1 excess demand (raises), item2 excess supply
+// (lowers), item3 balanced (holds). The currency slot (item0) is skipped by UpdatePrices.
+inline std::vector<Qty> MakeShowcaseDemand(const World& w) {
+    std::vector<Qty> d(w.itemCount, Qty{0});
+    if (w.itemCount > 1) d[1] = 100;   // item1: strong demand
+    if (w.itemCount > 2) d[2] = 10;    // item2: weak demand
+    if (w.itemCount > 3) d[3] = 50;    // item3: balanced with supply -> holds
+    return d;
+}
+inline std::vector<Qty> MakeShowcaseSupply(const World& w) {
+    std::vector<Qty> s(w.itemCount, Qty{0});
+    if (w.itemCount > 1) s[1] = 20;    // item1: supply < demand -> price rises
+    if (w.itemCount > 2) s[2] = 90;    // item2: supply > demand -> price falls
+    if (w.itemCount > 3) s[3] = 50;    // item3: supply == demand -> price holds
+    return s;
+}
+
 }  // namespace hf::econ
