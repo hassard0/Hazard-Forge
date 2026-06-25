@@ -1,4 +1,5 @@
 #include "asset/gltf_loader.h"
+#include "asset/gltf_ext.h"   // issue #36: unsupported-extension diagnostics (pure, unit-tested)
 #include "scene/vertex.h"
 #include "anim/skeleton.h"
 #include "anim/animation.h"
@@ -292,6 +293,28 @@ cgltf_data* OpenGltf(const char* path) {
     if (data->meshes_count == 0 || data->meshes[0].primitives_count == 0) {
         cgltf_free(data);
         throw std::runtime_error(std::string("glTF has no mesh/primitive: ") + path);
+    }
+
+    // Issue #36: a glb that REQUIRES a compression extension we can't decode (Draco / meshopt) used to load
+    // empty/garbage geometry and render "0 instances" with NO error. Detect it and FAIL LOUDLY + actionably
+    // instead of silently. (Pure decision logic lives in asset/gltf_ext.h so it is unit-testable.)
+    {
+        std::vector<std::string> requiredExts;
+        for (cgltf_size i = 0; i < data->extensions_required_count; ++i)
+            if (data->extensions_required[i]) requiredExts.emplace_back(data->extensions_required[i]);
+        int dracoPrims = 0, totalPrims = 0;
+        for (cgltf_size m = 0; m < data->meshes_count; ++m)
+            for (cgltf_size p = 0; p < data->meshes[m].primitives_count; ++p) {
+                ++totalPrims;
+                if (data->meshes[m].primitives[p].has_draco_mesh_compression) ++dracoPrims;
+            }
+        const ExtDiagnostic diag = DiagnoseExtensions(requiredExts, dracoPrims, totalPrims, path);
+        if (!diag.warning.empty()) std::fprintf(stderr, "%s\n", diag.warning.c_str());
+        if (!diag.fatal.empty()) {
+            std::fprintf(stderr, "%s\n", diag.fatal.c_str());
+            cgltf_free(data);
+            throw std::runtime_error(diag.fatal);
+        }
     }
     return data;
 }

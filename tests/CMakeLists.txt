@@ -150,6 +150,10 @@ hf_add_pure_test(wfc_test)
 # are bit-identical run-to-run AND MSVC-vs-Apple-clang. The golden is the pinned hash IN the test (NO
 # image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(econ_test)
+# glTF unsupported-extension diagnostics (issue #36): the PURE decision the loader uses to FAIL LOUDLY
+# (not silently) when a glb REQUIRES a compression extension this build can't decode (Draco / meshopt) —
+# e.g. the three.js Ferrari. Synthetic inputs only (no device/cgltf/glb), so it stays a pure hf_core test.
+hf_add_pure_test(gltf_ext_test)
 # CPU particle / VFX emitter system (Slice CC): the authorable emitter (spawn rate, lifetime, init
 # velocity + spread, gravity, drag, size/color over life) simulated at a fixed timestep with a
 # fixed-seed integer LCG for the spread jitter (engine/vfx/particles.{h,cpp}) — DISTINCT from the
