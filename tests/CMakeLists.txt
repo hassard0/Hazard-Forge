@@ -171,6 +171,14 @@ hf_add_pure_test(flow_test)
 # load-bearing), an exact linear midpoint, and the clamp-low/clamp-high holds. The golden is the pinned
 # hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(seq_test)
+# SELF-CONTAINED, CLEAN-ROOM Draco mesh decoder substrate (Slice DRACO-DR1, issue #36 — load
+# KHR_draco_mesh_compression glTF): engine/asset/draco_decode.h — a header-only, SELF-CONTAINED (only
+# <cstddef>/<cstdint>/<vector> + net/session.h) bitstream substrate: a bounds-checked little-endian byte
+# reader (mem_get_le16/24/32), the LEB128 varint decode, and the Draco header parser. Implemented FROM the
+# published Draco spec (we do NOT vendor draco source). The golden is a PINNED net::DigestBytes over a
+# varint round-trip sweep + parsing the REAL embedded Box-Draco header (NO image, NO render-bake). Pure CPU
+# (hf_core), no RHI/backend symbols, ASan-eligible, bit-identical MSVC == Windows-clang == Mac-clang.
+hf_add_pure_test(draco_test)
 # Deterministic UI widget tree + INTEGER box model (Slice WIDGET-S1, issue #30 — the DETERMINISTIC
 # UMG-CLASS UI FRAMEWORK beachhead): engine/ui/widget.h — a header-only, SELF-CONTAINED (only
 # <cstddef>/<cstdint>/<vector> + net/session.h) UI substrate. A widget hierarchy (parent/first-child/
