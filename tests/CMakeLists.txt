@@ -171,6 +171,21 @@ hf_add_pure_test(flow_test)
 # load-bearing), an exact linear midpoint, and the clamp-low/clamp-high holds. The golden is the pinned
 # hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(seq_test)
+# Profiler-capture event model + interned name table (Slice PROFILE-S1, issue #31 — the DETERMINISTIC
+# SCRUB-FRIENDLY PROFILER CAPTURE beachhead): engine/profile/profile.h — a header-only, SELF-CONTAINED
+# (only <cstddef>/<cstdint>/<vector> + net/session.h) capture core. A profiler measures TIME
+# (non-deterministic), so the moat is NOT "a deterministic profiler" — it is a capture whose STRUCTURE is
+# golden + deterministic with TIMING as a NON-golden overlay stored separately. A capture event stream
+# (kinds/interned-name-ids/structural payloads) + an interned name table (byte-strings, first-seen
+# linear-scan dedup, NO unordered/<string>), hand-LE encoded (PutU32/PutBytes, the wav.cpp/replay.h
+# discipline) into a StructuralDigest (net::DigestBytes/FNV-1a-64) that EXCLUDES the parallel cpu/gpu-nanos
+# timing overlay by construction. The LOAD-BEARING proof: filling timings with arbitrary nonzero values
+# leaves StructuralDigest UNCHANGED. Asserts the pinned showcase structural digest (the cross-platform byte
+# proof), re-encode determinism, the timing-excluded invariant, first-seen-stable interning, and that a
+# changed draw count / a different scope name change the digest (structure + names load-bearing). The golden
+# is the pinned hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols,
+# ASan-eligible.
+hf_add_pure_test(profile_test)
 # Slice SEQ-S6 — the cinematic-sequencer LIT 3D render-capstone bridge (engine/seq/seq_render.h, the
 # money-shot of FLAGSHIP #25). The cheap pre-bake CPU proof that the FLOAT render bridge faithfully +
 # deterministically carries the bit-exact Q16.16 transform timeline into render instances: 24-instance
