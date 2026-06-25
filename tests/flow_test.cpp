@@ -207,6 +207,122 @@ int main() {
               "flow-s2: S1's pinned digest 0x0e5b8ec26f0d8730 is UNCHANGED (the EdgeMask refinement is byte-identical for S1 graphs)");
     }
 
+    // ==================================================================================================
+    // Slice FLOW-S3 — CONTROL FLOW + EVENTS: the deterministic Blueprint EXECUTION wire. Append-only
+    // (S1+S2 above stay green). The golden = a PINNED per-tick EVENT-trace digest stream (8 ticks) over
+    // MakeShowcaseControlData() + MakeShowcaseExecGraph() + MakeControlInputStream(), bit-identical
+    // Windows/MSVC vs Mac/clang via the standalone compile.
+    // ==================================================================================================
+
+    const Graph     ctrlData = MakeShowcaseControlData();
+    const ExecGraph execG    = MakeShowcaseExecGraph();
+    const std::vector<std::vector<Reg>> ctrlInputs = MakeControlInputStream();
+    const std::vector<uint64_t> evTrace = RunFlowTrace(ctrlData, execG, ctrlInputs, 8);
+
+    std::printf("flow-s3: per-tick event trace (8 ticks):\n");
+    for (std::size_t t = 0; t < evTrace.size(); ++t)
+        std::printf("  tick %zu event-digest = 0x%016llx\n", t,
+                    static_cast<unsigned long long>(evTrace[t]));
+    std::printf("flow-s3: per-tick event trace (8 ticks) final digest = 0x%016llx\n",
+                static_cast<unsigned long long>(evTrace.empty() ? 0ull : evTrace.back()));
+
+    // ---- (1) PINNED EVENT TRACE — the cross-platform make-or-break (identical on MSVC + clang). -------
+    // PINNED on first run (MSVC == clang). The full per-tick DigestEvents trace of the showcase exec graph.
+    const uint64_t kPinnedEvTrace[8] = {
+        0x7cad1c04312095a8ull,  // tick 0  even, input 5 -> [kEvTrue, kEvGate, kEvSeqB] payload 5
+        0xf045888c785b1a6aull,  // tick 1  odd,  input 2 -> [kEvFalse, kEvGate, kEvSeqB] payload 2
+        0xe2d0039142b98e8aull,  // tick 2  even, input 7 -> [kEvTrue, kEvGate, kEvSeqB] payload 7
+        0x42f905fdea17fca6ull,  // tick 3  odd,  input 0 -> [kEvFalse] only (gate CLOSED)
+        0x938040d670d9e2ceull,  // tick 4  even, input 3 -> [kEvTrue, kEvGate, kEvSeqB] payload 3
+        0xa18386dc7b61c9f1ull,  // tick 5  odd,  input 9 -> [kEvFalse, kEvGate, kEvSeqB] payload 9
+        0x61f3cd06f50746c7ull,  // tick 6  even, input 0 -> [kEvTrue] only (gate CLOSED)
+        0xd5735423148033ccull,  // tick 7  odd,  input 4 -> [kEvFalse, kEvGate, kEvSeqB] payload 4
+    };
+    {
+        bool match = (evTrace.size() == 8);
+        for (std::size_t t = 0; match && t < 8; ++t)
+            if (evTrace[t] != kPinnedEvTrace[t]) match = false;
+        check(match,
+              "flow-s3: RunFlowTrace event-trace digest stream == pinned uint64[] (deterministic per-tick events)");
+    }
+
+    // ---- (2) REPLAY-STABLE — a second run reproduces the IDENTICAL event trace. ----------------------
+    {
+        const std::vector<uint64_t> evTrace2 = RunFlowTrace(ctrlData, execG, ctrlInputs, 8);
+        check(evTrace2 == evTrace,
+              "flow-s3: re-running is bit-identical");
+    }
+
+    // ---- (3) BRANCH — only the taken pin's event fires. Hand-check two ticks: tick 0 (even, parity n4!=0)
+    //          fires kEvTrue and NOT kEvFalse; tick 1 (odd, parity n4==0) fires kEvFalse and NOT kEvTrue.
+    {
+        GraphState st0 = MakeState(ctrlData);
+        // Advance to tick 0 fresh.
+        std::vector<EventRecord> e0 = StepFlow(ctrlData, execG, st0, ctrlInputs[0], 0);  // even
+        std::vector<EventRecord> e1 = StepFlow(ctrlData, execG, st0, ctrlInputs[1], 1);  // odd
+        bool t0True = false, t0False = false, t1True = false, t1False = false;
+        for (const EventRecord& e : e0) { if (e.eventId == kEvTrue) t0True = true; if (e.eventId == kEvFalse) t0False = true; }
+        for (const EventRecord& e : e1) { if (e.eventId == kEvTrue) t1True = true; if (e.eventId == kEvFalse) t1False = true; }
+        check(t0True && !t0False && t1False && !t1True,
+              "flow-s3: eBranch fires ONLY the taken pin's event (true on even ticks, false on odd — hand-checked)");
+    }
+
+    // ---- (4) SEQUENCE ORDER — the eSeq pair [6]=kEvGate then [7]=kEvSeqB fires in next-list order (A
+    //          before B), not reversed/hash. Hand-check on tick 0 (gate OPEN): kEvGate precedes kEvSeqB.
+    {
+        GraphState st = MakeState(ctrlData);
+        std::vector<EventRecord> e0 = StepFlow(ctrlData, execG, st, ctrlInputs[0], 0);  // input 5 -> gate open
+        // Find the positions of kEvGate and kEvSeqB in the fired-event order.
+        int posGate = -1, posSeqB = -1;
+        for (std::size_t i = 0; i < e0.size(); ++i) {
+            if (e0[i].eventId == kEvGate && posGate < 0) posGate = static_cast<int>(i);
+            if (e0[i].eventId == kEvSeqB && posSeqB < 0) posSeqB = static_cast<int>(i);
+        }
+        check(posGate >= 0 && posSeqB >= 0 && posGate < posSeqB,
+              "flow-s3: eSeq fires its successor events in the FIXED order (hand-checked event sequence)");
+    }
+
+    // ---- (5) GATE — the gated events (kEvGate, kEvSeqB) are ABSENT on a closed-gate tick (input 0) and
+    //          PRESENT on an open-gate tick. Tick 0 (input 5) open; tick 3 (input 0) closed.
+    {
+        GraphState st = MakeState(ctrlData);
+        std::vector<EventRecord> e0 = StepFlow(ctrlData, execG, st, ctrlInputs[0], 0);  // input 5 -> OPEN
+        std::vector<EventRecord> e1 = StepFlow(ctrlData, execG, st, ctrlInputs[1], 1);  // input 2 -> OPEN
+        std::vector<EventRecord> e2 = StepFlow(ctrlData, execG, st, ctrlInputs[2], 2);  // input 7 -> OPEN
+        std::vector<EventRecord> e3 = StepFlow(ctrlData, execG, st, ctrlInputs[3], 3);  // input 0 -> CLOSED
+        bool openHasGate = false, closedHasGate = false;
+        for (const EventRecord& e : e0) if (e.eventId == kEvGate) openHasGate = true;
+        for (const EventRecord& e : e3) if (e.eventId == kEvGate) closedHasGate = true;
+        check(openHasGate && !closedHasGate,
+              "flow-s3: eGate blocks the event when its predicate is 0, passes when nonzero (hand-checked)");
+    }
+
+    // ---- (6) EVENT PAYLOAD — an eEvent's payload == regs[pred] at that tick. The Events read n0 (the
+    //          input). On tick 2 input==7 -> every fired event's payload == 7.
+    {
+        GraphState st = MakeState(ctrlData);
+        StepFlow(ctrlData, execG, st, ctrlInputs[0], 0);
+        StepFlow(ctrlData, execG, st, ctrlInputs[1], 1);
+        std::vector<EventRecord> e2 = StepFlow(ctrlData, execG, st, ctrlInputs[2], 2);  // input 7
+        bool payloadOk = !e2.empty();
+        for (const EventRecord& e : e2) if (e.payload != 7) payloadOk = false;
+        check(payloadOk,
+              "flow-s3: eEvent's payload == regs[pred] at that tick (hand-checked)");
+    }
+
+    // ---- (7) BOUNDED — a contrived exec graph with a LOOP (a successor reaching back) terminates within
+    //          the step cap, no hang. Node 0 eSeq -> {0} loops onto itself forever absent the cap.
+    {
+        ExecGraph loopEg;
+        loopEg.nodes.resize(1);
+        loopEg.entry = 0;
+        loopEg.nodes[0] = ExecNode{ eSeq, /*pred=*/0, /*eventId=*/0, /*next=*/{0u} };  // self-loop
+        std::vector<Reg> dummyRegs(4, 0);
+        std::vector<EventRecord> evLoop = RunExec(loopEg, dummyRegs);  // must RETURN (bounded), not hang
+        check(evLoop.empty(),  // no eEvent in the loop -> no events; the point is it TERMINATES
+              "flow-s3: the traversal is bounded (a contrived exec loop terminates deterministically, no hang)");
+    }
+
     if (g_fail == 0) { std::printf("flow_test: ALL PASS\n"); return 0; }
     std::printf("flow_test: %d FAIL\n", g_fail);
     return 1;

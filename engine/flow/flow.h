@@ -481,4 +481,264 @@ inline std::vector<std::vector<Reg>> MakeShowcaseInputStream() {
     };
 }
 
+// ====================================================================================================
+// Slice FLOW-S3 — CONTROL FLOW + EVENTS: the deterministic Blueprint EXECUTION wire (issue #24).
+// APPEND-ONLY below S2 (S1/S2 above stay byte-identical: S1 0x0e5b8ec26f0d8730, S2 trace final
+// 0x670cf80b235bdafd are UNCHANGED — S3 adds NEW types/functions only, touches nothing above).
+//
+// S1/S2 are the DATA wire (a DAG of integer registers, ticking). Blueprint has a SECOND wire — the white
+// EXECUTION pin that decides WHICH nodes fire and in WHAT ORDER. S3 adds that exec layer as a SEPARATE
+// graph (ExecGraph) of Sequence/Branch/Gate/Event nodes, traversed from an entry in a PINNED order,
+// reading predicates from the S2 data register file. In UE5 exec/event order depends on tick groups +
+// actor registration + float timing (two machines fire events in different orders); here two peers fed
+// the same inputs fire the SAME events on the SAME tick in the SAME order — the literal Blueprint exec
+// model made bit-identical. Pure-CPU INTEGER; header stays self-contained (only <cstddef>/<cstdint>/
+// <vector> + net/session.h).
+// ====================================================================================================
+
+// ExecKind: FIXED enum numbering = the wire contract (never renumber). Exec nodes are SEPARATE from data
+// nodes (data = values; exec = control flow).
+enum ExecKind : uint32_t {
+    eSeq    = 0,   // fire ALL of `next` in order (a Sequence node)
+    eBranch = 1,   // read regs[pred]: !=0 -> fire next[0] (TRUE), else next[1] (FALSE) — exactly ONE
+    eGate   = 2,   // fire next[0] ONLY if regs[pred] != 0 (open), else nothing (a Gate)
+    eEvent  = 3,   // emit EventRecord{eventId, payload=regs[pred]} then fire next[0]
+};
+
+// ExecNode: one exec-graph node. `pred` is a DATA NodeId (the Branch/Gate predicate, or an Event's payload
+// source); `eventId` is the fired tag for eEvent; `next` is the ORDERED exec-successor indices (into
+// ExecGraph::nodes) — the pinned traversal order. A "no successor" slot is simply a short `next`.
+struct ExecNode {
+    uint32_t              kind    = eSeq;   // ExecKind
+    NodeId                pred    = 0;      // a DATA node id (Branch/Gate predicate or Event payload source)
+    uint32_t              eventId = 0;      // eEvent: the fired event's id (a fixed tag)
+    std::vector<uint32_t> next;             // ordered exec-successor indices into ExecGraph::nodes
+};
+
+// ExecGraph: the exec wire — a flat node array + the entry index traversal starts from.
+struct ExecGraph {
+    std::vector<ExecNode> nodes;
+    uint32_t              entry = 0;
+};
+
+// EventRecord: one fired event (the exec-trace currency). payload is the Reg value of pred at fire time.
+struct EventRecord { uint32_t eventId = 0; Reg payload = 0; };
+
+// ---- RunExec: traverse the exec graph from `entry` in a PINNED order, reading predicates from the data
+// register file `regs` (the S2 StepGraph output), returning fired events in TRAVERSAL order.
+//
+// TRAVERSAL RULE (the determinism crux):
+//   - A STACK (a std::vector used LIFO) seeded with `entry`. Each pop dispatches by kind and pushes its
+//     chosen successors onto the stack in REVERSED next-list order, so they POP in forward next-list
+//     order (a stack reverses, so we reverse-on-push to cancel it) -> exec successors are processed in
+//     ascending `next`-index position, NEVER hash/insertion-of-a-set order. NO unordered_* anywhere.
+//   - eSeq   : push ALL of next (reversed) -> all fire, in next order.
+//   - eBranch: read regs[pred] (out-of-range -> 0); push next[0] if regs[pred]!=0 (TRUE) else next[1]
+//              (FALSE) — exactly ONE successor (a missing pin -> no successor pushed).
+//   - eGate  : push next[0] only if regs[pred]!=0 (open), else nothing.
+//   - eEvent : emit EventRecord{eventId, payload=regs[pred] (oob->0)}, then push next[0] (if present).
+//   - An out-of-range successor index is SKIPPED (deterministic no-op), never UB.
+//
+// VISITED / RE-ENTRY RULE: there is NO per-node visited guard — Blueprint allows a node to be re-entered
+// (a Sequence fanning into a shared sub-tree fires it twice), so we keep that semantics. Re-entry / an
+// accidental exec LOOP is bounded purely by the STEP CAP below.
+//
+// STEP CAP (the bound): at most kStepCap = nodes.size()*8 + 64 pops. A graph that would loop forever
+// (a successor reaching back) simply stops at the cap — a DETERMINISTIC give-up, never a hang, never UB.
+// (v1 showcase exec graphs are acyclic and finish far under the cap; the cap is the safety net + the
+// bounded-traversal proof in the test.)
+inline std::vector<EventRecord> RunExec(const ExecGraph& eg, const std::vector<Reg>& regs) {
+    std::vector<EventRecord> events;
+    const std::size_t n = eg.nodes.size();
+    if (n == 0) return events;
+
+    // Read a data predicate register with the "no edge / out-of-range -> 0" discipline.
+    auto readReg = [&](NodeId id) -> Reg {
+        return (static_cast<std::size_t>(id) < regs.size()) ? regs[static_cast<std::size_t>(id)] : Reg{0};
+    };
+    // Push a successor index onto the stack iff it is in range (out-of-range -> deterministic skip).
+    auto pushIf = [&](std::vector<uint32_t>& stk, uint32_t idx) {
+        if (static_cast<std::size_t>(idx) < n) stk.push_back(idx);
+    };
+
+    const std::size_t kStepCap = n * 8u + 64u;   // the bound: deterministic give-up, never a hang
+
+    std::vector<uint32_t> stack;
+    pushIf(stack, eg.entry);
+
+    std::size_t steps = 0;
+    while (!stack.empty() && steps < kStepCap) {
+        ++steps;
+        const uint32_t cur = stack.back();
+        stack.pop_back();
+        const ExecNode& en = eg.nodes[static_cast<std::size_t>(cur)];
+
+        switch (en.kind) {
+            case eSeq: {
+                // Fire ALL successors in next-list order: push REVERSED so they pop forward.
+                for (std::size_t k = en.next.size(); k-- > 0; ) pushIf(stack, en.next[k]);
+                break;
+            }
+            case eBranch: {
+                const bool taken = (readReg(en.pred) != 0);
+                if (taken) { if (en.next.size() > 0) pushIf(stack, en.next[0]); }   // TRUE pin
+                else       { if (en.next.size() > 1) pushIf(stack, en.next[1]); }   // FALSE pin
+                break;
+            }
+            case eGate: {
+                if (readReg(en.pred) != 0 && en.next.size() > 0) pushIf(stack, en.next[0]);  // open
+                break;
+            }
+            case eEvent: {
+                events.push_back(EventRecord{ en.eventId, readReg(en.pred) });
+                if (en.next.size() > 0) pushIf(stack, en.next[0]);
+                break;
+            }
+            default: break;   // unknown exec kind -> deterministic no-op
+        }
+    }
+    return events;
+}
+
+// ---- StepFlow: the FULL per-tick step = S2 data + S3 control -> events. This is the StepFn shape S4
+// wraps in net::Session (StepGraph already matches Advance's step(world,inputs,tick); RunExec layers on
+// the exec trace). Runs StepGraph (updates `state`, returns regs) then RunExec over those regs.
+inline std::vector<EventRecord> StepFlow(const Graph& dataG, const ExecGraph& execG,
+                                         GraphState& state, const std::vector<Reg>& inputs, uint32_t tick) {
+    const std::vector<Reg> regs = StepGraph(dataG, state, inputs, tick);
+    return RunExec(execG, regs);
+}
+
+// ---- DigestEvents: FNV-1a-64 over the fired-event trace. HAND-SERIALIZED little-endian (eventId as 4 LE
+// bytes, then payload's int32 bits as 4 LE bytes, per record) into a byte buffer, then net::DigestBytes —
+// NOT a struct memcpy (EventRecord may carry padding; hand-LE is padding-safe + endianness-stable, the
+// replay.h discipline). An empty trace digests the empty buffer (a fixed value) -> ticks with no events
+// still have a well-defined deterministic digest.
+inline uint64_t DigestEvents(const std::vector<EventRecord>& ev) {
+    std::vector<unsigned char> buf;
+    buf.reserve(ev.size() * 8u);
+    auto putU32 = [&](uint32_t v) {
+        buf.push_back(static_cast<unsigned char>( v        & 0xFFu));
+        buf.push_back(static_cast<unsigned char>((v >> 8)  & 0xFFu));
+        buf.push_back(static_cast<unsigned char>((v >> 16) & 0xFFu));
+        buf.push_back(static_cast<unsigned char>((v >> 24) & 0xFFu));
+    };
+    for (const EventRecord& e : ev) {
+        putU32(e.eventId);
+        putU32(static_cast<uint32_t>(e.payload));   // int32 bits as a uint32 (two's-complement LE)
+    }
+    return hf::net::DigestBytes(buf.data(), buf.size());
+}
+
+// ---- RunFlowTrace: run `ticks` StepFlows from a FRESH state over the per-tick `inputStream`, recording
+// DigestEvents(events) AFTER each tick -> the per-tick EVENT-trace digest stream (the S3 golden currency,
+// the net::DigestTrace shape for the exec wire). Deterministic of (dataG, execG, inputStream, ticks)
+// alone -> two runs emit the IDENTICAL trace. A missing/short input entry -> an empty (all-zero) input.
+inline std::vector<uint64_t> RunFlowTrace(const Graph& dataG, const ExecGraph& execG,
+                                          const std::vector<std::vector<Reg>>& inputStream,
+                                          uint32_t ticks) {
+    GraphState state = MakeState(dataG);
+    std::vector<uint64_t> trace;
+    trace.reserve(static_cast<std::size_t>(ticks));
+    static const std::vector<Reg> kEmpty{};
+    for (uint32_t t = 0; t < ticks; ++t) {
+        const std::vector<Reg>& in =
+            (static_cast<std::size_t>(t) < inputStream.size()) ? inputStream[static_cast<std::size_t>(t)]
+                                                               : kEmpty;
+        const std::vector<EventRecord> ev = StepFlow(dataG, execG, state, in, t);
+        trace.push_back(DigestEvents(ev));   // record the event-trace digest AFTER the tick
+    }
+    return trace;
+}
+
+// ====================================================================================================
+// S3 fixtures (FIXED forever — the golden pins the per-tick event trace of MakeShowcaseExecGraph() over
+// MakeShowcaseControlData() + MakeControlInputStream()).
+// ====================================================================================================
+
+// MakeShowcaseControlData: a FIXED 6-node DATA graph providing the exec PREDICATES. The headline is a
+// self-deriving TICK-PARITY toggle built from a kDelay feedback (NO mod node needed, NO external parity
+// channel): parity = Sub(one, Delay(parity)). At tick 0 prev[parity]=0 -> parity=1-0=1; tick 1
+// prev=1 -> 0; tick 2 -> 1; ... so parity = 1,0,1,0,... (NONZERO on EVEN ticks 0,2,4,6; ZERO on ODD
+// ticks 1,3,5,7). Delay's `a` is a STATE read (EdgeMask 0), so parity->Delay->parity is NOT a topo cycle.
+//   n0 = kInput[0]              -- the external per-tick input (also the Event payload source + a gate cond)
+//   n1 = kConst 1              -- the "one" used to flip the toggle
+//   n2 = kDelay(a=n4)          -- the PREVIOUS-tick parity (the feedback lag)
+//   n3 = kConst 0              -- (a spare const; keeps the layout fixed / a known-zero predicate source)
+//   n4 = Sub(n1, n2) = 1 - prevParity  -- THE PARITY TOGGLE (1 on even ticks, 0 on odd ticks)
+//   n5 = n0 via Max(n0,n3)=Max(input,0) -- the GATE condition = the input (>0 when input>0, 0 when input 0)
+// Predicates used by the exec graph: parity = n4 (Branch), gateCond = n5 (Gate), payloadSrc = n0 (Event).
+inline Graph MakeShowcaseControlData() {
+    Graph g;
+    g.nodes.resize(6);
+    g.nodes[0] = Node{ kInput, /*a=*/0, /*b=*/0, /*c=*/0, /*const=*/0 };  // input index 0
+    g.nodes[1] = Node{ kConst, /*a=*/1, /*b=*/1, /*c=*/1, /*const=*/1 };  // one
+    g.nodes[2] = Node{ kDelay, /*a=*/4, /*b=*/2, /*c=*/2, /*const=*/0 };  // prev parity (Delay of n4)
+    g.nodes[3] = Node{ kConst, /*a=*/3, /*b=*/3, /*c=*/3, /*const=*/0 };  // zero
+    g.nodes[4] = Node{ kSub,   /*a=*/1, /*b=*/2, /*c=*/4, /*const=*/0 };  // 1 - prevParity = THE TOGGLE
+    g.nodes[5] = Node{ kMax,   /*a=*/0, /*b=*/3, /*c=*/5, /*const=*/0 };  // Max(input,0) = gate condition
+    return g;
+}
+
+// Event id tags (FIXED forever — part of the wire contract / the pinned trace).
+enum FlowEventId : uint32_t {
+    kEvTrue  = 100,   // the eBranch TRUE pin's event (fires on EVEN ticks, parity n4 != 0)
+    kEvFalse = 101,   // the eBranch FALSE pin's event (fires on ODD ticks, parity n4 == 0)
+    kEvGate  = 200,   // the eGate's event (fires ONLY when the gate cond n5 != 0, i.e. input > 0)
+    kEvSeqA  = 300,   // the trailing eSeq's FIRST event (fixed-order proof: A before B)
+    kEvSeqB  = 301,   // the trailing eSeq's SECOND event
+};
+
+// MakeShowcaseExecGraph: a FIXED exec graph over MakeShowcaseControlData() exercising EVERY ExecKind and
+// producing a non-trivial per-tick event trace. The shape (indices into nodes[]):
+//
+//   [0] entry eSeq  -> next {1, 4}      : fire the Branch sub-tree (1), THEN the Gate (4), in THIS order
+//   [1] eBranch(pred=n4 parity) -> next {2, 3}  : TRUE pin [2] on even ticks, FALSE pin [3] on odd ticks
+//   [2] eEvent(kEvTrue,  payload=n0)    : the TRUE event   (no successor)
+//   [3] eEvent(kEvFalse, payload=n0)    : the FALSE event  (no successor)
+//   [4] eGate(pred=n5 gateCond) -> next {5}     : OPEN only when input>0 (n5 != 0)
+//   [5] eSeq -> next {6, 7}             : fire TWO events in FIXED order A-then-B (the order proof)
+//   [6] eEvent(kEvGate, payload=n0)     : behind the gate -> the gate's event (== kEvSeqA position? no:
+//                                          [6] is kEvGate, the first of the eSeq pair)
+//   [7] eEvent(kEvSeqB, payload=n0)     : the second of the eSeq pair
+//
+// Per-tick trace logic (input from MakeControlInputStream):
+//   - EVEN tick (parity n4==1): Branch fires [2]=kEvTrue.  ODD tick (parity 0): Branch fires [3]=kEvFalse.
+//   - Gate [4] opens iff input>0 -> then eSeq [5] fires [6]=kEvGate THEN [7]=kEvSeqB (A-before-B order).
+//     If input==0 the gate is CLOSED -> NEITHER kEvGate nor kEvSeqB fires that tick (the gate proof).
+// So a typical even+input>0 tick trace = [kEvTrue(payload=input), kEvGate(input), kEvSeqB(input)] in THAT
+// exec order; an odd+input>0 tick = [kEvFalse, kEvGate, kEvSeqB]; an input==0 tick drops the last two.
+inline ExecGraph MakeShowcaseExecGraph() {
+    ExecGraph eg;
+    eg.nodes.resize(8);
+    eg.entry = 0;
+
+    eg.nodes[0] = ExecNode{ eSeq,    /*pred=*/0, /*eventId=*/0,        /*next=*/{1u, 4u} };  // entry
+    eg.nodes[1] = ExecNode{ eBranch, /*pred=*/4, /*eventId=*/0,        /*next=*/{2u, 3u} };  // on parity n4
+    eg.nodes[2] = ExecNode{ eEvent,  /*pred=*/0, /*eventId=*/kEvTrue,  /*next=*/{} };        // TRUE event
+    eg.nodes[3] = ExecNode{ eEvent,  /*pred=*/0, /*eventId=*/kEvFalse, /*next=*/{} };        // FALSE event
+    eg.nodes[4] = ExecNode{ eGate,   /*pred=*/5, /*eventId=*/0,        /*next=*/{5u} };       // on gateCond n5
+    eg.nodes[5] = ExecNode{ eSeq,    /*pred=*/0, /*eventId=*/0,        /*next=*/{6u, 7u} };  // fixed-order pair
+    eg.nodes[6] = ExecNode{ eEvent,  /*pred=*/0, /*eventId=*/kEvGate,  /*next=*/{} };        // pair A (gated)
+    eg.nodes[7] = ExecNode{ eEvent,  /*pred=*/0, /*eventId=*/kEvSeqB,  /*next=*/{} };        // pair B (gated)
+
+    return eg;
+}
+
+// MakeControlInputStream: a FIXED 8-tick single-channel input stream (index 0). The input doubles as the
+// Event PAYLOAD source (n0) AND the gate condition (n5=Max(input,0)). Tick 3 and tick 6 carry input 0 ->
+// the gate CLOSES those ticks (the gate-blocks proof); the other ticks carry input>0 -> the gate opens.
+inline std::vector<std::vector<Reg>> MakeControlInputStream() {
+    return {
+        { 5 },   // tick 0  even, input 5  -> Branch TRUE,  gate OPEN  (payload 5)
+        { 2 },   // tick 1  odd,  input 2  -> Branch FALSE, gate OPEN
+        { 7 },   // tick 2  even, input 7  -> Branch TRUE,  gate OPEN
+        { 0 },   // tick 3  odd,  input 0  -> Branch FALSE, gate CLOSED (gate proof)
+        { 3 },   // tick 4  even, input 3  -> Branch TRUE,  gate OPEN
+        { 9 },   // tick 5  odd,  input 9  -> Branch FALSE, gate OPEN
+        { 0 },   // tick 6  even, input 0  -> Branch TRUE,  gate CLOSED (gate proof)
+        { 4 },   // tick 7  odd,  input 4  -> Branch FALSE, gate OPEN
+    };
+}
+
 }  // namespace hf::flow
