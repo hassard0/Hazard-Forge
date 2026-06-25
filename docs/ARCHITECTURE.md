@@ -1545,6 +1545,64 @@ and Mac clang — **no render-bake**; only the optional S6 capstone crosses into
 
 ---
 
+## Visual-Scripting Runtime — deterministic node-graph VM (`engine/flow/flow.h`, namespace `hf::flow`) — issue #24
+
+Slices S1–S5 add a **deterministic node-graph execution VM** — the runtime a Blueprint-class visual
+scripting system would drive (the visual *editor* is out of scope; this is the engine that evaluates the
+graph). The moat is the sharpest UE5 contrast in the engine: UE5 Blueprints are *the* canonical
+non-deterministic UE5 subsystem — event/exec order depends on actor registration, tick groups, `TMap`
+iteration, float math, and per-frame timing, so two machines running the same graph on the same inputs
+routinely diverge (which is exactly why UE5's deterministic-rollback path *excludes* Blueprints). Here a
+graph's evaluation is **bit-identical across MSVC/clang/Vulkan/Metal and lockstep/rollback/replay-able** —
+a capability UE5 structurally lacks. `flow.h` is header-only and **fully self-contained** (only
+`<cstddef>`/`<cstdint>`/`<vector>` + the self-contained `net/session.h`); the whole VM is strict integer —
+**no RHI / no shader / no GPU / no float / no clock / no RNG** — so every golden is a pinned FNV-1a-64
+`DigestBytes` proven identical under MSVC, Windows clang, and Mac clang, **no render-bake**. The crux
+throughout is FIXED ordering (canonical topological order via a lowest-id ascending scan; pinned exec
+traversal; sorted-not-hashed everything) — the same discipline as `wfc`/`econ`.
+
+- **Graph model + canonical topological order + integer eval (S1).** `Node{kind, a/b/c inputs, constArg}` /
+  `Graph` + an arithmetic/select node set (Const/Add/Sub/Mul/Min/Max/Select) evaluated in a CANONICAL topo
+  order (Kahn's algorithm taking the lowest ready `NodeId` via an ascending scan — never insertion/hash
+  order). **Proof:** a pinned `DigestGraph` over the evaluated register file; a cyclic graph is a
+  deterministic rejection (no UB); and — the central determinism proof — a permuted-but-equivalent graph
+  evaluates to the SAME digest (the topo order is canonical, independent of array layout).
+- **Stateful nodes + the per-tick step (S2).** A persistent `GraphState` register file + stateful nodes
+  (`kInput`/`kCounter`/`kDelay`/`kLatch`) driven by `StepGraph(graph, state, inputs, tick)` — the signature
+  `net::Session::Advance`'s `StepFn` templates over. The key insight: stateful nodes read PREVIOUS state
+  (an `EdgeMask` excludes them from current-tick topo edges), so **feedback loops** (`acc = Add(input,
+  Delay(acc))`) work without a topological cycle. **Proof:** a pinned per-tick `DigestTrace`; the feedback
+  accumulator is correct; counter/delay/latch behave deterministically.
+- **Control flow + events — the Blueprint exec wire (S3).** An exec layer (Branch / Sequence / Gate /
+  Event) traversed from an entry in a PINNED order, reading predicates from the data register file —
+  Blueprint's white execution pin made deterministic. **Proof:** a pinned per-tick event-trace digest; the
+  Branch fires only the taken pin, the Sequence fires its successors in fixed order, the Gate blocks
+  correctly, and the traversal is bounded (a contrived exec loop terminates deterministically, never hangs).
+- **Lockstep / replay composition — the moat payoff (S4).** A `flow::Graph` is a pure `(state, inputs) ->
+  state'`, so it drops straight into `net::RunLockstep` / `DigestTrace` as the `StepFn` (World =
+  `GraphState`, Input = `Reg`) with ZERO new netcode. **Proof:** the graph-driven `RunLockstep` reproduces a
+  pinned digest (a peer re-derives the script from inputs alone); two peers have identical `DigestTrace` at
+  every tick; the Session-driven eval equals the direct eval tick-for-tick (the graph IS a valid `StepFn`);
+  replay-stable; a one-tick input divergence is located at the exact tick by `net::DesyncDetector`.
+- **Rollback + serialization (S5, the netcode-grade capstone).** A 2-channel graph (`kInput[0]` = local,
+  `kInput[1]` = remote) driven through `net::RollbackSession` + a `ScriptedTransport`: a mispredicted remote
+  input rolls the graph state back to the BIT-IDENTICAL authority. Plus hand-LE `SerializeGraph`/
+  `DeserializeGraph` (the `replay.h` discipline — never a host-struct memcpy) so a graph round-trips
+  byte-identically — a savable visual script (a save game / a multiplayer-sync delta). **Proof:** the
+  rolled-back state == the authority (with `didRollback` fired, converging even under delay/reorder/resend);
+  snapshot completeness (a deliberately incomplete restore DIVERGES — every stateful slot is captured); the
+  serialized-graph hash is pinned + a loaded graph evaluates identically. **The deterministic visual-scripting
+  RUNTIME is complete** — a visual script two peers re-derive bit-identically and roll back/replay through
+  the existing netcode engine, which UE5's non-deterministic Blueprints cannot do. Honest scope: the visual
+  EDITOR (drag-and-drop canvas, node palette, wire-drawing) is OUT of scope — this is the runtime the editor
+  would drive (graphs are authored programmatically / via the serialized format). The node set is integer/
+  Q16.16 only (no float/transcendental nodes — they would forfeit cross-platform identity); v1 is a DAG +
+  exec layer evaluated once per tick (no loops-with-arbitrary-iteration, no recursion, no dynamic node
+  creation); registers are integer + exec pins only (no strings/arrays/structs-on-wires). An optional float
+  render capstone (a graph driving a lit scene) was deliberately skipped — the moat is fully the integer VM.
+
+---
+
 ## Material / Shader Graph Layer (`engine/material/`)
 
 Phase 4 adds a **data-driven material system** that authors shaders as node graphs instead of hand-written HLSL, while preserving the "shaders are generated, not hand-written" and golden-stability invariants. It is pure host logic above the seam — no `vk*`/`MTL*`/`Backend` symbols — and is split into five concerns plus a build-time tool:
