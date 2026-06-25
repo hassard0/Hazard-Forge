@@ -610,4 +610,157 @@ inline std::vector<CompileJob> MakeShowcaseJobsReordered() {
     return jobs;
 }
 
+// =========================================================================================================
+// Slice ASSET-S6 — Hot-reload watch + incremental recompile capstone (issue #16). APPEND-ONLY below S5;
+// S1's key 0x7fb6a48b4b99f1b7, S2's artifact 0xf7ee13c169dc0464, S3's cache 0x029174f13e64c9f1, S4's
+// rebuild 0x0808b56e0322d8c1, and S5's manifest 0x37ca56d9da205682 + trace 0xcfbe58567fb8fa07 are UNCHANGED.
+// The LIVE capstone: a self-contained NodeId-keyed AssetWatcher (the SAME mtime-increase logic as
+// runtime::FileWatcher, but keyed by the stable integer NodeId, NOT a path string — so the header stays the
+// one pure standalone-clang-compilable file, NO <string>/<functional>, NO runtime/hot_reload.h, NO
+// ecs/scene coupling). HotReload polls the watcher, computes the S4 InvalidationSet for the changed nodes,
+// RebuildOrders it, recompiles ONLY the dirty nodes (the rest stay S3 cache hits), then rebuilds the FULL
+// S5 manifest over all sources' current artifact digests.
+//
+// THE S1 INVARIANT RESTATED: mtime is the TRIGGER ONLY — it decides WHAT to recompile; it NEVER enters a
+// key, an artifact, or any pinned digest. The post-reload manifest digest is over {NodeId, artifactDigest}
+// (no mtime). `currentMtimes` is INJECTED (the in-memory "filesystem") — NO real std::filesystem, NO clock.
+// =========================================================================================================
+
+// --- The NodeId-keyed watcher (self-contained — the FileWatcher mtime-increase logic, integer-keyed) ------
+struct AssetWatcher {
+    std::vector<std::pair<NodeId, int64_t>> seen;   // last-observed mtime per NodeId, SORTED-UNIQUE by NodeId
+};
+
+// Record the baseline mtime for `node` (so the next PollChanged does NOT report it as changed). Sorted-unique
+// upsert (the InsertSortedUnique binary-search pattern). mtime is an opaque monotonic integer (the injected
+// "filesystem" clock) — NEVER the artifact key.
+inline void WatchAsset(AssetWatcher& w, NodeId node, int64_t mtime) {
+    std::size_t lo = 0, hi = w.seen.size();
+    while (lo < hi) { std::size_t mid = (lo + hi) / 2; if (w.seen[mid].first < node) lo = mid + 1; else hi = mid; }
+    if (lo < w.seen.size() && w.seen[lo].first == node) { w.seen[lo].second = mtime; return; }  // overwrite
+    w.seen.insert(w.seen.begin() + (std::ptrdiff_t)lo, std::pair<NodeId, int64_t>{ node, mtime });
+}
+
+// Return the NodeIds whose CURRENT mtime is GREATER than the last seen (or newly present) — i.e. edited —
+// SORTED ASCENDING, and UPDATE `seen` to the current values. `current` is the injected mtime table (the
+// test's in-memory "filesystem"; need NOT be sorted). A change is a mtime INCREASE (the runtime::FileWatcher
+// semantics). Hand binary search for the last-seen mtime; NO <algorithm>.
+inline std::vector<NodeId> PollChanged(AssetWatcher& w, const std::vector<std::pair<NodeId, int64_t>>& current) {
+    std::vector<NodeId> changed;   // collected in `current` order, then sorted-unique below
+    for (std::size_t i = 0; i < current.size(); ++i) {
+        const NodeId node = current[i].first;
+        const int64_t mtime = current[i].second;
+        // binary-search `seen` for this node's last-observed mtime.
+        std::size_t lo = 0, hi = w.seen.size();
+        while (lo < hi) { std::size_t mid = (lo + hi) / 2; if (w.seen[mid].first < node) lo = mid + 1; else hi = mid; }
+        const bool present = (lo < w.seen.size() && w.seen[lo].first == node);
+        if (!present || mtime > w.seen[lo].second) {
+            InsertSortedUniqueDep(changed, node);   // sorted-unique ascending NodeId
+            WatchAsset(w, node, mtime);             // update seen to the current value
+        }
+    }
+    return changed;
+}
+
+// --- HotReload — one reload pass (watch -> invalidate -> recompile dirty -> full manifest) ----------------
+struct ReloadBatch {
+    std::vector<NodeId> recompiled;        // the dirty set actually recompiled, in topo (RebuildOrder) order
+    CacheKey            manifestDigest = 0; // the post-reload manifest digest (the whole build's new state)
+    bool                ok = true;          // false on a dependency cycle (RebuildOrder failure)
+};
+
+// Find a source CompileJob by NodeId (linear scan — `sources` is a tiny fixed list). nullptr if absent.
+inline const CompileJob* SourceForNode(const std::vector<CompileJob>& sources, NodeId node) {
+    for (std::size_t i = 0; i < sources.size(); ++i) if (sources[i].node == node) return &sources[i];
+    return nullptr;
+}
+
+// One reload pass: PollChanged the watcher for edits; union the S4 InvalidationSet (changed + transitive
+// dependents) for each changed node; RebuildOrder it (ok=false on a cycle); GetOrCompile each dirty node from
+// its CURRENT source bytes into `cache` (the dirty ones miss+recompile, everything else stays a hit); then
+// build the FULL manifest over ALL sources (UpsertManifest(node, DigestArtifact(GetOrCompile(cache,src).blob))
+// so an unchanged node still contributes its unchanged digest). Deterministic of (watcher state, cache,
+// graph, sources, currentMtimes) alone. mtime NEVER enters the manifest digest.
+inline ReloadBatch HotReload(AssetWatcher& w, AssetCache& cache, const DepGraph& g,
+                             const std::vector<CompileJob>& sources,
+                             const std::vector<std::pair<NodeId, int64_t>>& currentMtimes) {
+    ReloadBatch out;
+    const std::vector<NodeId> changed = PollChanged(w, currentMtimes);
+    // union the InvalidationSet of every changed node (sorted-unique).
+    std::vector<NodeId> invalidation;
+    for (std::size_t c = 0; c < changed.size(); ++c) {
+        const std::vector<NodeId> inv = InvalidationSet(g, changed[c]);
+        for (std::size_t i = 0; i < inv.size(); ++i) InsertSortedUniqueDep(invalidation, inv[i]);
+    }
+    const OrderResult ord = RebuildOrder(g, invalidation);
+    if (!ord.ok) { out.ok = false; return out; }
+    out.recompiled = ord.order;
+    // recompile each dirty node from its current source (miss -> CompileObj + Insert).
+    for (std::size_t i = 0; i < out.recompiled.size(); ++i) {
+        const CompileJob* src = SourceForNode(sources, out.recompiled[i]);
+        if (src) GetOrCompile(cache, src->bytes, src->n, src->params);
+    }
+    // build the FULL manifest over ALL sources' current artifact digests (cache hits for the unchanged ones).
+    Manifest m;
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+        const CompileJob& src = sources[i];
+        const CompileResult r = GetOrCompile(cache, src.bytes, src.n, src.params);
+        UpsertManifest(m, src.node, DigestArtifact(r.blob));
+    }
+    out.manifestDigest = ManifestDigest(m);
+    return out;
+}
+
+// --- Fixtures (FIXED forever — the golden pins the post-reload manifest) ----------------------------------
+// Node 0's EDITED content — a DIFFERENT OBJ from ShowcaseRawBytes() (a moved apex), used to simulate an edit.
+// Keep FIXED forever.
+inline const char* ShowcaseRawBytesEdited() {
+    return "hf-asset-fixture-v1-edited\nv 0 0 0\nv 1 0 0\nv 0 2 0\nf 1 2 3\n";
+}
+inline std::size_t ShowcaseRawLenEdited() {
+    const char* s = ShowcaseRawBytesEdited();
+    std::size_t n = 0;
+    while (s[n] != '\0') ++n;        // no <cstring>; count bytes (excludes the NUL terminator)
+    return n;
+}
+
+// A fixed small graph over the 3 source nodes: 0 and 1 meshes, 2 depends on {0, 1}. So editing mesh 0
+// invalidates {0, 2}; mesh 1 stays a cache hit. Keep FIXED.
+inline DepGraph MakeHotReloadGraph() {
+    DepGraph g;
+    AddNode(g, 0);    // mesh
+    AddNode(g, 1);    // mesh
+    AddDep(g, 2, 0);  // node 2 depends on mesh 0
+    AddDep(g, 2, 1);  // node 2 depends on mesh 1
+    return g;
+}
+
+// The baseline source set (all 3 nodes UNedited) + the baseline mtimes (all at 100). FIXED.
+inline std::vector<CompileJob> MakeHotReloadSourcesBaseline() {
+    std::vector<CompileJob> s;
+    s.push_back(CompileJob{ 0, ShowcaseRawBytes(),  ShowcaseRawLen(),  ShowcaseParams() });
+    s.push_back(CompileJob{ 1, ShowcaseRawBytesB(), ShowcaseRawLenB(), ShowcaseParams() });
+    s.push_back(CompileJob{ 2, ShowcaseRawBytesC(), ShowcaseRawLenC(), ShowcaseParams() });
+    return s;
+}
+
+// The EDITED source set — node 0's bytes swapped to ShowcaseRawBytesEdited() (1 and 2 unchanged). FIXED.
+inline std::vector<CompileJob> MakeHotReloadSourcesEdited() {
+    std::vector<CompileJob> s;
+    s.push_back(CompileJob{ 0, ShowcaseRawBytesEdited(), ShowcaseRawLenEdited(), ShowcaseParams() });
+    s.push_back(CompileJob{ 1, ShowcaseRawBytesB(),      ShowcaseRawLenB(),      ShowcaseParams() });
+    s.push_back(CompileJob{ 2, ShowcaseRawBytesC(),      ShowcaseRawLenC(),      ShowcaseParams() });
+    return s;
+}
+
+// The baseline mtime table (all 3 nodes at 100). FIXED.
+inline std::vector<std::pair<NodeId, int64_t>> MakeHotReloadMtimesBaseline() {
+    return std::vector<std::pair<NodeId, int64_t>>{ { 0, 100 }, { 1, 100 }, { 2, 100 } };
+}
+
+// The edited mtime table (node 0 bumped to 101, 1 and 2 unchanged at 100). FIXED.
+inline std::vector<std::pair<NodeId, int64_t>> MakeHotReloadMtimesEdited() {
+    return std::vector<std::pair<NodeId, int64_t>>{ { 0, 101 }, { 1, 100 }, { 2, 100 } };
+}
+
 }  // namespace hf::asset

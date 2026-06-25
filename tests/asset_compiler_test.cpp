@@ -384,6 +384,96 @@ int main() {
               "asset-s5: two RunLockstep runs over the same ring yield the IDENTICAL final digest (deterministic build)");
     }
 
+    // =====================================================================================================
+    // Slice ASSET-S6 — Hot-reload watch + incremental recompile capstone. A NodeId-keyed AssetWatcher detects
+    // an edited input (a mtime INCREASE), HotReload computes the S4 InvalidationSet, recompiles ONLY the dirty
+    // nodes (the rest stay S3 hits), and rebuilds the full S5 manifest. mtime is the TRIGGER only — the
+    // post-reload manifest digest is over {NodeId, artifactDigest}, never mtime.
+    // =====================================================================================================
+
+    const DepGraph hrGraph = MakeHotReloadGraph();
+
+    // Pre-edit baseline: watch all 3 nodes at mtime 100, compile the baseline sources into a cache, capture
+    // the pre-edit manifest digest.
+    AssetWatcher hrWatcher;
+    {
+        const std::vector<std::pair<NodeId, int64_t>> base = MakeHotReloadMtimesBaseline();
+        for (std::size_t i = 0; i < base.size(); ++i) WatchAsset(hrWatcher, base[i].first, base[i].second);
+    }
+    AssetCache hrCache;
+    const Manifest hrPreManifest = CompileSet(MakeHotReloadSourcesBaseline(), hrCache);
+    const CacheKey hrPreDigest = ManifestDigest(hrPreManifest);
+
+    // The reload: swap node 0's bytes (edited) + bump its mtime to 101, then HotReload.
+    const ReloadBatch reload = HotReload(hrWatcher, hrCache, hrGraph,
+                                         MakeHotReloadSourcesEdited(), MakeHotReloadMtimesEdited());
+    std::printf("asset-s6: post-reload manifest digest = 0x%016llx  recompiled = [",
+                (unsigned long long)reload.manifestDigest);
+    for (std::size_t i = 0; i < reload.recompiled.size(); ++i)
+        std::printf("%s%u", i ? ", " : "", reload.recompiled[i]);
+    std::printf("]\n");
+
+    // (S6-1) PRIOR INVARIANT — all S1–S5 digests STILL pinned (S6 is additive).
+    check(key == 0x7fb6a48b4b99f1b7ULL && artifact == 0xf7ee13c169dc0464ULL &&
+          cacheDigest == 0x029174f13e64c9f1ULL && rb0.digest == 0x0808b56e0322d8c1ULL &&
+          manifestDigest == 0x37ca56d9da205682ULL && traceDigest == 0xcfbe58567fb8fa07ULL,
+          "asset-s6: S1 0x7fb6a48b4b99f1b7 + S2 0xf7ee13c169dc0464 + S3 0x029174f13e64c9f1 + S4 0x0808b56e0322d8c1 + S5 manifest 0x37ca56d9da205682 + trace 0xcfbe58567fb8fa07 UNCHANGED (S6 additive)");
+
+    // (S6-2) NO SPURIOUS RELOAD — a just-baselined watcher polled with the SAME mtimes reports nothing.
+    {
+        AssetWatcher w;
+        const std::vector<std::pair<NodeId, int64_t>> base = MakeHotReloadMtimesBaseline();
+        for (std::size_t i = 0; i < base.size(); ++i) WatchAsset(w, base[i].first, base[i].second);
+        const std::vector<NodeId> none = PollChanged(w, base);   // same mtimes -> no change
+        check(none.empty(),
+              "asset-s6: a no-edit PollChanged after WatchAsset reports nothing (no spurious reload)");
+    }
+
+    // (S6-3) DIRTY SET — editing mesh 0 (bump mtime + swap bytes) recompiles exactly {0, 2} in topo order.
+    {
+        const bool ok = (reload.ok && reload.recompiled == std::vector<NodeId>{ 0, 2 });
+        check(ok, "asset-s6: editing mesh 0 (bump mtime + swap bytes) recompiles exactly {0, 2} in topo order");
+    }
+
+    // (S6-4) RELOAD == COLD — node 0's reloaded artifact == DigestArtifact(CompileObj(edited bytes)).
+    {
+        const CacheKey coldEdited =
+            DigestArtifact(CompileObj(ShowcaseRawBytesEdited(), ShowcaseRawLenEdited(), ShowcaseParams()));
+        const CacheKey key0 = MakeKey((uint32_t)AssetKind::Mesh,
+                                      HashRawAsset(ShowcaseRawBytesEdited(), ShowcaseRawLenEdited()),
+                                      HashParams(ShowcaseParams()));
+        const std::vector<uint8_t>* reloaded = Lookup(hrCache, key0);
+        const bool ok = reloaded && DigestArtifact(*reloaded) == coldEdited;
+        check(ok, "asset-s6: reload == cold compile — node 0's reloaded artifact digest == DigestArtifact(CompileObj(edited))");
+    }
+
+    // (S6-5) UNCHANGED HIT — node 1 is NOT recompiled (it stays a cache hit).
+    {
+        bool node1Recompiled = false;
+        for (std::size_t i = 0; i < reload.recompiled.size(); ++i)
+            if (reload.recompiled[i] == 1) { node1Recompiled = true; break; }
+        check(!node1Recompiled, "asset-s6: the unchanged mesh 1 is NOT recompiled (it stays a cache hit)");
+    }
+
+    // (S6-6) PINNED POST-RELOAD MANIFEST — the digest == the hard-pinned uint64, and DIFFERS from the pre-edit.
+    const CacheKey kPinnedReload = 0x08d873cf22c28cbfULL;
+    check(reload.manifestDigest == kPinnedReload && reload.manifestDigest != hrPreDigest,
+          "asset-s6: the post-reload manifest digest == pinned uint64 (and differs from the pre-edit manifest)");
+
+    // (S6-7) DETERMINISTIC — two reloads from the same edited state (fresh watcher/cache each) -> identical.
+    {
+        AssetWatcher wa, wb;
+        const std::vector<std::pair<NodeId, int64_t>> base = MakeHotReloadMtimesBaseline();
+        for (std::size_t i = 0; i < base.size(); ++i) { WatchAsset(wa, base[i].first, base[i].second); WatchAsset(wb, base[i].first, base[i].second); }
+        AssetCache ca, cb;
+        CompileSet(MakeHotReloadSourcesBaseline(), ca);
+        CompileSet(MakeHotReloadSourcesBaseline(), cb);
+        const ReloadBatch ra = HotReload(wa, ca, hrGraph, MakeHotReloadSourcesEdited(), MakeHotReloadMtimesEdited());
+        const ReloadBatch rb = HotReload(wb, cb, hrGraph, MakeHotReloadSourcesEdited(), MakeHotReloadMtimesEdited());
+        check(ra.manifestDigest == rb.manifestDigest && ra.recompiled == rb.recompiled,
+              "asset-s6: HotReload is deterministic — two reloads from the same edited state are identical");
+    }
+
     if (g_fail == 0) std::printf("asset_compiler_test: ALL PASS\n");
     else             std::printf("asset_compiler_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
