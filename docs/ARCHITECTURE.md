@@ -1802,6 +1802,78 @@ Slices SEQ-S1–SEQ-S6 add a **cinematic sequencer** — the timeline-evaluation
 - **Lockstep / replay / SCRUB via net::Session — the moat headline (Slice SEQ-S5).** The whole timeline wraps as a `net::Session` `StepFn`: the `World` is a flat, value-copyable `SeqPlayhead{time, bus}` (so `net::Session`'s value-copy snapshot is **complete by construction** — the `verdict.h` completeness discipline), `StepPlayhead` advances `time` by the summed per-tick input deltas and resamples the bus, `DigestPlayhead` is the hand-LE `time + bus` digest. It composes `RunLockstep`/`DigestTrace`/`RollbackSession`/`RunWithTransport`/`ScriptedTransport`/`JoinSnapshot`/`CatchUp` **verbatim**. **Proof:** `RunLockstep` is deterministic; the final digest is pinned `0x9ec0eb2bfbb40dca`; the 90-tick `DigestTrace` digests to `0x7c63291062cf0ca7`; a `RollbackSession` over a delayed-mispredicted remote delta rolls back to the bit-identical authority (`0x5963d4a3c0282769`, `didRollback`); the value-copy snapshot is complete (an incomplete restore that zeroes `time` diverges). **The headline — SCRUB == SEEK:** `CatchUp(JoinSnapshot@tick S=45, toTick=90)` reaches the **bit-identical** world a from-tick-0 play reaches at 90 (full-digest equality, not a tolerance), and seeking to S reads the exact frame the from-0 playback shows there (`DigestPlayhead@S == trace[S−1]`). **Two machines scrubbing the same cutscene land on the identical frame, every bit — which mainstream float playback timing structurally cannot provide.**
 - **Lit 3D render — the cutscene money-shot (Slice SEQ-S6, render-only — `seq_render.h`).** The capstone: a hero `TransformTrack` sampled at 24 successive times → a **ghosted motion trail** that makes the keyframe interpolation visible (the sequencer's signature visual), each `FxTransform` turned into a float `math::Mat4` by `SeqTransformToMat4` (the `FxBodyTransform` pattern for a full TRS — the single host-float crossing, in a separate `seq_render.h` so `seq.h` stays `<cmath>`-free, the `econ_render.h` split) and drawn as **matte** lit instanced cubes (roughness 1.0, no sky-IBL iridescence — the GF6/FR6 lesson) through the **existing `lit_instanced` pipeline reused verbatim** (no new shader, no new RHI). The arc's one **float** slice (the visresolve-bar): Metal-baked golden, the bar is Metal-determinism (two-run BYTE-IDENTICAL) + provenance (the 24 instances derive from the bit-exact S1–S5 `SampleTransform` output, `instances == rebuild`) + visual parity, the cross-vendor delta the documented float baseline (**44.5/channel**, Windows-Vulkan real-GPU vs Mac-Metal). **Proof:** `{samples:24, instances:24}` provenance, two-render determinism, instances == rebuild, the empty no-op. Golden `seq_render` (the lit 3D cutscene motion-trail). **Completes flagship #25 — the twenty-fifth flagship.** **Honest scope:** the visual editor GUI is out of scope (runtime only); no float Bézier/cubic-spline keyframe handles (v1 is keyframe + selectable integer easing — the cubic is a later slice); rotation is nlerp, not true constant-velocity slerp; no track blending/layering or sample-accurate audio-DSP scheduling in v1.
 
+### Deterministic content-addressed asset pipeline (`engine/asset/asset_compiler.h`, namespace `hf::asset`) — flagship #16
+
+Slices ASSET-S1–S6 add the **asset compiler + hot-reload pipeline** — the layer above the loaders
+(`obj_loader.h`, `gltf_loader`) that turns raw assets into compiled artifacts with caching and incremental
+rebuild. The moat angle: the **same raw input always compiles to the byte-identical artifact on every
+compiler** (content-hash cache keys → deterministic compiled blobs → incremental rebuild that recompiles only
+what changed), so a build is reproducible and a cache is a true content address. **The load-bearing
+invariant: a cache key is content + params only — file mtime NEVER enters a key** (mtime is the recompile
+*trigger*, never an artifact's *identity*). The whole flagship is **one growing header-only self-contained
+file** (`<cstdint>/<cstddef>/<vector>` + `net/session.h` + the `obj_loader.h` it compiles), pure-integer on
+the bit-exact path (the single float op is an exact power-of-two Q16.16 quantization), with pinned
+`net::DigestBytes` goldens identical on MSVC/Windows-clang/Mac-clang and **NO render-bake** — the build *is*
+the determinism proof. Reuses `net::DigestBytes` + the `replay.h` hand-LE discipline + the `chunk_diff.h`
+sorted-vector content-addressed-store template + `ParseObj` + `net::Session`. **No new RHI**, no new
+dependency — the SIXTEENTH-issue flagship, complete (6/6).
+
+- **Content-addressed CacheKey (Slice ASSET-S1, beachhead).** `CacheKey` (an FNV-1a-64 content address) +
+  `AssetId{kind, contentHash, paramHash}` + `HashRawAsset` (FNV over the raw bytes) + `HashParams`
+  (hand-LE-serialize integer/Q16.16 options — NO float in the key) + `MakeKey` (hand-LE the triple → FNV).
+  **Proof:** the showcase key is pinned `0x7fb6a48b4b99f1b7`; reproducible from the same inputs; a flipped
+  content byte / a changed param / a different kind each changes the key; the key is pointer- and
+  timestamp-independent (the content-addressed property). **The invariant** — mtime never enters the key — is
+  bannered in the header.
+- **Deterministic compiled-artifact format (Slice ASSET-S2).** `CompileObj` runs `ParseObj` then serializes a
+  canonical, versioned, hand-LE blob whose geometry is **quantized to Q16.16 integers** (NOT raw float bits).
+  The cross-compiler trick: `FxQuantize(f) = (int32)(f * 65536.0f)` is **exact** because 65536 is a power of
+  two (the multiply only shifts the exponent — no rounding/FMA ambiguity), so the artifact is byte-identical
+  on every compiler. `DecodeCompiledMesh` round-trips; `DigestArtifact` hashes the blob. **Proof:** the
+  artifact digest is pinned `0xf7ee13c169dc0464` (140 bytes) and **verified identical MSVC vs clang** (the
+  quantization is exact); the round-trip recovers vertices/indices; a changed param/content changes the
+  digest; `(1,0,0)` at scale 2.0 decodes to the exact integer `131072`. (v1 applies the import `scale`
+  geometrically; `recomputeNormals`/`tangentMode` are recorded in the header — load-bearing on the digest —
+  but their geometry effect is a documented deferred refinement.)
+- **The content-addressed cache (Slice ASSET-S3).** `AssetCache` is a sorted-unique-by-key vector (binary
+  search, no `unordered_map` — the `ChunkDiffStore` mold) with `Lookup`/`Insert`/`GetOrCompile`
+  (compile-on-miss) + hand-LE `SerializeCache`/`DeserializeCache`/`DigestCache`. **Proof:** the cache digest
+  is pinned `0x029174f13e64c9f1`; a cold compile misses and a second is a hit with a **byte-identical** blob
+  (no `wasHit` leak — the flag is never serialized); the serialize round-trips; and the digest is
+  **independent of insertion order** (insert A,B,C vs C,B,A → same digest — two machines that compiled the
+  same assets in any order get the byte-identical cache).
+- **Dependency graph + incremental rebuild (Slice ASSET-S4).** A stable logical `NodeId` (distinct from the
+  content-address — a node's content hash changes on edit, but its graph identity persists) + a `DepGraph`
+  (sorted adjacency) + `InvalidationSet` (a node + its transitive **dependents**, by reverse reachability) +
+  `RebuildOrder` (a hand Kahn topological sort, lowest-id ascending-scan, dependencies before dependents,
+  cycle → `ok=false` with no hang) + `Rebuild` (the ordered recompile plan + digest). **Proof:** changing
+  mesh 0 invalidates exactly `{0, 2}` (the mesh + the scene depending on it) — recompiling **2 nodes, not all
+  6** (the incrementality headline); a shared mesh hits both scenes `{1, 2, 5}`; the order is topological; a
+  cyclic graph returns `ok=false`; the rebuild plan is pinned `0x0808b56e0322d8c1`.
+- **Manifest / batch compile — the build as a lockstep replay (Slice ASSET-S5).** A batch compile produces a
+  sorted `Manifest{NodeId → artifactDigest}`, and the build step IS a `net::Session` `StepFn` (`World =
+  Manifest`, `Input = CompileJob`), so `RunLockstep`/`DigestTrace` make the build **literally a deterministic
+  replay** — the same job stream yields the same per-tick trace and the same manifest, in any submit order.
+  **Proof:** the manifest digest is pinned `0x37ca56d9da205682` and the per-tick build trace `0xcfbe58567fb8fa07`;
+  the lockstep build reaches the same manifest as the plain batch (`RunLockstep final == CompileSet
+  ManifestDigest`); two submit orders yield the identical manifest; two runs are bit-identical. **The build is
+  reproducible — a pinned golden, like playback being a replay.**
+- **Hot-reload watch + incremental recompile (Slice ASSET-S6, capstone).** A self-contained, `NodeId`-keyed
+  `AssetWatcher` (the `runtime::FileWatcher` mtime-increase logic, but integer-keyed so the asset pipeline
+  stays decoupled from the ecs/scene-coupled runtime watcher and the header stays pure) + `HotReload`: poll
+  for edits → the S4 `InvalidationSet` → recompile only the dirty set into the S3 cache → the new manifest.
+  **Proof:** a just-baselined watcher reports no change; editing mesh 0 recompiles exactly `{0, 2}` in topo
+  order while the unchanged mesh 1 stays a cache hit; the **reloaded artifact is byte-identical to a cold
+  compile** of the edited bytes (`reload == cold compile`); the post-reload manifest is pinned
+  `0x08d873cf22c28cbf` and differs from the pre-edit manifest; two reloads from the same edited state are
+  identical. mtime drives *what* recompiles but never enters the artifact or any digest (the injected
+  in-memory stat — no real filesystem, no clock). **Completes flagship #16 — the sixteenth-issue flagship.**
+  **Honest scope:** OBJ-only compilation in v1 (textures/audio are opaque content-hashed passthrough — real
+  transcoding needs a codec dep that would break self-containment); geometry is Q16.16-quantized (sub-quantum
+  precision dropped, the grid pinned in the blob version); no cache eviction/GC; the bit-exact tests use an
+  injected stat (real-FS watching is the live editor's `runtime::FileWatcher`); the optional `--asset-shot`
+  render was intentionally skipped (the value is the determinism, fully proven in the pure test).
+
 ### Simulated transport + client interpolation (`engine/net/transport.*`)
 
 Slice BU layers the **hard** part of networking on top of the BQ snapshot core — an **imperfect channel** and a **client jitter buffer with interpolation** — still **without any real sockets** (real UDP/TCP transport remains a future slice). Like `snapshot.*`, `transport.*` is **pure CPU above `engine/math` + `engine/net`** with **zero RHI/backend symbols**, compiled into both `hf_core` (ASan-scoped, unit-tested via `net_transport_test`) and `hf_engine` (the live `--netsim-shot` showcase).
