@@ -154,6 +154,11 @@ hf_add_pure_test(econ_test)
 # (not silently) when a glb REQUIRES a compression extension this build can't decode (Draco / meshopt) —
 # e.g. the three.js Ferrari. Synthetic inputs only (no device/cgltf/glb), so it stays a pure hf_core test.
 hf_add_pure_test(gltf_ext_test)
+# Deterministic chunk-diff layer (issue #41): the engine path for runtime world mutations (destroy/add/move)
+# that must survive chunk-streaming regeneration — "same world from (seed + diff log)" = save-game +
+# multiplayer-sync + undo. Content-addressed sorted storage (NOT unordered_*), so the diff hashes +
+# serializes byte-identically. Pure hf_core, identical MSVC + Windows-clang + Mac/clang.
+hf_add_pure_test(chunk_diff_test)
 # CPU particle / VFX emitter system (Slice CC): the authorable emitter (spawn rate, lifetime, init
 # velocity + spread, gravity, drag, size/color over life) simulated at a fixed timestep with a
 # fixed-seed integer LCG for the spread jitter (engine/vfx/particles.{h,cpp}) — DISTINCT from the
