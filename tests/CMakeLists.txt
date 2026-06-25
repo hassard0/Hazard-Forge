@@ -186,6 +186,19 @@ hf_add_pure_test(seq_test)
 # is the pinned hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols,
 # ASan-eligible.
 hf_add_pure_test(profile_test)
+# Slice PROFILE-S6 (FLAGSHIP #31 capstone): the LIVE ScopedZone capstone (engine/profile/profile_live.h).
+# A ScopedZone RAII helper measures REAL wall-clock time into the NON-golden timing OVERLAY while building
+# structure via the SAME S1 EmitEnter/EmitExit emitters — proving the structure-vs-timing split holds with
+# REAL measured timing (structure golden + deterministic; timing real + non-deterministic). The clock
+# crossing (<chrono>) is ISOLATED in profile_live.h (the seq_render.h precedent) so profile.h stays
+# <chrono>-free + standalone-clang-pure. Asserts the LIVE structural digest == the scripted
+# MakeShowcaseCapture digest (0xedc7791443141dfd), RAII provenance (live events == scripted events
+# field-for-field), real timing populated (a measured zone's cpuNanos > 0), STRUCTURE GOLDEN UNDER REAL
+# TIMING (two DIFFERENT-work runs -> the IDENTICAL structural digest), and the two runs' measured timings
+# recorded (the non-deterministic overlay, printed). The STRUCTURAL assertions are deterministic goldens;
+# the timing assertions are >0 liveness checks (NO assertion on timing values/differences/ordering —
+# non-flaky). Links hf_core (exercises real timing); ASan-eligible like the others.
+hf_add_pure_test(profile_live_test)
 # Slice SEQ-S6 — the cinematic-sequencer LIT 3D render-capstone bridge (engine/seq/seq_render.h, the
 # money-shot of FLAGSHIP #25). The cheap pre-bake CPU proof that the FLOAT render bridge faithfully +
 # deterministically carries the bit-exact Q16.16 transform timeline into render instances: 24-instance
