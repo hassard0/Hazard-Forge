@@ -169,6 +169,16 @@ hf_add_pure_test(flow_test)
 # re-maps references + keeps the graph evaluable. The golden is the pinned hash IN the test (NO image, NO
 # render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(flow_editor_test)
+# Profiler timeline VIEW data model (issue #31, the GUI half of Profiler + GPU debugger integration):
+# engine/editor/profiler_view_data.h lays a profile::Capture out as an Insights-class profiler view — a
+# TIMELINE row of frame cells (BuildFrameIndex, fixed stride), the BuildScopeTree hierarchy as INDENTED
+# cpu-time-PROPORTIONAL bars (depth -> X indent, pre-order -> Y, cpuNanos -> integer bar width over a FIXED
+# -timings capture), and per-pass DRAW-CALL rows (selfDrawCount). A pure, ImGui-free, backend-free VIEW whose
+# hand-LE FNV-1a-64 DigestProfilerView is bit-identical run-to-run AND MSVC-vs-Apple-clang. Asserts the frame
+# -cell count (4), the scope-row count + indent layout, the per-pass draw counts (2,2,5,1), the cpu
+# -proportional bar-width normalizer, the pinned view digest, and replay-stability. The golden is the pinned
+# hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(profiler_view_test)
 # Deterministic Q16.16 scalar keyframe track + integer lerp (Slice SEQ-S1, issue #25 — the
 # DETERMINISTIC CINEMATIC SEQUENCER beachhead): engine/seq/seq.h — a header-only, SELF-CONTAINED
 # (only <cstddef>/<cstdint>/<vector> + sim/fpx.h + net/session.h) timeline-evaluation core. A scalar
