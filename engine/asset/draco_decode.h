@@ -327,15 +327,20 @@ inline bool DecodeRawSymbols(ByteReader& r, uint32_t num_values, std::vector<uin
     return !r.error;
 }
 
+// Forward declaration: the TAGGED-symbol path (implemented in DR3 below, an allowed completion of the
+// DR2 stub -- the DR2 RAW/rABS digests are unaffected).
+inline bool DecodeTaggedSymbols(ByteReader& r, uint32_t num_values, uint32_t num_components,
+                                std::vector<uint32_t>& out);
+
 // ---- DecodeSymbols (spec verbatim) --------------------------------------------------------------
-// scheme UI8; kRawSymbols -> DecodeRawSymbols. kTaggedSymbols is a STUB returning false (DR3
-// implements the tagged path + the bit reader). num_components only matters for tagged.
-inline bool DecodeSymbols(ByteReader& r, uint32_t num_values, uint32_t /*num_components*/,
+// scheme UI8; kRawSymbols -> DecodeRawSymbols; kTaggedSymbols -> DecodeTaggedSymbols (DR3).
+// num_components only matters for the tagged path.
+inline bool DecodeSymbols(ByteReader& r, uint32_t num_values, uint32_t num_components,
                           std::vector<uint32_t>& out) {
     const uint8_t scheme = r.U8();
     if (r.error) return false;
     if (scheme == kTaggedSymbols) {
-        return false;  // DR3: DecodeTaggedSymbols + the bit reader
+        return DecodeTaggedSymbols(r, num_values, num_components, out);
     }
     if (scheme == kRawSymbols) {
         return DecodeRawSymbols(r, num_values, out);
@@ -367,6 +372,724 @@ inline uint8_t RabsDescRead(AnsDecoder& ans, uint32_t p0) {
         ans.state = x - xn - p;
     }
     return val;
+}
+
+// ================================ DR3 -- the bit reader + tagged-symbol completion ===============
+// APPEND-ONLY: nothing above this line changes. DR1's varint digest 0x2d4aaca6fd14312a and DR2's rANS
+// (0xbc91b8ba74fbf8b1) / rABS (0xb6efc1e48524ecd8) stay frozen. DR3 adds (a) a Draco bit reader
+// (LSB-first within each byte), (b) the deferred DecodeTaggedSymbols (completing the DR2 stub -- an
+// allowed completion, NOT a DR2 modification), and (c) the full edgebreaker connectivity decode.
+//
+// Implemented spec-driven, clean-room, from the published Draco spec (corner.md, connectivity.decoder.md,
+// edgebreaker.decoder.md, edgebreaker.traversal[.valence].md, boundary.decoder.md, sequential.decoder.md,
+// variable.descriptions.md). We implement from the SPEC pseudocode; we do NOT copy any draco source.
+
+// ---- DR3 constants (variable.descriptions.md -- FROZEN) -----------------------------------------
+constexpr uint8_t  kStandardEdgebreaker = 0;   // STANDARD_EDGEBREAKER
+constexpr uint8_t  kValenceEdgebreaker  = 2;   // VALENCE_EDGEBREAKER
+constexpr uint8_t  kMeshSeqEncoding     = 0;   // MESH_SEQUENTIAL_ENCODING
+constexpr uint8_t  kMeshEbEncoding      = 1;   // MESH_EDGEBREAKER_ENCODING
+
+constexpr int kTopologyC = 0;   // TOPOLOGY_C
+constexpr int kTopologyS = 1;   // TOPOLOGY_S
+constexpr int kTopologyL = 3;   // TOPOLOGY_L
+constexpr int kTopologyR = 5;   // TOPOLOGY_R
+constexpr int kTopologyE = 7;   // TOPOLOGY_E
+
+constexpr int kMinValence        = 2;   // MIN_VALENCE
+constexpr int kMaxValence        = 7;   // MAX_VALENCE
+constexpr int kNumUniqueValences = 6;   // NUM_UNIQUE_VALENCES
+
+constexpr int kLeftFaceEdge   = 0;   // LEFT_FACE_EDGE
+constexpr int kRightFaceEdge  = 1;   // RIGHT_FACE_EDGE
+constexpr int kInvalidCornerIndex = -1;
+
+// edge_breaker_symbol_to_topology_id (variable.descriptions.md): the per-context valence symbol index
+// (0..4) maps to a CLERS topology constant. 0:C(0) 1:S(1) 2:L(3) 3:R(5) 4:E(7).
+constexpr int kEbSymbolToTopologyId[5] = { kTopologyC, kTopologyS, kTopologyL, kTopologyR, kTopologyE };
+
+// ---- The Draco bit reader (LSB-first within each byte) ------------------------------------------
+// Draco's symbol/topology-split bits are packed LSB-first inside each byte and bytes are consumed
+// low-to-high. ReadBits(nbits) returns the next nbits as an unsigned value (bit 0 == the next bit).
+// Bounds-checked: reading past the end sets error=true and yields 0 (deterministic, never UB).
+struct BitReader {
+    const uint8_t* p = nullptr;
+    std::size_t    n = 0;        // byte count of the bit-coded span
+    std::size_t    byte_pos = 0; // current byte
+    uint32_t       bit_pos = 0;  // bit within the current byte (0..7)
+    bool           error = false;
+
+    void Reset(const uint8_t* data, std::size_t bytes) {
+        p = data; n = bytes; byte_pos = 0; bit_pos = 0; error = false;
+    }
+    // ResetBitReader(): align to the next whole byte (the spec calls this after the f[1] split bits).
+    void ResetBitReader() {
+        if (bit_pos != 0) { ++byte_pos; bit_pos = 0; }
+    }
+    uint32_t ReadBits(uint32_t nbits) {
+        uint32_t value = 0;
+        for (uint32_t i = 0; i < nbits; ++i) {
+            if (byte_pos >= n) { error = true; return value; }
+            const uint32_t bit = (static_cast<uint32_t>(p[byte_pos]) >> bit_pos) & 1u;
+            value |= (bit << i);
+            ++bit_pos;
+            if (bit_pos == 8u) { bit_pos = 0; ++byte_pos; }
+        }
+        return value;
+    }
+    // Bytes consumed so far (rounded up if mid-byte) -- to advance an outer ByteReader past the span.
+    std::size_t BytesConsumed() const {
+        return byte_pos + (bit_pos != 0 ? 1u : 0u);
+    }
+};
+
+// ---- DecodeTaggedSymbols (completing the DR2 stub) ----------------------------------------------
+// The TAGGED scheme (rans.decoding.md): a per-group tag rANS over TAGGED_RANS_BASE/TAGGED_RANS_PRECISION
+// selects the bit-length of each component group, then the raw component values are read bit-packed
+// (size bits each) via the bit reader. `r` is the ByteReader positioned at the tagged blob. Reads the
+// prob tables for the tag symbols, the rANS buffer, then the bit-coded raw values; advances `r` past
+// the consumed buffer. Returns false on any read error.
+inline bool DecodeTaggedSymbols(ByteReader& r, uint32_t num_values, uint32_t num_components,
+                                std::vector<uint32_t>& out) {
+    // The tag-symbol prob table (num_symbols = number of distinct bit-lengths) at fixed precision.
+    std::vector<uint32_t> lut_table;
+    std::vector<RansSym>  prob_table;
+    const uint32_t num_symbols = r.VarU32();
+    if (r.error) return false;
+    lut_table.assign(kTaggedRansPrec, 0u);
+    {
+        std::vector<uint32_t> token_probs(num_symbols, 0u);
+        for (uint32_t i = 0; i < num_symbols; ++i) {
+            const uint32_t prob_data = r.U8();
+            const uint32_t token = prob_data & 3u;
+            if (token == 3u) {
+                const uint32_t offset = prob_data >> 2;
+                for (uint32_t j = 0; j < offset + 1u && (i + j) < num_symbols; ++j)
+                    token_probs[i + j] = 0u;
+                i += offset;
+            } else {
+                uint32_t prob = prob_data >> 2;
+                for (uint32_t j = 0; j < token; ++j) {
+                    const uint32_t eb = r.U8();
+                    prob |= eb << (8u * (j + 1u) - 2u);
+                }
+                if (i < num_symbols) token_probs[i] = prob;
+            }
+        }
+        RansBuildLookUpTable(token_probs, num_symbols, lut_table, prob_table);
+    }
+    if (r.error) return false;
+
+    // The rANS buffer holding the tags is read BACKWARD from its end (TAGGED_RANS_BASE).
+    const uint64_t size = r.VarU64();
+    if (r.error) return false;
+    if (size == 0u || size > r.Remaining()) return false;
+    const uint8_t* rans_buf = r.p + r.pos;
+    AnsDecoder ans;
+    RansInitDecoder(ans, rans_buf, static_cast<int>(size), kTaggedRansBase);
+    r.Skip(static_cast<std::size_t>(size));
+    if (r.error) return false;
+
+    // The remaining bytes of `r` are the bit-packed raw component values. Read them LSB-first.
+    BitReader bits;
+    bits.Reset(r.p + r.pos, r.Remaining());
+
+    out.clear();
+    out.reserve(num_values);
+    const uint32_t nc = (num_components == 0u) ? 1u : num_components;
+    uint32_t produced = 0;
+    while (produced < num_values) {
+        // One tag per component group: the symbol value IS the bit-length of this group's values.
+        const uint32_t bit_length = RansRead(ans, kTaggedRansBase, kTaggedRansPrec, lut_table, prob_table);
+        for (uint32_t c = 0; c < nc && produced < num_values; ++c) {
+            const uint32_t v = (bit_length == 0u) ? 0u : bits.ReadBits(bit_length);
+            out.push_back(v);
+            ++produced;
+        }
+        if (bits.error) return false;
+    }
+    // Advance r past the consumed bit bytes.
+    r.Skip(bits.BytesConsumed());
+    return !r.error;
+}
+
+// ================================ DR3 -- edgebreaker connectivity decode =========================
+// The decode result: the cube's triangle topology as three corner-vertex lists. Face f's three corner
+// vertices are (face_to_vertex[0][f], face_to_vertex[1][f], face_to_vertex[2][f]).
+struct Connectivity {
+    uint32_t num_faces = 0, num_vertices = 0;
+    std::vector<uint32_t> face_to_vertex[3];
+    bool ok = false;
+};
+
+// The whole edgebreaker decoder state in one struct (mirrors the spec's globals). All vectors grow as
+// needed; every index is bounds-guarded so a malformed stream sets ok=false and never reads out of
+// range. att_dec=0 (MESH_VERTEX_ATTRIBUTE) throughout DR3, so Opposite()==PosOpposite() and the
+// attribute-seam paths are stubbed.
+struct EdgebreakerDecoder {
+    // ---- parsed header fields ----
+    uint8_t  edgebreaker_traversal_type = 0;
+    uint32_t num_encoded_vertices = 0;
+    uint32_t num_faces = 0;
+    uint8_t  num_attribute_data = 0;
+    uint32_t num_encoded_symbols = 0;
+    uint32_t num_encoded_split_symbols = 0;
+
+    // ---- topology split events ----
+    std::vector<uint32_t> source_symbol_id;   // decoder-side queue (popped back-to-front)
+    std::vector<uint32_t> split_symbol_id;
+    std::vector<uint8_t>  source_edge_bit;
+
+    // ---- the mesh corner table being built ----
+    std::vector<int> face_to_vertex[3];       // signed: vertices indexed >=0, may be relabeled
+    std::vector<int> opposite_corners_;       // default -1
+    std::vector<int> corner_to_vertex_map_;   // corner -> vertex (default -1)
+    std::vector<int> vertex_corners_;         // vertex -> a representative corner (default -1)
+    std::vector<uint8_t> is_vert_hole_;
+    std::vector<int> vertex_valences_;        // VALENCE only
+
+    // ---- traversal state ----
+    int last_symbol_ = -1;
+    int active_context_ = -1;
+    int last_vert_added = -1;
+    std::vector<int> active_corner_stack;
+    std::vector<int> topology_split_id;
+    std::vector<int> split_active_corners;
+
+    // ---- the bit-coded standard symbol stream + the start-face rABS buffer ----
+    BitReader symbol_bits;                     // STANDARD: eb_symbol_buffer
+    const uint8_t* eb_start_face_buffer = nullptr;
+    std::size_t    eb_start_face_buffer_size = 0;
+    uint8_t        eb_start_face_buffer_prob_zero = 0;
+
+    // ---- VALENCE state ----
+    std::vector<std::vector<uint32_t>> ebv_context_symbols;  // [NUM_UNIQUE_VALENCES][...]
+    std::vector<uint32_t>              ebv_context_counters;
+
+    bool ok = true;
+
+    void Fail() { ok = false; }
+
+    // ---- corner.md primitives (exact) ----
+    static int Next(int c)     { return c < 0 ? c : ((c % 3) == 2 ? c - 2 : c + 1); }
+    static int Previous(int c) { return c < 0 ? c : ((c % 3) == 0 ? c + 2 : c - 1); }
+
+    int PosOpposite(int c) const {
+        if (c < 0 || static_cast<std::size_t>(c) >= opposite_corners_.size()) return -1;
+        return opposite_corners_[c];
+    }
+    // att_dec=0 throughout DR3 => Opposite == PosOpposite (attribute-seam paths are DR4+; stubbed).
+    int Opposite(int /*att_dec*/, int c) const { return PosOpposite(c); }
+    int SwingLeft(int att_dec, int c)  { return Next(Opposite(att_dec, Next(c))); }
+    int SwingRight(int att_dec, int c) { return Previous(Opposite(att_dec, Previous(c))); }
+
+    void EnsureCorner(int c) {
+        if (c < 0) return;
+        const std::size_t need = static_cast<std::size_t>(c) + 1u;
+        if (opposite_corners_.size() < need) opposite_corners_.resize(need, -1);
+        if (corner_to_vertex_map_.size() < need) corner_to_vertex_map_.resize(need, -1);
+    }
+    void EnsureVertex(int v) {
+        if (v < 0) return;
+        const std::size_t need = static_cast<std::size_t>(v) + 1u;
+        if (vertex_corners_.size() < need) vertex_corners_.resize(need, -1);
+        if (is_vert_hole_.size() < need)   is_vert_hole_.resize(need, 1u);
+        if (edgebreaker_traversal_type == kValenceEdgebreaker &&
+            vertex_valences_.size() < need) vertex_valences_.resize(need, 0);
+    }
+
+    void SetOppositeCorners(int a, int b) {
+        EnsureCorner(a); EnsureCorner(b);
+        if (a < 0 || b < 0) { Fail(); return; }
+        opposite_corners_[a] = b;
+        opposite_corners_[b] = a;
+    }
+
+    void MapCornerToVertex(int corner_id, int vert_id) {
+        EnsureCorner(corner_id);
+        if (corner_id < 0) { Fail(); return; }
+        corner_to_vertex_map_[corner_id] = vert_id;
+        if (vert_id >= 0) { EnsureVertex(vert_id); vertex_corners_[vert_id] = corner_id; }
+    }
+
+    int CornerToVert(int /*att_dec*/, int corner_id) const {
+        if (corner_id < 0) return -1;
+        const int local = corner_id % 3;
+        const std::size_t face = static_cast<std::size_t>(corner_id) / 3u;
+        if (face >= face_to_vertex[0].size()) return -1;
+        if (local == 0) return face_to_vertex[0][face];
+        if (local == 1) return face_to_vertex[1][face];
+        return face_to_vertex[2][face];
+    }
+    // CornerToVerts -> (v,n,p) for att_dec=0 (position attribute).
+    void CornerToVerts(int /*att_dec*/, int corner_id, int& v, int& nx, int& pv) const {
+        v = nx = pv = -1;
+        if (corner_id < 0) return;
+        const int local = corner_id % 3;
+        const std::size_t face = static_cast<std::size_t>(corner_id) / 3u;
+        if (face >= face_to_vertex[0].size()) return;
+        const int a = face_to_vertex[0][face], b = face_to_vertex[1][face], c = face_to_vertex[2][face];
+        if (local == 0) { v = a; nx = b; pv = c; }
+        else if (local == 1) { v = b; nx = c; pv = a; }
+        else { v = c; nx = a; pv = b; }
+    }
+
+    // ReplaceVerts(from,to): relabel every occurrence in the three lists.
+    void ReplaceVerts(int from, int to) {
+        for (int k = 0; k < 3; ++k) {
+            for (std::size_t i = 0; i < face_to_vertex[k].size(); ++i)
+                if (face_to_vertex[k][i] == from) face_to_vertex[k][i] = to;
+        }
+    }
+
+    // UpdateCornersAfterMerge(c,v): walk SwingLeft from Next(opp) remapping corners to v.
+    void UpdateCornersAfterMerge(int c, int v) {
+        const int opp_corner = PosOpposite(c);
+        if (opp_corner >= 0) {
+            int corner_n = Next(opp_corner);
+            int guard = 0;
+            while (corner_n >= 0) {
+                MapCornerToVertex(corner_n, v);
+                corner_n = SwingLeft(0, corner_n);
+                if (++guard > 1000000) { Fail(); break; }
+            }
+        }
+    }
+
+    // ---- topology split helpers (edgebreaker.decoder.md) ----
+    bool IsTopologySplit(int encoder_symbol_id, int& out_face_edge, int& out_split_id) {
+        if (source_symbol_id.empty()) return false;
+        if (static_cast<int>(source_symbol_id.back()) != encoder_symbol_id) return false;
+        out_face_edge = static_cast<int>(source_edge_bit.back());
+        out_split_id  = static_cast<int>(split_symbol_id.back());
+        source_edge_bit.pop_back();
+        split_symbol_id.pop_back();
+        source_symbol_id.pop_back();
+        return true;
+    }
+
+    // ---- the C/S/L/R/E switch -- the heart (edgebreaker.decoder.md NewActiveCornerReached) ----
+    void NewActiveCornerReached(int new_corner, int symbol_id) {
+        bool check_topology_split = false;
+        EnsureCorner(new_corner + 2);
+        int vert = -1, next = -1, prev = -1;
+
+        switch (last_symbol_) {
+        case kTopologyC: {
+            if (active_corner_stack.empty()) { Fail(); return; }
+            int corner_a = active_corner_stack.back();
+            int corner_b = Previous(corner_a);
+            int guard = 0;
+            while (PosOpposite(corner_b) >= 0) {
+                corner_b = Previous(PosOpposite(corner_b));
+                if (++guard > 1000000) { Fail(); return; }
+            }
+            SetOppositeCorners(corner_a, new_corner + 1);
+            SetOppositeCorners(corner_b, new_corner + 2);
+            active_corner_stack.back() = new_corner;
+
+            vert = CornerToVert(0, Next(corner_a));
+            next = CornerToVert(0, Next(corner_b));
+            prev = CornerToVert(0, Previous(corner_a));
+            if (edgebreaker_traversal_type == kValenceEdgebreaker) {
+                EnsureVertex(next); EnsureVertex(prev);
+                if (next >= 0) vertex_valences_[next] += 1;
+                if (prev >= 0) vertex_valences_[prev] += 1;
+            }
+            face_to_vertex[0].push_back(vert);
+            face_to_vertex[1].push_back(next);
+            face_to_vertex[2].push_back(prev);
+            EnsureVertex(vert);
+            if (vert >= 0) is_vert_hole_[vert] = 0u;
+            MapCornerToVertex(new_corner, vert);
+            MapCornerToVertex(new_corner + 1, next);
+            MapCornerToVertex(new_corner + 2, prev);
+            break;
+        }
+        case kTopologyS: {
+            if (active_corner_stack.empty()) { Fail(); return; }
+            int corner_b = active_corner_stack.back(); active_corner_stack.pop_back();
+            for (std::size_t i = 0; i < topology_split_id.size(); ++i) {
+                if (topology_split_id[i] == symbol_id)
+                    active_corner_stack.push_back(split_active_corners[i]);
+            }
+            if (active_corner_stack.empty()) { Fail(); return; }
+            int corner_a = active_corner_stack.back();
+            SetOppositeCorners(corner_a, new_corner + 2);
+            SetOppositeCorners(corner_b, new_corner + 1);
+            active_corner_stack.back() = new_corner;
+
+            vert = CornerToVert(0, Previous(corner_a));
+            next = CornerToVert(0, Next(corner_a));
+            prev = CornerToVert(0, Previous(corner_b));
+            MapCornerToVertex(new_corner, vert);
+            MapCornerToVertex(new_corner + 1, next);
+            MapCornerToVertex(new_corner + 2, prev);
+            int corner_n = Next(corner_b);
+            int vertex_n = CornerToVert(0, corner_n);
+            if (edgebreaker_traversal_type == kValenceEdgebreaker) {
+                EnsureVertex(vert); EnsureVertex(vertex_n);
+                if (vert >= 0 && vertex_n >= 0) vertex_valences_[vert] += vertex_valences_[vertex_n];
+            }
+            ReplaceVerts(vertex_n, vert);
+            if (edgebreaker_traversal_type == kValenceEdgebreaker) {
+                EnsureVertex(next); EnsureVertex(prev);
+                if (next >= 0) vertex_valences_[next] += 1;
+                if (prev >= 0) vertex_valences_[prev] += 1;
+            }
+            face_to_vertex[0].push_back(vert);
+            face_to_vertex[1].push_back(next);
+            face_to_vertex[2].push_back(prev);
+            UpdateCornersAfterMerge(new_corner + 1, vert);
+            if (vertex_n >= 0) { EnsureVertex(vertex_n); vertex_corners_[vertex_n] = kInvalidCornerIndex; }
+            break;
+        }
+        case kTopologyR: {
+            if (active_corner_stack.empty()) { Fail(); return; }
+            int corner_a = active_corner_stack.back();
+            int opp_corner = new_corner + 2;
+            SetOppositeCorners(opp_corner, corner_a);
+            active_corner_stack.back() = new_corner;
+            check_topology_split = true;
+
+            vert = CornerToVert(0, Previous(corner_a));
+            next = CornerToVert(0, Next(corner_a));
+            prev = ++last_vert_added;
+            if (edgebreaker_traversal_type == kValenceEdgebreaker) {
+                EnsureVertex(vert); EnsureVertex(next); EnsureVertex(prev);
+                if (vert >= 0) vertex_valences_[vert] += 1;
+                if (next >= 0) vertex_valences_[next] += 1;
+                if (prev >= 0) vertex_valences_[prev] += 2;
+            }
+            face_to_vertex[0].push_back(vert);
+            face_to_vertex[1].push_back(next);
+            face_to_vertex[2].push_back(prev);
+            MapCornerToVertex(new_corner + 2, prev);
+            MapCornerToVertex(new_corner, vert);
+            MapCornerToVertex(new_corner + 1, next);
+            break;
+        }
+        case kTopologyL: {
+            if (active_corner_stack.empty()) { Fail(); return; }
+            int corner_a = active_corner_stack.back();
+            int opp_corner = new_corner + 1;
+            SetOppositeCorners(opp_corner, corner_a);
+            active_corner_stack.back() = new_corner;
+            check_topology_split = true;
+
+            vert = CornerToVert(0, Next(corner_a));
+            next = ++last_vert_added;
+            prev = CornerToVert(0, Previous(corner_a));
+            if (edgebreaker_traversal_type == kValenceEdgebreaker) {
+                EnsureVertex(vert); EnsureVertex(next); EnsureVertex(prev);
+                if (vert >= 0) vertex_valences_[vert] += 1;
+                if (next >= 0) vertex_valences_[next] += 2;
+                if (prev >= 0) vertex_valences_[prev] += 1;
+            }
+            face_to_vertex[0].push_back(vert);
+            face_to_vertex[1].push_back(next);
+            face_to_vertex[2].push_back(prev);
+            MapCornerToVertex(new_corner + 2, prev);
+            MapCornerToVertex(new_corner, vert);
+            MapCornerToVertex(new_corner + 1, next);
+            break;
+        }
+        case kTopologyE: {
+            active_corner_stack.push_back(new_corner);
+            check_topology_split = true;
+            vert = last_vert_added + 1;
+            next = vert + 1;
+            prev = next + 1;
+            if (edgebreaker_traversal_type == kValenceEdgebreaker) {
+                EnsureVertex(vert); EnsureVertex(next); EnsureVertex(prev);
+                vertex_valences_[vert] += 2;
+                vertex_valences_[next] += 2;
+                vertex_valences_[prev] += 2;
+            }
+            face_to_vertex[0].push_back(vert);
+            face_to_vertex[1].push_back(next);
+            face_to_vertex[2].push_back(prev);
+            last_vert_added = prev;
+            MapCornerToVertex(new_corner, vert);
+            MapCornerToVertex(new_corner + 1, next);
+            MapCornerToVertex(new_corner + 2, prev);
+            break;
+        }
+        default:
+            Fail();
+            return;
+        }
+
+        if (edgebreaker_traversal_type == kValenceEdgebreaker) {
+            EnsureVertex(next);
+            int active_valence = (next >= 0) ? vertex_valences_[next] : 0;
+            int clamped_valence = active_valence;
+            if (active_valence < kMinValence) clamped_valence = kMinValence;
+            else if (active_valence > kMaxValence) clamped_valence = kMaxValence;
+            active_context_ = clamped_valence - kMinValence;
+        }
+
+        if (check_topology_split) {
+            int encoder_symbol_id = static_cast<int>(num_encoded_symbols) - symbol_id - 1;
+            int split_edge = 0, enc_split_id = 0;
+            while (IsTopologySplit(encoder_symbol_id, split_edge, enc_split_id)) {
+                if (active_corner_stack.empty()) { Fail(); return; }
+                int act_top_corner = active_corner_stack.back();
+                int new_active_corner =
+                    (split_edge == kRightFaceEdge) ? Next(act_top_corner) : Previous(act_top_corner);
+                int dec_split_id = static_cast<int>(num_encoded_symbols) - enc_split_id - 1;
+                topology_split_id.push_back(dec_split_id);
+                split_active_corners.push_back(new_active_corner);
+            }
+        }
+    }
+
+    // ---- ParseEdgebreakerStandardSymbol (edgebreaker.decoder.md) ----
+    void ParseEdgebreakerStandardSymbol() {
+        uint32_t symbol = symbol_bits.ReadBits(1);
+        if (static_cast<int>(symbol) != kTopologyC) {
+            uint32_t suffix = symbol_bits.ReadBits(2);
+            symbol |= (suffix << 1);
+        }
+        last_symbol_ = static_cast<int>(symbol);
+        if (symbol_bits.error) Fail();
+    }
+
+    // ---- EdgebreakerValenceDecodeSymbol (edgebreaker.traversal.valence.md) ----
+    void EdgebreakerValenceDecodeSymbol() {
+        if (active_context_ != -1) {
+            const std::size_t ctx = static_cast<std::size_t>(active_context_);
+            if (ctx >= ebv_context_symbols.size() || ctx >= ebv_context_counters.size()) { Fail(); return; }
+            if (ebv_context_counters[ctx] == 0u) { Fail(); return; }
+            const uint32_t idx = --ebv_context_counters[ctx];
+            if (idx >= ebv_context_symbols[ctx].size()) { Fail(); return; }
+            const uint32_t symbol_id = ebv_context_symbols[ctx][idx];
+            if (symbol_id >= 5u) { Fail(); return; }
+            last_symbol_ = kEbSymbolToTopologyId[symbol_id];
+        } else {
+            last_symbol_ = kTopologyE;
+        }
+    }
+
+    void EdgebreakerDecodeSymbol() {
+        if (edgebreaker_traversal_type == kValenceEdgebreaker) EdgebreakerValenceDecodeSymbol();
+        else if (edgebreaker_traversal_type == kStandardEdgebreaker) ParseEdgebreakerStandardSymbol();
+        else Fail();
+    }
+
+    // ---- ProcessInteriorEdges (edgebreaker.decoder.md) ----
+    void ProcessInteriorEdges() {
+        if (eb_start_face_buffer == nullptr || eb_start_face_buffer_size == 0) {
+            // No interior-edge buffer: nothing to weld (a closed manifold may still have an empty buffer).
+            // The spec always inits the rANS decoder; if there is no buffer we simply skip the welds.
+            return;
+        }
+        AnsDecoder ans;
+        RansInitDecoder(ans, eb_start_face_buffer, static_cast<int>(eb_start_face_buffer_size), kLRansBase);
+
+        int guard = 0;
+        while (!active_corner_stack.empty()) {
+            int corner_a = active_corner_stack.back(); active_corner_stack.pop_back();
+            const uint8_t interior_face = RabsDescRead(ans, eb_start_face_buffer_prob_zero);
+            if (interior_face) {
+                int corner_b = Previous(corner_a);
+                int g2 = 0;
+                while (PosOpposite(corner_b) >= 0) {
+                    corner_b = Previous(PosOpposite(corner_b));
+                    if (++g2 > 1000000) { Fail(); return; }
+                }
+                int corner_c = Next(corner_a);
+                g2 = 0;
+                while (PosOpposite(corner_c) >= 0) {
+                    corner_c = Next(PosOpposite(corner_c));
+                    if (++g2 > 1000000) { Fail(); return; }
+                }
+                int new_corner = static_cast<int>(face_to_vertex[0].size()) * 3;
+                EnsureCorner(new_corner + 2);
+                SetOppositeCorners(new_corner, corner_a);
+                SetOppositeCorners(new_corner + 1, corner_b);
+                SetOppositeCorners(new_corner + 2, corner_c);
+
+                int tv, next_a, tp, next_b, next_c;
+                CornerToVerts(0, corner_a, tv, next_a, tp);
+                CornerToVerts(0, corner_b, tv, next_b, tp);
+                CornerToVerts(0, corner_c, tv, next_c, tp);
+                MapCornerToVertex(new_corner, next_b);
+                MapCornerToVertex(new_corner + 1, next_c);
+                MapCornerToVertex(new_corner + 2, next_a);
+                face_to_vertex[0].push_back(next_b);
+                face_to_vertex[1].push_back(next_c);
+                face_to_vertex[2].push_back(next_a);
+                EnsureVertex(next_a); EnsureVertex(next_b); EnsureVertex(next_c);
+                if (next_b >= 0) is_vert_hole_[next_b] = 0u;
+                if (next_c >= 0) is_vert_hole_[next_c] = 0u;
+                if (next_a >= 0) is_vert_hole_[next_a] = 0u;
+            }
+            if (++guard > 100000000) { Fail(); return; }
+        }
+    }
+
+    // ---- DecodeEdgeBreakerConnectivity (edgebreaker.decoder.md) ----
+    void DecodeEdgeBreakerConnectivity() {
+        is_vert_hole_.assign(num_encoded_vertices + num_encoded_split_symbols, 1u);
+        last_vert_added = -1;
+        for (uint32_t i = 0; i < num_encoded_symbols; ++i) {
+            EdgebreakerDecodeSymbol();
+            if (!ok) return;
+            int corner = static_cast<int>(3u * i);
+            NewActiveCornerReached(corner, static_cast<int>(i));
+            if (!ok) return;
+        }
+        ProcessInteriorEdges();
+    }
+};
+
+// ---- ParseEdgebreakerConnectivityData (edgebreaker.decoder.md) -----------------------------------
+inline void ParseEdgebreakerConnectivityData(ByteReader& r, EdgebreakerDecoder& d) {
+    d.edgebreaker_traversal_type   = r.U8();
+    d.num_encoded_vertices         = r.VarU32();
+    d.num_faces                    = r.VarU32();
+    d.num_attribute_data           = r.U8();
+    d.num_encoded_symbols          = r.VarU32();
+    d.num_encoded_split_symbols    = r.VarU32();
+    if (r.error) d.Fail();
+}
+
+// ---- DecodeTopologySplitEvents (ParseTopologySplitEvents + ProcessSplitData) ---------------------
+// The split source/split-symbol ids + the f[1] source_edge_bit run, then ResetBitReader (byte-align).
+inline void DecodeTopologySplitEvents(ByteReader& r, EdgebreakerDecoder& d) {
+    const uint32_t num_topology_splits = r.VarU32();
+    if (r.error) { d.Fail(); return; }
+    std::vector<uint32_t> source_id_delta(num_topology_splits, 0u);
+    std::vector<uint32_t> split_id_delta(num_topology_splits, 0u);
+    for (uint32_t i = 0; i < num_topology_splits; ++i) {
+        source_id_delta[i] = r.VarU32();
+        split_id_delta[i]  = r.VarU32();
+    }
+    // The source_edge_bit f[1] values are bit-packed (LSB-first) over the remaining bytes; after the
+    // run the reader is byte-realigned (ResetBitReader). We read them from the current cursor.
+    BitReader bits;
+    bits.Reset(r.p + r.pos, r.Remaining());
+    std::vector<uint8_t> source_edge_bit(num_topology_splits, 0u);
+    for (uint32_t i = 0; i < num_topology_splits; ++i)
+        source_edge_bit[i] = static_cast<uint8_t>(bits.ReadBits(1));
+    bits.ResetBitReader();
+    r.Skip(bits.BytesConsumed());
+    if (r.error || bits.error) { d.Fail(); return; }
+
+    // ProcessSplitData: source_symbol_id[i] = source_id_delta[i] + last_id;
+    // split_symbol_id[i] = source_symbol_id[i] - split_id_delta[i]; last_id = source_symbol_id[i].
+    d.source_symbol_id.clear();
+    d.split_symbol_id.clear();
+    d.source_edge_bit = source_edge_bit;
+    uint32_t last_id = 0;
+    for (uint32_t i = 0; i < num_topology_splits; ++i) {
+        const uint32_t src = source_id_delta[i] + last_id;
+        d.source_symbol_id.push_back(src);
+        d.split_symbol_id.push_back(src - split_id_delta[i]);
+        last_id = src;
+    }
+}
+
+// ---- EdgebreakerTraversalStart (edgebreaker.traversal[.valence].md) ------------------------------
+// STANDARD: parse the bit-coded symbol buffer + the start-face rABS buffer + the attribute conn data.
+// VALENCE : parse the start-face + attribute conn data, init valences, read per-context symbol streams.
+inline void EdgebreakerTraversalStart(ByteReader& r, EdgebreakerDecoder& d) {
+    d.last_symbol_ = -1;
+    d.active_context_ = -1;
+
+    if (d.edgebreaker_traversal_type == kStandardEdgebreaker) {
+        // ParseEdgebreakerTraversalStandardSymbolData: sz varUI64, then eb_symbol_buffer[sz].
+        const uint64_t sym_sz = r.VarU64();
+        if (r.error || sym_sz > r.Remaining()) { d.Fail(); return; }
+        d.symbol_bits.Reset(r.p + r.pos, static_cast<std::size_t>(sym_sz));
+        r.Skip(static_cast<std::size_t>(sym_sz));
+
+        // ParseEdgebreakerTraversalStandardFaceData: prob_zero UI8, sz varUI32, buffer[sz].
+        d.eb_start_face_buffer_prob_zero = r.U8();
+        const uint32_t face_sz = r.VarU32();
+        if (r.error || face_sz > r.Remaining()) { d.Fail(); return; }
+        d.eb_start_face_buffer = r.p + r.pos;
+        d.eb_start_face_buffer_size = face_sz;
+        r.Skip(face_sz);
+
+        // ParseEdgebreakerTraversalStandardAttributeConnectivityData (consumed, used by DR4 boundary).
+        for (uint32_t i = 0; i < d.num_attribute_data; ++i) {
+            (void)r.U8();                       // attribute_connectivity_decoders_prob_zero[i]
+            const uint32_t sz = r.VarU32();     // attribute_connectivity_decoders_size[i]
+            if (r.error || sz > r.Remaining()) { d.Fail(); return; }
+            r.Skip(sz);                         // attribute_connectivity_decoders_buffer[i]
+        }
+        if (r.error) d.Fail();
+    } else if (d.edgebreaker_traversal_type == kValenceEdgebreaker) {
+        // EdgeBreakerTraversalValenceStart: face data + attribute conn data first.
+        d.eb_start_face_buffer_prob_zero = r.U8();
+        const uint32_t face_sz = r.VarU32();
+        if (r.error || face_sz > r.Remaining()) { d.Fail(); return; }
+        d.eb_start_face_buffer = r.p + r.pos;
+        d.eb_start_face_buffer_size = face_sz;
+        r.Skip(face_sz);
+
+        for (uint32_t i = 0; i < d.num_attribute_data; ++i) {
+            (void)r.U8();
+            const uint32_t sz = r.VarU32();
+            if (r.error || sz > r.Remaining()) { d.Fail(); return; }
+            r.Skip(sz);
+        }
+
+        d.vertex_valences_.assign(d.num_encoded_vertices + d.num_encoded_split_symbols, 0);
+        d.ebv_context_symbols.assign(kNumUniqueValences, std::vector<uint32_t>());
+        d.ebv_context_counters.assign(kNumUniqueValences, 0u);
+        for (int i = 0; i < kNumUniqueValences; ++i) {
+            const uint32_t cnt = r.VarU32();        // ParseValenceContextCounters(i)
+            if (r.error) { d.Fail(); return; }
+            d.ebv_context_counters[i] = cnt;
+            if (cnt > 0u) {
+                std::vector<uint32_t> syms;
+                if (!DecodeSymbols(r, cnt, 1u, syms)) { d.Fail(); return; }
+                d.ebv_context_symbols[i] = syms;
+            }
+        }
+    } else {
+        d.Fail();
+    }
+}
+
+// ---- DecodeEdgebreakerConnectivityData (edgebreaker.decoder.md) ----------------------------------
+inline Connectivity DecodeEdgebreakerConnectivityData(ByteReader& r) {
+    EdgebreakerDecoder d;
+    ParseEdgebreakerConnectivityData(r, d);
+    if (!d.ok) return Connectivity{};
+    DecodeTopologySplitEvents(r, d);
+    if (!d.ok) return Connectivity{};
+    EdgebreakerTraversalStart(r, d);
+    if (!d.ok) return Connectivity{};
+    d.DecodeEdgeBreakerConnectivity();
+
+    Connectivity out;
+    out.ok = d.ok && (static_cast<uint32_t>(d.face_to_vertex[0].size()) == d.num_faces);
+    out.num_faces = static_cast<uint32_t>(d.face_to_vertex[0].size());
+    out.num_vertices = d.num_encoded_vertices + d.num_encoded_split_symbols;
+    if (out.ok) {
+        for (int k = 0; k < 3; ++k) {
+            out.face_to_vertex[k].reserve(d.face_to_vertex[k].size());
+            for (int v : d.face_to_vertex[k])
+                out.face_to_vertex[k].push_back(static_cast<uint32_t>(v < 0 ? 0 : v));
+        }
+    }
+    return out;
+}
+
+// ---- DecodeConnectivity (connectivity.decoder.md DecodeConnectivityData dispatch) ----------------
+// The decode entry: after the header (and optional metadata), dispatch on encoderMethod. For DR3 only
+// MESH_EDGEBREAKER is implemented; MESH_SEQUENTIAL returns ok=false (a DR-later stub).
+inline Connectivity DecodeConnectivity(ByteReader& r, const DracoHeader& h) {
+    if (!h.valid) return Connectivity{};
+    if (h.encoderMethod == kMeshEbEncoding) {
+        return DecodeEdgebreakerConnectivityData(r);
+    }
+    // MESH_SEQUENTIAL_ENCODING (and anything else) -- not decoded in DR3.
+    return Connectivity{};
 }
 
 }  // namespace hf::asset::draco
