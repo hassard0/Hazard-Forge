@@ -27,6 +27,8 @@
 
 using namespace hf::seq;
 namespace flow = hf::flow;  // S3: the deterministic-VM the event track composes with (EventRecord/Graph/StepGraph)
+namespace seq  = hf::seq;   // S5: explicit qualifier for the net::Session wiring (SeqPlayhead/StepPlayhead/...)
+namespace net  = hf::net;   // S5: the deterministic session core (RunLockstep/DigestTrace/RollbackSession/CatchUp)
 
 static int g_fail = 0;
 static void check(bool cond, const char* what) {
@@ -364,6 +366,196 @@ int main() {
         const std::vector<fx> mutSweep = SampleTransformSweep(mutated, kOne / 30, 90);
         check(DigestTrack(mutSweep) != xfDig,
               "seq-s4: nudging one rotation key changes the transform-sweep digest (rotation keys are load-bearing)");
+    }
+
+    // =============================== SEQ-S5 — lockstep / replay / SCRUB via net::Session (THE MOAT) =
+    // Wrap the timeline as a net::Session StepFn -> lockstep-replayable + desync-detectable + SCRUB-able,
+    // and prove seeking to tick S then playing forward is BIT-IDENTICAL to playing from tick 0 (a
+    // deterministic timeline scrub UE5 Sequencer's float playback timing CANNOT do). Pure-CPU integer.
+    {
+        // The fixed playhead fixture + the step/digest lambdas (capturing the fixed Sequence). The
+        // net::Session World is seq::SeqPlayhead; the per-tick Input is seq::fx (a delta in Q16.16 seconds).
+        const seq::Sequence S = seq::MakeShowcasePlayheadSeq();
+        auto step   = [&S](seq::SeqPlayhead& w, const std::vector<seq::fx>& in, uint32_t t){ seq::StepPlayhead(S, w, in, t); };
+        auto digest = [](const seq::SeqPlayhead& w){ return seq::DigestPlayhead(w); };
+
+        // A fixed per-tick delta of kOne/30 (30 Hz playback) over 90 ticks (3 s). Seek tick S=45 (1.5 s),
+        // toTick=90 — all FIXED.
+        const uint32_t kTicks  = 90;
+        const uint32_t kSeek   = 45;   // the scrub/seek tick S
+        const seq::fx  kDelta  = kOne / 30;
+        net::InputRing<seq::fx> ring;
+        for (uint32_t t = 0; t < kTicks; ++t) ring.AddInput(t, kDelta);   // 30 Hz advance
+
+        // The from-0 final digest + the per-tick trace (the digest AFTER each tick).
+        const uint64_t lockstepFinal = net::RunLockstep(seq::SeqPlayhead{}, ring, kTicks, step, digest);
+        const std::vector<uint64_t> trace = net::DigestTrace(seq::SeqPlayhead{}, ring, kTicks, step, digest);
+        const uint64_t traceOfTrace =
+            net::DigestBytes(trace.data(), trace.size() * sizeof(uint64_t));
+
+        std::printf("seq-s5: lockstep final digest = 0x%016llx\n", (unsigned long long)lockstepFinal);
+        std::printf("seq-s5: trace-of-trace digest = 0x%016llx   (%zu ticks)\n",
+                    (unsigned long long)traceOfTrace, trace.size());
+
+        // ---- Pinned S5 goldens (computed on first run, hardcoded — the cross-platform bar). ----------
+        const uint64_t kPinnedLockstep = 0x9ec0eb2bfbb40dcaull;  // PINNED on first run (MSVC == clang)
+        const uint64_t kPinnedTrace    = 0x7c63291062cf0ca7ull;  // PINNED on first run (MSVC == clang)
+
+        // ---- (1) PRIOR INVARIANT — re-assert S1 + all 4 S2 + S3 + S4 digests, all UNCHANGED. ----------
+        {
+            const bool s1ok = DigestTrack(SampleSweep(MakeShowcaseTrack(), kOne / 30, 90)) == 0xd314f17ebe3d480bull;
+            const bool s2tbl = DigestTrack(SineEaseTable()) == 0x8f13b44545cc3c97ull
+                            && DigestTrack(QuadInTable())   == 0x7ebbb0956a7f50a2ull
+                            && DigestTrack(QuadOutTable())  == 0x5289c36d8551004aull;
+            const bool s2seq = DigestTrack(SampleSequenceSweep(MakeShowcaseSequence(), kOne / 30, 90)) == 0xee44096d40ab3946ull;
+            const bool s3ev  = flow::DigestEvents(SampleEventSweep(MakeShowcaseEvents(), kOne / 30, 90)) == 0x1035f49824b6ac7aull;
+            const bool s4xf  = DigestTrack(SampleTransformSweep(MakeShowcaseTransform(), kOne / 30, 90)) == 0x59e3f94ce2da437dull;
+            check(s1ok && s2tbl && s2seq && s3ev && s4xf,
+                  "seq-s5: prior invariant — S1 + all 4 S2 + S3 + S4 digests UNCHANGED (S5 is purely additive)");
+        }
+
+        // ---- (2) DETERMINISTIC — two RunLockstep calls over the same ring -> identical final digest. ---
+        {
+            const uint64_t again = net::RunLockstep(seq::SeqPlayhead{}, ring, kTicks, step, digest);
+            check(again == lockstepFinal,
+                  "seq-s5: RunLockstep is deterministic — two runs over the same ring yield the IDENTICAL final digest");
+        }
+
+        // ---- (3) PINNED FINAL — the from-0 lockstep final digest == a pinned uint64. -------------------
+        check(lockstepFinal == kPinnedLockstep,
+              "seq-s5: lockstep final digest == pinned uint64 (the timeline is bit-identical cross-platform)");
+
+        // ---- (4) TRACE PINNED — DigestTrace has length ticks AND its byte-digest == a pinned uint64. ---
+        check(trace.size() == (std::size_t)kTicks && traceOfTrace == kPinnedTrace,
+              "seq-s5: DigestTrace length == ticks and its digest == pinned uint64 (per-tick checksum stream stable)");
+
+        // ---- (5) SCRUB = SEEK (THE MOAT) — CatchUp(snapshot@S, toTick) == the from-0 world at toTick. --
+        // Capture the world AS OF tick S=45 by stepping a Session to S (read s.world), wrap it in a
+        // JoinSnapshot{S, worldAtS}, then CatchUp(snap, 90, ring, step) — the ring IS the tail (it carries
+        // every tick's delta). Assert its digest == the from-0 world at tick 90 (re-derived the same way).
+        // BIT-IDENTICAL: seek-then-play == play-from-0. THE scrub-determinism headline.
+        seq::SeqPlayhead worldAtS;            // step a Session to S to capture the confirmed world AS OF S
+        {
+            net::Session<seq::SeqPlayhead, seq::fx> ss;
+            ss.world = seq::SeqPlayhead{};
+            ss.ring  = ring;
+            ss.tick  = 0;
+            for (uint32_t t = 0; t < kSeek; ++t) net::Advance(ss, step);
+            worldAtS = ss.world;              // the world after ticks [0, S)
+        }
+        seq::SeqPlayhead worldAt90;           // the from-0 world at toTick=90 (re-derived by the same loop)
+        {
+            net::Session<seq::SeqPlayhead, seq::fx> ss;
+            ss.world = seq::SeqPlayhead{};
+            ss.ring  = ring;
+            ss.tick  = 0;
+            for (uint32_t t = 0; t < kTicks; ++t) net::Advance(ss, step);
+            worldAt90 = ss.world;
+        }
+        {
+            net::JoinSnapshot<seq::SeqPlayhead> snap{ kSeek, worldAtS };
+            const seq::SeqPlayhead caughtUp = net::CatchUp(snap, kTicks, ring, step);
+            check(seq::DigestPlayhead(caughtUp) == seq::DigestPlayhead(worldAt90),
+                  "seq-s5: SCRUB=SEEK — CatchUp(snapshot@S, toTick) == the from-0 world at toTick (BIT-IDENTICAL) [THE MOAT]");
+        }
+
+        // ---- (6) SCRUB READS THE FRAME — DigestPlayhead(seek to S) == the from-0 trace digest at S. -----
+        // The trace records the digest AFTER each tick, so the digest after tick S is index S-1. Seeking to
+        // S shows the EXACT frame the from-0 playback shows at S.
+        check(seq::DigestPlayhead(worldAtS) == trace[(std::size_t)kSeek - 1],
+              "seq-s5: scrub reads the same frame — DigestPlayhead(seek to S) == the from-0 trace digest at tick S");
+
+        // ---- (7) ROLLBACK == AUTHORITY — a mispredicted remote delta rolls back to the BIT-IDENTICAL
+        // authority + didRollback. Build a small fixed local/remote delta stream over T ticks. The remote
+        // stream is what's predicted/corrected. We DELAY the remote delta for tick `kMispredictTick` past
+        // its origin (delivered late) AND make it DIFFER from the prediction (lastConfirmed) so a real
+        // mispredict fires. Authority = RunLockstep over an authRing whose At(t) = {local[t], remote[t]}
+        // (two inputs per tick, summed by the step). The rollback session must converge to == authority.
+        const uint64_t kPinnedRollback = 0x5963d4a3c0282769ull;  // PINNED on first run (MSVC == clang)
+        bool didRollbackOut = false;
+        {
+            const uint32_t T = 8;
+            // local[t] = a steady kOne/30 advance; remote[t] = a steady kOne/60 advance, EXCEPT tick 3's
+            // remote is kOne/15 (it DIFFERS from the predicted kOne/60 -> forces a mispredict when its true
+            // value arrives late). The prediction source is lastConfirmed remote (initially 0).
+            const uint32_t kMispredictTick = 3;
+            std::vector<seq::fx> local(T), remote(T);
+            for (uint32_t t = 0; t < T; ++t) { local[t] = kOne / 30; remote[t] = kOne / 60; }
+            remote[kMispredictTick] = kOne / 15;   // the surprise — != predicted kOne/60
+
+            // Authority: a clean lockstep over both streams, summed per tick (no latency, no rollback).
+            net::InputRing<seq::fx> authRing;
+            for (uint32_t t = 0; t < T; ++t) { authRing.AddInput(t, local[t]); authRing.AddInput(t, remote[t]); }
+            const uint64_t authority = net::RunLockstep(seq::SeqPlayhead{}, authRing, T, step, digest);
+
+            // The scripted transport: deliver every remote ON TIME (deliverTick == forTick) EXCEPT the
+            // mispredict tick, whose true delta is delivered LATE (well after it was speculatively stepped
+            // with the prediction) -> ConfirmRemote sees applied(prediction) != real -> rollback fires.
+            net::ScriptedTransport<seq::fx> tx;
+            for (uint32_t t = 0; t < T; ++t) {
+                if (t == kMispredictTick) net::Schedule(tx, /*deliverTick=*/T - 1, /*forTick=*/t, remote[t]);
+                else                      net::Schedule(tx, /*deliverTick=*/t,     /*forTick=*/t, remote[t]);
+            }
+
+            net::RollbackSession<seq::SeqPlayhead, seq::fx> rs;
+            rs.world = seq::SeqPlayhead{};
+            net::RunWithTransport(rs, local, tx, T, step);
+            didRollbackOut = rs.didRollback;
+
+            const uint64_t rbDigest = seq::DigestPlayhead(rs.world);
+            std::printf("seq-s5: rollback authority digest = 0x%016llx, didRollback = %d\n",
+                        (unsigned long long)rbDigest, (int)rs.didRollback);
+            check(rbDigest == authority && rs.didRollback && rbDigest == kPinnedRollback,
+                  "seq-s5: rollback — a mispredicted remote delta rolls back to the BIT-IDENTICAL authority + didRollback");
+        }
+        (void)didRollbackOut;
+
+        // ---- (8) COMPLETENESS — snapshot/advance-K/restore/re-advance-K == straight advance. ------------
+        // From an advanced playhead, value-copy a snapshot; advance K ticks (diverge); restore the snapshot;
+        // re-advance the SAME K -> byte-identical (DigestPlayhead) to a straight K-advance from the snapshot.
+        // Proves the value-copy is the WHOLE state.
+        {
+            const uint32_t K = 10;
+            const std::vector<seq::fx> kIn = { kOne / 30 };
+            // Advance to some point, then snapshot.
+            seq::SeqPlayhead base;
+            for (uint32_t t = 0; t < 20; ++t) seq::StepPlayhead(S, base, kIn, t);
+            const seq::SeqPlayhead snap = base;          // value-copy snapshot (the whole state, by claim)
+
+            // Reference: a straight K-advance from the snapshot.
+            seq::SeqPlayhead ref = snap;
+            for (uint32_t t = 0; t < K; ++t) seq::StepPlayhead(S, ref, kIn, t);
+            const uint64_t refDig = seq::DigestPlayhead(ref);
+
+            // Advance the live world K (diverge), restore the snapshot, re-advance the SAME K.
+            seq::SeqPlayhead live = snap;
+            for (uint32_t t = 0; t < K; ++t) seq::StepPlayhead(S, live, kIn, t);    // diverge
+            live = snap;                                                            // restore the snapshot
+            for (uint32_t t = 0; t < K; ++t) seq::StepPlayhead(S, live, kIn, t);    // re-advance
+            check(seq::DigestPlayhead(live) == refDig,
+                  "seq-s5: snapshot completeness — snapshot/advance-K/restore/re-advance-K == straight advance (complete)");
+        }
+
+        // ---- (9) INCOMPLETE DIVERGES — restore a snapshot with `time` zeroed -> a DIFFERENT digest. -----
+        // No stateful field escapes the value-copy snapshot: dropping the real state (time) before
+        // re-advancing yields a different digest than the complete restore (the verdict.h discipline).
+        {
+            const uint32_t K = 10;
+            const std::vector<seq::fx> kIn = { kOne / 30 };
+            seq::SeqPlayhead base;
+            for (uint32_t t = 0; t < 20; ++t) seq::StepPlayhead(S, base, kIn, t);
+            const seq::SeqPlayhead snap = base;
+
+            seq::SeqPlayhead complete = snap;
+            for (uint32_t t = 0; t < K; ++t) seq::StepPlayhead(S, complete, kIn, t);
+
+            seq::SeqPlayhead incomplete = snap;
+            incomplete.time = 0;                                                    // DROP the real state
+            for (uint32_t t = 0; t < K; ++t) seq::StepPlayhead(S, incomplete, kIn, t);
+
+            check(seq::DigestPlayhead(incomplete) != seq::DigestPlayhead(complete),
+                  "seq-s5: an incomplete restore (zeroing time) DIVERGES (no state escapes the value-copy snapshot)");
+        }
     }
 
     if (g_fail == 0) { std::printf("seq_test: ALL PASS\n"); return 0; }

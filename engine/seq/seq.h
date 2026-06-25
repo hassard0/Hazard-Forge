@@ -494,4 +494,52 @@ inline TransformTrack MakeShowcaseTransform() {
     return tr;
 }
 
+// ============================ S5 — lockstep / replay / SCRUB via net::Session (THE MOAT) =============
+// THE HEADLINE: wrap timeline evaluation as a net::Session StepFn so the whole sequence becomes
+// lockstep-replayable, desync-detectable, and SCRUB-able — and prove the moat property UE5 Sequencer's
+// float playback timing CANNOT do: seeking to tick S then playing forward is BIT-IDENTICAL to playing
+// from tick 0 (a deterministic timeline scrub). The playhead is a FLAT, value-copyable World
+// (snapshot-complete by construction — net::Session's value-copy captures the WHOLE state); the step is
+// integer add + SampleSequence; the digest is hand-LE fx (NEVER DigestBytes the struct — the bus vector
+// has a heap pointer). APPEND-ONLY — S1–S4 untouched + golden-invariant. NO new include: net/session.h
+// is already pulled in (S1). STILL NO <cmath>/<algorithm>/float/<random>/clock/std::hash.
+
+// SeqPlayhead — the net::Session World: a FLAT, value-copyable struct. `time` is the TRUE state (the
+// current Q16.16 timeline position); `bus` is DERIVED from `time` each step (the readable outputs sampled
+// at `time`). Flat + value-copyable → net::Session's value-copy snapshot captures the WHOLE state by
+// construction (the verdict.h completeness argument).
+struct SeqPlayhead {
+    fx              time = 0;   // current Q16.16 timeline position (the TRUE state)
+    std::vector<fx> bus;        // the value-bus sampled at `time` (derived outputs)
+};
+
+// StepPlayhead — the deterministic transition net::Session drives. Advance the playhead by the SUM of
+// this tick's inputs (delta in Q16.16 seconds), then resample the bus. `inputs` is net::Session's per-tick
+// input vector: {delta} in plain lockstep, {local, remote} in rollback (StepPredicted/ConfirmRemote pass a
+// TWO-element vector) — so we SUM in fixed order (one elem lockstep, two rollback).
+inline void StepPlayhead(const Sequence& seq, SeqPlayhead& w, const std::vector<fx>& inputs, uint32_t /*tick*/) {
+    fx delta = 0;
+    for (fx d : inputs) delta += d;          // sum (1 elem lockstep, 2 elems rollback) — fixed order
+    w.time += delta;
+    w.bus = SampleSequence(seq, w.time);     // resample the multi-track value-bus at the new time
+}
+
+// DigestPlayhead — hand-LE digest of the playhead: serialize time (1 fx) then the bus (N fx) into a
+// contiguous fx buffer -> DigestTrack (S1's net::DigestBytes over the int32 bytes). Padding-safe +
+// byte-stable. NEVER DigestBytes a SeqPlayhead — the `bus` vector has a heap pointer + size; serialize the
+// VALUES (the S4 field-by-field discipline).
+inline uint64_t DigestPlayhead(const SeqPlayhead& w) {
+    std::vector<fx> buf;
+    buf.reserve(w.bus.size() + 1u);
+    buf.push_back(w.time);
+    for (fx v : w.bus) buf.push_back(v);
+    return DigestTrack(buf);                 // == net::DigestBytes(buf.data(), buf.size()*sizeof(fx))
+}
+
+// MakeShowcasePlayheadSeq() — the FIXED S5 fixture: reuse MakeShowcaseSequence() (the S2 3-channel
+// sequence, mixed easings) so the bus is non-trivial. Keep FIXED forever — the S5 goldens hash its playback.
+inline Sequence MakeShowcasePlayheadSeq() {
+    return MakeShowcaseSequence();
+}
+
 }  // namespace hf::seq
