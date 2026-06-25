@@ -139,6 +139,17 @@ hf_add_pure_test(replay_test)
 # platform proof is the SAME CPU test producing the IDENTICAL hash on MSVC + Apple clang. Pure CPU (hf_core),
 # no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(wfc_test)
+# Deterministic integer LEDGER + atomic transactions (Slice ECON-S1, flagship #30 ECON beachhead):
+# engine/econ/econ.h — a header-only, SELF-CONTAINED (only <cstdint>/<cstddef>/<vector> + net/session.h)
+# inventory/economy state machine. A dense fixed-order stock grid (entity x item) mutated ONLY through an
+# atomic Add/Remove/Transfer transaction primitive (reject + no-op on non-positive amount, out-of-range
+# ids, or unaffordable Remove/Transfer; Transfer conserves TotalQuantity). Asserts the pinned ledger
+# digest after a fixed showcase script, replay-stability, Transfer conservation, amount load-bearing,
+# the affordability + bounds reject gates (no-op, digest unchanged), and no negative stock. Because it is
+# pure integer set-arithmetic over a fixed-iteration-order array, the ledger + its FNV-1a-64 DigestWorld
+# are bit-identical run-to-run AND MSVC-vs-Apple-clang. The golden is the pinned hash IN the test (NO
+# image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(econ_test)
 # CPU particle / VFX emitter system (Slice CC): the authorable emitter (spawn rate, lifetime, init
 # velocity + spread, gravity, drag, size/color over life) simulated at a fixed timestep with a
 # fixed-seed integer LCG for the spread jitter (engine/vfx/particles.{h,cpp}) — DISTINCT from the
