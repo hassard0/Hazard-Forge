@@ -192,6 +192,17 @@ hf_add_pure_test(chunk_diff_test)
 # format the McGuire archive / Stanford scans / every Blender export ship. The headline is reproducibility
 # — re-importing the same OBJ is BYTE-IDENTICAL (pinned digest), identical MSVC + Windows-clang + Mac/clang.
 hf_add_pure_test(obj_loader_test)
+# Content-addressed CacheKey (Slice ASSET-S1, issue #16 beachhead): engine/asset/asset_compiler.h — a
+# header-only, SELF-CONTAINED (only <cstdint>/<cstddef>/<vector> + net/session.h) cache-key core for the
+# DETERMINISTIC CONTENT-ADDRESSED ASSET PIPELINE. The CacheKey is a pure function of (raw content bytes,
+# integer Q16.16/enum compile params, asset kind) via hand-LE serialization + net::DigestBytes (FNV-1a-64) —
+# the LOAD-BEARING INVARIANT is that mtime NEVER enters a key (content + params only; mtime is S6's recompile
+# trigger, never an artifact's identity). Asserts the PINNED showcase key (the cross-platform byte-layout
+# proof, identical MSVC + Mac/clang), reproducibility, content/params/kind load-bearing (a flipped byte /
+# changed param / different AssetKind -> a DIFFERENT key), and POINTER-INDEPENDENCE (two copies of the bytes
+# at different addresses -> the same key). The golden is the pinned hash IN the test (NO image, NO
+# render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(asset_compiler_test)
 # fpx collision EVENTS (issue #44): the additive event API (FxHitEvent / CollectContacts / a 5-arg StepWorld
 # overload) for sample authors who drive the raw deterministic core. APPEND-ONLY to fpx.h — the test proves
 # the 5-arg StepWorld is byte-identical physics to the frozen 4-arg, so every fpx golden is invariant.
