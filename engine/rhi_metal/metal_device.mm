@@ -31,6 +31,9 @@ MetalDevice::MetalDevice(uint32_t width, uint32_t height) {
 }
 
 void MetalDevice::Init() {
+    // Slice METAL-RT S1: cache the HW ray-tracing capability once at device creation. Both ctors set
+    // device_ before calling Init(). M4 -> true; M1/M2 -> false (SupportsHardwareRayQuery reports this).
+    supportsRaytracing_ = device_ ? (bool)[device_ supportsRaytracing] : false;
     inFlight_ = dispatch_semaphore_create(kFramesInFlight);
     CreateFrameResources();
     recorder_ = std::make_unique<MetalCommandBuffer>(*this);

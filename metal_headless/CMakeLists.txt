@@ -1152,6 +1152,9 @@ add_executable(visual_test
     ${HF_ROOT}/engine/rhi_metal/metal_command_buffer.mm
     ${HF_ROOT}/engine/rhi_metal/metal_pipeline.mm
     ${HF_ROOT}/engine/rhi_metal/metal_compute_pipeline.mm
+    # Slice METAL-RT S1: the Metal acceleration-structure backend (CreateBlas/CreateTlas/
+    # SupportsHardwareRayQuery behind the RT1 IAccelStructure seam). Drives the --rt2-query-rhi showcase.
+    ${HF_ROOT}/engine/rhi_metal/metal_accel.mm
     ${HF_ROOT}/engine/rhi_metal/metal_texture.mm
     ${HF_ROOT}/engine/rhi_metal/metal_render_target.mm
     ${HF_ROOT}/engine/rhi_metal/metal_cubemap_target.mm

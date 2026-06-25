@@ -56,6 +56,10 @@ public:
 
     void BindComputePipeline(IComputePipeline& pipeline) override;
     void BindStorageBuffer(IBuffer& buffer, uint32_t index) override;
+    // Slice METAL-RT S1 — bind a TLAS (a MetalAccelStructure) at the ray-query slot on the active compute
+    // encoder: setAccelerationStructure:atBufferIndex: + useResource: for the AS and its child BLAS
+    // handles (lifted visual_test.mm:25708-25709). Drives the inline-ray-query rt_query.metal kernel.
+    void BindAccelStructure(IAccelStructure& tlas, uint32_t slot) override;
     void BindShadowMapCompute(IRenderTarget& shadowMap) override;
     void ComputePushConstants(const void* data, uint32_t size) override;
     void DispatchCompute(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) override;

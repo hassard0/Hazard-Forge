@@ -44,6 +44,15 @@ public:
     std::unique_ptr<IBuffer> CreateBuffer(const BufferDesc&) override;
     std::unique_ptr<ITexture> CreateTexture(const TextureDesc&) override;
 
+    // Slice METAL-RT S1 — Hardware Ray Tracing: the acceleration-structure factories behind the RT1
+    // IAccelStructure seam (impls in metal_accel.mm). Build a procedural-AABB primitive BLAS / a TLAS
+    // over child BLAS(es); SupportsHardwareRayQuery reports the cached [mtlDevice supportsRaytracing].
+    // On a Mac without HW ray tracing (M1/M2) supportsRaytracing_ is false -> these return nullptr /
+    // false and callers keep the CPU path. Mirrors the Vulkan backend (rhi_vulkan/vulkan_accel.cpp).
+    std::unique_ptr<IAccelStructure> CreateBlas(const BlasDesc&) override;
+    std::unique_ptr<IAccelStructure> CreateTlas(const TlasDesc&) override;
+    bool SupportsHardwareRayQuery() const override;
+
     // Metal-only shader entry: compile MSL source at runtime. Not on IRHIDevice (keeps the RHI
     // seam SPIR-V-shaped); the sample calls this under __APPLE__.
     std::unique_ptr<IShaderModule> CreateShaderModuleMSL(const std::string& source,
@@ -108,6 +117,11 @@ private:
 
     id<MTLDevice>       device_ = nil;
     id<MTLCommandQueue> queue_  = nil;
+
+    // Slice METAL-RT S1: cached [device_ supportsRaytracing] (set in Init() at device creation, BOTH the
+    // headless and windowed ctors call Init()). M4 -> true; M1/M2 -> false. SupportsHardwareRayQuery()
+    // returns this; CreateBlas/CreateTlas early-out to nullptr when false.
+    bool supportsRaytracing_ = false;
 
     std::unique_ptr<MetalSwapchain> swapchain_;
     std::unique_ptr<MetalCommandBuffer> recorder_;

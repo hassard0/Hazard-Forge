@@ -3,6 +3,7 @@
 #include "rhi_metal/metal_pipeline.h"
 #include "rhi_metal/metal_compute_pipeline.h"
 #include "rhi_metal/metal_buffer.h"
+#include "rhi_metal/metal_accel.h"
 #include "rhi_metal/metal_texture.h"
 #include "rhi_metal/metal_sampled.h"
 #include "rhi_metal/metal_render_target.h"
@@ -407,6 +408,24 @@ void MetalCommandBuffer::BindStorageBuffer(IBuffer& buffer, uint32_t index) {
     auto& b = static_cast<MetalBuffer&>(buffer);
     // Storage buffers bind at kCsStorage + index (the particle SSBO is at buffer(0)).
     [computeEncoder_ setBuffer:b.handle() offset:0 atIndex:kCsStorage + index];
+}
+
+void MetalCommandBuffer::BindAccelStructure(IAccelStructure& tlas, uint32_t slot) {
+    // Slice METAL-RT S1: bind the TLAS at the ray-query buffer slot on the active compute encoder, and
+    // declare the AS (+ every child BLAS handle it references) RESIDENT for the dispatch's traversal.
+    // Lifted from the proven showcase visual_test.mm:25708-25709
+    //   [ce setAccelerationStructure:accel atBufferIndex:3];
+    //   [ce useResource:accel usage:MTLResourceUsageRead];
+    // The seam slot maps to the kernel's `accel [[buffer(3)]]` (rt_query.metal:180); the rt2-query-rhi
+    // showcase passes slot 3 (== ComputePipelineDesc::accelStructureBinding -> rt_query.metal's buffer(3)).
+    auto& as = static_cast<MetalAccelStructure&>(tlas);
+    [computeEncoder_ setAccelerationStructure:as.Handle() atBufferIndex:slot];
+    [computeEncoder_ useResource:as.Handle() usage:MTLResourceUsageRead];
+    // A TLAS references child BLAS handles indirectly (the GPU traversal walks into them), so they must
+    // ALSO be made resident. For the S1 degenerate "TLAS == its single BLAS", ChildHandles() is the single
+    // shared BLAS handle; useResource: is idempotent so the duplicate-with-Handle() is harmless.
+    for (id<MTLAccelerationStructure> child : as.ChildHandles())
+        [computeEncoder_ useResource:child usage:MTLResourceUsageRead];
 }
 
 void MetalCommandBuffer::BindShadowMapCompute(IRenderTarget& shadowMap) {

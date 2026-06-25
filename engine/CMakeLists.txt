@@ -57,6 +57,8 @@ if(APPLE)
     rhi_metal/metal_shader.mm
     rhi_metal/metal_pipeline.mm
     rhi_metal/metal_compute_pipeline.mm
+    # Slice METAL-RT S1: the Metal acceleration-structure backend behind the RT1 IAccelStructure seam.
+    rhi_metal/metal_accel.mm
     rhi_metal/metal_buffer.mm
     rhi_metal/metal_command_buffer.mm
     rhi_metal/metal_texture.mm

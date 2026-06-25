@@ -9,7 +9,12 @@ MetalShaderModule::MetalShaderModule(id<MTLDevice> device, const std::string& so
     NSError* err = nil;
     NSString* src = [NSString stringWithUTF8String:source.c_str()];
     MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
-    // Default language version is fine for the first cut; the Mac may need a pin (e.g. 2.4).
+    // Slice METAL-RT S1: pin MSL 2.4. metal::raytracing::intersection_query (shaders/rt_query.metal,
+    // bound via the RT1 IAccelStructure seam) REQUIRES Metal 2.4 — matches the proven showcase's pin
+    // (visual_test.mm:25678, opts.languageVersion = MTLLanguageVersion2_4). 2.4 is a superset of the
+    // default + the >=2.2 visbuffer/visresolve shaders need, so the existing MSL still compiles and the
+    // existing Metal goldens are byte-unaffected (this is a compile TARGET, not a codegen change).
+    opts.languageVersion = MTLLanguageVersion2_4;
     library_ = [device newLibraryWithSource:src options:opts error:&err];
     if (!library_) {
         std::string msg = "newLibraryWithSource failed";
