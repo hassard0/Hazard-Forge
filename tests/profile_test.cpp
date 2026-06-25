@@ -219,6 +219,94 @@ int main() {
               "profile-s2: TIMING STILL EXCLUDED -- filling timings nonzero leaves BOTH the structural AND tree digest unchanged");
     }
 
+    // ================================ SLICE PROFILE-S3 — frame boundaries + TIMELINE =================
+    // S3 brackets each frame with FrameBegin/FrameEnd markers and builds a per-frame timeline index where
+    // every frame carries its OWN structural sub-digest (events-only, position-independent — the seek prop).
+
+    // ---- Build the 4-frame timeline + its whole-timeline digest. ------------------------------------
+    const Capture timeline = MakeTimelineCapture();
+    const std::vector<FrameIndex> frames = BuildFrameIndex(timeline);
+    const uint64_t timelineDigest = DigestTimeline(frames);
+    std::printf("profile-s3: timeline digest = 0x%016llx  (%zu frames)\n",
+                static_cast<unsigned long long>(timelineDigest), frames.size());
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        std::printf("profile-s3:   frame %u  events[%u..%u]  structuralDigest = 0x%016llx\n",
+                    frames[i].frameNumber, frames[i].firstEvent,
+                    frames[i].firstEvent + frames[i].eventCount,
+                    static_cast<unsigned long long>(frames[i].structuralDigest));
+    }
+
+    const uint64_t kPinnedTimelineDigest = 0xc68ff46e1ab25f37ull;  // PINNED on first run (MSVC == clang)
+
+    // ---- (S3-1) PRIOR INVARIANT — S1 0xedc7791443141dfd and S2 0xb41eb67a1d13443e both UNCHANGED. ----
+    {
+        const bool s1Same = (StructuralDigest(MakeShowcaseCapture()) == 0xedc7791443141dfdull);
+        const bool s2Same = (DigestTree(BuildScopeTree(MakeShowcaseCapture())) == 0xb41eb67a1d13443eull);
+        check(s1Same && s2Same,
+              "profile-s1/s2: prior digests 0xedc7791443141dfd + 0xb41eb67a1d13443e UNCHANGED (append-only)");
+    }
+
+    // ---- (S3-2) FRAME COUNT — exactly 4 frames, frameNumber 0,1,2,3, each eventCount == 5. ----------
+    {
+        bool ok = (frames.size() == 4u);
+        for (std::size_t i = 0; ok && i < frames.size(); ++i) {
+            ok = ok && (frames[i].frameNumber == static_cast<uint32_t>(i)) && (frames[i].eventCount == 5u);
+            // Each frame is bracketed FrameBegin..FrameEnd.
+            ok = ok && (timeline.events[frames[i].firstEvent].kind == EvKind::FrameBegin);
+            ok = ok && (timeline.events[frames[i].firstEvent + frames[i].eventCount - 1u].kind == EvKind::FrameEnd);
+        }
+        check(ok,
+              "profile-s3: BuildFrameIndex(timeline) has 4 frames, each bracketed FrameBegin..FrameEnd");
+    }
+
+    // ---- (S3-3) PINNED TIMELINE — DigestTimeline == the hard-pinned uint64 (identical MSVC + clang). -
+    check(timelineDigest == kPinnedTimelineDigest,
+          "profile-s3: DigestTimeline == pinned uint64 (the multi-frame timeline is byte-stable cross-platform)");
+
+    // ---- (S3-4) PER-FRAME REPRODUCIBILITY — frame 0 and frame 1 (identical workload) match. ---------
+    check(frames[0].structuralDigest == frames[1].structuralDigest,
+          "profile-s3: per-frame reproducibility -- frame 0 and frame 1 (identical workload) have the SAME structuralDigest");
+
+    // ---- (S3-5) FRAMES DISTINGUISH WORKLOADS — frame 2 (Lit) differs from frame 0 (Shadow). ---------
+    check(frames[2].structuralDigest != frames[0].structuralDigest,
+          "profile-s3: a different-workload frame (frame 2) has a DIFFERENT structuralDigest (frames distinguish workloads)");
+
+    // ---- (S3-6) POSITION-INDEPENDENT — a second capture of frame 0's workload ALONE has the same cell.
+    {
+        Capture solo;
+        // Intern names in the SAME first-seen order as MakeTimelineCapture so the interned ids match
+        // (the per-frame digest encodes nameId; the seek property is over the SAME interned id space).
+        const char kFrame[]  = { 'F', 'r', 'a', 'm', 'e' };
+        const char kShadow[] = { 'S', 'h', 'a', 'd', 'o', 'w' };
+        (void)Intern(solo.names, kFrame, sizeof(kFrame));   // id 0 (matches the timeline capture)
+        const uint32_t shadow = Intern(solo.names, kShadow, sizeof(kShadow));  // id 1
+        EmitFrameBegin(solo, 0u);
+        EmitEnter(solo, shadow);
+        EmitDraw (solo, shadow, 2);
+        EmitExit (solo, shadow);
+        EmitFrameEnd(solo);
+        const std::vector<FrameIndex> soloFrames = BuildFrameIndex(solo);
+        check(soloFrames.size() == 1u && soloFrames[0].structuralDigest == frames[0].structuralDigest,
+              "profile-s3: a frame's structuralDigest depends only on its OWN events (position-independent -- the seek property)");
+    }
+
+    // ---- (S3-7) TIMING STILL EXCLUDED — fill timings nonzero, timeline + per-frame digests unchanged. -
+    {
+        Capture timed = MakeTimelineCapture();
+        for (std::size_t i = 0; i < timed.timings.size(); ++i) {
+            timed.timings[i].cpuNanos = static_cast<uint64_t>(i) * 1000ull + 7ull;
+            timed.timings[i].gpuNanos = static_cast<uint64_t>(i) * 9ull;
+        }
+        const std::vector<FrameIndex> timedFrames = BuildFrameIndex(timed);
+        bool perFrameSame = (timedFrames.size() == frames.size());
+        for (std::size_t i = 0; perFrameSame && i < timedFrames.size(); ++i) {
+            perFrameSame = perFrameSame && (timedFrames[i].structuralDigest == frames[i].structuralDigest);
+        }
+        const bool timelineSame = (DigestTimeline(timedFrames) == timelineDigest);
+        check(perFrameSame && timelineSame,
+              "profile-s3: TIMING STILL EXCLUDED -- filling timings nonzero leaves the timeline digest unchanged");
+    }
+
     if (g_fail == 0) { std::printf("profile_test: ALL PASS\n"); return 0; }
     std::printf("profile_test: %d FAIL\n", g_fail);
     return 1;

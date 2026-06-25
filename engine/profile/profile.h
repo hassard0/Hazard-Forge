@@ -268,4 +268,149 @@ inline uint64_t DigestTree(const ScopeTree& t) {
     return net::DigestBytes(buf.data(), buf.size());
 }
 
+// ============================ SLICE PROFILE-S3 — frame boundaries + multi-frame TIMELINE =============
+// APPEND-ONLY below S2 (do NOT modify S1/S2 — 0xedc7791443141dfd and 0xb41eb67a1d13443e stay pinned).
+// S3 adds FrameBegin/FrameEnd markers that bracket each frame's events, plus a TIMELINE: a per-frame
+// index where every frame carries its OWN structural sub-digest (the digest of just that frame's events).
+// CRUCIAL: a frame's digest depends on ONLY that frame's events — NO cross-frame state, NO timings — which
+// is the position-independence that makes S5's seek-to-frame exact. NO new include. NO recursion (integer
+// walk). The frame index is built from `events` ONLY — `timings` is NEVER read.
+
+// --- Frame-marker emitters: push the marker + a parallel zero TimingSample (events.size()==timings.size())
+inline void EmitFrameBegin(Capture& c, uint32_t frameNumber) {
+    c.events.push_back(CaptureEvent{ EvKind::FrameBegin, 0u, frameNumber, 0u });
+    c.timings.push_back(TimingSample{});
+}
+inline void EmitFrameEnd(Capture& c) {
+    c.events.push_back(CaptureEvent{ EvKind::FrameEnd, 0u, 0u, 0u });
+    c.timings.push_back(TimingSample{});
+}
+
+// --- EncodeFrameEvents: hand-LE a SLICE [first, first+count) of the event stream (NO names, NO absolute
+// position): PutU32(count), then per event PutU32((uint32_t)kind), PutU32(nameId), PutU32(a), PutU32(b).
+// Position-independent by construction — two frames with the identical event RECORDS encode identically.
+inline std::vector<uint8_t> EncodeFrameEvents(const Capture& c, uint32_t first, uint32_t count) {
+    std::vector<uint8_t> b;
+    PutU32(b, count);
+    for (uint32_t k = 0; k < count; ++k) {
+        const CaptureEvent& e = c.events[static_cast<std::size_t>(first) + k];
+        PutU32(b, static_cast<uint32_t>(e.kind));
+        PutU32(b, e.nameId);
+        // A FrameBegin's `a` is the FRAME NUMBER — pure timeline metadata, NOT structural workload. Encoding
+        // it as 0 here is what makes two identical-workload frames (frame 0 vs frame 1) hash IDENTICALLY,
+        // the position-independence the spec's per-frame-reproducibility property demands (the frame number
+        // is preserved separately in FrameIndex.frameNumber + serialized by DigestTimeline). Every OTHER
+        // event encodes its `a` verbatim.
+        PutU32(b, (e.kind == EvKind::FrameBegin) ? 0u : e.a);
+        PutU32(b, e.b);
+    }
+    return b;
+}
+inline uint64_t FrameStructuralDigest(const Capture& c, uint32_t first, uint32_t count) {
+    const std::vector<uint8_t> b = EncodeFrameEvents(c, first, count);
+    return net::DigestBytes(b.data(), b.size());
+}
+
+// --- The frame index (the timeline) — one FrameIndex per complete frame ------------------------------
+struct FrameIndex {
+    uint32_t frameNumber      = 0;   // the FrameBegin's `a`
+    uint32_t firstEvent       = 0;   // index of this frame's FrameBegin in c.events
+    uint32_t eventCount       = 0;   // number of events in [FrameBegin .. FrameEnd] inclusive
+    uint64_t structuralDigest = 0;   // FrameStructuralDigest over this frame's events (the timeline cell)
+};
+
+// --- BuildFrameIndex — split the event stream on FrameBegin/FrameEnd markers (integer walk, NO recursion).
+// On FrameBegin record firstEvent/frameNumber + open a frame; on FrameEnd close it. An unclosed final frame
+// runs to the end of the stream (deterministic, never UB). Events outside any frame are skipped.
+inline std::vector<FrameIndex> BuildFrameIndex(const Capture& c) {
+    std::vector<FrameIndex> frames;
+    bool     open       = false;
+    uint32_t firstEvent = 0u;
+    uint32_t frameNumber = 0u;
+    for (std::size_t i = 0; i < c.events.size(); ++i) {
+        const CaptureEvent& ev = c.events[i];
+        if (ev.kind == EvKind::FrameBegin) {
+            open        = true;
+            firstEvent  = static_cast<uint32_t>(i);
+            frameNumber = ev.a;
+        } else if (ev.kind == EvKind::FrameEnd) {
+            if (open) {
+                const uint32_t eventCount = static_cast<uint32_t>(i) - firstEvent + 1u;
+                FrameIndex fi;
+                fi.frameNumber      = frameNumber;
+                fi.firstEvent       = firstEvent;
+                fi.eventCount       = eventCount;
+                fi.structuralDigest = FrameStructuralDigest(c, firstEvent, eventCount);
+                frames.push_back(fi);
+                open = false;
+            }
+            // A stray FrameEnd with no open frame is ignored (deterministic).
+        }
+    }
+    if (open) {   // an unclosed trailing frame -> close it at the end of the stream
+        const uint32_t eventCount = static_cast<uint32_t>(c.events.size()) - firstEvent;
+        FrameIndex fi;
+        fi.frameNumber      = frameNumber;
+        fi.firstEvent       = firstEvent;
+        fi.eventCount       = eventCount;
+        fi.structuralDigest = FrameStructuralDigest(c, firstEvent, eventCount);
+        frames.push_back(fi);
+    }
+    return frames;
+}
+
+// --- DigestTimeline — hand-LE over the frame index: PutU32(frameCount), then per frame PutU32(frameNumber),
+// PutU32(eventCount), PutU64(structuralDigest). Then net::DigestBytes.
+inline uint64_t DigestTimeline(const std::vector<FrameIndex>& frames) {
+    std::vector<uint8_t> b;
+    PutU32(b, static_cast<uint32_t>(frames.size()));
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        PutU32(b, frames[i].frameNumber);
+        PutU32(b, frames[i].eventCount);
+        PutU64(b, frames[i].structuralDigest);
+    }
+    return net::DigestBytes(b.data(), b.size());
+}
+
+// --- The deterministic FIXED timeline fixture (pinned forever by the golden) -------------------------
+// intern "Frame","Shadow","Lit","Post"; build 4 frames. Frame 0 and frame 1 are the IDENTICAL workload
+// (different frame number) so their structuralDigest MUST match.
+inline Capture MakeTimelineCapture() {
+    Capture c;
+    const char kFrame[]  = { 'F', 'r', 'a', 'm', 'e' };
+    const char kShadow[] = { 'S', 'h', 'a', 'd', 'o', 'w' };
+    const char kLit[]    = { 'L', 'i', 't' };
+    const char kPost[]   = { 'P', 'o', 's', 't' };
+    (void)Intern(c.names, kFrame, sizeof(kFrame));       // "Frame" interned (id 0) for stable parity with S1
+    const uint32_t shadow = Intern(c.names, kShadow, sizeof(kShadow));
+    const uint32_t lit    = Intern(c.names, kLit,    sizeof(kLit));
+    const uint32_t post   = Intern(c.names, kPost,   sizeof(kPost));
+
+    // frame 0: FrameBegin(0); Enter Shadow; Draw(Shadow,2); Exit Shadow; FrameEnd
+    EmitFrameBegin(c, 0u);
+    EmitEnter(c, shadow);
+    EmitDraw (c, shadow, 2);
+    EmitExit (c, shadow);
+    EmitFrameEnd(c);
+    // frame 1: IDENTICAL workload, FrameBegin(1)
+    EmitFrameBegin(c, 1u);
+    EmitEnter(c, shadow);
+    EmitDraw (c, shadow, 2);
+    EmitExit (c, shadow);
+    EmitFrameEnd(c);
+    // frame 2: FrameBegin(2); Enter Lit; Draw(Lit,5); Exit Lit; FrameEnd
+    EmitFrameBegin(c, 2u);
+    EmitEnter(c, lit);
+    EmitDraw (c, lit, 5);
+    EmitExit (c, lit);
+    EmitFrameEnd(c);
+    // frame 3: FrameBegin(3); Enter Post; Draw(Post,1); Exit Post; FrameEnd
+    EmitFrameBegin(c, 3u);
+    EmitEnter(c, post);
+    EmitDraw (c, post, 1);
+    EmitExit (c, post);
+    EmitFrameEnd(c);
+    return c;
+}
+
 }  // namespace hf::profile
