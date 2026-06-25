@@ -159,6 +159,270 @@ int main() {
               "draco-dr1: a bad-magic / truncated header parses to valid=false (no UB, deterministic)");
     }
 
+    // ================================ DR2 -- rANS entropy decoder ===============================
+    // The TEST implements minimal rANS RAW + rABS *encoders* (TEST-ONLY scaffolding, NOT in the
+    // shipped header) -- the faithful inverses of RansRead/RabsDescRead -- to produce valid streams,
+    // then the DR2 decoder recovers them bit-exactly. This proves the decoder is deterministic,
+    // self-consistent, and cross-platform byte-identical. (Caveat, per spec: the round-trip proves
+    // consistency, not yet Draco-encoder correctness; that is DR3/DR4 against the real Box.)
+
+    // ---- (DR2.2) TABLE -- rans_build_look_up_table direct unit check (no encoder needed). --------
+    // probs {3,1,4} sum to 8 (== rans_precision here). lut maps rem -> the symbol whose cumulative
+    // range [cum_prob, cum_prob+prob) contains rem; cum_prob is the running prefix sum.
+    {
+        const uint32_t kPrec = 8u;
+        std::vector<uint32_t> token_probs = { 3u, 1u, 4u };  // cum: 0,3,4 ; ranges [0,3) [3,4) [4,8)
+        std::vector<uint32_t> lut(kPrec, 0u);
+        std::vector<RansSym>  prob_table;
+        RansBuildLookUpTable(token_probs, 3u, lut, prob_table);
+
+        const uint32_t expect_lut[8] = { 0,0,0, 1, 2,2,2,2 };
+        bool lut_ok = true;
+        for (uint32_t i = 0; i < kPrec; ++i) if (lut[i] != expect_lut[i]) lut_ok = false;
+        const bool cum_ok = prob_table.size() == 3
+            && prob_table[0].prob == 3 && prob_table[0].cum_prob == 0
+            && prob_table[1].prob == 1 && prob_table[1].cum_prob == 3
+            && prob_table[2].prob == 4 && prob_table[2].cum_prob == 4;
+        check(lut_ok && cum_ok,
+              "draco-dr2: rans_build_look_up_table builds a correct cumulative table (lut maps rem->symbol)");
+    }
+
+    // ---- The TEST-ONLY RAW rANS encoder (the exact inverse of DecodeRawSymbols). -----------------
+    // Builds the SAME prob table the decoder builds (via BuildSymbolTables tokens), then encodes the
+    // symbols in REVERSE. For each symbol s with (prob, cum_prob):
+    //   renorm-out: while state >= ((l_rans_base / precision) * IO_BASE) * prob:
+    //                  emit state % IO_BASE (low byte), state /= IO_BASE;
+    //   state = (state / prob) * precision + (state % prob) + cum_prob;
+    // Then flush `state` into the trailing header byte(s) in the RansInitDecoder layout (1..4 bytes,
+    // top 2 bits of the LAST byte = #extra bytes, low 30 bits = state - l_rans_base). The renorm-out
+    // bytes were emitted low-first; the decoder pulls them high-first reading backward -- so the
+    // emitted-byte vector is reversed (oldest emit ends up nearest the header) to form the buffer
+    // the decoder reads from buffer[size-1] backward. This is the standard rANS little-endian layout.
+
+    // Encode `num_symbols` per-symbol prob TOKENS (token==1/2 paths) so BuildSymbolTables rebuilds the
+    // identical table from the wire. probs < 64 use a single byte (token=0, prob<<2); larger probs use
+    // extra bytes. Here all our probs fit in the token=1 (1 extra byte) form generically.
+    auto encodeProbTokens = [](std::vector<uint8_t>& out, const std::vector<uint32_t>& probs) {
+        for (uint32_t prob : probs) {
+            // Choose the smallest token (#extra bytes) that holds `prob`: 6 bits in byte0, then +8/extra.
+            uint32_t token = 0;            // extra bytes
+            if (prob >= (1u << 6))  token = 1;
+            if (prob >= (1u << 14)) token = 2;
+            if (prob >= (1u << 22)) token = 3 - 3;  // (won't happen for our small probs)
+            uint8_t b0 = static_cast<uint8_t>(((prob & 0x3Fu) << 2) | (token & 3u));
+            out.push_back(b0);
+            for (uint32_t j = 0; j < token; ++j) {
+                uint32_t eb = (prob >> (8u * (j + 1u) - 2u)) & 0xFFu;
+                out.push_back(static_cast<uint8_t>(eb));
+            }
+        }
+    };
+
+    // The faithful RAW-rANS encoder. Produces the full symbol blob: max_bit_length, num_symbols_,
+    // prob tokens, size (varUI64), then the rANS buffer.
+    auto encodeRawSymbols = [&](const std::vector<uint32_t>& symbols,
+                                const std::vector<uint32_t>& probs,   // per-symbol, summing to precision
+                                uint32_t max_bit_length) -> std::vector<uint8_t> {
+        uint32_t rans_precision_bits = (3u * max_bit_length) / 2u;
+        if (rans_precision_bits > 20u) rans_precision_bits = 20u;
+        if (rans_precision_bits < 12u) rans_precision_bits = 12u;
+        const uint32_t precision = 1u << rans_precision_bits;
+        const uint32_t l_rans_base = precision * 4u;
+
+        // cum_prob prefix sums (matching rans_build_look_up_table order).
+        std::vector<uint32_t> cum(probs.size(), 0u);
+        { uint32_t c = 0; for (std::size_t i = 0; i < probs.size(); ++i) { cum[i] = c; c += probs[i]; } }
+
+        // Encode in REVERSE. state starts at l_rans_base (the minimal valid renormalized state).
+        uint32_t state = l_rans_base;
+        std::vector<uint8_t> emitted;  // low-byte-first emission order
+        for (std::size_t k = symbols.size(); k-- > 0; ) {
+            const uint32_t s = symbols[k];
+            const uint32_t prob = probs[s];
+            const uint32_t cp   = cum[s];
+            // renorm-out: keep state in [l_rans_base, l_rans_base/precision * IO_BASE * prob).
+            const uint32_t x_max = ((l_rans_base / precision) * kIoBase) * prob;
+            while (state >= x_max) {
+                emitted.push_back(static_cast<uint8_t>(state % kIoBase));
+                state /= kIoBase;
+            }
+            state = (state / prob) * precision + (state % prob) + cp;
+        }
+
+        // Flush `state` into the RansInitDecoder trailing-header layout. state currently includes
+        // l_rans_base (RansInitDecoder adds l_rans_base AFTER masking, so we subtract it here).
+        const uint32_t hdr = state - l_rans_base;  // the masked value the decoder reconstructs
+        std::vector<uint8_t> header;  // bytes in buffer order (low ... high), the LAST byte carries x.
+        if (hdr < (1u << 6)) {            // x == 0, 1 byte
+            header.push_back(static_cast<uint8_t>((0u << 6) | (hdr & 0x3Fu)));
+        } else if (hdr < (1u << 14)) {    // x == 1, 2 bytes (LE16)
+            header.push_back(static_cast<uint8_t>(hdr & 0xFFu));
+            header.push_back(static_cast<uint8_t>((1u << 6) | ((hdr >> 8) & 0x3Fu)));
+        } else if (hdr < (1u << 22)) {    // x == 2, 3 bytes (LE24)
+            header.push_back(static_cast<uint8_t>(hdr & 0xFFu));
+            header.push_back(static_cast<uint8_t>((hdr >> 8) & 0xFFu));
+            header.push_back(static_cast<uint8_t>((2u << 6) | ((hdr >> 16) & 0x3Fu)));
+        } else {                          // x == 3, 4 bytes (LE32)
+            header.push_back(static_cast<uint8_t>(hdr & 0xFFu));
+            header.push_back(static_cast<uint8_t>((hdr >> 8) & 0xFFu));
+            header.push_back(static_cast<uint8_t>((hdr >> 16) & 0xFFu));
+            header.push_back(static_cast<uint8_t>((3u << 6) | ((hdr >> 24) & 0x3Fu)));
+        }
+
+        // The rANS buffer: the renorm-out bytes (in PUSH order) come first, then the header at the
+        // very end. The decoder reads the header first (it lives at buffer[size-1] backward), then
+        // walks BACKWARD via buf[--buf_offset] -- consuming the emitted bytes last-pushed-first (LIFO).
+        // So the byte emitted LAST during the reverse encode sits nearest the header and is pulled in
+        // FIRST during the forward decode: buffer = emitted (forward push order) ++ header.
+        std::vector<uint8_t> ransBuf;
+        for (uint8_t b : emitted) ransBuf.push_back(b);
+        for (uint8_t b : header) ransBuf.push_back(b);
+
+        // Assemble the full blob.
+        std::vector<uint8_t> blob;
+        blob.push_back(static_cast<uint8_t>(max_bit_length));
+        EncodeVarU32(blob, static_cast<uint32_t>(probs.size()));  // num_symbols_
+        encodeProbTokens(blob, probs);
+        // size (varUI64) -- use the same LEB128 encoder (low 32 bits; our sizes are tiny).
+        EncodeVarU32(blob, static_cast<uint32_t>(ransBuf.size()));
+        for (uint8_t b : ransBuf) blob.push_back(b);
+        return blob;
+    };
+
+    // ---- (DR2.3 + DR2.4) RAW rANS round-trip + PINNED digest. ------------------------------------
+    // A fixed symbol sequence over 4 symbols with a fixed distribution summing to precision (4096).
+    const std::vector<uint32_t> kRawSymbolSeq =
+        { 0,1,2,1,0,3,2,2,1,0,3,3,1,2,0,1,2,3,0,1 };
+    const std::vector<uint32_t> kRawProbs = { 1024u, 1536u, 1024u, 512u };  // sums to 4096 == precision
+    const uint32_t kMaxBitLength = 8u;  // -> rans_precision_bits = 12 -> precision 4096
+    {
+        std::vector<uint8_t> blob = encodeRawSymbols(kRawSymbolSeq, kRawProbs, kMaxBitLength);
+
+        ByteReader r{ blob.data(), blob.size(), 0, false };
+        std::vector<uint32_t> recovered;
+        const bool ok = DecodeRawSymbols(r, static_cast<uint32_t>(kRawSymbolSeq.size()), recovered);
+
+        bool exact = ok && recovered.size() == kRawSymbolSeq.size();
+        if (exact) for (std::size_t i = 0; i < recovered.size(); ++i)
+            if (recovered[i] != kRawSymbolSeq[i]) exact = false;
+
+        check(exact,
+              "draco-dr2: RAW rANS round-trip -- encode a fixed symbol sequence, DecodeRawSymbols recovers it EXACTLY");
+
+        const uint64_t digest = net::DigestBytes(recovered.data(), recovered.size() * sizeof(uint32_t));
+        std::printf("draco-dr2: raw-rans roundtrip digest = 0x%016llx\n",
+                    static_cast<unsigned long long>(digest));
+        const uint64_t kPinnedRawDigest = 0xbc91b8ba74fbf8b1ull;  // PINNED on first run (MSVC == clang)
+        check(digest == kPinnedRawDigest,
+              "draco-dr2: the recovered-symbols digest == pinned uint64 (deterministic + byte-stable cross-platform)");
+    }
+
+    // ---- The TEST-ONLY rABS encoder (the exact inverse of RabsDescRead). -------------------------
+    // RabsDescRead: p = P - p0; quot = x/P; rem = x%P; val = rem<p; state = val ? quot*p + rem :
+    //   x - quot*p - p.  The encoder inverts: given the bit `val` and current state, produce the
+    //   pre-state x such that decoding it yields `val` and leaves the given state. Encode bits in
+    //   REVERSE, renorm-out (emit a byte) when the next state would overflow the 14-bit range, and
+    //   flush the final state via the RansInitDecoder header layout (l_rans_base = kRabsLBase).
+    auto encodeRabs = [&](const std::vector<uint8_t>& bits, uint32_t p0) -> std::vector<uint8_t> {
+        const uint32_t P = kRabsP8Precision;
+        const uint32_t p = P - p0;
+        std::vector<uint8_t> emitted;  // low-first
+        uint32_t state = kRabsLBase;   // minimal valid renormalized state
+        // For a bit `val`, the decoder maps x -> new state. The forward (encode) map is the inverse:
+        //   if val: the post-state s = (x/P)*p + (x%P) with x%P < p  -> x = (s/p)*P + (s%p).
+        //   else  : s = x - (x/P)*p - p, with x%P in [p,P) -> let q=s/(P-p): x = q*P + (s%(P-p)) + p.
+        // Renorm-out before applying so the resulting x stays < kRabsLBase * IO_BASE (the decoder
+        // renorms IN when state < kRabsLBase, one byte at a time).
+        const uint32_t state_max = kRabsLBase * kIoBase;  // strict upper bound for a renormalized state
+        for (std::size_t k = bits.size(); k-- > 0; ) {
+            const uint8_t val = bits[k] ? 1u : 0u;
+            // Compute the candidate pre-state x for the current `state`; renorm-out if it would exceed.
+            for (;;) {
+                uint32_t x;
+                if (val) {
+                    x = (state / p) * P + (state % p);
+                } else {
+                    const uint32_t q = state / (P - p);
+                    x = q * P + (state % (P - p)) + p;
+                }
+                if (x < state_max) { state = x; break; }
+                // renorm-out one byte and retry (the decoder will pull it back in).
+                emitted.push_back(static_cast<uint8_t>(state % kIoBase));
+                state /= kIoBase;
+            }
+        }
+        // Flush state via the RansInitDecoder header layout (subtract kRabsLBase like raw).
+        const uint32_t hdr = state - kRabsLBase;
+        std::vector<uint8_t> header;
+        if (hdr < (1u << 6)) {
+            header.push_back(static_cast<uint8_t>((0u << 6) | (hdr & 0x3Fu)));
+        } else if (hdr < (1u << 14)) {
+            header.push_back(static_cast<uint8_t>(hdr & 0xFFu));
+            header.push_back(static_cast<uint8_t>((1u << 6) | ((hdr >> 8) & 0x3Fu)));
+        } else if (hdr < (1u << 22)) {
+            header.push_back(static_cast<uint8_t>(hdr & 0xFFu));
+            header.push_back(static_cast<uint8_t>((hdr >> 8) & 0xFFu));
+            header.push_back(static_cast<uint8_t>((2u << 6) | ((hdr >> 16) & 0x3Fu)));
+        } else {
+            header.push_back(static_cast<uint8_t>(hdr & 0xFFu));
+            header.push_back(static_cast<uint8_t>((hdr >> 8) & 0xFFu));
+            header.push_back(static_cast<uint8_t>((hdr >> 16) & 0xFFu));
+            header.push_back(static_cast<uint8_t>((3u << 6) | ((hdr >> 24) & 0x3Fu)));
+        }
+        std::vector<uint8_t> buf;  // emitted (forward push order) ++ header -- same LIFO layout as raw.
+        for (uint8_t b : emitted) buf.push_back(b);
+        for (uint8_t b : header) buf.push_back(b);
+        return buf;
+    };
+
+    // ---- (DR2.5) binary rABS round-trip + pinned digest. -----------------------------------------
+    const std::vector<uint8_t> kBits =
+        { 1,0,1,1,0,0,1,0,1,1,1,0,0,1,0,1,0,0,1,1,1,0,1,0 };
+    const uint32_t kP0 = 154u;  // P(0) in [0,256); P(1) = 256 - 154 = 102.
+    {
+        std::vector<uint8_t> buf = encodeRabs(kBits, kP0);
+
+        AnsDecoder ans;
+        RabsInitDecoder(ans, buf.data(), static_cast<int>(buf.size()));
+        std::vector<uint8_t> recovered;
+        recovered.reserve(kBits.size());
+        for (std::size_t i = 0; i < kBits.size(); ++i)
+            recovered.push_back(RabsDescRead(ans, kP0));
+
+        bool exact = recovered.size() == kBits.size();
+        if (exact) for (std::size_t i = 0; i < kBits.size(); ++i)
+            if (recovered[i] != kBits[i]) exact = false;
+
+        check(exact,
+              "draco-dr2: binary rABS round-trip -- encode a fixed bit sequence with p0, RabsDescRead recovers it exactly");
+
+        const uint64_t digest = net::DigestBytes(recovered.data(), recovered.size() * sizeof(uint8_t));
+        std::printf("draco-dr2: rabs roundtrip digest = 0x%016llx\n",
+                    static_cast<unsigned long long>(digest));
+        const uint64_t kPinnedRabsDigest = 0xb6efc1e48524ecd8ull;  // PINNED on first run (MSVC == clang)
+        check(digest == kPinnedRabsDigest,
+              "draco-dr2: the recovered-bits digest == pinned uint64 (deterministic + byte-stable cross-platform)");
+    }
+
+    // ---- (DR2.6) LOAD-BEARING -- change one symbol -> the recovered digest changes. --------------
+    {
+        std::vector<uint32_t> altSeq = kRawSymbolSeq;
+        altSeq[0] = (altSeq[0] == 0u) ? 3u : 0u;  // flip the first symbol
+        std::vector<uint8_t> blob = encodeRawSymbols(altSeq, kRawProbs, kMaxBitLength);
+        ByteReader r{ blob.data(), blob.size(), 0, false };
+        std::vector<uint32_t> recovered;
+        const bool ok = DecodeRawSymbols(r, static_cast<uint32_t>(altSeq.size()), recovered);
+
+        bool exact = ok && recovered.size() == altSeq.size();
+        if (exact) for (std::size_t i = 0; i < recovered.size(); ++i)
+            if (recovered[i] != altSeq[i]) exact = false;
+
+        const uint64_t altDigest = net::DigestBytes(recovered.data(), recovered.size() * sizeof(uint32_t));
+        const uint64_t kPinnedRawDigest = 0xbc91b8ba74fbf8b1ull;
+        check(exact && altDigest != kPinnedRawDigest,
+              "draco-dr2: a different symbol/probability changes the digest (the coder is load-bearing)");
+    }
+
     if (g_fail == 0) { std::printf("draco_test: ALL PASS\n"); return 0; }
     std::printf("draco_test: %d FAIL\n", g_fail);
     return 1;
