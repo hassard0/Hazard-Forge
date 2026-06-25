@@ -229,6 +229,227 @@ int main() {
         }
     }
 
+    // ================================================================================================
+    // ---- Slice WFC-S3: the full deterministic BACKTRACKING solver ----------------------------------
+    // ================================================================================================
+    // PART A — a full solve on the permissive showcase tileset. PART B — a constrained scenario that
+    // FORCES backtracking + an unsolvable scenario that returns solved==false (no hang). All ordering
+    // pinned, so the fully-collapsed grid digest is bit-identical run-to-run AND MSVC-vs-clang.
+
+    // A full-validity sweep: for EVERY cell + EVERY in-bounds neighbor, the neighbor's single tile must be
+    // in AllowedMask(this tile, dir). Returns true iff the whole tilemap obeys every adjacency rule. Assumes
+    // every cell PopCount==1 (a fully-collapsed grid).
+    auto globallyConsistent = [&](const TileSet& tset, const Grid& gg) -> bool {
+        static const int kDirs[4] = { kRight, kUp, kLeft, kDown };
+        static const int kDx[4]   = { +1, 0, -1, 0 };
+        static const int kDz[4]   = {  0, +1, 0, -1 };
+        for (int32_t z = 0; z < gg.h; ++z) {
+            for (int32_t x = 0; x < gg.w; ++x) {
+                const Domain d = gg.cell[static_cast<std::size_t>(gg.cellId(x, z))];
+                if (popcount64(d) != 1) return false;  // not fully collapsed
+                uint32_t self = 0;
+                for (uint32_t t = 0; t < tset.tileCount; ++t)
+                    if ((d >> t) & Domain{1}) { self = t; break; }
+                for (int dd = 0; dd < 4; ++dd) {
+                    const int32_t nx = x + kDx[dd];
+                    const int32_t nz = z + kDz[dd];
+                    if (nx < 0 || nx >= gg.w || nz < 0 || nz >= gg.h) continue;
+                    const Domain nDom = gg.cell[static_cast<std::size_t>(gg.cellId(nx, nz))];
+                    uint32_t nTile = 0;
+                    for (uint32_t t = 0; t < tset.tileCount; ++t)
+                        if ((nDom >> t) & Domain{1}) { nTile = t; break; }
+                    const Domain allow = AllowedMask(tset, self, kDirs[dd]);
+                    if (((allow >> nTile) & Domain{1}) == 0) return false;  // rule violated
+                }
+            }
+        }
+        return true;
+    };
+
+    // ---- PART A — full solve on the showcase -------------------------------------------------------
+    {
+        const uint32_t kSeed    = 0x1234ABCDu;
+        const uint32_t kMaxSteps = 100000u;
+
+        Grid ga = MakeShowcaseGrid(16, 16);
+        const SolveResult r = Solve(ts, ga, kSeed, kMaxSteps);
+        const uint64_t solveDigest = DigestGrid(ga);
+
+        std::printf("wfc-s3: solve -> solved=%d didBacktrack=%d steps=%u backtracks=%u, digest=0x%016llx\n",
+                    static_cast<int>(r.solved), static_cast<int>(r.didBacktrack),
+                    r.steps, r.backtracks, static_cast<unsigned long long>(solveDigest));
+
+        // (1) SOLVED — fully collapsed, every cell PopCount==1.
+        bool allDecided = r.solved;
+        for (const Domain d : ga.cell) if (popcount64(d) != 1) { allDecided = false; break; }
+        check(allDecided,
+              "wfc-s3: Solve fully collapsed the grid (solved==true, every cell PopCount==1)");
+
+        // (2) PINNED DIGEST — the cross-platform proof.
+        const uint64_t kS3PinnedDigest = 0x0fffd74f7e8419acull;  // PINNED on first run
+        check(solveDigest == kS3PinnedDigest,
+              "wfc-s3: fully-collapsed grid digest == pinned uint64 (the cross-platform proof)");
+
+        // (3) GLOBAL CONSISTENCY — every adjacent pair satisfies the rules.
+        check(globallyConsistent(ts, ga),
+              "wfc-s3: the collapsed assignment is GLOBALLY consistent (every adjacent pair satisfies the rules)");
+
+        // (4) REPLAY-STABLE — same seed -> identical solved/steps/backtracks/digest.
+        {
+            Grid g2 = MakeShowcaseGrid(16, 16);
+            const SolveResult r2 = Solve(ts, g2, kSeed, kMaxSteps);
+            check(r2.solved == r.solved && r2.steps == r.steps && r2.backtracks == r.backtracks &&
+                  DigestGrid(g2) == solveDigest,
+                  "wfc-s3: re-running the same seed is bit-identical (solved/steps/backtracks/digest all identical)");
+        }
+
+        // (5) SEED-DRIVEN — a different seed -> a DIFFERENT digest, ALSO solved + globally consistent.
+        {
+            Grid g3 = MakeShowcaseGrid(16, 16);
+            const SolveResult r3 = Solve(ts, g3, kSeed ^ 0xFFFFu, kMaxSteps);
+            const uint64_t d3 = DigestGrid(g3);
+            check(r3.solved && d3 != solveDigest && globallyConsistent(ts, g3),
+                  "wfc-s3: a different seed yields a different (but still valid+consistent) full collapse");
+        }
+    }
+
+    // ---- PART B — backtracking actually fires + an unsolvable scenario -----------------------------
+    // Strategy (a): a deliberately TIGHT tileset — the canonical WFC "pipes/circuit" rule-set with
+    // DIRECTIONAL (anisotropic) adjacency. Each tile has a 4-bit connector signature (a pipe stub on each
+    // of its R/U/L/D sides); two tiles may share an edge IFF their stubs MATCH across that edge (both
+    // present or both absent — a pipe never dead-ends into a wall). With a CLOSED border (no stub may point
+    // off-grid) the only valid layouts are closed loops, and the S2 min-entropy greedy paints itself into
+    // corners that AC-3 propagation only catches AFTER a doomed collapse — forcing the solver to BACKTRACK.
+    // 8 tiles: 0 empty, 1 horiz(R,L), 2 vert(U,D), 3 cross(R,U,L,D), 4 elbow R+U, 5 U+L, 6 L+D, 7 D+R.
+    // Weights {1,3,3,5,2,2,2,2} (the cross weighted heavy) bias the greedy into the trap — chosen so the
+    // pinned scenario below fires backtracking deterministically. The tileset is adjacency-symmetric by
+    // construction (the stub-match relation is symmetric).
+    static const int kStub[8] = {
+        0,                                  // 0 empty
+        (1<<0)|(1<<2),                      // 1 horiz: R,L
+        (1<<1)|(1<<3),                      // 2 vert:  U,D
+        (1<<0)|(1<<1)|(1<<2)|(1<<3),        // 3 cross
+        (1<<0)|(1<<1),                      // 4 elbow R+U
+        (1<<1)|(1<<2),                      // 5 elbow U+L
+        (1<<2)|(1<<3),                      // 6 elbow L+D
+        (1<<3)|(1<<0)                       // 7 elbow D+R
+    };
+    auto makePipesTileSet = []() -> TileSet {
+        TileSet t;
+        t.tileCount = 8;
+        const int32_t w[8] = { 1, 3, 3, 5, 2, 2, 2, 2 };
+        t.weight.assign(w, w + 8);
+        t.allowed.assign(8u * 4u, Domain{0});
+        // dir order: kRight=0,kUp=1,kLeft=2,kDown=3 (the stub bit index matches the dir index). Across edge
+        // `dir`, my stub on side `dir` must equal the neighbor's stub on side Opposite(dir).
+        for (uint32_t tt = 0; tt < 8u; ++tt)
+            for (int dir = 0; dir < 4; ++dir) {
+                const int myStub = (kStub[tt] >> dir) & 1;
+                const int opp    = Opposite(dir);
+                Domain mask = 0;
+                for (uint32_t u = 0; u < 8u; ++u)
+                    if (((kStub[u] >> opp) & 1) == myStub) mask |= (Domain{1} << u);
+                t.allowed[static_cast<std::size_t>(tt) * 4u + static_cast<std::size_t>(dir)] = mask;
+            }
+        return t;
+    };
+
+    {
+        const TileSet sts = makePipesTileSet();
+        check(IsSymmetric(sts), "wfc-s3: the constrained (pipes) tileset is adjacency-symmetric (AC-3 sound)");
+
+        const uint32_t kSeed     = 0x20ae7589u;  // PINNED: this seed fires backtracking on the 5x8 closed grid
+        const uint32_t kMaxSteps = 100000u;
+
+        // Build a 5x8 all-domain grid, then forbid any tile whose stub points OFF the grid border (a closed
+        // boundary). Propagating that boundary constraint leaves a tight loops-only search the greedy must
+        // backtrack through. Factor it so we can replay bit-for-bit.
+        auto buildConstrained = [&]() -> Grid {
+            const int32_t W = 5, H = 8;
+            Grid g;
+            g.w = W; g.h = H;
+            const Domain all = (Domain{1} << 8) - Domain{1};  // all 8 tiles
+            g.cell.assign(static_cast<std::size_t>(W) * static_cast<std::size_t>(H), all);
+            for (int32_t z = 0; z < H; ++z)
+                for (int32_t x = 0; x < W; ++x) {
+                    Domain keep = 0;
+                    for (uint32_t t = 0; t < 8u; ++t) {
+                        bool ok = true;
+                        if (x == W - 1 && (kStub[t] & (1 << 0))) ok = false;  // right border: no R stub
+                        if (z == H - 1 && (kStub[t] & (1 << 1))) ok = false;  // top border:   no U stub
+                        if (x == 0     && (kStub[t] & (1 << 2))) ok = false;  // left border:  no L stub
+                        if (z == 0     && (kStub[t] & (1 << 3))) ok = false;  // bottom border:no D stub
+                        if (ok) keep |= (Domain{1} << t);
+                    }
+                    g.cell[static_cast<std::size_t>(g.cellId(x, z))] &= keep;
+                }
+            return g;
+        };
+        // Seed-propagate the whole boundary-constrained grid before solving.
+        auto seedAndSolve = [&](Grid& g) -> SolveResult {
+            std::vector<int32_t> wl;
+            for (int32_t i = 0; i < g.w * g.h; ++i) wl.push_back(i);
+            Propagate(sts, g, wl);  // make the boundary constraints live
+            return Solve(sts, g, kSeed, kMaxSteps);
+        };
+
+        Grid gC = buildConstrained();
+        const SolveResult rC = seedAndSolve(gC);
+        const uint64_t cDigest = DigestGrid(gC);
+
+        std::printf("wfc-s3: constrained solve -> solved=%d didBacktrack=%d steps=%u backtracks=%u, digest=0x%016llx\n",
+                    static_cast<int>(rC.solved), static_cast<int>(rC.didBacktrack),
+                    rC.steps, rC.backtracks, static_cast<unsigned long long>(cDigest));
+
+        // (6) BACKTRACK FIRED — didBacktrack && backtracks>=1 && solved, globally consistent.
+        check(rC.didBacktrack && rC.backtracks >= 1u && rC.solved && globallyConsistent(sts, gC),
+              "wfc-s3: backtracking FIRES on the constrained scenario (didBacktrack==true, backtracks>=1) and still solves consistently");
+
+        // (6b) PINNED DIGEST + bit-identical re-run (the deterministic backtracking path).
+        const uint64_t kS3ConstrainedDigest = 0x8adb136f5b4c690aull;  // PINNED on first run
+        {
+            Grid gC2 = buildConstrained();
+            const SolveResult rC2 = seedAndSolve(gC2);
+            check(cDigest == kS3ConstrainedDigest &&
+                  rC2.solved == rC.solved && rC2.didBacktrack == rC.didBacktrack &&
+                  rC2.steps == rC.steps && rC2.backtracks == rC.backtracks &&
+                  DigestGrid(gC2) == cDigest,
+                  "wfc-s3: the constrained solve is also bit-identical on re-run (deterministic backtracking path) + pinned digest");
+        }
+
+        // (7) UNSOLVABLE IS DETERMINISTIC — two horizontally-adjacent cells pre-pinned to tiles whose stubs
+        // CLASH across their shared edge (cell A = tile 1 horiz, which presents an R stub on its right edge;
+        // cell B = tile 0 empty, which presents NO L stub) -> the stub-match rule forbids them adjacent ->
+        // propagation empties a domain -> Solve must return solved==false within maxSteps (no hang),
+        // reproducibly. (Both cells already single-tile, so there is no alternative to back out to.)
+        auto buildUnsolvable = [&]() -> Grid {
+            Grid g;
+            g.w = 2; g.h = 1;
+            const Domain all = (Domain{1} << 8) - Domain{1};
+            g.cell.assign(2, all);
+            g.cell[static_cast<std::size_t>(g.cellId(0, 0))] = Domain{1} << 1;  // horiz: R stub on its right edge
+            g.cell[static_cast<std::size_t>(g.cellId(1, 0))] = Domain{1} << 0;  // empty: no L stub -> clash
+            return g;
+        };
+        {
+            Grid gU = buildUnsolvable();
+            std::vector<int32_t> wl{ gU.cellId(0,0), gU.cellId(1,0) };
+            const bool propOk = Propagate(sts, gU, wl);  // already contradicts (empties a domain)
+            const SolveResult rU = Solve(sts, gU, kSeed, kMaxSteps);
+
+            Grid gU2 = buildUnsolvable();
+            std::vector<int32_t> wl2{ gU2.cellId(0,0), gU2.cellId(1,0) };
+            Propagate(sts, gU2, wl2);
+            const SolveResult rU2 = Solve(sts, gU2, kSeed, kMaxSteps);
+
+            std::printf("wfc-s3: unsolvable -> propOk=%d solved=%d steps=%u (reproduce solved=%d)\n",
+                        static_cast<int>(propOk), static_cast<int>(rU.solved), rU.steps,
+                        static_cast<int>(rU2.solved));
+            check(!rU.solved && !rU2.solved && rU.steps <= kMaxSteps,
+                  "wfc-s3: an UNSOLVABLE scenario returns solved==false deterministically (no hang)");
+        }
+    }
+
     if (g_fail == 0) { std::printf("wfc_test: ALL PASS\n"); return 0; }
     std::printf("wfc_test: %d FAIL\n", g_fail);
     return 1;

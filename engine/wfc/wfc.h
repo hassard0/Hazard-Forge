@@ -299,4 +299,161 @@ inline StepResult ObserveStep(const TileSet& ts, Grid& g, uint32_t seed) {
     return StepResult::kProgressed;
 }
 
+// ===================================================================================================
+// --- Slice WFC-S3: the full deterministic BACKTRACKING solver (the make-or-break) ------------------
+// ===================================================================================================
+// S1 built Propagate; S2 built SelectCell/Collapse/ObserveStep (observe WITHOUT backtrack). S3 is the
+// heart of the flagship: a COMPLETE WFC solver — observe → propagate, and on a CONTRADICTION (an empty
+// domain) BACKTRACK to the last decision, remove the just-tried tile, and retry — until the grid is fully
+// collapsed or proven unsolvable. Real WFC goes non-deterministic exactly here (ordered-set iteration,
+// RNG re-seed, float entropy on retry). S3 makes the WHOLE backtracking search bit-identical CPU/Vulkan/
+// Metal by pinning every ordering and snapshotting domains by byte-exact value-copy — the fpx
+// SnapshotWorld/RestoreWorld discipline + the net::RollbackSession didRollback flag, applied to the WFC
+// domain array. APPEND-ONLY below S2 — S1/S2 types/functions are untouched. Still PURE-CPU INTEGER,
+// self-contained, NO float/RNG/hash-set in the solve path.
+
+// --- Decision: one entry on the backtracking stack --------------------------------------------------
+// snapshot is a byte-exact value-copy of the WHOLE g.cell vector AS OF just BEFORE this cell's collapse
+// (the RestoreWorld discipline — restores bit-exact). triedMask records tiles ALREADY tried at this cell.
+struct Decision {
+    int32_t              cellId;      // the cell this decision collapsed
+    Domain               triedMask;   // tiles already tried at this cell (bit set => tried)
+    std::vector<Domain>  snapshot;    // value-copy of g.cell just BEFORE this collapse
+};
+
+// --- SolveResult: the outcome + provenance ----------------------------------------------------------
+struct SolveResult {
+    bool     solved       = false;  // true iff fully collapsed with no contradiction
+    bool     didBacktrack = false;  // true iff >=1 backtrack fired (the didRollback twin)
+    uint32_t steps        = 0;      // observe+backtrack iterations consumed (the maxSteps guard counter)
+    uint32_t backtracks   = 0;      // how many times we popped/retried
+};
+
+// --- PickTileFromDomain: the deterministic weighted draw over a CANDIDATE set -----------------------
+// total = SumWeight(ts, cand); if total <= 0 return -1 (empty candidate set). r = WfcHash(seed ^
+// kCollapseSalt, idx) % total; walk cand's SET bits ASCENDING accumulating weight[t], return the FIRST
+// tile whose running sum > r. The S2 Collapse draw, but restricted to an arbitrary candidate mask and
+// indexed by a caller-supplied idx (so successive retries at the same cell draw DIFFERENT tiles). NEW
+// append-only helper — S2's Collapse is NOT modified.
+inline int PickTileFromDomain(const TileSet& ts, Domain cand, uint32_t seed, uint32_t idx) {
+    const int total = SumWeight(ts, cand);
+    if (total <= 0) return -1;
+    const uint32_t r = WfcHash(seed ^ kCollapseSalt, idx) % static_cast<uint32_t>(total);
+    uint32_t acc = 0;
+    for (uint32_t t = 0; t < ts.tileCount; ++t) {
+        if ((cand >> t) & Domain{1}) {
+            acc += static_cast<uint32_t>(ts.weight[t]);
+            if (acc > r) return static_cast<int>(t);
+        }
+    }
+    return -1;  // unreachable when total > 0 (acc reaches total > r)
+}
+
+// --- Solve: the decision-stack backtracking solver --------------------------------------------------
+// Loop up to maxSteps. Each iteration:
+//   - c = SelectCell(ts, g). If c == -1 → fully collapsed → solved=true, return.
+//   - DECIDE: push Decision{cellId=c, triedMask=0, snapshot=g.cell (whole-grid value-copy BEFORE collapse)}.
+//     Pick a tile from the candidate set (snapshot[c] & ~triedMask) via PickTileFromDomain indexed by
+//     (c*64 + PopCount(triedMask)) so retries draw different tiles. Set g.cell[c]=1<<tile, mark triedMask,
+//     seed worklist with c, Propagate. If Propagate fails → contradiction path (next iteration).
+//   - On a contradiction (the top decision's collapse failed): ++backtracks; didBacktrack=true. Restore
+//     g.cell = top.snapshot (bit-exact). cand = top.snapshot[top.cellId] & ~top.triedMask (untried tiles).
+//     If cand != 0: pick the next tile (same rule, indexed by triedCount), set+mark+propagate STAYING at
+//     this decision (do NOT push). If cand == 0 (cell exhausted): pop this Decision and backtrack to the
+//     PARENT (restore + try its next tile — same logic, re-evaluated from the new top next iteration). If
+//     the stack empties with no candidate → solved=false (unsolvable), return.
+// Each loop body re-evaluates the current top rather than recursing — clean "retry current" vs "pop to
+// parent" handling. Hitting maxSteps without full collapse → solved=false (deterministic give-up).
+// FIXED ORDER everywhere: SelectCell (S2), weighted ascending tile trial indexed by (cellId,triedCount),
+// LIFO std::vector<Decision>, whole-grid value-copy snapshot/restore. NO unordered/hash/float.
+inline SolveResult Solve(const TileSet& ts, Grid& g, uint32_t seed, uint32_t maxSteps) {
+    SolveResult res;
+    std::vector<Decision> stack;
+
+    // pendingContradiction == true means the current top decision's last collapse contradicted and we must
+    // back out / retry BEFORE selecting a new cell. false means we are in the "forward" decide phase.
+    bool pendingContradiction = false;
+
+    for (uint32_t step = 0; step < maxSteps; ++step) {
+        res.steps = step + 1u;
+
+        if (!pendingContradiction) {
+            // --- FORWARD: select a cell and decide it. ---
+            const int32_t c = SelectCell(ts, g);
+            if (c < 0) {
+                // SelectCell skips both decided (pop==1) AND empty (pop==0) cells, so a -1 means "no cell
+                // with pop>1". Distinguish a genuine full collapse from a grid that already holds an empty
+                // domain (e.g. a pre-pinned contradiction the search must back out of).
+                bool hasEmpty = false;
+                for (const Domain d : g.cell) if (d == 0) { hasEmpty = true; break; }
+                if (!hasEmpty) { res.solved = true; return res; }  // fully collapsed, no contradiction
+                pendingContradiction = true;  // an empty domain — back out (or prove unsolvable)
+                continue;
+            }
+
+            // Push a fresh decision: snapshot the WHOLE grid BEFORE collapsing.
+            Decision d;
+            d.cellId    = c;
+            d.triedMask = 0;
+            d.snapshot  = g.cell;  // byte-exact value-copy (RestoreWorld discipline)
+            stack.push_back(std::move(d));
+            Decision& top = stack.back();
+
+            const Domain cand = top.snapshot[static_cast<std::size_t>(c)] & ~top.triedMask;
+            const uint32_t idx = static_cast<uint32_t>(c) * 64u +
+                                 static_cast<uint32_t>(PopCount(top.triedMask));
+            const int tile = PickTileFromDomain(ts, cand, seed, idx);
+            if (tile < 0) { pendingContradiction = true; continue; }  // no candidate — back out
+
+            g.cell[static_cast<std::size_t>(c)] = Domain{1} << static_cast<uint32_t>(tile);
+            top.triedMask |= Domain{1} << static_cast<uint32_t>(tile);
+
+            std::vector<int32_t> worklist{ c };
+            if (!Propagate(ts, g, worklist)) { pendingContradiction = true; continue; }
+            // else: progressed — next iteration selects the next cell.
+        } else {
+            // --- BACKTRACK: the current top's collapse contradicted. ---
+            ++res.backtracks;
+            res.didBacktrack = true;
+
+            if (stack.empty()) { res.solved = false; return res; }  // nothing to back out to
+            Decision& top = stack.back();
+
+            // Restore the whole grid to this decision's pre-collapse state (bit-exact).
+            g.cell = top.snapshot;
+
+            const Domain cand = top.snapshot[static_cast<std::size_t>(top.cellId)] & ~top.triedMask;
+            if (cand == 0) {
+                // This cell is exhausted — pop it and back out to the parent (retry parent next iter).
+                stack.pop_back();
+                if (stack.empty()) { res.solved = false; return res; }  // unsolvable
+                // pendingContradiction stays true: re-evaluate the new top next iteration.
+                continue;
+            }
+
+            const uint32_t idx = static_cast<uint32_t>(top.cellId) * 64u +
+                                 static_cast<uint32_t>(PopCount(top.triedMask));
+            const int tile = PickTileFromDomain(ts, cand, seed, idx);
+            if (tile < 0) {  // defensive — cand != 0 implies total > 0, but guard anyway
+                stack.pop_back();
+                if (stack.empty()) { res.solved = false; return res; }
+                continue;
+            }
+
+            g.cell[static_cast<std::size_t>(top.cellId)] = Domain{1} << static_cast<uint32_t>(tile);
+            top.triedMask |= Domain{1} << static_cast<uint32_t>(tile);
+
+            std::vector<int32_t> worklist{ top.cellId };
+            if (Propagate(ts, g, worklist)) {
+                pendingContradiction = false;  // retry succeeded — back to forward decide
+            }
+            // else: STILL contradicts — stay pendingContradiction, retry/back out next iteration.
+        }
+    }
+
+    // Hit maxSteps without fully collapsing — deterministic give-up.
+    res.solved = false;
+    return res;
+}
+
 }  // namespace hf::wfc
