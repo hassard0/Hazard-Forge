@@ -1943,6 +1943,73 @@ render-bake**. **No new RHI**, no new dependency — the THIRTY-FIRST-issue flag
   timeline (the runtime + capture format a GUI would drive); the optional `--profile-shot` visualization was
   intentionally skipped (the value is the deterministic capture, fully proven in the pure tests).
 
+### Deterministic UMG-class UI framework (`engine/ui/widget.h`, namespace `hf::ui`) — flagship #30
+
+Slices WIDGET-S1–S6 add a **UMG-class UI framework** — widget hierarchy + layout + data binding + animations,
+beyond the existing text overlay. Mainstream UI is float (float pixel layout, float animation curves, float
+event timing). This flagship makes the UI **CORE** deterministic: an **integer-pixel** layout solver, a
+deterministic data-binding propagation, animation driven by the SEQ flagship's Q16.16 sampler, and input/event
+state wrapped as a `net::Session` so a UI interaction sequence is **bit-identical cross-platform and
+lockstep/replay/scrub-able**. The boundary decision is the moat's crux: the box model is **integer pixels**
+(no float rounding ambiguity), Q16.16 enters ONLY for animation (quantized to pixels on apply), and the float
+text-shaping + pixel raster are isolated entirely in `engine/ui/widget_render.h` (the `seq_render.h`/
+`profile_live.h` precedent). The bit-exact header is header-only, self-contained, pure-integer, with pinned
+`net::DigestBytes` goldens identical on MSVC/Windows-clang/Mac-clang and **no render-bake** (S1–S5); S6 the one
+float render slice. It composes the just-built `seq.h` (animation) + `net::Session` (scrub) + the existing
+`ui/text.h` (the render text crossing). **No new RHI**, no new shader — the THIRTIETH-issue flagship, complete
+(6/6).
+
+- **Widget tree + integer box model (Slice WIDGET-S1, beachhead).** A `Widget` hierarchy (indices not
+  pointers — the `flow.h` NodeId discipline; an ordered first-child/next-sibling chain) with an integer-pixel
+  `Style` (size, margins, padding, flex weight + `StyleFlags`). `EncodeTree` hand-LE-serializes the tree
+  field-by-field. **Proof:** the tree digest is pinned `0x53da0581a48f615e`; shape + child-order + style + a
+  changed hierarchy are all load-bearing. (Box model is `int32_t` pixels — Q16.16 is reserved for S4.)
+- **Integer layout solver — the crux (Slice WIDGET-S2).** `SolveLayout` is a single deterministic top-down
+  pass (process widgets in index order — a parent's index is always below its children's, so a parent lays out
+  its own children, no recursion) that honors padding/margins/fixed sizes and distributes leftover main-axis
+  space to flex children by **integer weighted division** with a precise remainder rule: the leftover pixels
+  that don't divide evenly are assigned to the **lowest-index flex children one each**, so the container is
+  always exactly filled AND deterministic. **Proof:** the rects digest is pinned `0x95da64c52733eb16`; the
+  viewport is exactly consumed; fixed sizes preserved; weighted flex; the remainder rule pinned in a direct
+  odd-width case (`left.w == right.w + 1`, `left.w + right.w == W`).
+- **Data binding (Slice WIDGET-S3).** A model (integer vector) drives widget properties through `Binding`s
+  applied in **ascending binding-index order** (a flat scan, no hash-map; last-write-wins), targeting existing
+  integer `Style` fields so the binding flows through to layout. **Proof:** the bound-tree digest is pinned
+  `0xbb31678bf35c1a37` and the bound-rects `0xc93bdcf2c0b473a3`; bound properties hold the model values;
+  last-write-wins resolves to the higher-index binding; the binding is load-bearing + deterministic.
+- **Widget animation via seq.h (Slice WIDGET-S4).** A `seq::ScalarTrack` (the just-shipped Q16.16 keyframe
+  sampler, proven bit-exact) is bound to a widget property; `ApplyAnims` samples it at a tick and **quantizes
+  Q16.16 → integer pixels** by a single documented round-nearest `(v + 0x8000) >> 16` — the only place
+  fixed-point touches the box model. **Proof:** the animated-tree digest is pinned `0x0fb90c2346c92ca4` and
+  animated-rects `0x494e7ff0ecd098de`; the header height animates 64→128 reaching exactly 96 at t=0.5s; the
+  quantizer is exact; the animation is load-bearing on time + deterministic. Reuses `seq::SampleScalar`
+  verbatim — zero new animation math.
+- **Input/event routing + SCRUB via net::Session (Slice WIDGET-S5, the headline).** Deterministic front-most
+  `HitTest` (reverse-index scan) + the whole UI wrapped as a flat, value-copyable `UiWorld` (tree + model +
+  clock + focus) driven by a `StepUi` that maps to `net::Session`'s `step(world, inputs, tick)`: a click routes
+  via hit-test, bumps the bound model, re-propagates bindings + re-applies animations. **Proof:** the lockstep
+  final digest is pinned `0x913aa55e209e8faf` and the per-tick trace `0x4f544f805d13ef98`; **SCRUB == SEEK** —
+  `CatchUp(snapshot@S, N)` reaches the bit-identical world a from-tick-0 playback reaches at N (full-world
+  equality, several S,N pairs); a click is load-bearing; two runs are identical. **A UI session — clicks,
+  animation, data changes over time — replays bit-for-bit on any machine, which mainstream float UI cannot
+  provide.**
+- **Lit 2D render capstone — the labeled-layout money-shot (Slice WIDGET-S6, render-only — `widget_render.h`).**
+  `WidgetTreeToLabels` places one label per widget at its bit-exact computed rect origin (the integer
+  placement), and the `--ui-shot` showcase draws each widget's name there via the existing `ui::LayoutText`
+  screen-space text overlay (the `--hud` path reused verbatim — no new shader, no new RHI); the float crossing
+  is only the pixel→NDC convert. **Proof:** the labels digest is pinned `0xbb55dc9cda2dc9a3`; the placement is
+  pure provenance (each label IS a bit-exact rect origin), and the render's `DigestRects == 0x95da64c52733eb16`
+  (the rendered layout IS the bit-exact S2 layout). The one **float** slice (the visresolve-bar): Metal-baked
+  golden, the bar is Metal-determinism (two-run BYTE-IDENTICAL) + provenance + visual parity, the cross-vendor
+  delta the documented float baseline (**0.33/channel** — the 2D text overlay rasters near-identically
+  cross-vendor, far tighter than the 3D shots). Golden `ui_render` (the labeled bit-exact layout). **Completes
+  flagship #30 — the thirtieth-issue flagship.** **Honest scope:** v1 reuses the 8×8 fixed-advance monospace
+  font (no kerning/proportional/Unicode shaping); stack + single-axis flex-grow only (no grid/wrap/shrink/
+  basis/percent/intrinsic sizing); model→view binding only (no two-way/observers); scalar-per-property
+  animation; pointer hit-test + click only (no keyboard/gestures/IME/accessibility); CPU-quad text + the
+  labeled-layout render (no SDF/GPU-vector/clipping/nine-slice/image widgets); the live interactive GUI editor
+  is out of scope (this is the runtime + render the editor would drive).
+
 ### Simulated transport + client interpolation (`engine/net/transport.*`)
 
 Slice BU layers the **hard** part of networking on top of the BQ snapshot core — an **imperfect channel** and a **client jitter buffer with interpolation** — still **without any real sockets** (real UDP/TCP transport remains a future slice). Like `snapshot.*`, `transport.*` is **pure CPU above `engine/math` + `engine/net`** with **zero RHI/backend symbols**, compiled into both `hf_core` (ASan-scoped, unit-tested via `net_transport_test`) and `hf_engine` (the live `--netsim-shot` showcase).
