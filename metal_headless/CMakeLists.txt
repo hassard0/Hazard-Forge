@@ -1238,6 +1238,7 @@ add_executable(visual_test
     ${HF_ROOT}/engine/editor/editor_panel_data.cpp
     ${HF_ROOT}/engine/editor/edit_ops.cpp
     ${HF_ROOT}/engine/editor/editor_panels.cpp
+    ${HF_ROOT}/engine/editor/flow_editor_panels.cpp
     ${HF_ROOT}/engine/editor/imgui_renderer.cpp
     ${HF_ROOT}/third_party/imgui/imgui.cpp
     ${HF_ROOT}/third_party/imgui/imgui_draw.cpp

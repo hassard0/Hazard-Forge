@@ -159,6 +159,16 @@ hf_add_pure_test(econ_test)
 # -clang. The golden is the pinned hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no
 # RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(flow_test)
+# Flow-graph EDITOR data model + edit ops (issue #24, the EDITOR half of Blueprint-class visual
+# scripting): engine/editor/flow_editor_data.h lays a flow::Graph out as a node graph (column = topological
+# rank, row = within-rank order on a fixed INTEGER grid, wires per EdgeMask) — a pure, ImGui-free, backend-
+# free VIEW whose hand-LE FNV-1a-64 DigestFlowGraphView is bit-identical run-to-run AND MSVC-vs-Apple-clang;
+# engine/editor/flow_edit_ops.h adds AddFlowNode/ConnectFlow/DeleteFlowNode (deterministic graph mutation,
+# NodeId-stable, TopoOrder-valid). Asserts the node count, the hand-checked topo-rank layout, the pinned
+# view digest, replay-stability, that an edit changes the digest deterministically, and that DeleteFlowNode
+# re-maps references + keeps the graph evaluable. The golden is the pinned hash IN the test (NO image, NO
+# render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(flow_editor_test)
 # Deterministic Q16.16 scalar keyframe track + integer lerp (Slice SEQ-S1, issue #25 — the
 # DETERMINISTIC CINEMATIC SEQUENCER beachhead): engine/seq/seq.h — a header-only, SELF-CONTAINED
 # (only <cstddef>/<cstdint>/<vector> + sim/fpx.h + net/session.h) timeline-evaluation core. A scalar
