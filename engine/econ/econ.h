@@ -262,4 +262,112 @@ inline std::vector<CraftOrder> MakeShowcaseCraftQueue() {
     };
 }
 
+// =====================================================================================================
+// ECON-S3 — Resource economy TICK: per-tick production / consumption flow (APPEND-ONLY below S2).
+// =====================================================================================================
+// The time-stepped core that makes the ledger a LIVING economy: producers add stock each tick, consumers
+// drain it, run in a FIXED order with a zero-floor and integer storage caps. This is the gameplay-state
+// `IntegrateStep` analog and stays strict INTEGER (the moat) — a determinism property a float-timer UE5
+// economy cannot guarantee. Reuses S1's At/Set/InRange VERBATIM; NO new bookkeeping, NO map, NO float.
+
+// --- Flow: one per-(entity,item) production OR consumption term. rate > 0 (units per tick). ------------
+struct Flow {
+    uint32_t entity;  // entity id
+    uint32_t item;    // item id
+    Qty      rate;    // units gained (producer) or lost (consumer) per tick; > 0 by fixture construction
+};
+
+// --- EconRules: the flat, fixed-order producer/consumer flows + an OPTIONAL dense storage-cap grid. ----
+// `cap` is either EMPTY (size 0) meaning "no caps anywhere", OR a dense [entityCount*itemCount] array
+// parallel to World::stock (same row-major indexing e*itemCount+t). A cap value <= 0 for a slot means
+// that individual slot is UNCAPPED. (NO map — flat arrays keep iteration deterministic by construction.)
+struct EconRules {
+    std::vector<Flow> producers;  // each tick (array order): entity gains `rate` of `item`, clamped UP to cap
+    std::vector<Flow> consumers;  // each tick (array order): entity loses `rate` of `item`, clamped DOWN to 0
+    std::vector<Qty>  cap;        // [entityCount*itemCount] storage cap, OR empty = no caps; slot <=0 = uncapped
+};
+
+// --- CapAt: the cap for slot (e,t), or the sentinel -1 meaning UNCAPPED. CONVENTION (PINNED): return -1
+// when `cap` is empty, when (e,t) is out of range, OR when the stored cap value is <= 0. Otherwise return
+// the stored positive cap. Callers treat a return of -1 as "no clamp" (production is unbounded for it). ---
+inline Qty CapAt(const EconRules& r, const World& w, uint32_t e, uint32_t t) {
+    if (r.cap.empty()) return -1;                  // no cap grid at all -> uncapped
+    if (!InRange(w, e, t)) return -1;              // out of range -> uncapped (defensive)
+    const std::size_t idx = (std::size_t)e * w.itemCount + t;
+    if (idx >= r.cap.size()) return -1;            // cap grid shorter than stock -> uncapped
+    const Qty c = r.cap[idx];
+    return c > 0 ? c : -1;                         // a non-positive cap value means "this slot is uncapped"
+}
+
+// --- EconTick: ONE economy step, in a FIXED two-phase order. ------------------------------------------
+// PRODUCTION phase FIRST (all producers, array order): newQ = At(e,item) + rate; if the slot is capped
+// (CapAt != -1), clamp UP: newQ = min(newQ, cap); Set. Out-of-range producer = deterministic skip.
+// CONSUMPTION phase SECOND, AFTER ALL production (all consumers, array order): newQ = max(0, At-rate);
+// Set. Out-of-range consumer = deterministic skip.
+// PRODUCTION-BEFORE-CONSUMPTION is PINNED: when an entity BOTH produces and consumes the SAME item in one
+// tick, the produced stock is added first (and capped), THEN the consumer drains from the post-production
+// value — so a slot that produces P and consumes C nets +(min(At+P,cap) - C) clamped to >= 0, NOT
+// At+(P-C). Integer min/max are inline ternaries (no <algorithm>); strict integer, no float.
+inline void EconTick(World& w, const EconRules& r) {
+    // --- Production phase (clamp UP to the per-slot cap if one exists). ---
+    for (const Flow& f : r.producers) {
+        if (!InRange(w, f.entity, f.item)) continue;     // out-of-range producer -> deterministic skip
+        Qty newQ = w.At(f.entity, f.item) + f.rate;      // gain `rate`
+        const Qty cap = CapAt(r, w, f.entity, f.item);
+        if (cap != -1 && newQ > cap) newQ = cap;         // clamp UP: production never exceeds storage cap
+        w.Set(f.entity, f.item, newQ);
+    }
+    // --- Consumption phase (AFTER all production; clamp DOWN to zero). ---
+    for (const Flow& f : r.consumers) {
+        if (!InRange(w, f.entity, f.item)) continue;      // out-of-range consumer -> deterministic skip
+        Qty newQ = w.At(f.entity, f.item) - f.rate;       // lose `rate`
+        if (newQ < 0) newQ = 0;                           // clamp DOWN: stock never goes negative
+        w.Set(f.entity, f.item, newQ);
+    }
+}
+
+// --- RunEconTicks: step the economy `ticks` times (fixed loop; deterministic of (w, r, ticks) alone —
+// the RunLockstep / StepWorldN precedent). ------------------------------------------------------------
+inline void RunEconTicks(World& w, const EconRules& r, uint32_t ticks) {
+    for (uint32_t i = 0; i < ticks; ++i) EconTick(w, r);
+}
+
+// --- MakeShowcaseRules: a FIXED producer/consumer/cap fixture over the S1 4x4 showcase world (integer
+// literals only). FIXED forever (the S3 golden pins the post-N-ticks digest over it). Designed so the
+// economy reaches STEADY STATE well within 24 ticks. Recall the seed: stock(e,t) = 10 + 7*e + 3*t.
+//
+//   PRODUCERS (gain per tick, clamped UP to cap):
+//     (e0,t0) +5/tick, cap 100   -> PURE producer: starts 10, rises 10,15,...,100, then holds at the cap.
+//     (e1,t1) +8/tick, cap 60    -> pure producer: starts 20, rises to 60, holds (a second capped saturator).
+//     (e2,t2) +6/tick, cap 90    -> BOTH producer AND consumer of the same (e2,t2) slot (pins phase order).
+//   CONSUMERS (lose per tick, clamped DOWN to 0):
+//     (e3,t3) -4/tick            -> PURE consumer (no producer): starts 10+21+9=... -> drains to 0, holds.
+//     (e2,t2) -2/tick            -> the SAME slot the (e2,t2) producer feeds: net +6-2=+4/tick UP to cap 90
+//                                   (production-before-consumption: add 6 [cap 90] THEN subtract 2).
+//
+// Net per tick for (e2,t2): min(At+6, 90) - 2. Starts At=10+14+6=30 -> 30+6=36-2=34 -> ... climbs by +4
+// until it nears 90, where the cap clamps production and the -2 consumer pulls it to a FIXED rest point of
+// 88 (90 produced-cap minus 2 consumed). So (e2,t2) ALSO settles (to 88) -> the whole economy is idempotent
+// at rest -> the steady-state assertion holds. Every flow saturates/floors before tick 24.
+inline EconRules MakeShowcaseRules(const World& w) {
+    EconRules r;
+    r.producers = std::vector<Flow>{
+        // entity, item, rate
+        { 0, 0, 5 },   // pure producer -> saturates to cap 100
+        { 1, 1, 8 },   // pure producer -> saturates to cap 60
+        { 2, 2, 6 },   // BOTH produces and consumes (e2,t2) -> pins production-before-consumption
+    };
+    r.consumers = std::vector<Flow>{
+        // entity, item, rate
+        { 3, 3, 4 },   // PURE consumer (no producer feeds it) -> drains to 0
+        { 2, 2, 2 },   // consumes the SAME slot (e2,t2) the producer above feeds -> rest point cap-2
+    };
+    // Dense cap grid parallel to stock; default 0 (= uncapped) for every slot, then set the few real caps.
+    r.cap.assign((std::size_t)w.entityCount * w.itemCount, Qty{0});
+    if (InRange(w, 0, 0)) r.cap[(std::size_t)0 * w.itemCount + 0] = 100;  // (e0,t0) cap
+    if (InRange(w, 1, 1)) r.cap[(std::size_t)1 * w.itemCount + 1] = 60;   // (e1,t1) cap
+    if (InRange(w, 2, 2)) r.cap[(std::size_t)2 * w.itemCount + 2] = 90;   // (e2,t2) cap (the both-flows slot)
+    return r;
+}
+
 }  // namespace hf::econ

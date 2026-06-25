@@ -234,6 +234,106 @@ int main() {
               "econ-s2: no stock slot is negative after the craft queue (>= 0 over the fixed scan)");
     }
 
+    // =================================================================================================
+    // ECON-S3 — Resource economy TICK: per-tick production / consumption flow (APPEND-ONLY below S2).
+    // =================================================================================================
+    // The showcase rules over the 4x4 seed world (stock(e,t) = 10 + 7*e + 3*t):
+    //   producers: (e0,t0)+5 cap100, (e1,t1)+8 cap60, (e2,t2)+6 cap90 (the both-flows slot)
+    //   consumers: (e3,t3)-4 (pure consumer -> 0), (e2,t2)-2 (same slot as the +6 producer)
+    // production-before-consumption pins (e2,t2): each tick min(At+6,90)-2 -> settles to 88.
+    const uint32_t kTicks = 24;  // N: every flow saturates/floors before this -> the economy has settled
+
+    World we = MakeShowcaseWorld(kEntities, kItems);
+    const EconRules rules = MakeShowcaseRules(we);
+    RunEconTicks(we, rules, kTicks);
+    const uint64_t s3Digest = DigestWorld(we);
+
+    std::printf("econ-s3: ledger digest after N=%u econ ticks = 0x%016llx\n",
+                kTicks, static_cast<unsigned long long>(s3Digest));
+
+    // The pinned S3 golden (computed on first run, hardcoded — the cross-platform anchor; MSVC == clang).
+    const uint64_t kPinnedS3Digest = 0xca63394d5a6a9a2bull;  // PINNED on first run (MSVC == clang)
+
+    // ---- (1) PINNED DIGEST — the cross-platform make-or-break (identical on MSVC + clang). -----------
+    check(s3Digest == kPinnedS3Digest,
+          "econ-s3: DigestWorld after RunEconTicks == pinned uint64 (the cross-platform proof)");
+
+    // ---- (2) REPLAY-STABLE — a fresh world + same rules + N ticks reproduces the digest. ------------
+    {
+        World we2 = MakeShowcaseWorld(kEntities, kItems);
+        const EconRules rules2 = MakeShowcaseRules(we2);
+        RunEconTicks(we2, rules2, kTicks);
+        check(DigestWorld(we2) == s3Digest,
+              "econ-s3: re-running N ticks is bit-identical (deterministic)");
+    }
+
+    // ---- (3) NON-NEGATIVE — scan the whole ledger after N ticks; every slot >= 0 (consumer clamp). ---
+    {
+        bool noNegative = true;
+        for (const Qty q : we.stock) if (q < 0) { noNegative = false; break; }
+        check(noNegative,
+              "econ-s3: no stock slot is negative after N ticks (consumers clamp to 0)");
+    }
+
+    // ---- (4) CAP-RESPECTED — every capped slot is <= its cap after N ticks (producer clamp). --------
+    {
+        bool capRespected = true;
+        for (uint32_t e = 0; e < kEntities; ++e)
+            for (uint32_t t = 0; t < kItems; ++t) {
+                const Qty cap = CapAt(rules, we, e, t);
+                if (cap != -1 && we.At(e, t) > cap) capRespected = false;
+            }
+        check(capRespected,
+              "econ-s3: no capped slot exceeds its cap after N ticks (producers clamp up)");
+    }
+
+    // ---- (5) PRODUCER SATURATION — a pure-producer slot (e0,t0) rises monotonically to its cap, holds.
+    {
+        // (e0,t0): +5/tick, cap 100, starts at 10. Track tick-by-tick: non-decreasing, ends == cap.
+        World ws = MakeShowcaseWorld(kEntities, kItems);
+        const EconRules rs = MakeShowcaseRules(ws);
+        const Qty cap = CapAt(rs, ws, 0, 0);
+        bool monotonicRise = true;
+        Qty prev = ws.At(0, 0);
+        for (uint32_t i = 0; i < kTicks; ++i) {
+            EconTick(ws, rs);
+            const Qty now = ws.At(0, 0);
+            if (now < prev) monotonicRise = false;  // never decreases (pure producer)
+            prev = now;
+        }
+        const bool endsAtCap = (ws.At(0, 0) == cap) && (cap == 100);
+        check(monotonicRise && endsAtCap,
+              "econ-s3: a pure-producer entity monotonically rises to its cap then holds (deterministic saturation)");
+    }
+
+    // ---- (6) CONSUMER DEPLETION — a pure-consumer slot (e3,t3) falls monotonically to 0, holds. ------
+    {
+        // (e3,t3): -4/tick, no producer, starts at 10+21+9 = 40. Track tick-by-tick: non-increasing, ends 0.
+        World wd = MakeShowcaseWorld(kEntities, kItems);
+        const EconRules rd = MakeShowcaseRules(wd);
+        bool monotonicFall = true;
+        Qty prev = wd.At(3, 3);
+        for (uint32_t i = 0; i < kTicks; ++i) {
+            EconTick(wd, rd);
+            const Qty now = wd.At(3, 3);
+            if (now > prev) monotonicFall = false;  // never increases (pure consumer)
+            prev = now;
+        }
+        const bool endsAtZero = (wd.At(3, 3) == 0);
+        check(monotonicFall && endsAtZero,
+              "econ-s3: a pure-consumer entity monotonically falls to 0 then holds (deterministic depletion)");
+    }
+
+    // ---- (7) STEADY STATE — after N ticks one more EconTick leaves the digest UNCHANGED (idempotent). -
+    {
+        // `we` is already at tick N (settled). Capture its digest, run ONE more tick, assert no change.
+        const uint64_t atRest = DigestWorld(we);
+        World wss = we;  // copy the settled world so we don't disturb `we`
+        EconTick(wss, rules);
+        check(DigestWorld(wss) == atRest,
+              "econ-s3: the economy reaches a STEADY STATE (digest at tick N == digest at tick N+1, EconTick idempotent at rest)");
+    }
+
     if (g_fail == 0) { std::printf("econ_test: ALL PASS\n"); return 0; }
     std::printf("econ_test: %d FAIL\n", g_fail);
     return 1;
