@@ -27,6 +27,7 @@
 #include "net/session.h"        // hf::net::DigestBytes (FNV-1a-64)
 #include "asset/obj_loader.h"   // hf::asset::ParseObj / ObjMesh / ObjVertex (S2 — pure header-only loader)
 #include "asset/fbx_loader.h"   // hf::asset::ParseFbx / FbxMesh (issue #15 — binary FBX mesh importer)
+#include "asset/usd_loader.h"   // hf::asset::ParseUsda / UsdMesh (issue #15 — USDA ASCII USD mesh importer)
 
 namespace hf::asset {
 
@@ -212,10 +213,37 @@ inline std::vector<uint8_t> CompileFbx(const uint8_t* bytes, std::size_t n, cons
     return b;
 }
 
-// --- CompileMeshByExtension — dispatch by file extension (OBJ vs binary FBX) -------------------------------
-// The asset-import entry that makes FBX a first-class format alongside OBJ/glTF: given the raw bytes + a
-// lowercase-or-mixed extension (with or without a leading '.'), route ".fbx" -> CompileFbx and everything
-// else (".obj") -> CompileObj. glTF stays on its own cgltf path (gltf_loader). Returns the canonical blob.
+// --- CompileUsd — raw USDA text bytes -> the SAME canonical Q16.16 blob as CompileObj/CompileFbx (issue #15)
+// ParseUsda (the self-contained ASCII-USD importer) -> the identical fixed-field LE blob layout CompileObj
+// emits, so USD assets flow through the SAME content-addressed cache + DecodeCompiledMesh round-trip as OBJ.
+// USDA carries positions only here (normals/UVs are primvar follow-ups), so uv/normal are written 0 — the
+// engine's BuildPrimitive smooth-normal pass fills them downstream exactly as it does for normal-less OBJ/FBX.
+inline std::vector<uint8_t> CompileUsd(const uint8_t* bytes, std::size_t n, const CompileParams& p) {
+    UsdMesh m = ParseUsda((const char*)bytes, n);
+    const uint32_t vcount = m.ok ? (uint32_t)(m.positions.size() / 3) : 0u;
+    std::vector<uint8_t> b;
+    PutU32(b, kCompiledMeshMagic);
+    PutU32(b, kCompiledMeshVersion);
+    PutU32(b, vcount);                                  // vertexCount
+    PutU32(b, m.ok ? (uint32_t)m.indices.size() : 0u);  // indexCount
+    PutU32(b, p.recomputeNormals);
+    PutU32(b, (uint32_t)p.scale);
+    PutU32(b, p.tangentMode);
+    PutU32(b, p.flags);
+    for (uint32_t v = 0; v < vcount; ++v) {
+        for (int i = 0; i < 3; ++i) PutU32(b, (uint32_t)FxMul(FxQuantize(m.positions[(std::size_t)v * 3 + i]), p.scale));
+        for (int i = 0; i < 2; ++i) PutU32(b, 0u);   // uv (USD primvars:st deferred)
+        for (int i = 0; i < 3; ++i) PutU32(b, 0u);   // normal (USD primvars:normals deferred)
+    }
+    if (m.ok) for (uint32_t idx : m.indices) PutU32(b, idx);
+    return b;
+}
+
+// --- CompileMeshByExtension — dispatch by file extension (OBJ vs binary FBX vs USDA) -----------------------
+// The asset-import entry that makes FBX + USD first-class formats alongside OBJ/glTF: given the raw bytes + a
+// lowercase-or-mixed extension (with or without a leading '.'), route ".fbx" -> CompileFbx, ".usda"/".usd" ->
+// CompileUsd, and everything else (".obj") -> CompileObj. glTF stays on its own cgltf path (gltf_loader).
+// Returns the canonical blob. With OBJ + glTF + FBX + USD all importing, this closes issue #15.
 inline bool ExtIs(const char* ext, const char* want) {   // case-insensitive ext compare (skips a leading '.')
     if (!ext) return false;
     if (*ext == '.') ++ext;
@@ -228,6 +256,7 @@ inline bool ExtIs(const char* ext, const char* want) {   // case-insensitive ext
 inline std::vector<uint8_t> CompileMeshByExtension(const char* ext, const uint8_t* bytes, std::size_t n,
                                                    const CompileParams& p) {
     if (ExtIs(ext, "fbx")) return CompileFbx(bytes, n, p);
+    if (ExtIs(ext, "usda") || ExtIs(ext, "usd")) return CompileUsd(bytes, n, p);
     return CompileObj((const char*)bytes, n, p);   // ".obj" / default
 }
 

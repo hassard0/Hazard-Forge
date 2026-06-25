@@ -1,0 +1,29 @@
+#usda 1.0
+(
+    doc = "Hazard Forge USDA importer fixture (issue #15): a unit cube, 8 points, 6 quad faces."
+    defaultPrim = "cube"
+    upAxis = "Y"
+)
+
+def Mesh "cube"
+{
+    point3f[] points = [
+        (-0.5, -0.5, -0.5),   # 0
+        ( 0.5, -0.5, -0.5),   # 1
+        ( 0.5,  0.5, -0.5),   # 2
+        (-0.5,  0.5, -0.5),   # 3
+        (-0.5, -0.5,  0.5),   # 4
+        ( 0.5, -0.5,  0.5),   # 5
+        ( 0.5,  0.5,  0.5),   # 6
+        (-0.5,  0.5,  0.5)    # 7
+    ]
+    int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+    int[] faceVertexIndices = [
+        0, 1, 2, 3,   # -Z back
+        5, 4, 7, 6,   # +Z front
+        4, 0, 3, 7,   # -X left
+        1, 5, 6, 2,   # +X right
+        3, 2, 6, 7,   # +Y top
+        4, 5, 1, 0    # -Y bottom
+    ]
+}

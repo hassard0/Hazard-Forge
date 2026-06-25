@@ -198,6 +198,14 @@ target_compile_definitions(draco_gltf_load_test PRIVATE
 hf_add_pure_test(fbx_loader_test)
 target_compile_definitions(fbx_loader_test PRIVATE
   "HF_BOX_FBX=\"${CMAKE_SOURCE_DIR}/assets/models/box.fbx\"")
+# USDA (ASCII USD) mesh importer (issue #15 ask #3 — support USD alongside glTF/OBJ/FBX; CLOSES #15): the
+# SELF-CONTAINED, clean-room engine/asset/usd_loader.h loads the authored unit cube assets/models/cube.usda
+# (8 points, 6 quad faces) to correct geometry: 8 verts / 12 triangles (6 quads fan-triangulated), each axis
+# 2 distinct values (a cube), with a PINNED net::DigestBytes over positions+indices (the cross-platform moat)
+# plus an embedded single-triangle USDA literal (the standalone-no-file case). Pure CPU, ASan-eligible.
+hf_add_pure_test(usd_loader_test)
+target_compile_definitions(usd_loader_test PRIVATE
+  "HF_CUBE_USDA=\"${CMAKE_SOURCE_DIR}/assets/models/cube.usda\"")
 # Deterministic UI widget tree + INTEGER box model (Slice WIDGET-S1, issue #30 — the DETERMINISTIC
 # UMG-CLASS UI FRAMEWORK beachhead): engine/ui/widget.h — a header-only, SELF-CONTAINED (only
 # <cstddef>/<cstdint>/<vector> + net/session.h) UI substrate. A widget hierarchy (parent/first-child/
