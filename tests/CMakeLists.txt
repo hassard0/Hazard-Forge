@@ -150,6 +150,15 @@ hf_add_pure_test(wfc_test)
 # are bit-identical run-to-run AND MSVC-vs-Apple-clang. The golden is the pinned hash IN the test (NO
 # image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(econ_test)
+# Deterministic node-graph EXECUTION VM (Slice FLOW-S1, flagship #24 visual-scripting beachhead):
+# engine/flow/flow.h — a header-only, SELF-CONTAINED (only <cstddef>/<cstdint>/<vector> + net/session.h)
+# Blueprint-class graph VM: a fixed node array (Const/Add/Sub/Mul/Min/Max/Select) evaluated over a
+# CANONICAL topological order (Kahn + lowest-NodeId-first tie-break = the wfc::Propagate ascending-scan
+# idiom, NEVER insertion/hash order) into an integer register file. Because it is pure integer eval over a
+# pinned order, the register file + its FNV-1a-64 DigestGraph are bit-identical run-to-run AND MSVC-vs-Apple
+# -clang. The golden is the pinned hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no
+# RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(flow_test)
 # glTF unsupported-extension diagnostics (issue #36): the PURE decision the loader uses to FAIL LOUDLY
 # (not silently) when a glb REQUIRES a compression extension this build can't decode (Draco / meshopt) —
 # e.g. the three.js Ferrari. Synthetic inputs only (no device/cgltf/glb), so it stays a pure hf_core test.
