@@ -126,6 +126,19 @@ hf_add_pure_test(session_test)
 # re-encode determinism. The golden is the pinned hash IN the test (NO image, NO render-bake). Pure CPU
 # (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(replay_test)
+# Deterministic WFC domain grid + adjacency rule-set + integer AC-3 propagation (Slice WFC-S1, flagship
+# #29 WFC beachhead): engine/wfc/wfc.h — a header-only, SELF-CONTAINED (only <cstdint>/<cstddef>/<vector> +
+# net/session.h) constraint-solver core. The first CONSTRAINT paradigm in the engine: a grid of superposed
+# tiles (uint64 Domain bitmasks) propagated by integer AC-3 (NeighborConstraint union + a worklist loop that
+# pops the LOWEST pending cell id each step — pure of insertion/hash order — over a 4-tile symmetric terrain
+# rule-set). NO randomness, NO collapse yet (S2/S3). Asserts the showcase rule-set is adjacency-symmetric
+# (AC-3 sound), the PINNED FNV-1a-64 DigestGrid over the center-collapse-propagated 16x16 grid (the cross-
+# platform byte proof), replay-stability, that flipping one adjacency bit changes the digest (rules are
+# load-bearing), that >=1 neighbor domain shrank (the constraint did work), and no contradiction (Propagate
+# true, no empty domain). The golden is the pinned hash IN the test (NO image, NO render-bake) — the cross-
+# platform proof is the SAME CPU test producing the IDENTICAL hash on MSVC + Apple clang. Pure CPU (hf_core),
+# no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(wfc_test)
 # CPU particle / VFX emitter system (Slice CC): the authorable emitter (spawn rate, lifetime, init
 # velocity + spread, gravity, drag, size/color over life) simulated at a fixed timestep with a
 # fixed-seed integer LCG for the spread jitter (engine/vfx/particles.{h,cpp}) — DISTINCT from the
