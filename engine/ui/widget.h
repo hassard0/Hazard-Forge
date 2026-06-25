@@ -478,4 +478,90 @@ inline std::vector<PropAnim> MakeShowcaseAnims() {
     return anims;
 }
 
+// =====================================================================================================
+// Slice WIDGET-S5 — Input/event routing + SCRUB via net::Session (issue #30 — THE HEADLINE). APPEND-ONLY
+// below S4. Deterministic pointer hit-testing + event routing, and wrapping the whole UI as a net::Session
+// World so a UI INTERACTION SEQUENCE (clicks + animation + data over time) is lockstep-replayable AND
+// SCRUB-able: seek to interaction-tick S then replay forward is BIT-IDENTICAL to replaying from tick 0
+// (the seq SCRUB==SEEK property via net::CatchUp). A UI session replays bit-for-bit on any machine — UE5's
+// UMG float playback timing cannot. Pure-integer; reuses SolveLayout/Propagate/ApplyAnims/HitTest verbatim.
+// NO new include (net/session.h + seq/seq.h already present). STILL NO <cmath>/float-on-bit-exact-path/RNG/
+// clock/<unordered_*>/<map>/std::hash/<algorithm>/<string>, NO recursion.
+// =====================================================================================================
+
+// --- Pointer events + deterministic hit-testing ------------------------------------------------------
+enum PointerType : uint32_t { kPointerNone = 0, kPointerDown = 1 };  // FROZEN wire values
+struct UiInput { int32_t x = 0, y = 0; uint32_t type = kPointerNone; };  // a net::Session Input (value-copyable)
+
+// HitTest: the FRONT-MOST widget whose rect contains (x,y). Scan rects in REVERSE index order (later
+// widgets = drawn on top = hit first), return the first containing rect, else kNoWidget. Integer compares
+// only (no z-buffer). Contains = x >= r.x && x < r.x+r.w && y >= r.y && y < r.y+r.h. NO recursion (flat scan).
+inline WidgetId HitTest(const std::vector<Rect>& rects, int32_t x, int32_t y) {
+    for (std::size_t k = rects.size(); k-- > 0; ) {
+        const Rect& r = rects[k];
+        if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
+            return static_cast<WidgetId>(k);
+    }
+    return kNoWidget;
+}
+
+// --- The UI world (a flat, value-copyable net::Session World) ----------------------------------------
+// The complete interactive UI state. Flat + value-copyable so net::Session's value-copy snapshot is
+// COMPLETE by construction (the seq SeqPlayhead discipline). `tree` carries the styles (mutated by
+// binding/animation), `model` the data, `time` the animation clock, `focus` the last-hit widget.
+struct UiWorld {
+    Tree                 tree;
+    std::vector<int32_t> model;
+    seq::fx              time  = 0;
+    uint32_t             focus = kNoWidget;
+};
+
+// DigestUi: hand-LE the WHOLE world — EncodeTree(tree) bytes, then model ints (PutI32), then time
+// (PutI32/PutU32), then focus (PutU32) -> net::DigestBytes. Bit-identical run-to-run + cross-platform.
+inline uint64_t DigestUi(const UiWorld& w) {
+    std::vector<uint8_t> b = EncodeTree(w.tree);
+    for (std::size_t i = 0; i < w.model.size(); ++i) PutI32(b, w.model[i]);
+    PutI32(b, static_cast<int32_t>(w.time & 0xFFFFFFFFu));          // low 32 bits of the Q16.16 clock
+    PutU32(b, static_cast<uint32_t>((static_cast<uint64_t>(w.time) >> 32) & 0xFFFFFFFFu));  // high 32 bits
+    PutU32(b, w.focus);
+    return net::DigestBytes(b.data(), b.size());
+}
+
+// --- StepUi — the deterministic UI transition (the net::Session StepFn) ------------------------------
+// One tick: advance the clock, route this tick's pointer events, then re-propagate bindings + re-apply
+// animations so the model/time changes flow into the tree. Static config (anims/bindings/viewport/dt) is
+// passed in; the test wraps it in a lambda capturing them (the StepPlayhead pattern). Reuses S2/S3/S4
+// verbatim. The click model mutation is EXACTLY model[hit % model.size()] += 1 (documented, deterministic).
+inline void StepUi(const std::vector<PropAnim>& anims, const std::vector<Binding>& bindings,
+                   Rect viewport, seq::fx dtPerTick,
+                   UiWorld& w, const std::vector<UiInput>& inputs, uint32_t /*tick*/) {
+    w.time += dtPerTick;
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        const UiInput& in = inputs[i];
+        if (in.type != kPointerDown) continue;
+        const std::vector<Rect> rects = SolveLayout(w.tree, viewport);
+        const WidgetId hit = HitTest(rects, in.x, in.y);
+        w.focus = hit;
+        if (hit != kNoWidget && !w.model.empty())
+            w.model[hit % w.model.size()] += 1;              // a click bumps the clicked widget's model slot
+    }
+    Propagate(w.tree, w.model, bindings);                    // the model flows into the tree (S3)
+    ApplyAnims(w.tree, anims, w.time);                       // the new clock flows into the tree (S4)
+}
+
+// --- Fixtures (FIXED forever — the golden pins them) -------------------------------------------------
+// MakeShowcaseUiWorld: the S2/S3 fixtures wrapped — { MakeLayoutShowcase(), MakeShowcaseModel(), 0, kNoWidget }.
+inline UiWorld MakeShowcaseUiWorld() {
+    return UiWorld{ MakeLayoutShowcase(), MakeShowcaseModel(), 0, kNoWidget };
+}
+
+// MakeShowcaseInputRing: a FIXED interaction schedule — a kPointerDown at {640,360} on tick 2 (a click in
+// body/right) + another at {40,30} on tick 5 (a click in header), empty otherwise. Keep FIXED.
+inline net::InputRing<UiInput> MakeShowcaseInputRing() {
+    net::InputRing<UiInput> ring;
+    ring.AddInput(2, UiInput{ 640, 360, kPointerDown });
+    ring.AddInput(5, UiInput{ 40,  30,  kPointerDown });
+    return ring;
+}
+
 }  // namespace hf::ui

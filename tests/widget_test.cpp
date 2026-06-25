@@ -355,6 +355,126 @@ int main() {
               "widget-s4: ApplyAnims is deterministic — re-applying at the same tick is bit-identical");
     }
 
+    // =================================================================================================
+    // Slice WIDGET-S5 — Input/event routing + SCRUB via net::Session (THE HEADLINE). Seven assertions.
+    // Wrap the whole UI as a net::Session World (UiWorld) so a UI interaction sequence (clicks +
+    // animation + data over time) is lockstep-replayable AND SCRUB-able: seek-to-tick-S+replay ==
+    // from-0 bit-identical (the seq SCRUB==SEEK property via net::CatchUp). Viewport {0,0,1280,720},
+    // dtPerTick = kOne/10 (0.1s/tick), N = 10 ticks. The ring clicks on tick 2 ({640,360}) + tick 5 ({40,30}).
+    // =================================================================================================
+    namespace net = hf::net;
+    {
+        // The step/digest lambdas (capturing the fixed anims/bindings/viewport/dt). The net::Session World
+        // is ui::UiWorld; the per-tick Input is ui::UiInput.
+        const Rect      s5viewport{0, 0, 1280, 720};
+        const hf::seq::fx s5dt = hf::seq::kOne / 10;   // 0.1 s / tick
+        const std::vector<PropAnim> s5anims    = MakeShowcaseAnims();
+        const std::vector<Binding>  s5bindings = MakeShowcaseBindings();
+        auto step = [&](UiWorld& w, const std::vector<UiInput>& in, uint32_t t){
+            StepUi(s5anims, s5bindings, s5viewport, s5dt, w, in, t); };
+        auto digest = [](const UiWorld& w){ return DigestUi(w); };
+
+        const uint32_t kTicks = 10;
+        const net::InputRing<UiInput> ring = MakeShowcaseInputRing();
+
+        // The from-0 final digest + the per-tick trace (the digest AFTER each tick).
+        const uint64_t uiFinal = net::RunLockstep(MakeShowcaseUiWorld(), ring, kTicks, step, digest);
+        const std::vector<uint64_t> trace = net::DigestTrace(MakeShowcaseUiWorld(), ring, kTicks, step, digest);
+        const uint64_t traceDigest = net::DigestBytes(trace.data(), trace.size() * sizeof(uint64_t));
+
+        std::printf("widget-s5: ui final digest = 0x%016llx   ui trace digest = 0x%016llx  (%u ticks)\n",
+                    static_cast<unsigned long long>(uiFinal),
+                    static_cast<unsigned long long>(traceDigest), kTicks);
+
+        // Pinned S5 goldens (computed on first run, hardcoded — the cross-platform bar; MSVC == clang).
+        const uint64_t kPinnedUiFinal = 0x913aa55e209e8fafull;  // PINNED on first run (MSVC == clang)
+        const uint64_t kPinnedUiTrace = 0x4f544f805d13ef98ull;  // PINNED on first run (MSVC == clang)
+
+        // ---- (S5-1) PRIOR INVARIANT — re-assert S1 + all S2 + S3 (both) + S4 (both) digests, UNCHANGED. -
+        check(DigestTree(MakeShowcaseTree()) == 0x53da0581a48f615eull
+           && DigestRects(SolveLayout(MakeLayoutShowcase(), kViewport)) == 0x95da64c52733eb16ull
+           && DigestTree(boundTree) == 0xbb31678bf35c1a37ull
+           && DigestRects(SolveLayout(boundTree, kViewport)) == 0xc93bdcf2c0b473a3ull
+           && DigestTree(animTree) == 0x0fb90c2346c92ca4ull
+           && DigestRects(SolveLayout(animTree, kViewport)) == 0x494e7ff0ecd098deull,
+              "widget-s1/s2/s3/s4: prior digests STILL green — all six UNCHANGED (S5 is purely additive)");
+
+        // ---- (S5-2) HITTEST — front-most on overlap, kNoWidget on a miss. ------------------------------
+        {
+            // Solve the layout showcase; a point inside body/right returns right (or the topmost child if
+            // one overlaps); the title (header child, last index) is the topmost over the header region.
+            const std::vector<Rect> hrects = SolveLayout(MakeLayoutShowcase(), kViewport);
+            const WidgetId hitCenter = HitTest(hrects, 640, 360);   // a click in the body region -> right (id 5)
+            const WidgetId hitTitle  = HitTest(hrects, 40,  30);    // a click in the header/title region
+            const WidgetId hitMiss   = HitTest(hrects, -5,  -5);    // outside every rect
+            // Front-most: the highest-index rect containing the point wins (title id 6 sits over header id 1).
+            const bool frontMost = (hitCenter == L_right)         // body/right is the front-most at center
+                                && (hitTitle == 6 || hitTitle == L_header)  // title (id 6) front-most over header
+                                && (hitMiss == kNoWidget);
+            check(frontMost,
+                  "widget-s5: HitTest is front-most — a point in an overlapping child returns the topmost widget, a miss returns kNoWidget");
+        }
+
+        // ---- (S5-3) PINNED FINAL — the from-0 lockstep final digest == a pinned uint64. ----------------
+        check(uiFinal == kPinnedUiFinal,
+              "widget-s5: RunLockstep ui final digest == pinned uint64 (a UI interaction sequence is deterministic)");
+
+        // ---- (S5-4) PINNED TRACE — DigestTrace has length N AND its byte-digest == a pinned uint64. -----
+        check(trace.size() == static_cast<std::size_t>(kTicks) && traceDigest == kPinnedUiTrace,
+              "widget-s5: the per-tick DigestTrace digest == pinned uint64 (the interaction trace is replayable)");
+
+        // ---- (S5-5) SCRUB == SEEK (THE HEADLINE) — CatchUp(snapshot@S, N) == the from-0 world at N. -----
+        // For several (S,N) pairs: capture the world AS OF tick S (by stepping a Session to S), wrap it in a
+        // JoinSnapshot{S, worldAtS}, then CatchUp(snap, N, ring, step) — the ring IS the tail. Assert its
+        // DigestUi == the from-0 world at N (re-derived the same way). BIT-IDENTICAL: seek-then-play == play-from-0.
+        {
+            const uint32_t pairsS[3] = { 2, 5, 7 };
+            const uint32_t pairsN[3] = { 10, 10, 7 };
+            bool scrubOk = true;
+            for (int p = 0; p < 3; ++p) {
+                const uint32_t S = pairsS[p], N = pairsN[p];
+                UiWorld worldAtS;                  // step a Session to S to capture the confirmed world AS OF S
+                {
+                    net::Session<UiWorld, UiInput> ss;
+                    ss.world = MakeShowcaseUiWorld();
+                    ss.ring  = ring;
+                    ss.tick  = 0;
+                    for (uint32_t t = 0; t < S; ++t) net::Advance(ss, step);
+                    worldAtS = ss.world;
+                }
+                UiWorld worldAtN;                  // the from-0 world at N (re-derived by the same loop)
+                {
+                    net::Session<UiWorld, UiInput> ss;
+                    ss.world = MakeShowcaseUiWorld();
+                    ss.ring  = ring;
+                    ss.tick  = 0;
+                    for (uint32_t t = 0; t < N; ++t) net::Advance(ss, step);
+                    worldAtN = ss.world;
+                }
+                net::JoinSnapshot<UiWorld> snap{ S, worldAtS };
+                const UiWorld caughtUp = net::CatchUp(snap, N, ring, step);
+                if (DigestUi(caughtUp) != DigestUi(worldAtN)) scrubOk = false;
+            }
+            check(scrubOk,
+                  "widget-s5: SCRUB==SEEK — CatchUp(snapshot@S, N) world == from-0 playback world at N (bit-identical), several (S,N)");
+        }
+
+        // ---- (S5-6) CLICK LOAD-BEARING — a run WITH the clicks differs from a run over an EMPTY ring. ----
+        {
+            const net::InputRing<UiInput> emptyRing;   // no clicks
+            const uint64_t emptyFinal = net::RunLockstep(MakeShowcaseUiWorld(), emptyRing, kTicks, step, digest);
+            check(emptyFinal != uiFinal,
+                  "widget-s5: a click is load-bearing — a run WITH the click differs from a run without (interaction changes state)");
+        }
+
+        // ---- (S5-7) DETERMINISTIC — two RunLockstep calls over the same ring -> identical final digest. --
+        {
+            const uint64_t again = net::RunLockstep(MakeShowcaseUiWorld(), ring, kTicks, step, digest);
+            check(again == uiFinal,
+                  "widget-s5: two RunLockstep runs over the same ring are identical (deterministic)");
+        }
+    }
+
     if (g_fail == 0) { std::printf("widget_test: ALL PASS\n"); return 0; }
     std::printf("widget_test: %d FAIL\n", g_fail);
     return 1;
