@@ -253,4 +253,56 @@ inline uint64_t DigestFlowGraphView(const FlowGraphView& v) {
     return hf::net::DigestBytes(buf.data(), buf.size());
 }
 
+// ====================================================================================================
+// Issue #24 — LIVE EXECUTION FEEDBACK (the Blueprint loop's third beat: author -> EXECUTE -> VISUALIZE).
+// APPEND-ONLY below everything above. Does NOT touch BuildFlowGraphView / FlowNodeView / KindLabel /
+// ShowsConstArg / DigestFlowGraphView — the static-view golden 0xaaf9beb70640a9b7 is UNCHANGED.
+//
+// The static view (above) surfaces each node's AUTHORED constArg. THIS surfaces each node's LIVE
+// EVALUATED value — the flow VM's computed output for that node (flow::Evaluate, the canonical-topo
+// register file). The editor can now show what UE5 Blueprint shows: the value that actually flows out of
+// each node when the graph runs. The annotated state is itself a deterministic VALUE -> a NEW pinned
+// digest below proves the value-annotated editor frame is byte-stable run-to-run AND cross-platform.
+// Pure CPU, ImGui-free, backend-free (same discipline as the static view).
+// ====================================================================================================
+
+// FlowLiveValues: the NodeId-indexed LIVE register file for graph `g` — element i is node i's COMPUTED
+// output (flow::Evaluate's canonical-topo evaluation; out-of-range/self inputs read 0; on a cycle an
+// all-zero file). This is exactly the VM output the editor annotates each node box with. Deterministic of
+// `g` alone (Evaluate topo-sorts first), so two calls are byte-identical.
+inline std::vector<flow::Reg> FlowLiveValues(const flow::Graph& g) {
+    return flow::Evaluate(g);
+}
+
+// DigestFlowLiveView: a NEW pinned FNV-1a-64 over the VALUE-ANNOTATED editor state = the existing
+// static-view bytes (DigestFlowGraphView's serialization) THEN each node's LIVE value folded in (int32
+// two's-complement LE, in NodeId order). Reuses DigestFlowGraphView for the static half (so the static
+// golden is literally a prefix of this), then mixes the live register file in NodeId order. Proving THIS
+// digest is stable proves the whole author->execute->visualize frame is deterministic + cross-platform.
+// `values` is FlowLiveValues(g) (NodeId-indexed); a short/long `values` is tolerated (missing slots fold
+// 0, extra slots ignored) so a value file sized to the graph always digests well-defined bytes.
+inline uint64_t DigestFlowLiveView(const FlowGraphView& view, const std::vector<flow::Reg>& values) {
+    // Fold the static-view digest (a uint64) in LE first, then each node's live value (int32 LE, NodeId
+    // order). Hand little-endian field by field — NEVER memcpy a host struct (the DigestFlowGraphView /
+    // replay.h discipline) -> byte-stable cross-platform.
+    std::vector<unsigned char> buf;
+    buf.reserve(8u + view.nodes.size() * 4u);
+    const uint64_t staticDigest = DigestFlowGraphView(view);
+    auto putU32 = [&](uint32_t x) {
+        buf.push_back(static_cast<unsigned char>( x        & 0xFFu));
+        buf.push_back(static_cast<unsigned char>((x >> 8)  & 0xFFu));
+        buf.push_back(static_cast<unsigned char>((x >> 16) & 0xFFu));
+        buf.push_back(static_cast<unsigned char>((x >> 24) & 0xFFu));
+    };
+    putU32(static_cast<uint32_t>( staticDigest        & 0xFFFFFFFFull));   // static digest low 32
+    putU32(static_cast<uint32_t>((staticDigest >> 32) & 0xFFFFFFFFull));   // static digest high 32
+    // Live value per node, in NodeId order (nodes[i].id == i). Missing slots fold 0 (deterministic).
+    for (const FlowNodeView& nv : view.nodes) {
+        const std::size_t idx = static_cast<std::size_t>(nv.id);
+        const flow::Reg v = (idx < values.size()) ? values[idx] : flow::Reg{0};
+        putU32(static_cast<uint32_t>(v));   // int32 bits as uint32 (two's-complement LE)
+    }
+    return hf::net::DigestBytes(buf.data(), buf.size());
+}
+
 }  // namespace hf::editor

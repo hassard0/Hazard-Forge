@@ -149,6 +149,48 @@ int main() {
         check(wiresInRange, "flow-editor: post-delete view wires all reference in-range nodes");
     }
 
+    // ---- (h) LIVE EXECUTION FEEDBACK (issue #24, the author->execute->visualize loop). ---------------
+    // FlowLiveValues == flow::Evaluate (the canonical-topo VM output), the evaluated values are the
+    // hand-checked ints, the NEW live digest is pinned, and re-eval is bit-identical (deterministic).
+    {
+        // (h.a) the STATIC golden STILL holds (the live path did NOT perturb BuildFlowGraphView/the digest).
+        check(DigestFlowGraphView(view) == kPinnedDigest,
+              "flow-live: static DigestFlowGraphView == 0xaaf9beb70640a9b7 UNCHANGED (append-only proof)");
+
+        // (h.b) FlowLiveValues(showcase) == flow::Evaluate(showcase), and the evaluated values are the
+        // expected ints. MakeShowcaseGraph hand-checks: n0=Add(5,2)=7, n6=Mul(7,3)=21, n7=Sub(10,2)=8,
+        // n8=Select(c=3?,21,8)=21, n9=Max(7,21)=21; the consts n1..n5 = 7,3,10,5,2.
+        const std::vector<Reg> live = FlowLiveValues(showcase);
+        const std::vector<Reg> eval = Evaluate(showcase);
+        check(live.size() == showcase.nodes.size() && live == eval,
+              "flow-live: FlowLiveValues == flow::Evaluate (the VM output, NodeId-indexed)");
+        std::printf("flow-live: evaluated values =");
+        for (std::size_t i = 0; i < live.size(); ++i)
+            std::printf(" n%zu=%d", i, static_cast<int>(live[i]));
+        std::printf("\n");
+        const bool valuesOk =
+            live.size() == 10 &&
+            live[0] == 7  && live[1] == 7  && live[2] == 3  && live[3] == 10 && live[4] == 5 &&
+            live[5] == 2  && live[6] == 21 && live[7] == 8  && live[8] == 21 && live[9] == 21;
+        check(valuesOk,
+              "flow-live: the evaluated showcase values are the hand-checked ints "
+              "(n6=21,n7=8,n8=21,n9=21,...)");
+
+        // (h.c) the NEW pinned live digest + re-eval is identical (deterministic / replay-stable).
+        const uint64_t liveDigest = DigestFlowLiveView(view, live);
+        std::printf("flow-live: live digest = 0x%016llx\n",
+                    static_cast<unsigned long long>(liveDigest));
+        const uint64_t kPinnedLiveDigest = 0x0f43e3ba0b638c14ull;  // PINNED on first run (MSVC == clang)
+        check(liveDigest == kPinnedLiveDigest,
+              "flow-live: DigestFlowLiveView == pinned uint64 (the value-annotated cross-platform proof)");
+        // Re-build the view + re-evaluate -> the SAME live digest (deterministic).
+        check(DigestFlowLiveView(BuildFlowGraphView(showcase, L), FlowLiveValues(showcase)) == liveDigest,
+              "flow-live: re-evaluating the live view is bit-identical (deterministic)");
+        // The live digest folds the static one in -> it MUST differ from the bare static digest.
+        check(liveDigest != kPinnedDigest,
+              "flow-live: the live digest differs from the static digest (live values are load-bearing)");
+    }
+
     if (g_fail == 0) std::printf("ALL PASS\n");
     else             std::printf("%d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;
