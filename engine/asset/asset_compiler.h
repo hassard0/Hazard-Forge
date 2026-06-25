@@ -521,4 +521,93 @@ inline DepGraph MakeShowcaseGraph() {
     return g;
 }
 
+// =========================================================================================================
+// Slice ASSET-S5 — Manifest / batch compile, the build AS a net::Session lockstep replay (issue #16).
+// APPEND-ONLY below S4; S1's key 0x7fb6a48b4b99f1b7, S2's artifact 0xf7ee13c169dc0464, S3's cache
+// 0x029174f13e64c9f1, and S4's rebuild 0x0808b56e0322d8c1 are UNCHANGED. Ties S1–S4 into a BATCH COMPILE
+// that produces a deterministic MANIFEST (every asset's NodeId -> its artifact digest) AND makes the build
+// LITERALLY a net::Session lockstep replay: the same job stream yields the same per-tick DigestTrace and the
+// same final manifest, on any machine, in any submit order. NO new include (net/session.h already present —
+// S5 USES more of it: InputRing / RunLockstep / DigestTrace). mtime NEVER enters the manifest or any digest.
+// =========================================================================================================
+
+// --- The manifest (the build output — sorted-unique by node, order-stable) -------------------------------
+struct ManifestEntry { NodeId node = 0; CacheKey artifactDigest = 0; };
+struct Manifest { std::vector<ManifestEntry> entries; };   // SORTED-UNIQUE by node (the order-stable store)
+
+// Sorted-unique insert (or overwrite) of `node` -> `artifactDigest` (the InsertSortedUnique binary-search
+// pattern; mirrors S3's Insert). A re-upsert of an existing node overwrites its digest. NO <algorithm>.
+inline void UpsertManifest(Manifest& m, NodeId node, CacheKey artifactDigest) {
+    std::size_t lo = 0, hi = m.entries.size();
+    while (lo < hi) { std::size_t mid = (lo + hi) / 2; if (m.entries[mid].node < node) lo = mid + 1; else hi = mid; }
+    if (lo < m.entries.size() && m.entries[lo].node == node) { m.entries[lo].artifactDigest = artifactDigest; return; }
+    m.entries.insert(m.entries.begin() + (std::ptrdiff_t)lo, ManifestEntry{ node, artifactDigest });
+}
+
+// Hand-LE: PutU32(count), then per entry IN SORTED-NODE ORDER: PutU32(node), PutU64(artifactDigest). The
+// entries are kept sorted by node, so the byte stream is identical regardless of compile order — the
+// content-addressed property AT THE BUILD LEVEL. mtime NEVER appears.
+inline std::vector<uint8_t> SerializeManifest(const Manifest& m) {
+    std::vector<uint8_t> b;
+    PutU32(b, (uint32_t)m.entries.size());
+    for (const ManifestEntry& e : m.entries) {
+        PutU32(b, e.node);
+        PutU64(b, e.artifactDigest);
+    }
+    return b;
+}
+
+inline CacheKey ManifestDigest(const Manifest& m) {
+    std::vector<uint8_t> b = SerializeManifest(m);
+    return net::DigestBytes(b.data(), b.size());
+}
+
+// --- The compile job (a value-copyable net::Session Input) -----------------------------------------------
+// One asset to compile: a stable NodeId + a pointer to its raw bytes (static fixtures in the test) + params.
+// Value-copyable (shallow ptr) so net::Session can ring/snapshot it; the bytes outlive the run.
+struct CompileJob { NodeId node = 0; const char* bytes = nullptr; std::size_t n = 0; CompileParams params; };
+
+// --- CompileSet — the plain batch (order-independent) ----------------------------------------------------
+// Compile every job into `cache` (GetOrCompile) and record node -> DigestArtifact(blob) in a manifest.
+// Order-independent: the manifest is sorted by node, so ANY job ordering yields the same ManifestDigest.
+inline Manifest CompileSet(const std::vector<CompileJob>& jobs, AssetCache& cache) {
+    Manifest m;
+    for (const CompileJob& j : jobs) {
+        CompileResult r = GetOrCompile(cache, j.bytes, j.n, j.params);
+        UpsertManifest(m, j.node, DigestArtifact(r.blob));
+    }
+    return m;
+}
+
+// --- StepBuild — the build AS a net::Session lockstep replay (THE HEADLINE) -------------------------------
+// The deterministic build transition: compile each job this tick into `cache`, upsert its artifact digest
+// into the manifest. A free function the test wraps in a lambda capturing the cache (like seq's
+// StepPlayhead). Signature matches net::Session: step(World&, const std::vector<Input>&, uint32_t tick).
+inline void StepBuild(AssetCache& cache, Manifest& w, const std::vector<CompileJob>& jobs, uint32_t /*tick*/) {
+    for (const CompileJob& j : jobs) {
+        CompileResult r = GetOrCompile(cache, j.bytes, j.n, j.params);
+        UpsertManifest(w, j.node, DigestArtifact(r.blob));
+    }
+}
+
+// --- Fixtures (FIXED forever — the golden pins the manifest + trace) --------------------------------------
+// 3 jobs: node 0 = ShowcaseRawBytes (S1), node 1 = ShowcaseRawBytesB, node 2 = ShowcaseRawBytesC (S3), all
+// with ShowcaseParams(). Keep FIXED.
+inline std::vector<CompileJob> MakeShowcaseJobs() {
+    std::vector<CompileJob> jobs;
+    jobs.push_back(CompileJob{ 0, ShowcaseRawBytes(),  ShowcaseRawLen(),  ShowcaseParams() });
+    jobs.push_back(CompileJob{ 1, ShowcaseRawBytesB(), ShowcaseRawLenB(), ShowcaseParams() });
+    jobs.push_back(CompileJob{ 2, ShowcaseRawBytesC(), ShowcaseRawLenC(), ShowcaseParams() });
+    return jobs;
+}
+
+// The SAME three jobs in a DIFFERENT order (for the order-independence golden). FIXED.
+inline std::vector<CompileJob> MakeShowcaseJobsReordered() {
+    std::vector<CompileJob> jobs;
+    jobs.push_back(CompileJob{ 2, ShowcaseRawBytesC(), ShowcaseRawLenC(), ShowcaseParams() });
+    jobs.push_back(CompileJob{ 0, ShowcaseRawBytes(),  ShowcaseRawLen(),  ShowcaseParams() });
+    jobs.push_back(CompileJob{ 1, ShowcaseRawBytesB(), ShowcaseRawLenB(), ShowcaseParams() });
+    return jobs;
+}
+
 }  // namespace hf::asset

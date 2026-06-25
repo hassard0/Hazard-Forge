@@ -15,6 +15,7 @@
 #include "test_main.h"
 
 using namespace hf::asset;
+namespace net = hf::net;   // S5: the build is a net::Session lockstep replay (InputRing/RunLockstep/DigestTrace)
 
 static int g_fail = 0;
 static void check(bool c, const char* what) {
@@ -305,6 +306,82 @@ int main() {
         for (std::size_t i = 0; i < inv.size(); ++i) if (inv[i] == 0) { meshAbsent = false; break; }
         check(ok && meshAbsent,
               "asset-s4: changing a leaf texture (3) invalidates {3,4,5}, an unrelated mesh (0) stays a cache hit");
+    }
+
+    // =====================================================================================================
+    // Slice ASSET-S5 — Manifest / batch compile, the build AS a net::Session lockstep replay. CompileSet
+    // produces a deterministic manifest (node -> artifact digest, sorted-unique); StepBuild is the
+    // net::Session StepFn so RunLockstep / DigestTrace replay the build to the SAME manifest + per-tick trace.
+    // =====================================================================================================
+
+    // The plain batch manifest over the three showcase jobs (a fresh cache).
+    AssetCache batchCache;
+    const Manifest batchManifest = CompileSet(MakeShowcaseJobs(), batchCache);
+    const CacheKey manifestDigest = ManifestDigest(batchManifest);
+    std::printf("asset-s5: manifest digest = 0x%016llx  (%zu entries)\n",
+                (unsigned long long)manifestDigest, batchManifest.entries.size());
+
+    // The build AS a net::Session lockstep replay: an InputRing<CompileJob> with job i on tick i, a step
+    // lambda capturing a cache, and digest = ManifestDigest. RunLockstep drives the build to the final
+    // manifest; DigestTrace records the per-tick manifest digest (the manifest grows one entry per tick).
+    net::InputRing<CompileJob> ring;
+    {
+        const std::vector<CompileJob> jobs = MakeShowcaseJobs();
+        for (uint32_t i = 0; i < (uint32_t)jobs.size(); ++i) ring.AddInput(i, jobs[i]);  // job i on tick i
+    }
+    const uint32_t kTicks = 3;
+    AssetCache lockstepCache;
+    auto step = [&lockstepCache](Manifest& w, const std::vector<CompileJob>& js, uint32_t tick) {
+        StepBuild(lockstepCache, w, js, tick);
+    };
+    auto digest = [](const Manifest& m) { return ManifestDigest(m); };
+
+    const uint64_t lockstepFinal = net::RunLockstep(Manifest{}, ring, kTicks, step, digest);
+
+    const std::vector<uint64_t> trace = net::DigestTrace(Manifest{}, ring, kTicks, step, digest);
+    std::vector<uint8_t> traceBytes;
+    for (std::size_t i = 0; i < trace.size(); ++i) PutU64(traceBytes, trace[i]);
+    const uint64_t traceDigest = net::DigestBytes(traceBytes.data(), traceBytes.size());
+    std::printf("asset-s5: build trace digest = 0x%016llx  (%zu ticks)\n",
+                (unsigned long long)traceDigest, trace.size());
+
+    // (S5-1) PRIOR INVARIANT — S1 key + S2 artifact + S3 cache + S4 rebuild digests STILL pinned (S5 additive).
+    check(key == 0x7fb6a48b4b99f1b7ULL && artifact == 0xf7ee13c169dc0464ULL &&
+          cacheDigest == 0x029174f13e64c9f1ULL && rb0.digest == 0x0808b56e0322d8c1ULL,
+          "asset-s5: S1 0x7fb6a48b4b99f1b7 + S2 0xf7ee13c169dc0464 + S3 0x029174f13e64c9f1 + S4 0x0808b56e0322d8c1 UNCHANGED (S5 additive)");
+
+    // (S5-2) PINNED MANIFEST — ManifestDigest(CompileSet(showcase)) == the hard-pinned uint64 (build output byte-stable).
+    const CacheKey kPinnedManifest = 0x37ca56d9da205682ULL;
+    check(manifestDigest == kPinnedManifest,
+          "asset-s5: ManifestDigest(CompileSet(showcase)) == pinned uint64 (the build output is byte-stable)");
+
+    // (S5-3) BUILD == LOCKSTEP — RunLockstep final digest == the CompileSet ManifestDigest (same manifest as the batch).
+    check(lockstepFinal == manifestDigest,
+          "asset-s5: the build is a lockstep replay — RunLockstep final digest == the CompileSet ManifestDigest");
+
+    // (S5-4) PINNED TRACE — DigestBytes of the per-tick DigestTrace vector == the hard-pinned uint64 (length == 3 ticks).
+    const CacheKey kPinnedTrace = 0xcfbe58567fb8fa07ULL;
+    check(traceDigest == kPinnedTrace && trace.size() == 3,
+          "asset-s5: DigestTrace digest == pinned uint64 (the per-tick build trace is replayable, 3 ticks)");
+
+    // (S5-5) ORDER-INDEPENDENT — CompileSet(jobs) and CompileSet(reordered jobs) -> the SAME manifest digest.
+    {
+        AssetCache c1, c2;
+        const CacheKey d1 = ManifestDigest(CompileSet(MakeShowcaseJobs(), c1));
+        const CacheKey d2 = ManifestDigest(CompileSet(MakeShowcaseJobsReordered(), c2));
+        check(d1 == d2,
+              "asset-s5: order-independent — CompileSet(jobs) and CompileSet(reordered) -> the SAME manifest digest");
+    }
+
+    // (S5-6) DETERMINISTIC — two RunLockstep calls over the same ring -> the IDENTICAL final digest.
+    {
+        AssetCache ca, cb;
+        auto stepA = [&ca](Manifest& w, const std::vector<CompileJob>& js, uint32_t tick) { StepBuild(ca, w, js, tick); };
+        auto stepB = [&cb](Manifest& w, const std::vector<CompileJob>& js, uint32_t tick) { StepBuild(cb, w, js, tick); };
+        const uint64_t a = net::RunLockstep(Manifest{}, ring, kTicks, stepA, digest);
+        const uint64_t b = net::RunLockstep(Manifest{}, ring, kTicks, stepB, digest);
+        check(a == b,
+              "asset-s5: two RunLockstep runs over the same ring yield the IDENTICAL final digest (deterministic build)");
     }
 
     if (g_fail == 0) std::printf("asset_compiler_test: ALL PASS\n");
