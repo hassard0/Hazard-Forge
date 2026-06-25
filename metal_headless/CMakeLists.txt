@@ -1244,6 +1244,10 @@ add_executable(visual_test
     # MUST be listed here so the Metal --seq-editor-shot link resolves BuildSeqEditorUI (the #31 link-gap
     # lesson — a panel .cpp wired only into the Vulkan editor lib breaks the Metal headless link).
     ${HF_ROOT}/engine/editor/seq_editor_panels.cpp
+    # Issue #30: the UMG-Designer widget-tree editor panels (ImGui over the pure WidgetEditorView).
+    # MUST be listed here so the Metal --widget-editor-shot link resolves BuildWidgetEditorUI (the #31
+    # link-gap lesson — a panel .cpp wired only into the Vulkan editor lib breaks the Metal headless link).
+    ${HF_ROOT}/engine/editor/widget_editor_panels.cpp
     ${HF_ROOT}/engine/editor/imgui_renderer.cpp
     ${HF_ROOT}/third_party/imgui/imgui.cpp
     ${HF_ROOT}/third_party/imgui/imgui_draw.cpp

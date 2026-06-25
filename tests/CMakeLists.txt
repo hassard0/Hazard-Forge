@@ -203,6 +203,18 @@ hf_add_pure_test(seq_test)
 # digest deterministically. The golden is the pinned hash IN the test (NO image, NO render-bake). Pure CPU
 # (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(seq_editor_test)
+# UMG-Designer WIDGET-TREE EDITOR view + edit data models (engine/editor/widget_editor_data.h +
+# engine/editor/widget_edit_ops.h, issue #30 — the GUI half of the UMG-class UI framework). Pure CPU
+# (hf_core) over the deterministic UI runtime (engine/ui/widget.h): BuildWidgetEditorView computes the
+# HIERARCHY rows (pre-order tree walk via a work-stack, depth->indent), the LAYOUT PREVIEW boxes (the
+# integer SolveLayout rects scaled into a preview pane), and the PROPERTY INSPECTOR (the selected widget's
+# Style fields) — every coordinate a PURE INTEGER function of (tree, viewport, selection). widget_edit_ops.h
+# adds AddChildWidget / SetWidgetStyleProp / DeleteWidget (the last COMPACTS indices + re-maps references).
+# Asserts row count == widget count, box count == widget count, the inspector carries the root's Style, the
+# pinned view digest, replay-stability, and that an AddChild/SetProp/Delete edit changes the digest
+# deterministically. The golden is the pinned hash IN the test (NO image, NO render-bake). Pure CPU,
+# no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(widget_editor_test)
 # SELF-CONTAINED, CLEAN-ROOM Draco mesh decoder substrate (Slice DRACO-DR1, issue #36 — load
 # KHR_draco_mesh_compression glTF): engine/asset/draco_decode.h — a header-only, SELF-CONTAINED (only
 # <cstddef>/<cstdint>/<vector> + net/session.h) bitstream substrate: a bounds-checked little-endian byte
