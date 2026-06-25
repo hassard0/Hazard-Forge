@@ -347,4 +347,178 @@ inline AssetCache MakeShowcaseCache() {
     return c;
 }
 
+// =========================================================================================================
+// Slice ASSET-S4 — Dependency graph + deterministic incremental rebuild (issue #16). APPEND-ONLY below S3;
+// S1's key 0x7fb6a48b4b99f1b7, S2's artifact 0xf7ee13c169dc0464, and S3's cache 0x029174f13e64c9f1 are
+// UNCHANGED. Adds the incremental-rebuild plan: a dependency graph (sorted-unique adjacency, the
+// ChunkDiffStore discipline), a deterministic InvalidationSet (reverse reachability — changed + transitive
+// dependents), a hand Kahn topological RebuildOrder (the flow.h lowest-id ascending-scan, NO std::sort /
+// lower_bound / <algorithm>), and a Rebuild plan whose digest pins the recompile order.
+//
+// NODE IDENTITY: `NodeId` is a STABLE LOGICAL asset id (the graph node) — it PERSISTS across edits, distinct
+// from S1's content-addressed AssetId (which changes when bytes change). The graph keys on NodeId; the cache
+// (S3) keys on the content-address. mtime NEVER enters the graph or any digest.
+// =========================================================================================================
+
+using NodeId = uint32_t;                          // a STABLE logical asset id (persists across edits)
+
+struct DepGraph {
+    // nodes[i] = (node, its sorted-unique list of DEPENDENCIES — the nodes it needs). Sorted by node.
+    // Edge semantics: `node` DEPENDS ON each id in its dependency list (so a change to a dependency must
+    // recompile `node`). Reverse edges (dependents) are derived on demand in InvalidationSet.
+    std::vector<std::pair<NodeId, std::vector<NodeId>>> nodes;
+};
+
+// Binary-search for `n` in g.nodes (sorted by .first); return its index or g.nodes.size() if absent.
+// Hand-written (the ChunkDiffStore Find loop) — NO std::lower_bound, NO <algorithm>.
+inline std::size_t FindNodeIndex(const DepGraph& g, NodeId n) {
+    std::size_t lo = 0, hi = g.nodes.size();
+    while (lo < hi) { std::size_t mid = (lo + hi) / 2; if (g.nodes[mid].first < n) lo = mid + 1; else hi = mid; }
+    return (lo < g.nodes.size() && g.nodes[lo].first == n) ? lo : g.nodes.size();
+}
+
+// Sorted-unique insert of node `n` (no deps yet). A no-op if `n` already present.
+inline void AddNode(DepGraph& g, NodeId n) {
+    std::size_t lo = 0, hi = g.nodes.size();
+    while (lo < hi) { std::size_t mid = (lo + hi) / 2; if (g.nodes[mid].first < n) lo = mid + 1; else hi = mid; }
+    if (lo < g.nodes.size() && g.nodes[lo].first == n) return;   // already present
+    g.nodes.insert(g.nodes.begin() + (std::ptrdiff_t)lo,
+                   std::pair<NodeId, std::vector<NodeId>>{ n, std::vector<NodeId>{} });
+}
+
+// Sorted-unique insert of `to` into a dependency vector (kept sorted-unique). Hand binary search.
+inline void InsertSortedUniqueDep(std::vector<NodeId>& v, NodeId to) {
+    std::size_t lo = 0, hi = v.size();
+    while (lo < hi) { std::size_t mid = (lo + hi) / 2; if (v[mid] < to) lo = mid + 1; else hi = mid; }
+    if (lo < v.size() && v[lo] == to) return;   // already present
+    v.insert(v.begin() + (std::ptrdiff_t)lo, to);
+}
+
+// `from` DEPENDS ON `to`. Ensures BOTH nodes exist; adds `to` to `from`'s sorted-unique dependency list.
+inline void AddDep(DepGraph& g, NodeId from, NodeId to) {
+    AddNode(g, from);
+    AddNode(g, to);
+    const std::size_t fi = FindNodeIndex(g, from);   // re-find: AddNode may have shifted indices
+    InsertSortedUniqueDep(g.nodes[fi].second, to);
+}
+
+// The sorted-unique DEPENDENCY list of `n` (the nodes it needs); nullptr if `n` is absent. Hand binary search.
+inline const std::vector<NodeId>* Dependencies(const DepGraph& g, NodeId n) {
+    const std::size_t i = FindNodeIndex(g, n);
+    return (i < g.nodes.size()) ? &g.nodes[i].second : nullptr;
+}
+
+// --- InvalidationSet — who must recompile when `changed` changes (reverse reachability) -------------------
+// The set = `changed` itself + every node that transitively DEPENDS ON it. A node is in the set if it equals
+// `changed` OR it depends on any node already in the set. Computed by a bounded fixed-point iteration over
+// nodes.size() passes (membership only grows -> cycles handled, bounded -> no hang). Returned SORTED
+// ASCENDING by NodeId; empty if `changed` is not in the graph.
+inline std::vector<NodeId> InvalidationSet(const DepGraph& g, NodeId changed) {
+    std::vector<NodeId> out;
+    if (FindNodeIndex(g, changed) == g.nodes.size()) return out;   // absent -> empty
+    // `in[i]` parallels g.nodes[i]: 1 if that node is in the set. Seed `changed`.
+    std::vector<uint8_t> in(g.nodes.size(), 0);
+    in[FindNodeIndex(g, changed)] = 1;
+    // Bounded fixed-point: at most nodes.size() passes (each pass can add at least one if it grows).
+    for (std::size_t pass = 0; pass < g.nodes.size(); ++pass) {
+        bool grew = false;
+        for (std::size_t i = 0; i < g.nodes.size(); ++i) {
+            if (in[i]) continue;
+            // node i is in the set if any of its dependencies is already in the set.
+            const std::vector<NodeId>& deps = g.nodes[i].second;
+            for (std::size_t d = 0; d < deps.size(); ++d) {
+                const std::size_t di = FindNodeIndex(g, deps[d]);
+                if (di < g.nodes.size() && in[di]) { in[i] = 1; grew = true; break; }
+            }
+        }
+        if (!grew) break;
+    }
+    // Emit in node order (g.nodes is sorted by .first -> ascending NodeId).
+    for (std::size_t i = 0; i < g.nodes.size(); ++i) if (in[i]) out.push_back(g.nodes[i].first);
+    return out;
+}
+
+// --- RebuildOrder — the deterministic topological recompile sequence (hand Kahn lowest-id scan) -----------
+struct OrderResult { std::vector<NodeId> order; bool ok = true; };  // ok=false iff a cycle blocks a total order
+
+// Kahn topological sort over the SUBGRAPH induced by `subset` (only edges between subset members count):
+// repeatedly emit the LOWEST-id not-yet-emitted subset node whose in-subset dependencies are ALL already
+// emitted (dependencies BEFORE dependents). The flow.h TopoOrder lowest-id ascending-scan — NO std::sort,
+// NO lower_bound. If no node is emittable but unemitted subset nodes remain -> a cycle -> ok=false (no hang).
+inline OrderResult RebuildOrder(const DepGraph& g, const std::vector<NodeId>& subset) {
+    OrderResult r;
+    // `inSubset[i]` / `emitted[i]` parallel a private sorted-unique copy of `subset` (so binary-membership
+    // works and emission is ascending-deterministic).
+    std::vector<NodeId> sub;          // sorted-unique copy of subset
+    for (std::size_t i = 0; i < subset.size(); ++i) InsertSortedUniqueDep(sub, subset[i]);
+    const std::size_t m = sub.size();
+    std::vector<uint8_t> emitted(m, 0);
+    // membership test in `sub` (hand binary search).
+    auto subIndex = [&sub, m](NodeId n) -> std::size_t {
+        std::size_t lo = 0, hi = m;
+        while (lo < hi) { std::size_t mid = (lo + hi) / 2; if (sub[mid] < n) lo = mid + 1; else hi = mid; }
+        return (lo < m && sub[lo] == n) ? lo : m;
+    };
+    std::size_t emittedCount = 0;
+    while (emittedCount < m) {
+        // find the LOWEST-id unemitted subset node whose in-subset deps are all emitted (sub is ascending).
+        std::size_t pick = m;
+        for (std::size_t i = 0; i < m; ++i) {
+            if (emitted[i]) continue;
+            const std::vector<NodeId>* deps = Dependencies(g, sub[i]);
+            bool ready = true;
+            if (deps) {
+                for (std::size_t d = 0; d < deps->size(); ++d) {
+                    const std::size_t si = subIndex((*deps)[d]);
+                    if (si != m && !emitted[si]) { ready = false; break; }   // an in-subset dep not yet emitted
+                }
+            }
+            if (ready) { pick = i; break; }     // ascending scan -> first ready is the lowest id
+        }
+        if (pick == m) { r.ok = false; return r; }   // nothing emittable but nodes remain -> cycle
+        emitted[pick] = 1;
+        r.order.push_back(sub[pick]);
+        ++emittedCount;
+    }
+    return r;
+}
+
+// --- Rebuild — the incremental result --------------------------------------------------------------------
+struct RebuildResult { std::vector<NodeId> recompiled; CacheKey digest = 0; bool ok = true; };
+
+// Union the InvalidationSet of every changed node (sorted-unique), topo-order it (RebuildOrder), and return
+// the ordered recompile list + a digest over it (PutU32 each NodeId in order -> DigestBytes). ok=false on a
+// cycle. The COUNT proves incrementality: only changed + dependents are in `recompiled`, NOT the whole graph.
+inline RebuildResult Rebuild(const DepGraph& g, const std::vector<NodeId>& changedNodes) {
+    RebuildResult r;
+    std::vector<NodeId> uni;   // sorted-unique union of all invalidation sets
+    for (std::size_t c = 0; c < changedNodes.size(); ++c) {
+        const std::vector<NodeId> inv = InvalidationSet(g, changedNodes[c]);
+        for (std::size_t i = 0; i < inv.size(); ++i) InsertSortedUniqueDep(uni, inv[i]);
+    }
+    const OrderResult ord = RebuildOrder(g, uni);
+    if (!ord.ok) { r.ok = false; return r; }
+    r.recompiled = ord.order;
+    std::vector<uint8_t> b;
+    for (std::size_t i = 0; i < r.recompiled.size(); ++i) PutU32(b, r.recompiled[i]);
+    r.digest = net::DigestBytes(b.data(), b.size());
+    return r;
+}
+
+// --- Fixture (FIXED forever — the golden pins its invalidation sets + rebuild) ----------------------------
+// A fixed 6-node graph: 0 mesh, 1 mesh, 2 scene deps{0,1}; 3 texture, 4 material deps{3}, 5 scene2 deps{4,1}.
+// (node 1 is shared by scene 2 and scene2 5; node 3 only affects 4 and 5.) Keep FIXED.
+inline DepGraph MakeShowcaseGraph() {
+    DepGraph g;
+    AddNode(g, 0);   // mesh
+    AddNode(g, 1);   // mesh
+    AddDep(g, 2, 0); // scene depends on mesh 0
+    AddDep(g, 2, 1); // scene depends on mesh 1
+    AddNode(g, 3);   // texture
+    AddDep(g, 4, 3); // material depends on texture 3
+    AddDep(g, 5, 4); // scene2 depends on material 4
+    AddDep(g, 5, 1); // scene2 depends on mesh 1
+    return g;
+}
+
 }  // namespace hf::asset

@@ -220,6 +220,93 @@ int main() {
               "asset-s3: Lookup of an absent key returns nullptr (clean miss)");
     }
 
+    // =====================================================================================================
+    // Slice ASSET-S4 — dependency graph + deterministic incremental rebuild. A fixed 6-node graph; when one
+    // input changes, recompile ONLY that node + its transitive dependents, in a deterministic topo order.
+    // =====================================================================================================
+
+    const DepGraph graph = MakeShowcaseGraph();
+
+    // The rebuild plan for a single mesh-0 change (the headline: incremental, byte-stable order).
+    const RebuildResult rb0 = Rebuild(graph, std::vector<NodeId>{ 0 });
+    std::printf("asset-s4: rebuild(change mesh 0) digest = 0x%016llx  recompiled = [",
+                (unsigned long long)rb0.digest);
+    for (std::size_t i = 0; i < rb0.recompiled.size(); ++i)
+        std::printf("%s%u", i ? ", " : "", rb0.recompiled[i]);
+    std::printf("]\n");
+
+    // (S4-1) PRIOR INVARIANT — S1 key + S2 artifact + S3 cache digests STILL pinned (S4 is additive).
+    check(key == 0x7fb6a48b4b99f1b7ULL && artifact == 0xf7ee13c169dc0464ULL &&
+          cacheDigest == 0x029174f13e64c9f1ULL,
+          "asset-s4: S1 0x7fb6a48b4b99f1b7 + S2 0xf7ee13c169dc0464 + S3 0x029174f13e64c9f1 UNCHANGED (S4 additive)");
+
+    // (S4-2) INVALIDATION (mesh 0) — InvalidationSet(g, 0) == {0, 2} exactly (mesh + the scene depending on it).
+    {
+        const std::vector<NodeId> inv = InvalidationSet(graph, 0);
+        const bool ok = (inv == std::vector<NodeId>{ 0, 2 });
+        check(ok, "asset-s4: InvalidationSet(change mesh 0) == {0, 2} exactly (mesh + the scene depending on it)");
+    }
+
+    // (S4-3) INVALIDATION (shared mesh 1) — InvalidationSet(g, 1) == {1, 2, 5} exactly (hits both scenes).
+    {
+        const std::vector<NodeId> inv = InvalidationSet(graph, 1);
+        const bool ok = (inv == std::vector<NodeId>{ 1, 2, 5 });
+        check(ok, "asset-s4: InvalidationSet(change mesh 1) == {1, 2, 5} exactly (shared mesh hits both scenes)");
+    }
+
+    // (S4-4) INCREMENTALITY — recompiling for one mesh change touches 2 nodes, NOT all 6.
+    check(rb0.recompiled.size() == 2,
+          "asset-s4: incrementality — recompiling for one mesh change touches 2 nodes, NOT all 6");
+
+    // (S4-5) TOPOLOGICAL — in RebuildOrder(g, InvalidationSet(g, 1)) every node appears AFTER its in-subset deps.
+    {
+        const std::vector<NodeId> inv = InvalidationSet(graph, 1);
+        const OrderResult ord = RebuildOrder(graph, inv);
+        bool topo = ord.ok;
+        // for each emitted node, every in-subset dependency must appear EARLIER in the order.
+        for (std::size_t i = 0; topo && i < ord.order.size(); ++i) {
+            const std::vector<NodeId>* deps = Dependencies(graph, ord.order[i]);
+            if (!deps) continue;
+            for (std::size_t d = 0; d < deps->size(); ++d) {
+                const NodeId dep = (*deps)[d];
+                // is `dep` in the subset? if so it must appear before index i.
+                bool inSubset = false, before = false;
+                for (std::size_t k = 0; k < inv.size(); ++k) if (inv[k] == dep) { inSubset = true; break; }
+                if (!inSubset) continue;
+                for (std::size_t j = 0; j < i; ++j) if (ord.order[j] == dep) { before = true; break; }
+                if (!before) { topo = false; break; }
+            }
+        }
+        check(topo,
+              "asset-s4: RebuildOrder is topological — every dependency precedes its dependent (and is deterministic)");
+    }
+
+    // (S4-6) PINNED REBUILD DIGEST — Rebuild(g, {0}).digest == the hard-pinned uint64 (byte-stable plan).
+    const CacheKey kPinnedRebuild = 0x0808b56e0322d8c1ULL;
+    check(rb0.digest == kPinnedRebuild,
+          "asset-s4: Rebuild(change mesh 0) digest == pinned uint64 (the recompile plan is byte-stable)");
+
+    // (S4-7) CYCLE — a hand-built graph with a cycle -> ok == false (a deterministic error, no hang).
+    {
+        DepGraph cyc;
+        AddDep(cyc, 10, 11);   // 10 depends on 11
+        AddDep(cyc, 11, 10);   // 11 depends on 10 -> a cycle
+        const OrderResult ord = RebuildOrder(cyc, std::vector<NodeId>{ 10, 11 });
+        const RebuildResult rr = Rebuild(cyc, std::vector<NodeId>{ 10 });
+        check(ord.ok == false && rr.ok == false,
+              "asset-s4: a cyclic graph -> ok == false (deterministic error, no hang)");
+    }
+
+    // (S4-8) LEAF TEXTURE — InvalidationSet(g, 3) == {3, 4, 5}; an unrelated mesh (0) is NOT in the set.
+    {
+        const std::vector<NodeId> inv = InvalidationSet(graph, 3);
+        bool ok = (inv == std::vector<NodeId>{ 3, 4, 5 });
+        bool meshAbsent = true;
+        for (std::size_t i = 0; i < inv.size(); ++i) if (inv[i] == 0) { meshAbsent = false; break; }
+        check(ok && meshAbsent,
+              "asset-s4: changing a leaf texture (3) invalidates {3,4,5}, an unrelated mesh (0) stays a cache hit");
+    }
+
     if (g_fail == 0) std::printf("asset_compiler_test: ALL PASS\n");
     else             std::printf("asset_compiler_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
