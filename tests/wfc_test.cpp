@@ -450,6 +450,188 @@ int main() {
         }
     }
 
+    // ================================================================================================
+    // ---- Slice WFC-S4: adjacency LEARNED from a sample + region pre-constraints ---------------------
+    // ================================================================================================
+    // PART A — learn an adjacency rule-set from a fixed sample tilemap (the Wang model) and solve a fresh
+    // 16x16 from it. PART B — region pre-constraints (PinCell/ConstrainCell/ApplyConstraints) honored
+    // through the solve. All ordering pinned, so the learned-adjacency digest + the solved grid digests are
+    // bit-identical run-to-run AND MSVC-vs-clang.
+
+    // ---- PART A — learned rules reproduce + solve --------------------------------------------------
+    {
+        // A fixed 7x7 gradient-island sample (ids 0=water,1=sand,2=grass,3=rock). Concentric rings:
+        // a water border, a sand ring, a grass core, and a single rock at the dead center. Every adjacent
+        // pair is a gradient step (water-water, water-sand, sand-sand, sand-grass, grass-grass, grass-rock),
+        // so the LEARNED rules match the S1 showcase gradient and a 16x16 is solvable.
+        SampleMap sample;
+        sample.w = 7; sample.h = 7;
+        const int32_t S[49] = {
+            //  x: 0  1  2  3  4  5  6
+                0, 0, 0, 0, 0, 0, 0,   // z=0
+                0, 1, 1, 1, 1, 1, 0,   // z=1
+                0, 1, 2, 2, 2, 1, 0,   // z=2
+                0, 1, 2, 3, 2, 1, 0,   // z=3  <- rock(3) at center, all neighbors grass(2)
+                0, 1, 2, 2, 2, 1, 0,   // z=4
+                0, 1, 1, 1, 1, 1, 0,   // z=5
+                0, 0, 0, 0, 0, 0, 0    // z=6
+        };
+        sample.tile.assign(S, S + 49);
+
+        const TileSet learned = LearnTileSet(sample);
+
+        // Expected per-tile occurrence counts (computed independently from the literal sample).
+        int32_t expCount[4] = { 0, 0, 0, 0 };
+        for (int i = 0; i < 49; ++i) ++expCount[S[i]];  // water=24, sand=16, grass=8, rock=1
+
+        // The learned adjacency-mask digest (over the allowed[] vector, the same currency as DigestGrid).
+        const uint64_t learnedAdjDigest =
+            hf::net::DigestBytes(learned.allowed.data(), learned.allowed.size() * sizeof(Domain));
+
+        std::printf("wfc-s4: learned tileset: tiles=%u, weights=[%d,%d,%d,%d], adjacency digest=0x%016llx\n",
+                    learned.tileCount, learned.weight[0], learned.weight[1], learned.weight[2],
+                    learned.weight[3], static_cast<unsigned long long>(learnedAdjDigest));
+
+        // (1) SYMMETRIC — every pair observed from both sides => adjacency-symmetric (AC-3 sound).
+        check(IsSymmetric(learned),
+              "wfc-s4: LearnTileSet is adjacency-symmetric (learned rules are AC-3 sound)");
+
+        // (2) ADJACENCY DIGEST PINNED — the rules are a deterministic function of the sample.
+        const uint64_t kS4AdjDigest = 0xb3b956701ab39c83ull;  // PINNED on first run (cross-platform anchor)
+        check(learnedAdjDigest == kS4AdjDigest,
+              "wfc-s4: learned adjacency-mask digest == pinned uint64 (rules derived deterministically from the sample)");
+
+        // (3) WEIGHTS = COUNTS — weight[t] equals the literal occurrence count of tile t in the sample.
+        check(learned.tileCount == 4u &&
+              learned.weight[0] == expCount[0] && learned.weight[1] == expCount[1] &&
+              learned.weight[2] == expCount[2] && learned.weight[3] == expCount[3],
+              "wfc-s4: learned weights == per-tile occurrence counts in the sample");
+
+        // (4) SOLVE PINNED + CONSISTENT — Solve a fresh 16x16 from the learned rules.
+        const uint32_t kSeed     = 0x1234ABCDu;
+        const uint32_t kMaxSteps = 100000u;
+        // A fresh all-tiles 16x16 grid for the learned 4-tile set (MakeShowcaseGrid also uses 4 tiles).
+        Grid gL = MakeShowcaseGrid(16, 16);
+        const SolveResult rL = Solve(learned, gL, kSeed, kMaxSteps);
+        const uint64_t solveDigestL = DigestGrid(gL);
+
+        std::printf("wfc-s4: learned solve -> solved=%d steps=%u backtracks=%u, digest=0x%016llx\n",
+                    static_cast<int>(rL.solved), rL.steps, rL.backtracks,
+                    static_cast<unsigned long long>(solveDigestL));
+
+        const uint64_t kS4SolveDigest = 0x2e31ea681c0bd906ull;  // PINNED on first run
+        bool allDecidedL = rL.solved;
+        for (const Domain d : gL.cell) if (popcount64(d) != 1) { allDecidedL = false; break; }
+        check(allDecidedL && globallyConsistent(learned, gL) && solveDigestL == kS4SolveDigest,
+              "wfc-s4: Solve(learnedTileSet, 16x16, seed) fully collapses + globally consistent, digest == pinned");
+
+        // (5) NO INVENTED TILES — every tile id in the solved grid also appears in the sample.
+        {
+            // Set of tile ids present in the sample.
+            uint64_t sampleTiles = 0;
+            for (int i = 0; i < 49; ++i) sampleTiles |= (Domain{1} << static_cast<uint32_t>(S[i]));
+            bool onlyObserved = true;
+            for (const Domain d : gL.cell) {
+                // d is a single-bit domain (decided); its bit must be a sample tile.
+                if ((d & sampleTiles) != d) { onlyObserved = false; break; }
+            }
+            check(onlyObserved,
+                  "wfc-s4: every tile in the solved output also appears in the sample (no tile invented out of nothing)");
+        }
+    }
+
+    // ---- PART B — region pre-constraints honored ---------------------------------------------------
+    {
+        const uint32_t kSeed     = 0x1234ABCDu;
+        const uint32_t kMaxSteps = 100000u;
+        const Domain   kSandMask = Domain{1} << 1;  // sand-only constraint mask
+
+        // The showcase gradient tileset (4 tiles, isotropic gradient) for the constrained solve.
+        // Pin water(0) at the top-left corner, rock(3) at the top-right corner (both gradient-consistent,
+        // and BOTH off the constrained bottom row so they don't clash with the sand mask), and constrain
+        // the entire bottom border row (z=0) to sand-only.
+        auto buildConstrained = [&]() -> Grid {
+            Grid g = MakeShowcaseGrid(16, 16);
+            PinCell(g, 0, 15, 0);             // water at the top-left corner
+            PinCell(g, 15, 15, 3);            // rock at the top-right corner
+            for (int32_t x = 0; x < 16; ++x)  // the whole bottom border row -> sand only
+                ConstrainCell(g, x, 0, kSandMask);
+            return g;
+        };
+
+        Grid gB = buildConstrained();
+        const bool applied = ApplyConstraints(ts, gB);
+        const SolveResult rB = Solve(ts, gB, kSeed, kMaxSteps);
+        const uint64_t solveDigestB = DigestGrid(gB);
+
+        std::printf("wfc-s4: constrained solve -> solved=%d, applied=%d, digest=0x%016llx\n",
+                    static_cast<int>(rB.solved), static_cast<int>(applied),
+                    static_cast<unsigned long long>(solveDigestB));
+
+        // (6) PINS PROPAGATE — ApplyConstraints returned true (no immediate contradiction).
+        check(applied,
+              "wfc-s4: ApplyConstraints propagated the pins without contradiction");
+
+        // (7) SOLVE PINNED + CONSISTENT — Solve fully collapses, globally consistent, pinned digest.
+        const uint64_t kS4ConstrainedDigest = 0xdeaac98f4242eecaull;  // PINNED on first run
+        bool allDecidedB = rB.solved;
+        for (const Domain d : gB.cell) if (popcount64(d) != 1) { allDecidedB = false; break; }
+        check(allDecidedB && globallyConsistent(ts, gB) && solveDigestB == kS4ConstrainedDigest,
+              "wfc-s4: Solve with pins fully collapses + globally consistent, digest == pinned");
+
+        // (8) PINS HONORED — every pinned cell holds exactly its pinned tile; the border row is all sand.
+        {
+            const Domain water = Domain{1} << 0;
+            const Domain rock  = Domain{1} << 3;
+            bool pinsHonored =
+                (gB.cell[static_cast<std::size_t>(gB.cellId(0, 15))]  == water) &&
+                (gB.cell[static_cast<std::size_t>(gB.cellId(15, 15))] == rock);
+            bool borderSand = true;
+            for (int32_t x = 0; x < 16; ++x)
+                if (gB.cell[static_cast<std::size_t>(gB.cellId(x, 0))] != kSandMask) { borderSand = false; break; }
+            check(pinsHonored && borderSand,
+                  "wfc-s4: every pinned cell holds EXACTLY its pinned tile + the sand-constrained border row holds only sand");
+        }
+
+        // (9) REPLAY-STABLE — re-running the constrained solve from the same seed is bit-identical.
+        {
+            Grid gB2 = buildConstrained();
+            const bool applied2 = ApplyConstraints(ts, gB2);
+            const SolveResult rB2 = Solve(ts, gB2, kSeed, kMaxSteps);
+            check(applied2 == applied && rB2.solved == rB.solved &&
+                  rB2.steps == rB.steps && rB2.backtracks == rB.backtracks &&
+                  DigestGrid(gB2) == solveDigestB,
+                  "wfc-s4: re-running the constrained solve is bit-identical (deterministic)");
+        }
+
+        // (10) CONTRADICTORY PINS DETERMINISTIC — two ADJACENT cells pinned to a forbidden pair (water
+        // next to rock — the gradient forbids water-rock adjacency) -> ApplyConstraints returns false
+        // (or Solve solved==false), reproducibly, no hang.
+        {
+            auto buildBadPins = [&]() -> Grid {
+                Grid g = MakeShowcaseGrid(16, 16);
+                PinCell(g, 5, 5, 0);  // water
+                PinCell(g, 6, 5, 3);  // rock, immediately to the right -> water-rock forbidden
+                return g;
+            };
+            Grid gBad = buildBadPins();
+            const bool appliedBad = ApplyConstraints(ts, gBad);
+            const SolveResult rBad = Solve(ts, gBad, kSeed, kMaxSteps);
+
+            Grid gBad2 = buildBadPins();
+            const bool appliedBad2 = ApplyConstraints(ts, gBad2);
+            const SolveResult rBad2 = Solve(ts, gBad2, kSeed, kMaxSteps);
+
+            std::printf("wfc-s4: contradictory pins -> applied=%d solved=%d (reproduce applied=%d solved=%d)\n",
+                        static_cast<int>(appliedBad), static_cast<int>(rBad.solved),
+                        static_cast<int>(appliedBad2), static_cast<int>(rBad2.solved));
+            check((!appliedBad || !rBad.solved) && (!appliedBad2 || !rBad2.solved) &&
+                  appliedBad == appliedBad2 && rBad.solved == rBad2.solved &&
+                  rBad.steps <= kMaxSteps,
+                  "wfc-s4: contradictory pins -> ApplyConstraints returns false (or Solve solved==false), deterministically (no hang)");
+        }
+    }
+
     if (g_fail == 0) { std::printf("wfc_test: ALL PASS\n"); return 0; }
     std::printf("wfc_test: %d FAIL\n", g_fail);
     return 1;

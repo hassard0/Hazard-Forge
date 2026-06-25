@@ -456,4 +456,98 @@ inline SolveResult Solve(const TileSet& ts, Grid& g, uint32_t seed, uint32_t max
     return res;
 }
 
+// ===================================================================================================
+// --- Slice WFC-S4: adjacency LEARNED from a sample (Wang model) + region pre-constraints -----------
+// ===================================================================================================
+// S1-S3 take a HAND-AUTHORED rule-set and solve it. S4 makes the rule-set itself LEARNED from a sample
+// tilemap (the "overlapping/Wang" model that gives WFC its reputation — feed a small example, generate
+// more that looks like it), plus REGION PRE-CONSTRAINTS (the caller pins/restricts cells before the
+// solve — the authoring knob). The learned rules are a deterministic INTEGER function of the sample, so
+// the generated levels are bit-identical on every machine (a float-hash WFC cannot guarantee this).
+// APPEND-ONLY below S3 — S1/S2/S3 types/functions are untouched. Still PURE-CPU INTEGER, self-contained,
+// NO float/RNG/hash-set. The dir->offset mapping below MATCHES S1 Propagate's exactly (kRight=(+1,0),
+// kUp=(0,+1), kLeft=(-1,0), kDown=(0,-1)) so learned rules are consistent with propagation.
+
+// --- SampleMap: a small example tilemap to learn from ----------------------------------------------
+// tile[z*w+x] = the tile id at that sample cell (0..tileCount-1). Same row-major layout as Grid.
+struct SampleMap {
+    int32_t              w = 0, h = 0;
+    std::vector<int32_t> tile;   // [w*h]
+};
+
+// --- LearnTileSet: derive the adjacency rule-set + weights from a sample (the Wang model) -----------
+// tileCount = (max tile id in the sample) + 1. weight[t] = the integer COUNT of tile t's occurrences in
+// the sample (frequency-as-weight — common tiles collapse more often). allowed[t*4+dir] starts 0 and
+// gets bit `u` set whenever tile u is found on the `dir` side of a cell holding tile t. Scan sample
+// cells in ASCENDING id; for each, for each in-bounds neighbor in the FIXED dir order {kRight,kUp,kLeft,
+// kDown} with offsets matching S1 Propagate, OR the neighbor's tile bit into allowed[thisTile*4+dir].
+// Because every adjacent pair is observed from BOTH sides, the learned rule is automatically symmetric
+// (IsSymmetric(LearnTileSet(s)) holds). NO std::hash / std::unordered_* / float anywhere.
+inline TileSet LearnTileSet(const SampleMap& s) {
+    TileSet ts;
+    const int32_t n = (s.w > 0 && s.h > 0) ? s.w * s.h : 0;
+
+    // tileCount = max tile id + 1 (ascending scan; tile ids assumed 0..63).
+    int32_t maxId = -1;
+    for (int32_t i = 0; i < n; ++i)
+        if (s.tile[static_cast<std::size_t>(i)] > maxId) maxId = s.tile[static_cast<std::size_t>(i)];
+    ts.tileCount = static_cast<uint32_t>(maxId + 1);  // 0 sample tiles -> tileCount 0
+
+    ts.weight.assign(static_cast<std::size_t>(ts.tileCount), 0);
+    ts.allowed.assign(static_cast<std::size_t>(ts.tileCount) * 4u, Domain{0});
+
+    // The 4 dirs in fixed order with their (dx,dz) offsets — IDENTICAL to S1 Propagate's kDirs/kDx/kDz.
+    static const int kDirs[4] = { kRight, kUp, kLeft, kDown };
+    static const int kDx[4]   = { +1, 0, -1, 0 };
+    static const int kDz[4]   = {  0, +1, 0, -1 };
+
+    for (int32_t z = 0; z < s.h; ++z) {
+        for (int32_t x = 0; x < s.w; ++x) {
+            const int32_t  thisTile = s.tile[static_cast<std::size_t>(z * s.w + x)];
+            ++ts.weight[static_cast<std::size_t>(thisTile)];  // frequency-as-weight
+            for (int d = 0; d < 4; ++d) {
+                const int32_t nx = x + kDx[d];
+                const int32_t nz = z + kDz[d];
+                if (nx < 0 || nx >= s.w || nz < 0 || nz >= s.h) continue;  // out of bounds
+                const int32_t nTile = s.tile[static_cast<std::size_t>(nz * s.w + nx)];
+                // tile nTile is permitted on the `dir`-th side of tile thisTile.
+                ts.allowed[static_cast<std::size_t>(thisTile) * 4u + static_cast<std::size_t>(kDirs[d])]
+                    |= (Domain{1} << static_cast<uint32_t>(nTile));
+            }
+        }
+    }
+    return ts;
+}
+
+// --- Region pre-constraints (authoring) ------------------------------------------------------------
+// PinCell: restrict a cell's domain to EXACTLY one tile (a hard pin). Does NOT propagate by itself.
+inline void PinCell(Grid& g, int32_t x, int32_t z, uint32_t tile) {
+    g.cell[static_cast<std::size_t>(g.cellId(x, z))] = Domain{1} << tile;
+}
+
+// ConstrainCell: INTERSECT a cell's domain with a caller-supplied mask (a soft region constraint — e.g.
+// "only floor tiles here"). Does NOT propagate by itself.
+inline void ConstrainCell(Grid& g, int32_t x, int32_t z, Domain allowedHere) {
+    g.cell[static_cast<std::size_t>(g.cellId(x, z))] &= allowedHere;
+}
+
+// ApplyConstraints: apply all pins/constraints already written into g, then Propagate their consequences.
+// Seeds the worklist with EVERY cell whose domain != all-tiles-set (the constrained cells), then runs the
+// S1 AC-3 Propagate. Returns false if the constraints are immediately contradictory (some domain became 0,
+// either pre-existing or produced by propagation). Solve then runs from the narrowed grid unchanged — a
+// pinned single-bit domain has no other tile to try, so the pins survive the solve.
+inline bool ApplyConstraints(const TileSet& ts, Grid& g) {
+    const int32_t n = g.w * g.h;
+    const Domain  all = (ts.tileCount < 64u)
+                            ? ((Domain{1} << ts.tileCount) - Domain{1})
+                            : ~Domain{0};
+    std::vector<int32_t> worklist;
+    for (int32_t c = 0; c < n; ++c) {
+        const Domain d = g.cell[static_cast<std::size_t>(c)];
+        if (d == 0) return false;          // a constraint already emptied a domain — contradictory
+        if (d != all) worklist.push_back(c);  // a constrained (narrowed) cell — seed it
+    }
+    return Propagate(ts, g, worklist);
+}
+
 }  // namespace hf::wfc
