@@ -28,6 +28,7 @@
 
 #include "sim/fpx.h"      // the Q16.16 toolbox: fx (int32 Q16.16) / kOne / fxmul / fxdiv
 #include "net/session.h"  // hf::net::DigestBytes (FNV-1a-64 over raw bytes)
+#include "flow/flow.h"    // S3: flow::EventRecord + flow::DigestEvents (the deterministic event-trace currency)
 
 namespace hf::seq {
 
@@ -261,6 +262,69 @@ inline Sequence MakeShowcaseSequence() {
 
     seq.tracks = {ch0, ch1, ch2};
     return seq;
+}
+
+// ============================ S3 — event track (discrete timeline events) ==========================
+// The OTHER half of a real timeline: discrete events that FIRE at exact tick boundaries as the playhead
+// sweeps a time interval (a cutscene triggers a sound / a Blueprint pulse / a gameplay flag on frame N).
+// The moat: the fired event SET is bit-identical cross-platform AND it composes with flow.h's
+// deterministic-VM — a sequence event feeds a flow::Graph input channel and the flow trace is itself
+// deterministic. UE5 Sequencer event tracks fire on FLOAT playback timing (two machines fire on
+// different frames); ours fires on INTEGER ticks, identically, replayably. APPEND-ONLY — S1+S2 untouched.
+
+// The event track: parallel-SoA (like ScalarTrack). `times` is STRICTLY ASCENDING (sorted, no dupes);
+// eventIds[i] is the id fired at times[i]; payloads is OPTIONAL (size==times.size() OR empty -> all 0).
+struct EventTrack {
+    std::vector<fx>       times;     // Q16.16 seconds, STRICTLY ASCENDING (the invariant — sorted, no dupes)
+    std::vector<uint32_t> eventIds;  // the event id fired at times[i]; eventIds.size()==times.size()
+    std::vector<fx>       payloads;  // OPTIONAL Q16.16 payload per event; payloads.size()==times.size() OR 0
+};
+
+// SampleEvents(tr, tPrev, t): fire every event whose time is in the HALF-OPEN window [tPrev, t) — so a
+// tick boundary fires EXACTLY ONCE across consecutive sweeps (the standard sampler-window convention).
+// A hand integer scan in ascending index order (NO <algorithm>); each fired event maps to a
+// flow::EventRecord. flow::EventRecord has exactly two fields: `uint32_t eventId` and `flow::Reg payload`
+// (Reg is int32, == our fx) — NO tick/order field, so ordering is purely emission (ascending-time) order.
+// We populate eventId = eventIds[i] and payload = (flow::Reg)(payloads.empty() ? 0 : payloads[i]).
+// Guard: t <= tPrev -> empty (no negative/empty window fires).
+inline std::vector<flow::EventRecord> SampleEvents(const EventTrack& tr, fx tPrev, fx t) {
+    std::vector<flow::EventRecord> out;
+    if (t <= tPrev) return out;                          // empty/negative window -> fires nothing
+    const std::size_t n = tr.times.size();
+    const bool hasPayload = !tr.payloads.empty();
+    for (std::size_t i = 0; i < n; ++i) {                // ascending index scan (times sorted) = ascending time
+        const fx ti = tr.times[i];
+        if (ti < tPrev) continue;                        // before the window -> skip
+        if (ti >= t)    break;                            // at/after the window end -> done (sorted, none remain)
+        const fx pay = hasPayload ? tr.payloads[i] : (fx)0;
+        out.push_back(flow::EventRecord{ tr.eventIds[i], (flow::Reg)pay });
+    }
+    return out;
+}
+
+// SampleEventSweep(tr, dt, n): drive the track across n fixed ticks -> ONE contiguous fired trace. For i
+// in [0,n) the window is [i*dt, (i+1)*dt) (int64 products to avoid overflow), all fired EventRecords
+// accumulated in order. Every event in [0, n*dt) fires exactly once, in ascending time order.
+inline std::vector<flow::EventRecord> SampleEventSweep(const EventTrack& tr, fx dt, uint32_t n) {
+    std::vector<flow::EventRecord> out;
+    for (uint32_t i = 0; i < n; ++i) {
+        const fx a = (fx)((int64_t)i * (int64_t)dt);          // window start  i*dt
+        const fx b = (fx)((int64_t)(i + 1) * (int64_t)dt);    // window end   (i+1)*dt (half-open)
+        const std::vector<flow::EventRecord> fired = SampleEvents(tr, a, b);
+        for (const flow::EventRecord& e : fired) out.push_back(e);
+    }
+    return out;
+}
+
+// MakeShowcaseEvents(): the FIXED golden fixture — 5 events at fixed ticks with distinct ids + payloads.
+// Note eventIds repeats 20 (proves the id is NOT a key — emission order is by time). Keep FIXED forever:
+// the pinned golden hashes its fired trace.
+inline EventTrack MakeShowcaseEvents() {
+    EventTrack tr;
+    tr.times    = {kOne / 2, kOne, 3 * kOne / 2, 2 * kOne, 5 * kOne / 2};  // 0.5s .. 2.5s
+    tr.eventIds = {10, 20, 30, 20, 40};                                    // repeated 20 — id is not a key
+    tr.payloads = {kOne, -kOne, kOne / 4, 2 * kOne, 0};
+    return tr;
 }
 
 }  // namespace hf::seq

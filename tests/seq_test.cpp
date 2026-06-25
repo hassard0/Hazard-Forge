@@ -26,6 +26,7 @@
 #include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::seq;
+namespace flow = hf::flow;  // S3: the deterministic-VM the event track composes with (EventRecord/Graph/StepGraph)
 
 static int g_fail = 0;
 static void check(bool cond, const char* what) {
@@ -161,6 +162,93 @@ int main() {
         std::printf("seq-s2: sequence-bus sweep digest = 0x%016llx\n", (unsigned long long)seqDig);
         check(seqDig == kPinnedSeqSweep,
               "seq-s2: SampleSequenceSweep digest == pinned uint64 (the multi-track timeline is byte-stable)");
+    }
+
+    // =============================== SEQ-S3 — event track (composes flow.h) ======================
+    // Discrete timeline events firing at integer tick boundaries, hashed via flow::DigestEvents (flow's
+    // hand-LE event digest) — the fired-event SET is byte-stable MSVC + clang AND it composes with the
+    // deterministic flow VM. PINNED on first run (MSVC == clang), the cross-platform bar.
+    const uint64_t kPinnedEventSweep = 0x1035f49824b6ac7aull;  // PINNED on first run (MSVC == clang)
+
+    const EventTrack evShowcase = MakeShowcaseEvents();
+    // Sweep 3s @ 30Hz (dt=kOne/30, 90 ticks) — covers all 5 events (last at 2.5s < 3.0s).
+    const std::vector<flow::EventRecord> evSweep = SampleEventSweep(evShowcase, kOne / 30, 90);
+    const uint64_t evDig = flow::DigestEvents(evSweep);
+    std::printf("seq-s3: event-sweep trace digest = 0x%016llx  (%zu events)\n",
+                (unsigned long long)evDig, evSweep.size());
+
+    // ---- (1) PRIOR INVARIANT — re-assert S1 + all 4 S2 digests, all UNCHANGED (S3 is additive). ----
+    {
+        const bool s1ok = DigestTrack(SampleSweep(MakeShowcaseTrack(), kOne / 30, 90)) == 0xd314f17ebe3d480bull;
+        const bool s2tbl = DigestTrack(SineEaseTable()) == 0x8f13b44545cc3c97ull
+                        && DigestTrack(QuadInTable())   == 0x7ebbb0956a7f50a2ull
+                        && DigestTrack(QuadOutTable())  == 0x5289c36d8551004aull;
+        const std::vector<fx> s2sweep = SampleSequenceSweep(MakeShowcaseSequence(), kOne / 30, 90);
+        const bool s2seq = DigestTrack(s2sweep) == 0xee44096d40ab3946ull;
+        check(s1ok && s2tbl && s2seq,
+              "seq-s3: prior invariant — S1 0xd314f17ebe3d480b + all 4 S2 digests UNCHANGED (S3 is purely additive)");
+    }
+
+    // ---- (2) FIRES-ONCE COUNT — every event fires exactly once across the sweep (count == 5). ------
+    check(evSweep.size() == evShowcase.times.size() && evSweep.size() == 5,
+          "seq-s3: SampleEventSweep fires every event exactly once across the sweep (count == track size)");
+
+    // ---- (3) PINNED TRACE DIGEST — the fired stream is byte-stable MSVC + clang. --------------------
+    check(evDig == kPinnedEventSweep,
+          "seq-s3: the fired-event trace digest == pinned uint64 (flow::DigestEvents, byte-stable cross-platform)");
+
+    // ---- (4) HALF-OPEN NO-DOUBLE-FIRE — an event exactly on a window boundary fires once, not twice.
+    // dt = kOne/2 makes the event at kOne/2 (id 10) land EXACTLY on a window boundary (t=0.5s is the start
+    // of window i=1: [kOne/2, kOne)). Sweep 6 windows (0..3s) and count id 10 in the trace == 1.
+    {
+        const std::vector<flow::EventRecord> bnd = SampleEventSweep(evShowcase, kOne / 2, 6);
+        int count10 = 0;
+        for (const flow::EventRecord& e : bnd) if (e.eventId == 10u) ++count10;
+        check(count10 == 1,
+              "seq-s3: half-open window — an event exactly on a tick boundary fires once, not twice (no double-fire)");
+    }
+
+    // ---- (5) EMPTY / NEGATIVE WINDOW — [t,t) and a negative window (t<tPrev) fire nothing. ----------
+    {
+        const std::vector<flow::EventRecord> empt = SampleEvents(evShowcase, 2 * kOne, 2 * kOne);  // [t,t)
+        const std::vector<flow::EventRecord> neg  = SampleEvents(evShowcase, 2 * kOne, kOne);      // t<tPrev
+        check(empt.empty() && neg.empty(),
+              "seq-s3: empty/negative window [t,t) fires nothing");
+    }
+
+    // ---- (6) LOAD-BEARING TIME — shift an event out of the swept window -> a DIFFERENT digest. -------
+    // The fired-trace digest hashes (eventId, payload) per record in emission order, so a nudge is only
+    // load-bearing if it changes WHICH events fall in the swept range [0, 3s) or their order. We shift the
+    // LAST event (times[4], 2.5s) PAST the sweep end (to 12.5s, beyond 90 ticks * kOne/30 = 3.0s) — which
+    // keeps the STRICTLY-ASCENDING invariant intact (it is already the last key) yet drops it from the
+    // fired trace (5 -> 4 events) -> a different digest: the event TIME is load-bearing.
+    {
+        EventTrack mutated = MakeShowcaseEvents();
+        mutated.times[4] += 10 * kOne;   // shift the last event out of the swept [0, 3s) window -> it no longer fires
+        const std::vector<flow::EventRecord> mutSweep = SampleEventSweep(mutated, kOne / 30, 90);
+        check(mutSweep.size() == 4 && flow::DigestEvents(mutSweep) != evDig,
+              "seq-s3: shifting an event out of the swept window changes the trace digest (event times are load-bearing)");
+    }
+
+    // ---- (7) FLOW COMPOSITION — feed a fired event's payload into a flow kInput channel; assert the
+    // flow output equals the hand-computed expected (the sequence drives the deterministic VM). Build a
+    // tiny 2-node graph: n0 = kInput[0] (the external per-tick input), n1 = kAdd(n0, n0) = 2*input.
+    // Take event index 3's payload (2*kOne), feed it as inputs[0], StepGraph once, assert n1 == 4*kOne.
+    {
+        flow::Graph g;
+        g.nodes.resize(2);
+        g.nodes[0] = flow::Node{ flow::kInput, /*a=*/0, /*b=*/0, /*c=*/0, /*const=*/0 };  // input index 0
+        g.nodes[1] = flow::Node{ flow::kAdd,   /*a=*/0, /*b=*/0, /*c=*/1, /*const=*/0 };  // n0 + n0 = 2*input
+
+        const flow::EventRecord fired = evSweep[3];               // the event with payload 2*kOne
+        std::vector<flow::Reg> inputs = { fired.payload };        // drive the kInput channel from the event
+        flow::GraphState state = flow::MakeState(g);
+        const std::vector<flow::Reg> regs = flow::StepGraph(g, state, inputs, /*tick=*/0);
+
+        const flow::Reg expected = (flow::Reg)(2 * kOne);        // payload 2*kOne, doubled = 4*kOne
+        check(regs.size() == 2 && regs[0] == fired.payload && regs[1] == 2 * fired.payload
+                  && regs[1] == 2 * expected,
+              "seq-s3: composition — a fired payload fed into a flow kInput channel yields the expected flow trace");
     }
 
     if (g_fail == 0) { std::printf("seq_test: ALL PASS\n"); return 0; }
