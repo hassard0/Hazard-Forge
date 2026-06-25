@@ -171,6 +171,18 @@ hf_add_pure_test(flow_test)
 # load-bearing), an exact linear midpoint, and the clamp-low/clamp-high holds. The golden is the pinned
 # hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(seq_test)
+# Deterministic UI widget tree + INTEGER box model (Slice WIDGET-S1, issue #30 — the DETERMINISTIC
+# UMG-CLASS UI FRAMEWORK beachhead): engine/ui/widget.h — a header-only, SELF-CONTAINED (only
+# <cstddef>/<cstdint>/<vector> + net/session.h) UI substrate. A widget hierarchy (parent/first-child/
+# next-sibling, the flow.h NodeId=index discipline) with an INTEGER-PIXEL box model (size/margins/padding
+# as int32_t — UI layout is pixel-quantized so integer constraint math is trivially deterministic; Q16.16
+# enters only in S4 animation), hand-LE encoded (PutU32/PutI32, the flow.h/replay.h discipline — NEVER
+# memcpy the struct) into a DigestTree (net::DigestBytes/FNV-1a-64) that is bit-identical run-to-run AND
+# MSVC-vs-Apple-clang. Asserts the pinned showcase-tree digest (the cross-platform anchor), re-encode
+# determinism, the tree shape (root 3 / body 2 / header 1 children), insertion-ordered children, and that
+# a changed margin / an extra child both change the digest (style + hierarchy are load-bearing). The golden
+# is the pinned hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols.
+hf_add_pure_test(widget_test)
 # Profiler-capture event model + interned name table (Slice PROFILE-S1, issue #31 — the DETERMINISTIC
 # SCRUB-FRIENDLY PROFILER CAPTURE beachhead): engine/profile/profile.h — a header-only, SELF-CONTAINED
 # (only <cstddef>/<cstdint>/<vector> + net/session.h) capture core. A profiler measures TIME
