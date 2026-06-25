@@ -61,34 +61,36 @@ you select the reflection path explicitly, as above.
 
 ## Hardware ray tracing (deterministically reconciled) — issues #7, #13
 
-✅ **Ships as a full RHI accel-structure seam on Vulkan.** The RT flagship added `IAccelerationStructure` / BLAS / TLAS
+✅ **Ships as a full RHI accel-structure seam on BOTH backends.** The RT flagship added `IAccelStructure` / BLAS / TLAS
 + inline ray query over `VK_KHR_ray_query` (Vulkan) to the RHI — *not* a single hint shader — and (#34) extended the
-accel binding to graphics/fragment pipelines. **Metal note (see the honest caveat below):** the Metal
-`MTLAccelerationStructure` + `intersection_query` path is proven *standalone* in the headless test (RT2b,
-`--rt2-query-hw`), NOT wired into `engine/rhi_metal/` — so the RHI accel seam is Vulkan-only today, and the Metal
-showcases run the deterministic CPU reference. The public path:
+accel binding to graphics/fragment pipelines. **Metal now implements the same seam (issues #42/#35, CLOSED):**
+`engine/rhi_metal/metal_accel.{h,mm}` builds a real `MTLAccelerationStructure` and `MetalDevice` overrides
+`CreateBlas`/`CreateTlas`/`BindAccelStructure`/`SupportsHardwareRayQuery` (→ **true on Apple-silicon HW**). The
+Metal RT showcases run **real hardware ray tracing through the RHI seam**, not the CPU reference. The int64→MSL
+blocker (HLSL+int64 `RayQuery` is Vulkan-SPIR-V-only) is sidestepped by **native MSL** kernels
+(`shaders/rt_query.metal`/`rt_shadow.metal`/`rt_reflect.metal`/`rt_hero.metal`) using `metal::raytracing::
+intersection_query<>` with int64 fx via MSL `long`. The public path:
 
 - `--rt1-trace` — the deterministic Q16.16 **software reference tracer** (the "ground-truth reference mode" of issue
   #13 — every HW path is validated to agree with it).
 - `--rt2-query` (Vulkan HW inline ray query, in the RHI) — real Vulkan hardware RT through the engine RHI.
-- `--rt2-query-hw` (Metal HW `intersection_query`, RT2b) — real Apple-Silicon hardware ray query, **demonstrated in
-  the headless Metal test** (`MTLAccelerationStructure` + `intersection_query`, proven byte-equal to the CPU
-  reference). **Honest caveat:** this Metal HW path lives in `metal_headless/visual_test.mm`, NOT in the RHI
-  (`engine/rhi_metal/` has no accel-structure plumbing yet), so a sample author cannot reach Metal HW RT through the
-  engine RHI / `accelStructureBinding`. **On the Metal backend, `--rt3-shadow`/`--rt4-reflect`/`--rt-reflect-graphics`
-  run the deterministic CPU `rtrace::` reference, not the GPU**, because the int64 RayQuery kernels are
-  Vulkan-SPIR-V-only (glslc/spirv-cross cannot lower int64 to MSL). Productizing Metal HW RT through the RHI +
-  graphics pipeline is a **deferred flagship (issue #35)**.
-- `--rt3-shadow`, `--rt4-reflect`, `--rt5-simrender`, `--rt6-hero` — RT shadows, reflections, sim-render, hero scene
-  (Vulkan HW; Metal runs the CPU reference per the caveat above).
+- `--rt2-query-rhi` (Metal HW, in the RHI) — real Apple-Silicon hardware ray query **through the engine RHI seam**
+  (`device->CreateBlas`/`CreateTlas` + `cmd->BindAccelStructure`), proven byte-equal to the CPU reference + the
+  `rt2_query` golden on an M4. (`--rt2-query-hw` is the original raw-`MTL*` standalone proof, kept for comparison.)
+- `--rt3-shadow`, `--rt4-reflect`, `--rt6-hero` — RT hard shadows, mirror reflections, and the lit hero capstone —
+  run **real Metal HW ray tracing through the RHI seam** on Apple-silicon (and Vulkan HW on Windows), each
+  byte-equal to the CPU `rtrace::` reference and its committed golden (`rt3_shadow`/`rt4_reflect`/`rt6_hero`). On a
+  Mac without HW ray tracing (M1/M2), they fall back to the CPU reference. (`--rt5-simrender` / `--rt-reflect-graphics`
+  remain CPU-reference on Metal — see the honest scope below.)
 
-The moat: the HW BVH is used only as a candidate generator; our integer intersection owns the closest hit, so the
-HW result is **bit-identical to the CPU reference** — a deterministic RT reference no float RT engine offers. NOTE:
-"bit-identical Vulkan/Metal" today means both agree with the same CPU `rtrace::` reference; the Vulkan HW path is
-proven equal to it, and the Metal HW path is proven equal to it for RT2b standalone — it is NOT a claim that Metal
-runs HW RT through the engine in the shadow/reflection showcases (those use the CPU reference on Metal). See ARCHITECTURE
-"Hardware ray tracing, deterministically reconciled". *Genuine remaining work:* a temporal RT **denoiser** for noisy
-1-spp paths (a screen-space denoiser exists for SSGI: `--ssgi-denoise`).
+The moat: the HW BVH is used only as a candidate generator (margin-inflated AABBs make the float overlap a strict
+superset); our integer Q16.16 intersection owns the closest hit, so the HW result is **bit-identical to the CPU
+reference on BOTH vendors** — Metal HW == Vulkan HW == CPU, byte-for-byte — a deterministic RT no float RT engine
+offers. **Honest v1 scope (issues #42/#35):** the Metal TLAS is a degenerate single-instance identity wrapper over
+one BLAS (sufficient for these single-BLAS scenes; true multi-instance transformed TLAS is future); fragment-stage
+RT (the graphics-pipeline `accelStructureBinding` / `--rt-reflect-graphics`) is wired on Vulkan but not yet on
+Metal. See ARCHITECTURE "Hardware ray tracing, deterministically reconciled". *Genuine remaining work:* a temporal
+RT **denoiser** for noisy 1-spp paths (a screen-space denoiser exists for SSGI: `--ssgi-denoise`).
 
 ## Virtualized geometry (Nanite-style) — issue #9
 
@@ -171,9 +173,10 @@ layer (#24), a UMG-class retained-mode UI framework (#30), a cinematic Sequencer
 UI (#31), spatial / graph-based audio (#26 — a deterministic integer mixer ships, but no HRTF/graph), a production
 networking layer (#27 — dedicated server / RPC / replication graph; a deterministic lockstep *substrate* ships beneath
 it), a PCG framework (#22), foliage-at-scale (#21), temporal upscaling (#20, TSR/FSR/DLSS-class), broader platform
-targets (#23, Linux / mobile / console), wider asset import (#15/#16 — FBX/OBJ/USD; glTF ships), and Metal hardware ray
-tracing *through the RHI* (#35 — Vulkan HW RT ships; Metal HW `intersection_query` is proven standalone in RT2b but not
-yet in the RHI). See the roadmap in the project notes.
+targets (#23, Linux / mobile / console), and wider asset import (#15/#16 — FBX/USD; glTF + OBJ-geometry ship).
+(Metal hardware ray tracing *through the RHI* — #42/#35 — now SHIPS: `engine/rhi_metal/` implements the accel seam,
+`SupportsHardwareRayQuery()` is true on Apple-silicon, and `--rt2-query-rhi`/`--rt3-shadow`/`--rt4-reflect`/`--rt6-hero`
+run real Metal HW RT byte-equal to the CPU reference.) See the roadmap in the project notes.
 
 **Recently shipped — moved OUT of this list:** ✅ **deterministic GPU particles** (#19, `--pt1-emit`…`--pt6-render`),
 ✅ **Substrate-lite layered materials** (#11, `--sb1-clearcoat`…`--sb6-substrate` — clearcoat/sheen/iridescence/aniso/

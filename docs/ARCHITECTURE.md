@@ -1018,9 +1018,17 @@ Honest scope: this is the moat-preserving *Tier-A* (deterministic, procedural/an
 plus a software-reference *Tier-C* golden — exactly the pieces a bit-exact reflections / GI path needs. Deliberately
 out of scope here: float HW-triangle ray tracing (the *Tier-B* fidelity path, a later concern), multi-bounce /
 path-traced global illumination (the next flagship), glossy/rough reflections, refraction, soft shadows, and AO. The
-analytic-primitive scenes (spheres + AABBs) are the bit-exact geometry tier; productizing the seam through the engine
-RHI (RT2b proves the capability in the headless harness) is a later step. The marketing line the architecture earns:
-*the only engine with hardware ray tracing AND a deterministic, cross-platform-identical reference for it.*
+analytic-primitive scenes (spheres + AABBs) are the bit-exact geometry tier. **Metal HW RT through the engine RHI now
+ships (issues #42/#35, CLOSED):** `engine/rhi_metal/metal_accel.{h,mm}` implements the `IAccelStructure` seam
+(`CreateBlas`/`CreateTlas`/`BindAccelStructure`/`SupportsHardwareRayQuery`→true on Apple-silicon), and the native MSL
+kernels (`shaders/rt_query.metal`/`rt_shadow.metal`/`rt_reflect.metal`/`rt_hero.metal`, `intersection_query<>` with
+int64 fx via MSL `long`) run `--rt2-query-rhi`/`--rt3-shadow`/`--rt4-reflect`/`--rt6-hero` as real Apple-silicon HW
+ray tracing through the RHI — each byte-equal to the CPU `rtrace::` reference and its golden (Metal HW == Vulkan HW ==
+CPU). The int64→MSL blocker that kept the Vulkan `RayQuery` kernels off Metal is sidestepped by writing native MSL
+(no HLSL/SPIR-V/spirv-cross). Honest v1 scope: the Metal TLAS is a degenerate single-instance wrapper (true
+multi-instance is future), and fragment-stage RT (`accelStructureBinding` on graphics pipelines) is Vulkan-only so
+far. The marketing line the architecture earns: *the only engine with hardware ray tracing on BOTH Vulkan and Metal
+AND a deterministic, cross-platform-identical integer reference that both are proven byte-equal to.*
 
 ### Deterministic Lumen-class global illumination (`engine/render/gi.h`, namespace `hf::render::gi`)
 
