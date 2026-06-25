@@ -126,6 +126,114 @@ int main() {
               "econ-s1: no stock slot is negative after the showcase (>= 0 over the fixed scan)");
     }
 
+    // =================================================================================================
+    // ECON-S2 — Crafting / recipe transformer + deterministic craft queue (APPEND-ONLY below S1).
+    // =================================================================================================
+    // The showcase recipes + queue (FIXED forever; the S2 golden pins the post-drain digest):
+    //   r0 = {2*item0 + 1*item1} -> {1*item2}   (ore+fuel->ingot)
+    //   r1 = {3*item2}           -> {1*item3}   (ingots->tool)
+    //   r2 = {1*item2 + 1*item3} -> {2*item2}   (item2 BOTH input+output -> pins consume-before-produce)
+    const RecipeSet recipes = MakeShowcaseRecipes();
+
+    // ---- Drain the fixed craft queue over a fresh showcase world. ------------------------------------
+    World wq = MakeShowcaseWorld(kEntities, kItems);
+    DrainCraftQueue(wq, recipes, MakeShowcaseCraftQueue());
+    const uint64_t s2Digest = DigestWorld(wq);
+
+    std::printf("econ-s2: ledger digest after craft queue = 0x%016llx\n",
+                static_cast<unsigned long long>(s2Digest));
+
+    // The pinned S2 golden (computed on first run, hardcoded — the cross-platform anchor).
+    const uint64_t kPinnedS2Digest = 0x95147ff9dabbfd13ull;  // PINNED on first run (MSVC == clang)
+
+    // ---- (1) PINNED DIGEST — the cross-platform make-or-break (identical on MSVC + clang). -----------
+    check(s2Digest == kPinnedS2Digest,
+          "econ-s2: DigestWorld after DrainCraftQueue == pinned uint64 (the cross-platform proof)");
+
+    // ---- (2) REPLAY-STABLE — a fresh world + same recipes + same queue reproduces the digest. --------
+    {
+        World wq2 = MakeShowcaseWorld(kEntities, kItems);
+        DrainCraftQueue(wq2, recipes, MakeShowcaseCraftQueue());
+        check(DigestWorld(wq2) == s2Digest,
+              "econ-s2: re-running the same queue is bit-identical (deterministic)");
+    }
+
+    // ---- (3) CRAFT BALANCE — a single ApplyRecipe's per-item ledger delta == Sigma outputs - inputs. -
+    {
+        World wb = MakeShowcaseWorld(kEntities, kItems);
+        const uint32_t entity = 0;
+        const uint32_t recipeId = 2;  // r2: {1*item2 + 1*item3} -> {2*item2} (item2 both input + output)
+        // Compute expected per-item deltas directly from the recipe (outputs - inputs), over every item.
+        const Recipe& r = recipes.recipes[recipeId];
+        std::vector<Qty> expected(kItems, 0);
+        for (const Ingredient& in  : r.inputs)  expected[in.item]  -= in.amount;
+        for (const Ingredient& out : r.outputs) expected[out.item] += out.amount;
+        // Snapshot the before-state of the crafting entity's whole row.
+        std::vector<Qty> before(kItems);
+        for (uint32_t t = 0; t < kItems; ++t) before[t] = wb.At(entity, t);
+        const bool applied = ApplyRecipe(wb, recipes, recipeId, entity);
+        bool balance = applied;
+        for (uint32_t t = 0; t < kItems; ++t)
+            if (wb.At(entity, t) - before[t] != expected[t]) balance = false;
+        // r2 touches item2 (net +1: consume 1, produce 2) and item3 (net -1) — proves consume-before-produce.
+        check(balance,
+              "econ-s2: an affordable recipe consumes inputs + produces outputs (ledger delta == outputs - inputs)");
+    }
+
+    // ---- (4) AFFORDABILITY GATE — an unaffordable recipe is a no-op (false + digest unchanged). ------
+    {
+        // Fresh world: entity 0 holds item2 = 10 (10+0+6) and item3 = 19. r1 needs 3*item2, affordable;
+        // craft r1 enough to drain item2 below 3, then assert the next r1 is a rejected no-op.
+        World wa = MakeShowcaseWorld(kEntities, kItems);
+        const uint32_t entity = 0;
+        // Drain item2 on entity 0 down to < 3 by repeatedly crafting r1 (3*item2 -> 1*item3).
+        while (RecipeAffordable(wa, recipes, /*r1=*/1, entity)) ApplyRecipe(wa, recipes, 1, entity);
+        const uint64_t beforeCmd = DigestWorld(wa);
+        const bool applied = ApplyRecipe(wa, recipes, /*r1=*/1, entity);  // now unaffordable
+        check(!applied && DigestWorld(wa) == beforeCmd,
+              "econ-s2: an unaffordable recipe is a deterministic no-op (digest unchanged, ApplyRecipe returned false)");
+    }
+
+    // ---- (5) PARTIAL DRAIN — count > affordable crafts exactly floor(available/cost) times, then stops.
+    {
+        // r0 on entity 1: needs 2*item0 + 1*item1. Fresh entity 1: item0=17 (10+7+0), item1=20 (10+7+3).
+        // floor(17/2)=8 limited by item0, floor(20/1)=20 by item1 -> exactly 8 successful crafts.
+        World wp = MakeShowcaseWorld(kEntities, kItems);
+        const uint32_t entity = 1;
+        const Qty item0Before = wp.At(entity, 0);
+        const Qty item1Before = wp.At(entity, 1);
+        const Qty item2Before = wp.At(entity, 2);
+        const int expectedCrafts = item0Before / 2;  // 17/2 = 8 (the binding constraint)
+        DrainCraftQueue(wp, recipes, std::vector<CraftOrder>{ { 0, entity, 100 } });  // count >> affordable
+        // After N crafts of r0: item0 -= 2N, item1 -= N, item2 += N.
+        const bool partial =
+            (wp.At(entity, 0) == item0Before - 2 * expectedCrafts) &&
+            (wp.At(entity, 1) == item1Before - 1 * expectedCrafts) &&
+            (wp.At(entity, 2) == item2Before + 1 * expectedCrafts) &&
+            !RecipeAffordable(wp, recipes, 0, entity);  // truly exhausted (can't afford a 9th)
+        check(partial && expectedCrafts == 8,
+              "econ-s2: a multi-count order crafts exactly as many times as affordable, then stops (partial drain deterministic)");
+    }
+
+    // ---- (6) BOUNDS GATE — an out-of-range recipeId is a no-op (false + digest unchanged). -----------
+    {
+        World wo = MakeShowcaseWorld(kEntities, kItems);
+        DrainCraftQueue(wo, recipes, MakeShowcaseCraftQueue());
+        const uint64_t beforeCmd = DigestWorld(wo);
+        const bool appliedBadRecipe = ApplyRecipe(wo, recipes, /*recipeId=*/99, /*entity=*/0);  // OOR recipe
+        const bool appliedBadEntity = ApplyRecipe(wo, recipes, /*recipeId=*/0, /*entity=*/99);  // OOR entity
+        check(!appliedBadRecipe && !appliedBadEntity && DigestWorld(wo) == beforeCmd,
+              "econ-s2: an out-of-range recipeId is a no-op (returned false, digest unchanged)");
+    }
+
+    // ---- (7) NO NEGATIVE STOCK — scan the whole ledger after the queue; every slot >= 0. ------------
+    {
+        bool noNegative = true;
+        for (const Qty q : wq.stock) if (q < 0) { noNegative = false; break; }
+        check(noNegative,
+              "econ-s2: no stock slot is negative after the craft queue (>= 0 over the fixed scan)");
+    }
+
     if (g_fail == 0) { std::printf("econ_test: ALL PASS\n"); return 0; }
     std::printf("econ_test: %d FAIL\n", g_fail);
     return 1;

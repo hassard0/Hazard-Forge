@@ -164,4 +164,102 @@ inline std::vector<Command> MakeShowcaseScript() {
     };
 }
 
+// =====================================================================================================
+// ECON-S2 — Crafting / recipe transformer + deterministic craft queue (APPEND-ONLY below S1).
+// =====================================================================================================
+// Adds the CRAFTING layer on top of S1's integer ledger: a RecipeSet (inputs -> outputs, integer
+// costs/yields) + an atomic ApplyRecipe that consumes inputs and produces outputs IFF affordable, plus a
+// deterministic craft queue drained in fixed array order. Strict integer, reuses the S1 ledger primitives
+// (At/Set/Affordable/InRange) VERBATIM — no new bookkeeping. Bit-identical CPU/Vulkan/Metal by the same
+// fixed-iteration-order / no-map / no-float discipline as S1.
+
+// --- Ingredient: one (item, amount) term of a recipe. amount > 0 by fixture construction. -------------
+struct Ingredient {
+    uint32_t item;    // item id
+    Qty      amount;  // quantity consumed (input) or produced (output); > 0
+};
+
+// --- Recipe: one crafting transform on a single entity's own stock. Inputs are consumed, outputs are
+// produced. Flat fixed-order ingredient lists (NO map) so iteration is deterministic by construction. ---
+struct Recipe {
+    std::vector<Ingredient> inputs;   // all consumed (every one must be affordable)
+    std::vector<Ingredient> outputs;  // all produced
+};
+
+// --- RecipeSet: the fixed catalogue, indexed by recipe id (= the recipes-vector index / iteration order).
+struct RecipeSet {
+    std::vector<Recipe> recipes;
+};
+
+// --- RecipeAffordable: recipeId in range, entity in range, and the entity holds >= amount of EVERY input
+// (scan inputs in array order). A recipe that can't pay is a deterministic no-op. Reuses S1 Affordable. --
+inline bool RecipeAffordable(const World& w, const RecipeSet& rs, uint32_t recipeId, uint32_t entity) {
+    if (recipeId >= rs.recipes.size()) return false;
+    const Recipe& r = rs.recipes[recipeId];
+    for (const Ingredient& in : r.inputs)
+        if (!Affordable(w, entity, in.item, in.amount)) return false;  // InRange + stock>=amount (S1)
+    return true;
+}
+
+// --- ApplyRecipe: the atomic craft. Returns false + NO mutation if out of range or not affordable.
+// Otherwise CONSUME every input (Set(entity,in.item, At-in.amount)) in array order, THEN PRODUCE every
+// output (Set(entity,out.item, At+out.amount)) in array order. CONSUME-BEFORE-PRODUCE is PINNED: when an
+// item is BOTH an input and an output the consume happens first, so the net delta is exactly
+// (Sigma outputs - Sigma inputs) for that item (e.g. consume 1 then produce 2 == net +1). Reuses S1
+// At/Set/Affordable; the up-front RecipeAffordable gate makes the consume loop never drive a slot negative.
+inline bool ApplyRecipe(World& w, const RecipeSet& rs, uint32_t recipeId, uint32_t entity) {
+    if (!RecipeAffordable(w, rs, recipeId, entity)) return false;  // out-of-range OR unaffordable -> no-op
+    const Recipe& r = rs.recipes[recipeId];
+    for (const Ingredient& in : r.inputs)                          // 1) consume every input (array order)
+        w.Set(entity, in.item, w.At(entity, in.item) - in.amount);
+    for (const Ingredient& out : r.outputs)                        // 2) produce every output (array order)
+        w.Set(entity, out.item, w.At(entity, out.item) + out.amount);
+    return true;
+}
+
+// --- CraftOrder: a queued craft request (craft recipeId on entity `count` times). ALSO a future
+// net::Session Input alongside Command (S5). ----------------------------------------------------------
+struct CraftOrder {
+    uint32_t recipeId;
+    uint32_t entity;
+    uint32_t count;  // attempt to craft this many times (stops early if it becomes unaffordable)
+};
+
+// --- DrainCraftQueue: process the queue in ARRAY ORDER; for each order attempt ApplyRecipe up to `count`
+// times, stopping EARLY when a craft becomes unaffordable (a partial drain is deterministic), then move to
+// the next order. Fixed order throughout (the RunScript precedent). --------------------------------------
+inline void DrainCraftQueue(World& w, const RecipeSet& rs, const std::vector<CraftOrder>& queue) {
+    for (const CraftOrder& o : queue)
+        for (uint32_t i = 0; i < o.count; ++i)
+            if (!ApplyRecipe(w, rs, o.recipeId, o.entity)) break;  // partial drain: stop this order early
+}
+
+// --- MakeShowcaseRecipes: a FIXED recipe catalogue over the S1 item ids (integer literals only). FIXED
+// forever (the S2 golden pins a craft queue over it). ---------------------------------------------------
+//   r0 = {2x item0 + 1x item1} -> {1x item2}   (ore + fuel -> ingot; reduces total by 2 — transmutation)
+//   r1 = {3x item2}            -> {1x item3}   (ingots -> tool)
+//   r2 = {1x item2 + 1x item3} -> {2x item2}   (item2 is BOTH input and output -> pins consume-before-
+//                                               produce: consume 1 then produce 2 == net +1 of item2)
+inline RecipeSet MakeShowcaseRecipes() {
+    RecipeSet rs;
+    rs.recipes.push_back(Recipe{ /*inputs=*/{ {0, 2}, {1, 1} }, /*outputs=*/{ {2, 1} } });
+    rs.recipes.push_back(Recipe{ /*inputs=*/{ {2, 3} },         /*outputs=*/{ {3, 1} } });
+    rs.recipes.push_back(Recipe{ /*inputs=*/{ {2, 1}, {3, 1} }, /*outputs=*/{ {2, 2} } });
+    return rs;
+}
+
+// --- MakeShowcaseCraftQueue: a FIXED queue exercising affordable crafts, a multi-count craft, a partial/
+// zero drain (unaffordable), and an out-of-range recipeId. FIXED forever. Designed for a >=4-entity x
+// >=4-item showcase world. ------------------------------------------------------------------------------
+inline std::vector<CraftOrder> MakeShowcaseCraftQueue() {
+    return std::vector<CraftOrder>{
+        // recipeId, entity, count
+        { 0, 0, 3   },   // craft r0 (ore+fuel->ingot) on entity 0, 3 times (multi-count; some may stop early)
+        { 1, 0, 2   },   // craft r1 (ingots->tool) on entity 0, twice
+        { 2, 0, 1   },   // craft r2 (the both-input-and-output recipe) on entity 0 once
+        { 0, 1, 100 },   // big multi-count on entity 1 -> PARTIAL drain (affords floor(avail/cost), then stops)
+        { 99, 0, 5  },   // OUT-OF-RANGE recipeId (99) -> zero crafts (no-op every attempt)
+    };
+}
+
 }  // namespace hf::econ
