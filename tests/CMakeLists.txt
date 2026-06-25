@@ -183,6 +183,15 @@ hf_add_pure_test(seq_test)
 # a changed margin / an extra child both change the digest (style + hierarchy are load-bearing). The golden
 # is the pinned hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols.
 hf_add_pure_test(widget_test)
+# UI render-capstone bridge (Slice WIDGET-S6, issue #30): engine/ui/widget_render.h — the labeled-layout
+# money-shot. One render label per widget, placed at the widget's bit-exact computed pixel Rect (S2
+# SolveLayout) + a fixed inset; the placements DERIVE byte-for-byte from the integer layout so DigestLabels
+# is pinned cross-platform (MSVC == clang). The float crossing (LayoutText -> NDC glyph quads, the EXISTING
+# --hud text-overlay pipeline) lives ONLY in the --ui-shot showcase (the documented visresolve-bar); the
+# integer layout digest (S2 0x95da64c52733eb16) is the real golden. Five assertions: one-label-per-widget
+# (count), each label == the bit-exact Rect origin + inset (provenance), pinned DigestLabels, S2 DigestRects
+# still 0x95da64c52733eb16 (the bridge did NOT perturb the layout), deterministic. widget.h is UNMODIFIED.
+hf_add_pure_test(widget_render_test)
 # Profiler-capture event model + interned name table (Slice PROFILE-S1, issue #31 — the DETERMINISTIC
 # SCRUB-FRIENDLY PROFILER CAPTURE beachhead): engine/profile/profile.h — a header-only, SELF-CONTAINED
 # (only <cstddef>/<cstdint>/<vector> + net/session.h) capture core. A profiler measures TIME
