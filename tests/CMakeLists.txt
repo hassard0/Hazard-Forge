@@ -171,6 +171,14 @@ hf_add_pure_test(flow_test)
 # load-bearing), an exact linear midpoint, and the clamp-low/clamp-high holds. The golden is the pinned
 # hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(seq_test)
+# Slice SEQ-S6 — the cinematic-sequencer LIT 3D render-capstone bridge (engine/seq/seq_render.h, the
+# money-shot of FLAGSHIP #25). The cheap pre-bake CPU proof that the FLOAT render bridge faithfully +
+# deterministically carries the bit-exact Q16.16 transform timeline into render instances: 24-instance
+# provenance count, two-call byte-identity (no RNG/clock), the empty no-op, and translation-column fidelity
+# (each instance's translation == FxToFloat of the sample's bit-exact translation). seq_render.h is the ONE
+# float crossing (seq.h stays the <cmath>-free bit-exact header); the test is pure CPU (hf_core), no
+# RHI/backend symbols, ASan-eligible, standalone-clang-buildable.
+hf_add_pure_test(seq_render_test)
 # glTF unsupported-extension diagnostics (issue #36): the PURE decision the loader uses to FAIL LOUDLY
 # (not silently) when a glb REQUIRES a compression extension this build can't decode (Draco / meshopt) —
 # e.g. the three.js Ferrari. Synthetic inputs only (no device/cgltf/glb), so it stays a pure hf_core test.
