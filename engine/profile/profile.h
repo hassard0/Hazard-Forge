@@ -413,4 +413,110 @@ inline Capture MakeTimelineCapture() {
     return c;
 }
 
+// ============================ SLICE PROFILE-S4 — draw-call / GPU-pass inspection =====================
+// APPEND-ONLY below S3 (do NOT modify S1/S2/S3 — 0xedc7791443141dfd / 0xb41eb67a1d13443e /
+// 0xc68ff46e1ab25f37 stay pinned). S4 adds the RENDER-STRUCTURE inspection: a deterministic record of the
+// frame's render passes + their draw calls (pass order, draw counts, instance counts, pipeline ids), with
+// its OWN pinned structural digest. This is the deterministic STRUCTURE of the render — NOT GPU timing
+// (that is the S6 non-golden overlay).
+//
+// THE CLANG-PURITY BOUNDARY: the real render structure lives in render::RenderGraph (render_graph.h), which
+// pulls rhi.h + <functional> + <string> → NOT standalone-clang-compilable. So profile.h NEVER #includes it.
+// Instead S4 defines a plain-POD RenderStructInput (vectors of integers) that the live engine (S6) fills
+// from RenderGraph::LastOrder() + per-pass draw enumeration — the exact replay.h serWorld injected boundary.
+// S4 is STANDALONE: it builds its own RenderStructure and does NOT mutate S1's Capture (EncodeStructural is
+// untouched). NO new include. NO timing in the render digest — counts + ids only.
+
+// --- The render-structure records (integers — structure, NOT timing) --------------------------------
+struct DrawRecord {
+    uint32_t passId        = 0;   // index of the owning pass in execution order
+    uint32_t pipelineId    = 0;   // the bound pipeline/PSO id (a stable engine-side id, not a pointer)
+    uint32_t drawCount     = 0;   // 1 for a normal draw; N for an MDI draw that collapses N objects
+    uint32_t instanceCount = 0;   // instances in this draw
+    uint32_t indexCount    = 0;   // indices drawn (0 for non-indexed)
+};
+struct PassRecord {
+    uint32_t nameId         = 0;   // the interned pass name id
+    uint32_t firstDraw      = 0;   // index of this pass's first DrawRecord in RenderStructure.draws
+    uint32_t drawCount      = 0;   // number of draws in this pass
+    uint32_t totalInstances = 0;   // sum of instanceCount over this pass's draws
+};
+struct RenderStructure { std::vector<PassRecord> passes; std::vector<DrawRecord> draws; };
+
+// --- The injected input (a plain POD — the live engine fills this from RenderGraph) ------------------
+// One pass as the live caller describes it: a name id + its draws (in submission order). The caller builds
+// `passes` in RenderGraph::LastOrder() execution order. profile.h NEVER #includes render_graph.h — this POD
+// is the boundary (the replay.h serWorld pattern).
+struct RenderPassInput { uint32_t nameId = 0; std::vector<DrawRecord> draws; };
+struct RenderStructInput { std::vector<RenderPassInput> passes; };  // in execution (topo) order
+
+// --- IngestRenderStructure — POD → the deterministic RenderStructure ---------------------------------
+// For each pass IN ORDER (passId == index — execution order is the canonical key, no sorting): record the
+// pass's first draw index + accumulate its draws + totalInstances.
+inline RenderStructure IngestRenderStructure(const RenderStructInput& in) {
+    RenderStructure rs;
+    for (std::size_t p = 0; p < in.passes.size(); ++p) {
+        const RenderPassInput& pin = in.passes[p];
+        const uint32_t passId    = static_cast<uint32_t>(p);
+        const uint32_t firstDraw = static_cast<uint32_t>(rs.draws.size());
+        uint32_t       totalInstances = 0u;
+        for (std::size_t d = 0; d < pin.draws.size(); ++d) {
+            const DrawRecord& dr = pin.draws[d];
+            rs.draws.push_back(DrawRecord{ passId, dr.pipelineId, dr.drawCount, dr.instanceCount, dr.indexCount });
+            totalInstances += dr.instanceCount;
+        }
+        rs.passes.push_back(PassRecord{ pin.nameId, firstDraw,
+                                        static_cast<uint32_t>(pin.draws.size()), totalInstances });
+    }
+    return rs;
+}
+
+// --- DigestRenderStructure — the pinned structural digest (counts + ids, NO timing) -----------------
+// Hand-LE in passId/draw order: PutU32(passCount), then per pass nameId/firstDraw/drawCount/totalInstances;
+// then PutU32(drawTotal), then per draw passId/pipelineId/drawCount/instanceCount/indexCount; net::DigestBytes.
+inline uint64_t DigestRenderStructure(const RenderStructure& rs) {
+    std::vector<uint8_t> b;
+    PutU32(b, static_cast<uint32_t>(rs.passes.size()));
+    for (std::size_t i = 0; i < rs.passes.size(); ++i) {
+        const PassRecord& p = rs.passes[i];
+        PutU32(b, p.nameId);
+        PutU32(b, p.firstDraw);
+        PutU32(b, p.drawCount);
+        PutU32(b, p.totalInstances);
+    }
+    PutU32(b, static_cast<uint32_t>(rs.draws.size()));
+    for (std::size_t i = 0; i < rs.draws.size(); ++i) {
+        const DrawRecord& d = rs.draws[i];
+        PutU32(b, d.passId);
+        PutU32(b, d.pipelineId);
+        PutU32(b, d.drawCount);
+        PutU32(b, d.instanceCount);
+        PutU32(b, d.indexCount);
+    }
+    return net::DigestBytes(b.data(), b.size());
+}
+
+// --- The deterministic FIXED showcase fixture (pinned forever by the golden) -------------------------
+// A fixed 3-pass frame (nameIds 10/11/12 representing Shadow/Lit/Composite — fixed ints, the test documents
+// the mapping): pass 0 Shadow 1 draw, pass 1 Lit 1 MDI draw (drawCount 64 = the inspection headline),
+// pass 2 Composite 1 draw. Keep FIXED — the golden pins its DigestRenderStructure.
+inline RenderStructInput MakeShowcaseRenderInput() {
+    RenderStructInput in;
+    RenderPassInput shadow;
+    shadow.nameId = 10u;
+    shadow.draws.push_back(DrawRecord{ 0u, 100u, 1u, 1u, 36u });
+    in.passes.push_back(shadow);
+
+    RenderPassInput lit;
+    lit.nameId = 11u;
+    lit.draws.push_back(DrawRecord{ 0u, 200u, 64u, 64u, 1536u });   // MDI collapses 64 objects
+    in.passes.push_back(lit);
+
+    RenderPassInput composite;
+    composite.nameId = 12u;
+    composite.draws.push_back(DrawRecord{ 0u, 300u, 1u, 1u, 3u });
+    in.passes.push_back(composite);
+    return in;
+}
+
 }  // namespace hf::profile

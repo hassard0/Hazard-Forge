@@ -307,6 +307,65 @@ int main() {
               "profile-s3: TIMING STILL EXCLUDED -- filling timings nonzero leaves the timeline digest unchanged");
     }
 
+    // ================================ SLICE PROFILE-S4 — draw-call / GPU-pass inspection =============
+    // S4 ingests an injected render structure (passes + draws, in execution order) into a deterministic
+    // RenderStructure with its OWN pinned digest (counts + ids, NO timing). The MDI Lit pass's drawCount==64
+    // is the draw-call-inspection headline.
+
+    // ---- Build the showcase render structure + its render-structure digest. --------------------------
+    const RenderStructure rstruct = IngestRenderStructure(MakeShowcaseRenderInput());
+    const uint64_t renderDigest = DigestRenderStructure(rstruct);
+    std::printf("profile-s4: render-structure digest = 0x%016llx  (%zu passes, %zu draws)\n",
+                static_cast<unsigned long long>(renderDigest), rstruct.passes.size(), rstruct.draws.size());
+
+    const uint64_t kPinnedRenderDigest = 0x9b75187d6a4c3bf1ull;  // PINNED on first run (MSVC == clang)
+
+    // ---- (S4-1) PRIOR INVARIANT — S1/S2/S3 digests all UNCHANGED (append-only). ---------------------
+    {
+        const bool s1Same = (StructuralDigest(MakeShowcaseCapture()) == 0xedc7791443141dfdull);
+        const bool s2Same = (DigestTree(BuildScopeTree(MakeShowcaseCapture())) == 0xb41eb67a1d13443eull);
+        const bool s3Same = (DigestTimeline(BuildFrameIndex(MakeTimelineCapture())) == 0xc68ff46e1ab25f37ull);
+        check(s1Same && s2Same && s3Same,
+              "profile-s1/s2/s3: prior digests 0xedc7791443141dfd + 0xb41eb67a1d13443e + 0xc68ff46e1ab25f37 UNCHANGED (append-only)");
+    }
+
+    // ---- (S4-2) STRUCTURE — 3 passes, 3 draws, in execution order (passId 0/1/2; Lit firstDraw==1). --
+    {
+        bool ok = (rstruct.passes.size() == 3u) && (rstruct.draws.size() == 3u);
+        ok = ok && (rstruct.draws[0].passId == 0u) && (rstruct.draws[1].passId == 1u) && (rstruct.draws[2].passId == 2u);
+        ok = ok && (rstruct.passes[1].firstDraw == 1u);
+        check(ok,
+              "profile-s4: IngestRenderStructure(showcase) has 3 passes, 3 draws, in execution order");
+    }
+
+    // ---- (S4-3) PINNED DIGEST — DigestRenderStructure == the hard-pinned uint64 (identical MSVC + clang).
+    check(renderDigest == kPinnedRenderDigest,
+          "profile-s4: DigestRenderStructure == pinned uint64 (the render structure is byte-stable cross-platform)");
+
+    // ---- (S4-4) MDI INSPECTION — the Lit pass's draw reports drawCount==64 (the MDI collapse count). -
+    check(rstruct.draws[1].drawCount == 64u,
+          "profile-s4: the Lit MDI pass's draw reports drawCount==64 (draw-call inspection -- the MDI collapse count)");
+
+    // ---- (S4-5) AGGREGATION — the Lit pass's totalInstances aggregates exactly to 64. ---------------
+    check(rstruct.passes[1].totalInstances == 64u,
+          "profile-s4: pass totalInstances aggregates exactly (Lit pass totalInstances == 64)");
+
+    // ---- (S4-6) COUNT LOAD-BEARING — change the MDI drawCount to 65 -> a DIFFERENT digest. -----------
+    {
+        RenderStructInput mutated = MakeShowcaseRenderInput();
+        mutated.passes[1].draws[0].drawCount = 65u;
+        check(DigestRenderStructure(IngestRenderStructure(mutated)) != renderDigest,
+              "profile-s4: a changed draw count changes the render-structure digest (counts are load-bearing)");
+    }
+
+    // ---- (S4-7) PIPELINE LOAD-BEARING — change a pipelineId -> a DIFFERENT digest. -------------------
+    {
+        RenderStructInput mutated = MakeShowcaseRenderInput();
+        mutated.passes[0].draws[0].pipelineId += 1u;
+        check(DigestRenderStructure(IngestRenderStructure(mutated)) != renderDigest,
+              "profile-s4: a changed pipelineId changes the digest (pipeline binding is load-bearing)");
+    }
+
     if (g_fail == 0) { std::printf("profile_test: ALL PASS\n"); return 0; }
     std::printf("profile_test: %d FAIL\n", g_fail);
     return 1;
