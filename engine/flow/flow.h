@@ -771,4 +771,90 @@ inline hf::net::InputRing<Reg> BuildInputRing(const std::vector<std::vector<Reg>
     return ring;
 }
 
+// ====================================================================================================
+// Slice FLOW-S5 — ROLLBACK + SERIALIZATION: the netcode-grade capstone (issue #24). APPEND-ONLY below
+// S4 (S1/S2/S3/S4 above stay byte-identical: S1 0x0e5b8ec26f0d8730, S2 trace final 0x670cf80b235bdafd,
+// S3 event-trace final 0xd5735423148033cc, S4 lockstep final 0x670cf80b235bdafd are UNCHANGED — S5 adds
+// NEW functions only, touches nothing above).
+//
+// S4 proved a flow::Graph composes with net::Session for lockstep/replay/desync. S5 completes the
+// netcode-grade runtime in two halves:
+//   (1) ROLLBACK — a flow::GraphState is a copy-restorable World, so net::RollbackSession<GraphState,Reg>
+//       drives the GGPO-class predict->snapshot->rollback loop over a graph with ZERO new netcode. A
+//       mispredicted REMOTE input rolls the graph state back to the bit-identical authority. The proof is
+//       in the TEST (it reuses RollbackSession/StepPredicted/ConfirmRemote/ScriptedTransport/
+//       RunWithTransport verbatim); the header adds the explicit Snapshot/Restore bridge below.
+//   (2) SERIALIZATION — a Graph (the static visual script) round-trips to bytes byte-identically: a
+//       visual script is a savable, shippable artifact (a save game / a multiplayer-sync delta). Hand
+//       little-endian, field-by-field — NEVER memcpy a host struct (padding/endianness-unsafe; the
+//       replay.h/wav.cpp discipline). UE5 Blueprints cannot roll back deterministically (their
+//       non-deterministic event order breaks re-simulation) — exactly why UE5's rollback path excludes
+//       them. Pure-CPU INTEGER; header stays self-contained (only <cstddef>/<cstdint>/<vector> +
+//       net/session.h).
+// ====================================================================================================
+
+// SnapshotState / RestoreState: explicit, bit-exact state snapshot + restore. GraphState is ONE
+// contiguous integer vector (prev), so EVERY stateful node's slot is in it by construction -> a value
+// copy is a COMPLETE snapshot (the net::Session value-copy works implicitly; these make it explicit and
+// let the test PROVE completeness the verdict.h way — an incomplete restore MUST diverge).
+inline GraphState SnapshotState(const GraphState& s) { return s; }                  // deep copy (vector)
+inline void       RestoreState(GraphState& s, const GraphState& snap) { s = snap; }  // bit-exact restore
+
+// PutU32 / GetU32: hand little-endian 32-bit codec (the replay.h discipline — NEVER memcpy a host
+// struct). S3's DigestEvents used a LOCAL lambda, not a namespace-level PutU32, so we define both here.
+inline void PutU32(std::vector<uint8_t>& b, uint32_t v) {
+    b.push_back(static_cast<uint8_t>( v        & 0xFFu));
+    b.push_back(static_cast<uint8_t>((v >> 8)  & 0xFFu));
+    b.push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
+    b.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
+}
+inline uint32_t GetU32(const uint8_t* p) {
+    return  static_cast<uint32_t>(p[0])
+         | (static_cast<uint32_t>(p[1]) << 8)
+         | (static_cast<uint32_t>(p[2]) << 16)
+         | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+// SerializeGraph: encode a Graph to bytes. Layout (all u32 LE): nodeCount, then per node
+// kind, a, b, c, constArg (the int32 constArg's two's-complement bits as a uint32). Hand-LE field by
+// field — the on-disk format is byte-stable cross-platform (MSVC == clang). A 5*4 = 20-byte fixed record
+// per node plus a 4-byte header.
+inline std::vector<uint8_t> SerializeGraph(const Graph& g) {
+    std::vector<uint8_t> bytes;
+    bytes.reserve(4u + g.nodes.size() * 20u);
+    PutU32(bytes, static_cast<uint32_t>(g.nodes.size()));
+    for (const Node& nd : g.nodes) {
+        PutU32(bytes, nd.kind);
+        PutU32(bytes, nd.a);
+        PutU32(bytes, nd.b);
+        PutU32(bytes, nd.c);
+        PutU32(bytes, static_cast<uint32_t>(nd.constArg));  // int32 bits as uint32 (two's-complement LE)
+    }
+    return bytes;
+}
+
+// DeserializeGraph: decode the SerializeGraph byte layout back into `out` (the inverse). Defensive length
+// checks at EVERY read -> returns false (and leaves out cleared) on truncation, never UB. On success
+// out.nodes equals the original field-for-field and SerializeGraph(out) == the input bytes.
+inline bool DeserializeGraph(const std::vector<uint8_t>& bytes, Graph& out) {
+    out.nodes.clear();
+    if (bytes.size() < 4u) return false;                    // need at least the node-count header
+    std::size_t off = 0;
+    const uint32_t count = GetU32(bytes.data() + off);
+    off += 4u;
+    // Truncation guard: every node is a fixed 20-byte record; the total must fit exactly-or-more.
+    if (bytes.size() < off + static_cast<std::size_t>(count) * 20u) return false;
+    out.nodes.resize(static_cast<std::size_t>(count));
+    for (std::size_t i = 0; i < static_cast<std::size_t>(count); ++i) {
+        Node nd;
+        nd.kind     =                   GetU32(bytes.data() + off); off += 4u;
+        nd.a        =                   GetU32(bytes.data() + off); off += 4u;
+        nd.b        =                   GetU32(bytes.data() + off); off += 4u;
+        nd.c        =                   GetU32(bytes.data() + off); off += 4u;
+        nd.constArg = static_cast<Reg>( GetU32(bytes.data() + off)); off += 4u;  // uint32 bits -> int32
+        out.nodes[i] = nd;
+    }
+    return true;
+}
+
 }  // namespace hf::flow

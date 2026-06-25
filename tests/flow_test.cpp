@@ -419,6 +419,195 @@ int main() {
               "flow-s4: a one-tick input divergence is LOCATED at the exact tick K (net::DesyncDetector), traces match for t<K");
     }
 
+    // ==================================================================================================
+    // Slice FLOW-S5 — ROLLBACK + SERIALIZATION: the netcode-grade capstone. Append-only (S1-S4 above stay
+    // green). PART A: a 2-input rollback graph driven through net::RollbackSession via RunWithTransport
+    // with a ScriptedTransport that DELAYS + MUTATES one remote -> a real mispredict + rollback that
+    // converges to the bit-identical net::RunLockstep authority. PART B: snapshot completeness (the
+    // verdict.h lesson). PART C: a Graph round-trips byte-identically (a savable visual script).
+    // ==================================================================================================
+
+    // ---- PART A — rollback correctness (the GGPO proof for visual scripting) -------------------------
+    // The 2-channel rollback graph: net::RollbackSession steps step(world,{local,remote},tick), a 2-elem
+    // input vector. So kInput[0]=LOCAL, kInput[1]=REMOTE feed a running accumulator via the S2 feedback
+    // pattern:  acc = Add( Add(kInput[0], kInput[1]), Delay(acc) ).  A mispredicted remote genuinely
+    // changes acc -> a wrong prediction diverges and the rollback visibly corrects it.
+    //   n0 = kInput[0]  (LOCAL)
+    //   n1 = kInput[1]  (REMOTE)
+    //   n2 = Add(n0, n1)            = local + remote (this tick's contribution)
+    //   n3 = kDelay(a=n4)           = the PREVIOUS-tick accumulator (the feedback lag; a is a state read)
+    //   n4 = Add(n2, n3)            = (local+remote) + prevAcc -> THE RUNNING ACCUMULATOR
+    Graph rbGraph;
+    rbGraph.nodes.resize(5);
+    rbGraph.nodes[0] = Node{ kInput, /*a=*/0, /*b=*/0, /*c=*/0, /*const=*/0 };  // LOCAL  (channel 0)
+    rbGraph.nodes[1] = Node{ kInput, /*a=*/1, /*b=*/1, /*c=*/1, /*const=*/1 };  // REMOTE (channel 1)
+    rbGraph.nodes[2] = Node{ kAdd,   /*a=*/0, /*b=*/1, /*c=*/2, 0 };            // local + remote
+    rbGraph.nodes[3] = Node{ kDelay, /*a=*/4, /*b=*/3, /*c=*/3, 0 };            // prev accumulator (feedback)
+    rbGraph.nodes[4] = Node{ kAdd,   /*a=*/2, /*b=*/3, /*c=*/4, 0 };            // running accumulator
+
+    // The two input streams over RB_T ticks. local[t] is known immediately; remote[t] is the peer's input.
+    const uint32_t RB_T = 8;
+    const std::vector<Reg> rbLocal  = { 5, 2, 7, 1, 3, 9, 6, 4 };
+    const std::vector<Reg> rbRemote = { 1, 4, 2, 8, 3, 7, 5, 9 };  // remote[3]=8 (the mispredict tick K=3)
+
+    // The rollback step: a 2-channel StepGraph (ins = {local, remote}). Matches RollbackSession's
+    // step(world, {localThisTick, remoteThisTick}, tick).
+    auto rbStep = [&](GraphState& w, const std::vector<Reg>& ins, uint32_t tick) {
+        StepGraph(rbGraph, w, ins, tick);
+    };
+
+    // Authority = net::RunLockstep over the TRUE combined per-tick {local[t], remote[t]} inputs. Build an
+    // InputRing whose At(t) == {local[t], remote[t]} (channel 0 then 1 — the kInput constArg order).
+    hf::net::InputRing<Reg> rbAuthorityRing;
+    for (uint32_t t = 0; t < RB_T; ++t) {
+        rbAuthorityRing.AddInput(t, rbLocal[t]);   // channel 0 = LOCAL
+        rbAuthorityRing.AddInput(t, rbRemote[t]);  // channel 1 = REMOTE
+    }
+    const uint64_t rbAuthority = hf::net::RunLockstep<GraphState, Reg>(
+        MakeState(rbGraph), rbAuthorityRing, RB_T,
+        rbStep, [&](const GraphState& w) { return DigestState(w); });
+
+    // The mispredict tick: remote[K] is DELAYED past its origin tick AND differs from the prediction
+    // (the prediction reuses the last confirmed remote = remote[K-1]=2; the real remote[K]=8 != 2 -> a
+    // genuine misprediction fires when remote[K] finally arrives). K=3.
+    const uint32_t RB_K = 3;
+
+    // PRIMARY schedule: deliver every remote on-time EXCEPT remote[K], delayed to deliver at tick K+2.
+    hf::net::ScriptedTransport<Reg> tx;
+    for (uint32_t t = 0; t < RB_T; ++t) {
+        if (t == RB_K) hf::net::Schedule(tx, /*deliverTick=*/RB_K + 2, /*forTick=*/t, rbRemote[t]);
+        else           hf::net::Schedule(tx, /*deliverTick=*/t,        /*forTick=*/t, rbRemote[t]);
+    }
+    hf::net::RollbackSession<GraphState, Reg> rbS;
+    rbS.world = MakeState(rbGraph);
+    hf::net::RunWithTransport<GraphState, Reg>(rbS, rbLocal, tx, RB_T, rbStep);
+    const uint64_t rbFinal = DigestState(rbS.world);
+
+    std::printf("flow-s5: rollback authority digest = 0x%016llx, didRollback = %s\n",
+                static_cast<unsigned long long>(rbAuthority), rbS.didRollback ? "true" : "false");
+
+    // PINNED on first run (MSVC == clang): the clean-authority rollback final digest.
+    const uint64_t kPinnedRbAuthority = 0x88b1cdd54ce2e9b0ull;
+
+    // (1) ROLLBACK == AUTHORITY — the rolled-back final state == the clean net::RunLockstep authority == pinned.
+    check(rbFinal == rbAuthority && rbAuthority == kPinnedRbAuthority,
+          "flow-s5: a mispredicted input rolls the graph state back to the BIT-IDENTICAL authority (== pinned uint64)");
+
+    // (2) DIDROLLBACK — a real misprediction fired (remote[K]=8 != predicted lastConfirmed remote[K-1]=2).
+    check(rbS.didRollback,
+          "flow-s5: rollback actually fired (didRollback == true)");
+
+    // (3) ADVERSARIAL — a heavier delay/reorder schedule STILL converges to the same authority digest.
+    // remote[K] delayed even further (deliver at the LAST tick), remote[5] reordered to deliver at tick 1
+    // (before its origin? no — at tick 1 < origin 5 means it arrives early as a future-confirm; harmless),
+    // and a RESEND of remote[2] (a duplicate, a no-op). All confirmed before the run ends.
+    hf::net::ScriptedTransport<Reg> txAdv;
+    for (uint32_t t = 0; t < RB_T; ++t) {
+        if (t == RB_K)      hf::net::Schedule(txAdv, /*deliver=*/RB_T - 1, /*forTick=*/t, rbRemote[t]);
+        else if (t == 5)    hf::net::Schedule(txAdv, /*deliver=*/6,        /*forTick=*/t, rbRemote[t]);
+        else if (t == 2)    hf::net::Schedule(txAdv, /*deliver=*/4,        /*forTick=*/t, rbRemote[t]);
+        else                hf::net::Schedule(txAdv, /*deliver=*/t,        /*forTick=*/t, rbRemote[t]);
+    }
+    hf::net::Schedule(txAdv, /*deliver=*/7, /*forTick=*/2, rbRemote[2]);  // a RESEND of remote[2] (no-op)
+    hf::net::RollbackSession<GraphState, Reg> rbAdv;
+    rbAdv.world = MakeState(rbGraph);
+    hf::net::RunWithTransport<GraphState, Reg>(rbAdv, rbLocal, txAdv, RB_T, rbStep);
+    check(DigestState(rbAdv.world) == rbAuthority,
+          "flow-s5: the adversarial (delayed/reordered/resent) schedule converges to the SAME pinned authority digest");
+
+    // ---- PART B — snapshot completeness (the verdict.h lesson) ---------------------------------------
+    // The combined-input stream for a straight per-tick advance (channel 0=local, 1=remote).
+    auto rbAdvanceK = [&](GraphState& w, uint32_t fromTick, uint32_t k) {
+        for (uint32_t i = 0; i < k; ++i) {
+            const uint32_t t = fromTick + i;
+            StepGraph(rbGraph, w, { rbLocal[t], rbRemote[t] }, t);
+        }
+    };
+    const uint32_t RB_SNAP_AT = 2;   // snapshot after advancing 2 ticks
+    const uint32_t RB_RE_K    = 3;   // re-advance 3 ticks (ticks 2,3,4)
+
+    // (4) COMPLETE — from a state advanced RB_SNAP_AT ticks: SnapshotState; advance RB_RE_K (diverge with
+    //     WRONG inputs); RestoreState; re-advance the SAME RB_RE_K correct ticks -> byte-identical to a
+    //     straight advance of RB_RE_K from the snapshot.
+    {
+        GraphState base = MakeState(rbGraph);
+        rbAdvanceK(base, 0, RB_SNAP_AT);                         // advance to the snapshot point
+        const GraphState snap = SnapshotState(base);            // explicit snapshot
+
+        // Diverge: advance with deliberately WRONG inputs to scramble the live state.
+        GraphState live = base;
+        for (uint32_t i = 0; i < RB_RE_K; ++i)
+            StepGraph(rbGraph, live, { 999, 777 }, RB_SNAP_AT + i);
+
+        // Restore + re-advance the SAME RB_RE_K correct ticks.
+        RestoreState(live, snap);
+        rbAdvanceK(live, RB_SNAP_AT, RB_RE_K);
+
+        // The straight reference: a separate advance of RB_RE_K from the snapshot.
+        GraphState straight = snap;
+        rbAdvanceK(straight, RB_SNAP_AT, RB_RE_K);
+
+        check(DigestState(live) == DigestState(straight),
+              "flow-s5: advance->snapshot->diverge->restore->re-advance == straight-advance (snapshot is complete)");
+    }
+
+    // (5) INCOMPLETE DIVERGES — restore a snapshot with ONE register slot zeroed -> re-advance differs
+    //     (proves no stateful slot escapes the snapshot — the feedback accumulator n4 is load-bearing).
+    {
+        GraphState base = MakeState(rbGraph);
+        rbAdvanceK(base, 0, RB_SNAP_AT);
+        const GraphState snap = SnapshotState(base);
+
+        GraphState whole = snap;       rbAdvanceK(whole, RB_SNAP_AT, RB_RE_K);
+
+        GraphState broken = snap;
+        broken.prev[4] = 0;            // zero the accumulator slot n4 (an INCOMPLETE restore)
+        rbAdvanceK(broken, RB_SNAP_AT, RB_RE_K);
+
+        check(DigestState(whole) != DigestState(broken),
+              "flow-s5: a deliberately INCOMPLETE restore (zeroing one register) DIVERGES (the snapshot must be whole)");
+    }
+
+    // ---- PART C — serialization round-trip (a savable visual script) --------------------------------
+    {
+        const Graph g = MakeShowcaseGraph();
+        const std::vector<uint8_t> ser = SerializeGraph(g);
+        Graph out;
+        const bool ok = DeserializeGraph(ser, out);
+        const std::vector<uint8_t> reSer = SerializeGraph(out);
+
+        const uint64_t serDigest = hf::net::DigestBytes(ser.data(), ser.size());
+        std::printf("flow-s5: SerializeGraph(showcase) digest = 0x%016llx  (%zu bytes)\n",
+                    static_cast<unsigned long long>(serDigest), ser.size());
+
+        // (6) ROUND-TRIP — deserialize succeeds, re-serialize is byte-exact, out.nodes == g.nodes field-for-field.
+        bool fieldsEqual = (out.nodes.size() == g.nodes.size());
+        for (std::size_t i = 0; fieldsEqual && i < g.nodes.size(); ++i)
+            fieldsEqual = (out.nodes[i].kind     == g.nodes[i].kind &&
+                           out.nodes[i].a        == g.nodes[i].a &&
+                           out.nodes[i].b        == g.nodes[i].b &&
+                           out.nodes[i].c        == g.nodes[i].c &&
+                           out.nodes[i].constArg == g.nodes[i].constArg);
+        check(ok && reSer == ser && fieldsEqual,
+              "flow-s5: Deserialize(Serialize(graph)) round-trips byte-exact (a save-game / sync artifact)");
+
+        // (7) PINNED SERIALIZED HASH — the on-disk format is byte-stable cross-platform (MSVC == clang).
+        const uint64_t kPinnedSerDigest = 0xd26266a3a25e5145ull;  // PINNED on first run
+        check(serDigest == kPinnedSerDigest,
+              "flow-s5: SerializeGraph digest == pinned uint64 (stable on-disk format, identical MSVC + Mac/clang)");
+
+        // (8) LOAD EVALUATES SAME — a loaded graph evaluates to the SAME result as the original.
+        check(DigestGraph(Evaluate(out)) == DigestGraph(Evaluate(g)),
+              "flow-s5: a loaded graph evaluates to the SAME result as the original (the script survives save/load)");
+
+        // Truncation defense: a short buffer is rejected deterministically (no UB).
+        std::vector<uint8_t> trunc = ser;
+        if (trunc.size() > 4) trunc.resize(trunc.size() - 1);   // drop a byte -> not a whole record
+        Graph dummy;
+        check(!DeserializeGraph(trunc, dummy),
+              "flow-s5: DeserializeGraph rejects a truncated buffer deterministically (defensive length checks)");
+    }
+
     if (g_fail == 0) { std::printf("flow_test: ALL PASS\n"); return 0; }
     std::printf("flow_test: %d FAIL\n", g_fail);
     return 1;
