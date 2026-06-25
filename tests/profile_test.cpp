@@ -114,6 +114,111 @@ int main() {
               "profile-s1: a different scope NAME changes the digest (interned names are load-bearing)");
     }
 
+    // ================================ SLICE PROFILE-S2 — scope/zone TREE ==============================
+    // S2 reconstructs the hierarchical scope tree from the flat Enter/Exit stream and aggregates draw
+    // counts bottom-up. The tree has its own PINNED digest; an unbalanced stream resolves deterministically.
+
+    // ---- Build the showcase tree + its tree digest. -------------------------------------------------
+    const ScopeTree tree = BuildScopeTree(showcase);
+    const uint64_t treeDigest = DigestTree(tree);
+    std::printf("profile-s2: scope-tree digest = 0x%016llx  (%zu nodes)\n",
+                static_cast<unsigned long long>(treeDigest), tree.nodes.size());
+
+    // ---- (S2-1) S1 INVARIANT — the structural digest is UNCHANGED by S2 (append-only). --------------
+    check(StructuralDigest(MakeShowcaseCapture()) == 0xedc7791443141dfdull,
+          "profile-s2: S1 structural digest 0xedc7791443141dfd UNCHANGED (append-only)");
+
+    // ---- (S2-2) PINNED TREE DIGEST — byte-stable cross-platform (identical MSVC + clang). -----------
+    const uint64_t kPinnedTreeDigest = 0xb41eb67a1d13443eull;  // PINNED on first run (MSVC == clang)
+    check(treeDigest == kPinnedTreeDigest,
+          "profile-s2: DigestTree(BuildScopeTree(showcase)) == pinned uint64 (zone tree byte-stable cross-platform)");
+
+    // ---- (S2-3) SHAPE — root -> Frame -> {Shadow, Lit} in emission order; self draws 2 and 5. -------
+    {
+        bool ok = tree.balanced;
+        // root (index 0) has exactly one child: Frame.
+        const ScopeNode& root = tree.nodes[0];
+        ok = ok && (root.firstChild != kNoNode) && (tree.nodes[root.firstChild].nextSibling == kNoNode);
+        const ScopeNode& frame = tree.nodes[root.firstChild];
+        // Frame has exactly two children: Shadow then Lit.
+        ok = ok && (frame.firstChild != kNoNode);
+        const uint32_t c0 = frame.firstChild;
+        ok = ok && (tree.nodes[c0].nextSibling != kNoNode);
+        const uint32_t c1 = tree.nodes[c0].nextSibling;
+        ok = ok && (tree.nodes[c1].nextSibling == kNoNode);
+        // Shadow.selfDrawCount == 2, Lit.selfDrawCount == 5 (emission order).
+        ok = ok && (tree.nodes[c0].selfDrawCount == 2u) && (tree.nodes[c1].selfDrawCount == 5u);
+        check(ok,
+              "profile-s2: the tree is balanced and has the expected shape (root -> Frame -> {Shadow, Lit})");
+    }
+
+    // ---- (S2-4) AGGREGATION EXACT — root & Frame subtreeDrawCount == total draws (7). ---------------
+    {
+        const ScopeNode& root  = tree.nodes[0];
+        const ScopeNode& frame = tree.nodes[root.firstChild];
+        check(root.subtreeDrawCount == 7u && frame.subtreeDrawCount == 7u,
+              "profile-s2: subtree draw aggregation is exact -- root subtreeDrawCount == total draws (7)");
+    }
+
+    // ---- (S2-5) HIERARCHY LOAD-BEARING — nest the draw one level deeper -> a DIFFERENT tree digest. -
+    {
+        // Frame{ Shadow{Draw2} Lit{ Cull{Draw5} } } — same total draws (7), DIFFERENT shape.
+        Capture deeper;
+        const char kFrame[]  = { 'F', 'r', 'a', 'm', 'e' };
+        const char kShadow[] = { 'S', 'h', 'a', 'd', 'o', 'w' };
+        const char kLit[]    = { 'L', 'i', 't' };
+        const char kCull[]   = { 'C', 'u', 'l', 'l' };
+        const uint32_t frame  = Intern(deeper.names, kFrame,  sizeof(kFrame));
+        const uint32_t shadow = Intern(deeper.names, kShadow, sizeof(kShadow));
+        const uint32_t lit    = Intern(deeper.names, kLit,    sizeof(kLit));
+        const uint32_t cull   = Intern(deeper.names, kCull,   sizeof(kCull));
+        EmitEnter(deeper, frame);
+        EmitEnter(deeper, shadow);
+        EmitDraw (deeper, shadow, 2);
+        EmitExit (deeper, shadow);
+        EmitEnter(deeper, lit);
+        EmitEnter(deeper, cull);
+        EmitDraw (deeper, cull, 5);
+        EmitExit (deeper, cull);
+        EmitExit (deeper, lit);
+        EmitExit (deeper, frame);
+        const ScopeTree deeperTree = BuildScopeTree(deeper);
+        check(DigestTree(deeperTree) != treeDigest && deeperTree.nodes[0].subtreeDrawCount == 7u,
+              "profile-s2: a deeper-nested scope changes the tree digest (hierarchy is load-bearing)");
+    }
+
+    // ---- (S2-6) UNBALANCED DETERMINISTIC — a missing Exit -> balanced==false + a stable canonical tree.
+    const uint64_t kPinnedUnbalancedDigest = 0xd37725f33c5a5a2full;  // PINNED on first run (MSVC == clang)
+    {
+        // Enter A; Draw 1;  (NO Exit A) -> open scope never closed.
+        Capture unb;
+        const char kA[] = { 'A' };
+        const uint32_t a = Intern(unb.names, kA, sizeof(kA));
+        EmitEnter(unb, a);
+        EmitDraw (unb, a, 1);
+        const ScopeTree ut1 = BuildScopeTree(unb);
+        const ScopeTree ut2 = BuildScopeTree(unb);   // a second build of the same stream
+        const uint64_t ud1 = DigestTree(ut1);
+        const uint64_t ud2 = DigestTree(ut2);
+        std::printf("profile-s2: unbalanced-tree digest = 0x%016llx\n",
+                    static_cast<unsigned long long>(ud1));
+        check(ut1.balanced == false && ud1 == ud2 && ud1 == kPinnedUnbalancedDigest,
+              "profile-s2: an unbalanced stream (a missing Exit) -> balanced==false + a deterministic canonical tree");
+    }
+
+    // ---- (S2-7) TIMING STILL EXCLUDED — filling timings nonzero leaves BOTH digests unchanged. ------
+    {
+        Capture timed = MakeShowcaseCapture();
+        for (std::size_t i = 0; i < timed.timings.size(); ++i) {
+            timed.timings[i].cpuNanos = static_cast<uint64_t>(i) * 1000ull + 7ull;
+            timed.timings[i].gpuNanos = static_cast<uint64_t>(i) * 9ull;
+        }
+        const bool structuralSame = (StructuralDigest(timed) == 0xedc7791443141dfdull);
+        const bool treeSame       = (DigestTree(BuildScopeTree(timed)) == treeDigest);
+        check(structuralSame && treeSame,
+              "profile-s2: TIMING STILL EXCLUDED -- filling timings nonzero leaves BOTH the structural AND tree digest unchanged");
+    }
+
     if (g_fail == 0) { std::printf("profile_test: ALL PASS\n"); return 0; }
     std::printf("profile_test: %d FAIL\n", g_fail);
     return 1;
