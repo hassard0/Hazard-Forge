@@ -89,6 +89,80 @@ int main() {
               "seq-s1: clamp-high — sampling after the last key holds values.back()");
     }
 
+    // =============================== SEQ-S2 — easing-curve LUT + multi-track ======================
+    // The pinned table digests (FNV-1a-64 over each LUT's raw int32 bytes) + the multi-track sweep
+    // digest. PINNED on first run (MSVC == clang), the cross-platform bar.
+    const uint64_t kPinnedSineTable = 0x8f13b44545cc3c97ull;  // PINNED on first run (MSVC == clang)
+    const uint64_t kPinnedQuadIn    = 0x7ebbb0956a7f50a2ull;  // PINNED on first run (MSVC == clang)
+    const uint64_t kPinnedQuadOut   = 0x5289c36d8551004aull;  // PINNED on first run (MSVC == clang)
+    const uint64_t kPinnedSeqSweep  = 0xee44096d40ab3946ull;  // PINNED on first run (MSVC == clang)
+
+    const uint64_t sineDig = DigestTrack(SineEaseTable());
+    const uint64_t qInDig  = DigestTrack(QuadInTable());
+    const uint64_t qOutDig = DigestTrack(QuadOutTable());
+    std::printf("seq-s2: sine-ease-table digest = 0x%016llx\n", (unsigned long long)sineDig);
+    std::printf("seq-s2: quad-in-table digest = 0x%016llx   quad-out-table digest = 0x%016llx\n",
+                (unsigned long long)qInDig, (unsigned long long)qOutDig);
+
+    // ---- (1) S1 INVARIANT — re-run S1 assertion 1; the Linear path MUST stay bit-identical. -------
+    check(DigestTrack(SampleSweep(MakeShowcaseTrack(), kOne / 30, 90)) == 0xd314f17ebe3d480bull,
+          "seq-s2: S1 invariant — showcase Linear sweep digest STILL 0xd314f17ebe3d480b (Ease no-op)");
+
+    // ---- (2) TABLE DIGESTS PINNED — the host-baked LUTs are byte-stable MSVC + clang. -------------
+    check(sineDig == kPinnedSineTable && qInDig == kPinnedQuadIn && qOutDig == kPinnedQuadOut,
+          "seq-s2: easing-table digests == pinned (the host-baked LUTs are byte-stable cross-platform)");
+
+    // ---- (3) ENDPOINTS EXACT — for every Easing, Ease(e,0)==0 and Ease(e,kOne)==kOne. -------------
+    {
+        bool ok = true;
+        const Easing all[] = {Easing::Step, Easing::Linear, Easing::EaseInOutSine,
+                              Easing::EaseInQuad, Easing::EaseOutQuad};
+        for (Easing e : all) { if (Ease(e, 0) != 0 || Ease(e, kOne) != kOne) ok = false; }
+        check(ok, "seq-s2: Ease(*, 0) == 0 and Ease(*, kOne) == kOne exactly (every easing fixes the endpoints)");
+    }
+
+    // ---- (4) LINEAR IDENTITY — for a sweep of t01 in [0,kOne], Ease(Linear,t01)==t01. -------------
+    {
+        bool ok = true;
+        for (int s = 0; s <= 64; ++s) {
+            const fx t01 = (fx)((int64_t)s * (int64_t)kOne / 64);
+            if (Ease(Easing::Linear, t01) != t01) ok = false;
+        }
+        check(ok, "seq-s2: Ease(Linear, t) == t for a sweep of t (the identity easing is a no-op)");
+    }
+
+    // ---- (5) SINE SYMMETRY — Ease(EaseInOutSine, kOne/2) == kOne/2 (+-1 LSB). ----------------------
+    {
+        const fx mid = Ease(Easing::EaseInOutSine, kOne / 2);
+        const fx d   = mid - kOne / 2;
+        check((d <= 1 && d >= -1),
+              "seq-s2: EaseInOutSine is symmetric — Ease(s, kOne/2) == kOne/2 (the S-curve midpoint, +-1 LSB)");
+    }
+
+    // ---- (6) CURVE BENDS — at t=kOne/4 the sine ease differs from Linear (not a hidden identity). --
+    {
+        check(Ease(Easing::EaseInOutSine, kOne / 4) != Ease(Easing::Linear, kOne / 4),
+              "seq-s2: EaseInOutSine(t) != Linear(t) at t=kOne/4 (the curve actually bends — not a sneaky identity)");
+    }
+
+    // ---- (7) MULTI-TRACK BUS — SampleSequence at t=0.5s; channel 0 == the S1 track verbatim. ------
+    {
+        const Sequence seq = MakeShowcaseSequence();
+        const std::vector<fx> bus = SampleSequence(seq, kOne / 2);
+        check(bus.size() == 3 && bus[0] == SampleScalar(MakeShowcaseTrack(), kOne / 2),
+              "seq-s2: SampleSequence at t=0.5s returns the per-channel eased bus (multi-track sampling)");
+    }
+
+    // ---- (8) SEQUENCE SWEEP PINNED — the whole multi-track timeline is byte-stable. ---------------
+    {
+        const Sequence seq = MakeShowcaseSequence();
+        const std::vector<fx> sweep2 = SampleSequenceSweep(seq, kOne / 30, 90);
+        const uint64_t seqDig = DigestTrack(sweep2);   // FNV-1a-64 over the contiguous int32 bytes
+        std::printf("seq-s2: sequence-bus sweep digest = 0x%016llx\n", (unsigned long long)seqDig);
+        check(seqDig == kPinnedSeqSweep,
+              "seq-s2: SampleSequenceSweep digest == pinned uint64 (the multi-track timeline is byte-stable)");
+    }
+
     if (g_fail == 0) { std::printf("seq_test: ALL PASS\n"); return 0; }
     std::printf("seq_test: %d FAIL\n", g_fail);
     return 1;
