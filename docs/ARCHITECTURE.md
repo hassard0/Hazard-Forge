@@ -1874,6 +1874,75 @@ dependency — the SIXTEENTH-issue flagship, complete (6/6).
   injected stat (real-FS watching is the live editor's `runtime::FileWatcher`); the optional `--asset-shot`
   render was intentionally skipped (the value is the determinism, fully proven in the pure test).
 
+### Deterministic scrub-friendly profiler capture (`engine/profile/profile.h`, namespace `hf::profile`) — flagship #31
+
+Slices PROFILE-S1–S6 add a **UE-Insights-class profiler** — frame timeline, scope/zone tracks, draw-call
+inspection, scrub-friendly capture. A profiler measures TIME, which is inherently non-deterministic, so the
+moat is NOT "a deterministic profiler" — it is the **structure-vs-timing byte split**: a capture's logical
+STRUCTURE (the scope tree, the per-frame event sequence, draw-call counts, pass structure) is byte-identical
+cross-platform, replayable, and **scrub-seekable**, while the measured TIMING (cpu/gpu nanoseconds) is a
+non-golden overlay that lives in a separate file section **provably outside the structural digest**. The
+capture is a seekable artifact — a demo of profiling events — built on the same `net::CatchUp` the seq scrub
+uses. The bit-exact header is header-only, self-contained (`<cstdint>/<cstddef>/<vector>` + `net/session.h`),
+pure-integer, with pinned `net::DigestBytes` goldens identical on MSVC/Windows-clang/Mac-clang and **no
+render-bake**. **No new RHI**, no new dependency — the THIRTY-FIRST-issue flagship, complete (6/6).
+
+- **Capture event model + interned name table (Slice PROFILE-S1, beachhead).** A flat event stream
+  (`ScopeEnter`/`ScopeExit`/`DrawCall`/`FrameBegin`/`FrameEnd`) over an interned `NameTable` (names are
+  byte-strings interned in first-seen order — no pointers in the digest, the `chunk_diff.h` content-addressing
+  move) + a parallel `timings` overlay. `EncodeStructural` hand-LE-serializes the names + events (NOT the
+  timings); `StructuralDigest` hashes that. **Proof:** the structural digest is pinned `0xedc7791443141dfd`;
+  the load-bearing moat proof — **filling `timings` with arbitrary nonzero values leaves the structural digest
+  UNCHANGED** (timing is out of the digest, the foundation of the flagship); structure/name fields are
+  load-bearing.
+- **Hierarchical scope/zone tree (Slice PROFILE-S2).** `BuildScopeTree` reconstructs the Insights "track"
+  view from the flat Enter/Exit stream via a single integer depth-stack pass (no recursion), aggregating draw
+  counts bottom-up in one reverse pass; an unbalanced stream resolves to a deterministic canonical tree (never
+  UB). **Proof:** the tree digest is pinned `0xb41eb67a1d13443e`; the root's `subtreeDrawCount == 7` (exact
+  aggregation); a deeper-nested scope changes the digest (hierarchy is load-bearing); the unbalanced case is
+  deterministic; timing still excluded from both digests.
+- **Frame boundaries + multi-frame timeline (Slice PROFILE-S3).** `FrameBegin`/`FrameEnd` bracket each frame;
+  `BuildFrameIndex` gives every frame its OWN structural sub-digest (over only that frame's events), and
+  `DigestTimeline` hashes the row. **Proof:** the timeline digest is pinned `0xc68ff46e1ab25f37`; **two frames
+  with the identical workload have the identical per-frame digest** (frame N is byte-reproducible), a
+  different-workload frame differs, and a frame's digest is position-independent — the seek-exactness property
+  S5 relies on. (The frame NUMBER is timeline metadata, deliberately excluded from the per-frame structural
+  digest.)
+- **Draw-call / GPU-pass inspection (Slice PROFILE-S4).** `DrawRecord`/`PassRecord` capture the render
+  structure — pass order, draw counts, instance counts, pipeline ids — ingested through an **injected POD**
+  (`RenderStructInput`) that the live engine fills from `render::RenderGraph::LastOrder()` + MDI `drawCount`;
+  the profiler header never `#include`s `render_graph.h` (which pulls `rhi.h`/`<functional>`/`<string>` and is
+  not clang-pure) — the `replay.h` `serWorld` boundary. **Proof:** the render-structure digest is pinned
+  `0x9b75187d6a4c3bf1`; the Lit MDI pass's draw reports `drawCount == 64` (the multi-draw-indirect collapse
+  count — the "draw call inspection" datum); counts + pipeline ids are load-bearing; **no GPU timing in the
+  digest**.
+- **The SCRUB — serializable `.capture` + seek-to-frame via net::CatchUp (Slice PROFILE-S5, the headline).**
+  `EncodeCapture` writes `[header][structural section][timing section]` — the structural section IS S1's
+  encoding (so the file's structural digest equals `StructuralDigest`), and the timing section lives at a byte
+  offset PAST it, **provably outside** the digest's byte range. Playback wraps as a `net::Session`
+  (`CaptureWorld` = current frame + a running fold), and `SeekToFrame` is literally `net::CatchUp(JoinSnapshot@K,
+  N, …)` — restore the nearest keyframe and replay forward. **Proof:** round-trip byte-exact; the
+  structural-section digest is pinned `0x9830afc651699a70`; **SCRUB == SEEK** — `CatchUp(keyframe@K, N)`
+  reaches the bit-identical world a from-frame-0 playback reaches at N (full-digest equality, several K,N
+  pairs); and the moat made testable — **corrupting a timing byte leaves the structural digest unchanged**
+  (`VerifyCapture` reports OK) while **corrupting a structural byte diverges at the exact frame**. **A
+  profiler capture is a deterministic, seekable artifact — two machines scrub the same capture to the
+  bit-identical structure, which a timing-coupled profiler cannot provide.**
+- **Live ScopedZone capstone — structure golden under real timing (Slice PROFILE-S6).** A `ScopedZone` RAII
+  helper (in a separate `engine/profile/profile_live.h`, the ONLY place `<chrono>` is allowed — the
+  `seq_render.h` isolation of the one non-deterministic crossing) emits structural enter/exit via the S1
+  emitters AND measures wall-clock nanoseconds into the timing overlay. **Proof:** a live-captured frame's
+  `StructuralDigest == 0xedc7791443141dfd` — byte-identical to the scripted path (RAII provenance: the live
+  events equal the scripted events field-for-field) — and **two runs with different real durations yield the
+  IDENTICAL structural digest** (the split holds with measured timing). The Mac and Windows runs produce the
+  byte-identical structure with genuinely different measured timings (Mac ~13.5M/27.2M ns, Windows ~4.0M/11.9M
+  ns) — the live demonstration of the whole thesis. **Completes flagship #31 — the thirty-first-issue
+  flagship.** **Honest scope:** timing is non-deterministic by nature (only the STRUCTURE is golden — no
+  oversell); no real GPU-timestamp determinism (`rhi.h` has no timestamp-query; `gpuNanos` is reserved); the
+  `RenderGraph` live-ingest is the S4 POD seam (mechanical glue, no new golden); no live interactive GUI
+  timeline (the runtime + capture format a GUI would drive); the optional `--profile-shot` visualization was
+  intentionally skipped (the value is the deterministic capture, fully proven in the pure tests).
+
 ### Simulated transport + client interpolation (`engine/net/transport.*`)
 
 Slice BU layers the **hard** part of networking on top of the BQ snapshot core — an **imperfect channel** and a **client jitter buffer with interpolation** — still **without any real sockets** (real UDP/TCP transport remains a future slice). Like `snapshot.*`, `transport.*` is **pure CPU above `engine/math` + `engine/net`** with **zero RHI/backend symbols**, compiled into both `hf_core` (ASan-scoped, unit-tested via `net_transport_test`) and `hf_engine` (the live `--netsim-shot` showcase).
