@@ -159,6 +159,10 @@ hf_add_pure_test(gltf_ext_test)
 # multiplayer-sync + undo. Content-addressed sorted storage (NOT unordered_*), so the diff hashes +
 # serializes byte-identically. Pure hf_core, identical MSVC + Windows-clang + Mac/clang.
 hf_add_pure_test(chunk_diff_test)
+# Wavefront OBJ geometry parser (issue #15 ask #1): a dependency-free importer (text -> ObjMesh) for the
+# format the McGuire archive / Stanford scans / every Blender export ship. The headline is reproducibility
+# — re-importing the same OBJ is BYTE-IDENTICAL (pinned digest), identical MSVC + Windows-clang + Mac/clang.
+hf_add_pure_test(obj_loader_test)
 # CPU particle / VFX emitter system (Slice CC): the authorable emitter (spawn rate, lifetime, init
 # velocity + spread, gravity, drag, size/color over life) simulated at a fixed timestep with a
 # fixed-seed integer LCG for the spread jitter (engine/vfx/particles.{h,cpp}) — DISTINCT from the
