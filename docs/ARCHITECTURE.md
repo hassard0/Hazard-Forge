@@ -1478,6 +1478,65 @@ no float, no pointer-/hash-ordered iteration anywhere in the solve path.
 
 ---
 
+## Gameplay-Systems Layer — deterministic inventory / crafting / economy / quests (`engine/econ/econ.h`, namespace `hf::econ`) — flagship #30
+
+Slices S1–S6 add the engine's **first gameplay-systems layer** — the deterministic state machine that makes
+a *game* out of the physics. Every prior flagship is world-simulation, rendering, or procedural generation;
+none is the inventory/crafting/economy/quest state that gameplay actually runs on. The moat fit is the
+sharpest of any flagship: gameplay state is pure integer bookkeeping (item counts, recipe transforms,
+resource flows, integer-condition quest flags), so it is bit-identical CPU/Vulkan/Metal BY CONSTRUCTION and
+— wrapped in `net::Session` — lockstep-replicable, deterministically rollback-correct, and replay-scrubbable.
+This is precisely what UE5's gameplay layer (Blueprint logic, replicated actor state, float timers, GAS)
+structurally CANNOT offer: it is the canonical non-deterministic glue that cannot lockstep, cannot
+deterministically roll back, and cannot bit-exactly replay. `econ.h` is header-only and **fully
+self-contained** (only `<bit>`-free `<cstddef>`/`<cstdint>`/`<vector>` + the self-contained `net/session.h`);
+the core is strict integer — **no RHI / no shader / no GPU / no float / no clock / no RNG** (the "rolls" are
+a deterministic `EconHash`, the `pcg::PcgHash` ops copied verbatim; the one "fractional" slice uses integer-
+ratio elasticity, not floats). S1–S5 are pinned-FNV-1a-64 goldens proven identical under MSVC, Windows clang,
+and Mac clang — **no render-bake**; only the optional S6 capstone crosses into float.
+
+- **Integer ledger + atomic transactions (S1).** A dense fixed-order `World` (stock per `(entity,item)`) +
+  atomic Add/Remove/Transfer `Command`s with conservation and affordability/bounds gates. **Proof:** a
+  pinned `DigestWorld`, Transfer conserves `TotalQuantity`, unaffordable/out-of-range commands are
+  deterministic no-ops, no negative stock.
+- **Crafting / recipe transformer (S2).** A `RecipeSet` (inputs→outputs) + `ApplyRecipe` (atomic
+  consume-then-produce iff affordable) + a deterministic craft queue with bit-exact partial drains.
+  **Proof:** a pinned digest, per-recipe balance (`Δ == Σoutputs − Σinputs`), affordability gate, partial
+  drain, the both-input-and-output recipe pins consume-before-produce.
+- **Resource economy tick (S3).** Per-tick producers (clamp up to integer storage caps) and consumers
+  (clamp down to zero), production-before-consumption in fixed order — the `IntegrateStep` analog for
+  gameplay state. **Proof:** a pinned digest after N ticks, non-negativity, cap-respect, producer
+  saturation, consumer depletion, and **steady-state idempotence** (`EconTick` is a no-op at rest).
+- **Pricing / market + deterministic rolls (S4).** Integer supply/demand pricing (integer-ratio elasticity,
+  monotonic, clamped), order clearing (trades at the current price paid in a currency item, conservation-
+  preserving), and seeded loot/yield rolls via `EconHash`. The arc's one "fractional" slice — solved strict
+  integer, no `fpx.h`. **Proof:** pinned market-state + roll-sequence digests, monotonic pricing,
+  clamp, trade conservation, roll reproducibility.
+- **Quest FSM + lockstep / rollback / desync (S5, the headline).** An integer-condition quest state machine
+  (objectives advanced by the economy, fixed order, prerequisite chains) and the whole `EconState`
+  (ledger + market + quests) wrapped in `net::Session`. **Proof:** two peers fed only the command stream
+  re-derive a BIT-IDENTICAL economy + quest state at every tick (`RunLockstep`/`DigestTrace`); a mispredicted
+  command (a delayed remote that differs from the prediction) ROLLS BACK to the bit-identical authority state
+  (`RollbackSession` + `ScriptedTransport`, `didRollback` fired) and converges under adversarial delay/reorder;
+  a one-command divergence is LOCATED at the exact tick (`DesyncDetector`); the quest chain completes
+  deterministically. The netcode machinery is reused verbatim — no duplication. **This is the UE5-can't-do-this
+  proof for gameplay state.**
+- **Lit 3D render capstone (S6, optional money-shot).** The ONE float crossing: the economy as a lit 3D
+  skyline — instanced bars per `(entity,item)` slot sized by the bit-exact integer stock, colored by item,
+  through the EXISTING instanced-lit pipeline (the WFC-S6 / PCG6-field pattern) — NO new shader/RHI. The
+  render bridge lives in a SEPARATE `engine/econ/econ_render.h` so `econ.h`'s self-contained clang-hash proof
+  stays intact (S1–S5 byte-unchanged). **Proof (FLOAT visresolve-bar):** the state is bit-exact + identical
+  cross-backend; the render gate is two renders BYTE-IDENTICAL per vendor + provenance (instances ==
+  recomputed `EconToRenderInstances(state after the fixed script)`) + a Metal-baked golden (two-run DIFF
+  0.0000, cross-vendor mean ~47 — the documented float baseline) + eyeball. **Completes flagship #30 —
+  deterministic gameplay systems.** Honest scope: not a full MMO economy (no auction houses, no networked
+  persistence beyond the `net::Session` lockstep proof); S5 quests are integer-condition state machines, not
+  authored dialogue/branching narrative; no floating-point economics on the bit-exact path (elasticity is
+  integer-ratio); fixtures are in-code (no designer authoring UI / asset loaders); the S6 render is eye-candy
+  — the moat is fully proven by the S1–S5 integer goldens without it.
+
+---
+
 ## Material / Shader Graph Layer (`engine/material/`)
 
 Phase 4 adds a **data-driven material system** that authors shaders as node graphs instead of hand-written HLSL, while preserving the "shaders are generated, not hand-written" and golden-stability invariants. It is pure host logic above the seam — no `vk*`/`MTL*`/`Backend` symbols — and is split into five concerns plus a build-time tool:
