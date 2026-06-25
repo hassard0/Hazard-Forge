@@ -11,6 +11,11 @@
 /metal_cube.png
 /metal_scene.png
 
+# Reference asset library (issue #18): the small CC0 .glb heroes are committed in-repo under
+# assets/reference/, but the heavy Sponza/Bistro-class scenes fetched on demand by
+# fetch_reference_assets.{sh,ps1} land here and must NOT bloat git.
+/assets/reference/_downloaded/
+
 # Conan
 /CMakeUserPresets.json
 conan/
