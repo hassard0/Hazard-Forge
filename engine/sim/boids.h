@@ -39,6 +39,9 @@
 // cross-platform bit-identity is the headline.
 
 #include <cstdint>
+#include <cstring>     // std::memcmp (lockstep/rollback bit-exact compare) — hoisted to file scope so
+                       // libstdc++ (Linux/gcc) processes <cstring> OUTSIDE namespace hf::sim; the mid-file
+                       // include below is now a guarded no-op, keeping the frozen lines byte-stable.
 #include <span>
 #include <vector>
 

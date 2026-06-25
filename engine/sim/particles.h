@@ -52,6 +52,9 @@
 // #included read-only + stays byte-unchanged, exactly as grain.h:51 does).
 
 #include <cstdint>
+#include <cstring>       // std::memcmp (PT5 lockstep bit-exact compare) — hoisted to file scope so libstdc++
+                         // (Linux/gcc) processes <cstring> OUTSIDE namespace hf::sim; the PT5 mid-file include
+                         // below (line ~633) is now a guarded no-op, keeping PT1-PT4 byte-frozen.
 #include <vector>
 
 #include "sim/fpx.h"     // read-only: fx / fxmul / FxVec3 / FxAdd / FxSub / FxScale / kOne / kFrac

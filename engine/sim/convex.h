@@ -30,6 +30,9 @@
 // separate). Per-pair-disjoint (one GPU thread per box pair) -> race-free, two runs byte-identical.
 
 #include <cstdint>
+#include <cstring>     // std::memcmp / std::memcpy (snapshot round-trip + peer compare) — hoisted to file
+                       // scope so libstdc++ (Linux/gcc) processes <cstring> OUTSIDE namespace hf::sim; the
+                       // mid-file include below is now a guarded no-op, keeping the frozen lines byte-stable.
 #include <vector>
 
 #include "sim/fpx.h"   // read-only: fx/fxmul/fxdiv/kOne/kFrac, FxVec3/FxAdd/FxSub/FxScale, FxDot? (no —
