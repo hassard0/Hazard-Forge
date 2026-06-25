@@ -741,4 +741,34 @@ inline std::vector<std::vector<Reg>> MakeControlInputStream() {
     };
 }
 
+// ====================================================================================================
+// Slice FLOW-S4 — LOCKSTEP / REPLAY COMPOSITION: the moat payoff (issue #24). APPEND-ONLY below S3
+// (S1/S2/S3 above stay byte-identical: S1 0x0e5b8ec26f0d8730, S2 trace final 0x670cf80b235bdafd, S3
+// event-trace final 0xd5735423148033cc are UNCHANGED — S4 adds ONE convenience function only, touches
+// nothing above).
+//
+// THE HEADLINE: a flow::Graph is a pure function (state, inputs) -> state' — EXACTLY the StepFn shape
+// net::Session<World,Input>::Advance / RunLockstep / DigestTrace / DesyncDetector template over. So a
+// visual script runs ON the existing deterministic rollback-netcode engine with ZERO new netcode: World =
+// flow::GraphState (a plain std::vector<int32_t> -> value-copy snapshot works), Input = flow::Reg (one per
+// kInput channel), step = a lambda capturing the static Graph that calls StepGraph, digest = DigestState.
+// Two peers fed only the input stream re-derive a BIT-IDENTICAL graph state at every tick (lockstep), the
+// run is replay-stable, and a one-tick input divergence is LOCATED at the exact tick (the NS5 detector over
+// a graph). UE5 Blueprints structurally cannot do this (non-deterministic event order). The substance of
+// S4 lives in the TEST (it reuses the net:: templates verbatim); the header adds only ONE bridge.
+// Pure-CPU INTEGER; header stays self-contained (only <cstddef>/<cstdint>/<vector> + net/session.h).
+// ====================================================================================================
+
+// BuildInputRing: bridge a flow per-tick input stream (stream[t] = the inputs feeding the kInput channels
+// on tick t) into a net::InputRing<Reg>. For each tick t, AddInput(t, v) for each v in stream[t] IN ORDER,
+// so the kInput channel index (a node's constArg) == the insertion index == InputRing::At(t)'s vector
+// index. This makes the net::Session-driven eval (StepGraph over ring.At(t)) byte-identical to the direct
+// S2 RunGraphTrace (StepGraph over stream[t]) — the COMPOSITION proof. Pure integer, no new include.
+inline hf::net::InputRing<Reg> BuildInputRing(const std::vector<std::vector<Reg>>& stream) {
+    hf::net::InputRing<Reg> ring;
+    for (uint32_t t = 0; t < stream.size(); ++t)
+        for (const Reg v : stream[static_cast<std::size_t>(t)]) ring.AddInput(t, v);
+    return ring;
+}
+
 }  // namespace hf::flow

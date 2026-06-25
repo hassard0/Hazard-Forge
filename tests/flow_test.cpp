@@ -323,6 +323,102 @@ int main() {
               "flow-s3: the traversal is bounded (a contrived exec loop terminates deterministically, no hang)");
     }
 
+    // ==================================================================================================
+    // Slice FLOW-S4 — LOCKSTEP / REPLAY COMPOSITION: the moat payoff. Append-only (S1+S2+S3 above stay
+    // green). The flow::Graph IS a net::Session StepFn: World = GraphState, Input = Reg, step = a lambda
+    // capturing the static data graph that calls StepGraph, digest = DigestState. We reuse the net::
+    // RunLockstep / DigestTrace / DesyncDetector templates VERBATIM (from the already-included net/session.h)
+    // — ZERO new netcode. The data graph + input stream are the S2 showcase fixtures. T = the S2 tick count.
+    // ==================================================================================================
+
+    const Graph& dataG = stateGraph;                          // World source = the S2 showcase state graph
+    const std::vector<std::vector<Reg>>& s4Stream = inputStream;  // the S2 8-tick input stream
+    const uint32_t T = static_cast<uint32_t>(s4Stream.size()); // T = 8 (matches MakeShowcaseInputStream)
+
+    // The StepFn shape net::Session::Advance templates over: step(world, inputs-this-tick, tick). The lambda
+    // captures the static data graph (config, not state) and forwards to StepGraph (the S2 per-tick step).
+    auto step   = [&](GraphState& w, const std::vector<Reg>& inputs, uint32_t tick) {
+        StepGraph(dataG, w, inputs, tick);
+    };
+    auto s4Digest = [&](const GraphState& w) { return DigestState(w); };
+
+    // Build the net::InputRing<Reg> from the flow input stream (the kInput channel index == insertion index).
+    hf::net::InputRing<Reg> ring = BuildInputRing(s4Stream);
+
+    // ---- PART A — lockstep over net::Session --------------------------------------------------------
+    const uint64_t s4Final = hf::net::RunLockstep<GraphState, Reg>(
+        MakeState(dataG), ring, T, step, s4Digest);
+    std::printf("flow-s4: lockstep final state digest = 0x%016llx  (T=%u ticks)\n",
+                static_cast<unsigned long long>(s4Final), T);
+
+    // (1) PINNED LOCKSTEP FINAL — net::RunLockstep over the graph == a hard-pinned uint64 (a peer re-derives
+    //     the bit-identical graph state from the input stream alone). PINNED on first run (MSVC == clang).
+    const uint64_t kPinnedS4Final = 0x670cf80b235bdafdull;  // PINNED on first run
+    check(s4Final == kPinnedS4Final,
+          "flow-s4: net::RunLockstep over the graph == pinned uint64 (a peer re-derives the bit-identical graph state)");
+
+    // (2) LOCKSTEP INVARIANT — two independent net::DigestTrace calls -> IDENTICAL per-tick traces.
+    const std::vector<uint64_t> traceA = hf::net::DigestTrace<GraphState, Reg>(
+        MakeState(dataG), ring, T, step, s4Digest);
+    {
+        const std::vector<uint64_t> traceA2 = hf::net::DigestTrace<GraphState, Reg>(
+            MakeState(dataG), ring, T, step, s4Digest);
+        check(traceA == traceA2,
+              "flow-s4: two peers from the same input ring have EQUAL net::DigestTrace at EVERY tick (lockstep invariant)");
+    }
+
+    // (3) COMPOSITION (the make-or-break) — the net::Session-driven DigestTrace == the DIRECT S2
+    //     RunGraphTrace tick-for-tick (proving the graph eval through the netcode engine is the SAME
+    //     computation as the direct eval -> the graph is a valid deterministic StepFn).
+    {
+        const std::vector<uint64_t> directTrace = RunGraphTrace(dataG, s4Stream, T);
+        check(traceA == directTrace,
+              "flow-s4: the net::Session-driven DigestTrace == the direct S2 RunGraphTrace (the graph IS a valid StepFn)");
+    }
+
+    // (4) REPLAY-STABLE — a second RunLockstep over the same ring -> identical final digest.
+    {
+        const uint64_t s4Replay = hf::net::RunLockstep<GraphState, Reg>(
+            MakeState(dataG), ring, T, step, s4Digest);
+        check(s4Replay == s4Final,
+              "flow-s4: a replay (second RunLockstep over the same ring) reproduces the identical final digest");
+    }
+
+    // ---- PART B — desync localization (the NS5 detector over a graph) -------------------------------
+    // Two input streams identical except one tick K's input differs -> traces match for t<K, diverge at K;
+    // net::DesyncDetector latches the exact tick.
+    const uint32_t K = 3;  // PINNED: the divergence tick (input 0 -> 99 on tick 3)
+    std::vector<std::vector<Reg>> streamB = s4Stream;
+    streamB[static_cast<std::size_t>(K)] = { 99 };  // change tick K's single input (0 -> 99)
+    hf::net::InputRing<Reg> ringB = BuildInputRing(streamB);
+    const std::vector<uint64_t> traceB = hf::net::DigestTrace<GraphState, Reg>(
+        MakeState(dataG), ringB, T, step, s4Digest);
+
+    // (5) CLEAN — DesyncDetector over (traceA vs traceA) -> no desync.
+    {
+        hf::net::DesyncDetector dClean;
+        for (uint32_t t = 0; t < T; ++t) hf::net::RecordLocal(dClean, t, traceA[t]);
+        for (uint32_t t = 0; t < T; ++t)
+            hf::net::IngestRemote(dClean, hf::net::ChecksumPacket{ t, traceA[t] });
+        check(!dClean.desynced,
+              "flow-s4: identical input streams report NO desync (clean)");
+    }
+
+    // (6) LOCATED — traceA (local) vs traceB (remote, tick K's input changed) -> d.desynced &&
+    //     d.desyncTick == K, traces equal for t < K. Pin K.
+    {
+        hf::net::DesyncDetector dDiv;
+        for (uint32_t t = 0; t < T; ++t) hf::net::RecordLocal(dDiv, t, traceA[t]);
+        for (uint32_t t = 0; t < T; ++t)
+            hf::net::IngestRemote(dDiv, hf::net::ChecksumPacket{ t, traceB[t] });
+        bool matchBeforeK = true;
+        for (uint32_t t = 0; t < K; ++t) if (traceA[t] != traceB[t]) matchBeforeK = false;
+        std::printf("flow-s4: desync injected at tick K=%u, detector latched tick=%u\n",
+                    K, dDiv.desyncTick);
+        check(dDiv.desynced && dDiv.desyncTick == K && matchBeforeK,
+              "flow-s4: a one-tick input divergence is LOCATED at the exact tick K (net::DesyncDetector), traces match for t<K");
+    }
+
     if (g_fail == 0) { std::printf("flow_test: ALL PASS\n"); return 0; }
     std::printf("flow_test: %d FAIL\n", g_fail);
     return 1;
