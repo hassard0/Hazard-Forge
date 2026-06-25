@@ -564,4 +564,208 @@ inline std::vector<Qty> MakeShowcaseSupply(const World& w) {
     return s;
 }
 
+// =====================================================================================================
+// ECON-S5 — Quest state machine + lockstep/rollback/desync capstone (APPEND-ONLY below S4). HEADLINE.
+// =====================================================================================================
+// The flagship's headline: a deterministic integer QUEST / OBJECTIVE state machine advanced by the
+// economy state, then the moat proof — the ENTIRE economy + quest state wrapped in net::Session so two
+// peers fed only the command stream re-derive a BIT-IDENTICAL economy+quest state (RunLockstep), a
+// mispredicted command ROLLS BACK to the bit-identical authority state (RollbackSession), and a
+// divergence is LOCATED at the exact tick (DesyncDetector). Pure-CPU INTEGER, reuses S1-S4 verbatim +
+// the net::* netcode machinery (read-only). This is the canonical non-deterministic gameplay glue
+// (Blueprint logic, replicated actor state, float timers, GAS) that UE5 structurally cannot lockstep,
+// deterministically rollback, or bit-exactly replay.
+
+// --- Objective: one integer-condition quest goal. Condition: ledger.At(entity,item) >= threshold. -----
+// `prereq` chains objectives: -1 = no prerequisite (starts ACTIVE); else this objective only ACTIVATES
+// once objective[prereq] is COMPLETE. Flat fixed index (NO map) -> deterministic iteration by construction.
+struct Objective {
+    uint32_t entity;     // condition entity
+    uint32_t item;       // condition item
+    Qty      threshold;  // condition: ledger.At(entity, item) >= threshold
+    int32_t  prereq;     // -1 = no prerequisite; else activates once objective[prereq] is complete
+};
+
+// --- QuestGraph: the STATIC quest config (NOT snapshotted — config, like RecipeSet/EconRules). --------
+struct QuestGraph { std::vector<Objective> objectives; };
+
+// --- ObjStatus: an objective's lifecycle. kLocked -> kActive (prereq met) -> kComplete (condition met).
+enum ObjStatus : uint8_t { kLocked = 0, kActive = 1, kComplete = 2 };
+
+// --- QuestState: parallel to QuestGraph::objectives; THIS is the snapshotted mutable state. -----------
+struct QuestState { std::vector<uint8_t> status; };  // status[i] == ObjStatus of objective i
+
+// --- MakeQuestState: all objectives kLocked except those with prereq == -1 which start kActive. -------
+inline QuestState MakeQuestState(const QuestGraph& g) {
+    QuestState q;
+    q.status.assign(g.objectives.size(), static_cast<uint8_t>(kLocked));
+    for (std::size_t i = 0; i < g.objectives.size(); ++i)
+        if (g.objectives[i].prereq == -1) q.status[i] = static_cast<uint8_t>(kActive);
+    return q;
+}
+
+// --- AdvanceQuests: ONE fixed-order pass over the objectives. A kLocked objective whose prereq is
+// kComplete (or has no prereq) becomes kActive; a kActive objective whose integer condition holds
+// (ledger.At(entity,item) >= threshold, bounds-checked) becomes kComplete. SINGLE PASS PER CALL: a
+// multi-step chain completes across SUCCESSIVE ticks (one link per call), NOT within one call — this
+// keeps the advance deterministic + lockstep-aligned (every peer advances exactly one pass per tick).
+// Pure integer, no float, no map; the status vector is the only mutated state.
+inline void AdvanceQuests(const World& ledger, const QuestGraph& g, QuestState& q) {
+    for (std::size_t i = 0; i < g.objectives.size(); ++i) {
+        const Objective& o = g.objectives[i];
+        if (q.status[i] == static_cast<uint8_t>(kLocked)) {
+            // Activate if there is no prereq, or the prereq objective is already complete.
+            const bool prereqMet =
+                (o.prereq == -1) ||
+                (static_cast<std::size_t>(o.prereq) < q.status.size() &&
+                 q.status[static_cast<std::size_t>(o.prereq)] == static_cast<uint8_t>(kComplete));
+            if (prereqMet) q.status[i] = static_cast<uint8_t>(kActive);
+        }
+        if (q.status[i] == static_cast<uint8_t>(kActive)) {
+            // Complete if the integer ledger condition holds (bounds-checked via InRange).
+            if (InRange(ledger, o.entity, o.item) &&
+                ledger.At(o.entity, o.item) >= o.threshold)
+                q.status[i] = static_cast<uint8_t>(kComplete);
+        }
+    }
+}
+
+// --- EconState: the unified net::Session World — ALL mutable state, value-copy snapshot/restore-able.
+// (The QuestGraph/EconRules/RecipeSet config lives OUTSIDE — captured by the step lambda — so this is a
+// pure snapshot of mutable state, exactly what RollbackSession copies into its snapshot ring.)
+struct EconState {
+    World      ledger;
+    Market     market;
+    QuestState quests;
+};
+
+// --- CmdTag / EconCommand: the net::Session Input — a tagged union of the S1-S4 operations. -----------
+enum CmdTag : uint32_t { kTxnCmd = 0, kCraftCmd = 1, kTradeCmd = 2, kTickCmd = 3, kNopCmd = 4 };
+struct EconCommand {
+    uint32_t   tag;         // CmdTag
+    Command    txn{};       // kTxnCmd   -> ApplyCommand (S1 Add/Remove/Transfer)
+    CraftOrder craft{};     // kCraftCmd -> DrainCraftQueue of one order (S2)
+    TradeOrder trade{};     // kTradeCmd -> ExecuteTrade (S4)
+    // kTickCmd -> EconTick(ledger, rules);  kNopCmd -> no-op.
+};
+
+// --- operator==(EconCommand): LOAD-BEARING for rollback. ConfirmRemote uses `appliedRemote[at] != real`
+// to detect a misprediction, so this must compare the tag PLUS every field relevant to that tag (a full
+// field equality — a different tag, or any differing field of the active tag, must compare unequal so a
+// genuine mispredict fires). Tags compared first; only the active tag's payload is compared (the inactive
+// payloads are default-constructed identically, but we compare per-tag to keep equality semantics exact).
+inline bool operator==(const EconCommand& a, const EconCommand& b) {
+    if (a.tag != b.tag) return false;
+    switch (a.tag) {
+        case kTxnCmd:
+            return a.txn.kind == b.txn.kind && a.txn.src == b.txn.src && a.txn.dst == b.txn.dst &&
+                   a.txn.item == b.txn.item && a.txn.amount == b.txn.amount;
+        case kCraftCmd:
+            return a.craft.recipeId == b.craft.recipeId && a.craft.entity == b.craft.entity &&
+                   a.craft.count == b.craft.count;
+        case kTradeCmd:
+            return a.trade.buyer == b.trade.buyer && a.trade.seller == b.trade.seller &&
+                   a.trade.item == b.trade.item && a.trade.qty == b.trade.qty;
+        case kTickCmd:
+        case kNopCmd:
+            return true;  // no payload — equal once the tags match
+        default:
+            return true;  // unknown tag: tag-equal is enough (both are no-ops)
+    }
+}
+inline bool operator!=(const EconCommand& a, const EconCommand& b) { return !(a == b); }
+
+// --- ApplyEconCommand: apply ONE command to the state, dispatching on tag, using the STATIC config
+// (rules/recipes). Reuses S1-S4 VERBATIM — every branch is the existing deterministic integer primitive.
+inline void ApplyEconCommand(EconState& s, const EconCommand& c,
+                             const EconRules& rules, const RecipeSet& recipes) {
+    switch (c.tag) {
+        case kTxnCmd:   ApplyCommand(s.ledger, c.txn); break;                          // S1
+        case kCraftCmd: DrainCraftQueue(s.ledger, recipes, { c.craft }); break;        // S2 (one order)
+        case kTradeCmd: ExecuteTrade(s.ledger, s.market, c.trade); break;              // S4
+        case kTickCmd:  EconTick(s.ledger, rules); break;                              // S3
+        case kNopCmd:   break;                                                         // no-op
+        default:        break;                                                         // unknown -> no-op
+    }
+}
+
+// --- DigestEconState: the combined snapshot digest = DigestState(ledger, market) folded with the quest
+// status bytes, in FIXED order (the DigestState/DigestWorld precedent). Continues the SAME FNV-1a-64:
+// seed with DigestState, then fold the quest status bytes. Bit-identical run-to-run AND platform-to-
+// platform (fixed byte layout + iteration order; the status is a flat uint8 vector).
+inline uint64_t DigestEconState(const EconState& s) {
+    uint64_t h = DigestState(s.ledger, s.market);  // ledger + market digest (fixed-order FNV-1a-64)
+    const std::uint64_t qh = net::DigestBytes(s.quests.status.data(), s.quests.status.size());
+    // Fold the quest digest's 8 bytes into the running hash (fixed order), so the combined digest is a
+    // single deterministic fold of (state || quests).
+    const auto* qp = reinterpret_cast<const unsigned char*>(&qh);
+    for (std::size_t i = 0; i < sizeof qh; ++i) { h ^= static_cast<uint64_t>(qp[i]); h *= 1099511628211ull; }
+    return h;
+}
+
+// --- MakeShowcaseQuests: a FIXED CHAINED quest graph over the 4x4 showcase world (integer literals).
+// FIXED forever (the S5 golden pins the chain's completion). A 3-link chain on entity 0:
+//   obj0:                entity0 has >= 1  item2  (craft an ingot — r0)
+//   obj1 (prereq obj0):  entity0 has >= 1  item3  (craft a tool  — r1, needs 3x item2)
+//   obj2 (prereq obj1):  entity0 has >= 5  item3  (stockpile tools)
+// The chain completes across SUCCESSIVE ticks: obj0 activates+completes once item2 accrues, obj1 then
+// activates (next tick) and completes once item3 accrues, obj2 then activates and completes at >=5 item3.
+inline QuestGraph MakeShowcaseQuests() {
+    QuestGraph g;
+    g.objectives.push_back(Objective{ /*entity=*/0, /*item=*/2, /*threshold=*/1, /*prereq=*/-1 });
+    g.objectives.push_back(Objective{ /*entity=*/0, /*item=*/3, /*threshold=*/1, /*prereq=*/ 0 });
+    g.objectives.push_back(Objective{ /*entity=*/0, /*item=*/3, /*threshold=*/5, /*prereq=*/ 1 });
+    return g;
+}
+
+// --- MakeShowcaseState: bundle the mutable showcase state (ledger + market + quests). The ledger is the
+// coin-seeded 4x4 showcase world; the market is the showcase market; quests start at MakeQuestState of
+// the showcase graph. FIXED forever. (entityCount/itemCount must match the showcase world: 4x4.) -------
+inline EconState MakeShowcaseState() {
+    EconState s;
+    s.ledger = MakeShowcaseWorld(4, 4);
+    SeedShowcaseCoin(s.ledger);                       // +500 coin (item0) per entity so trades can pay
+    s.market = MakeShowcaseMarket(s.ledger);
+    s.quests = MakeQuestState(MakeShowcaseQuests());
+    return s;
+}
+
+// --- MakeShowcaseCommandStream: a FIXED mixed command stream (txns / crafts / trades / ticks) that drives
+// the economy AND completes the quest chain. FIXED forever (the S5 golden pins the lockstep+rollback over
+// it). Entity 0 must accumulate item2 (>=1, then >=3 for the tool craft) then item3 (>=5) for the chain
+// to finish. Recall the seed: stock(e,t) = 10 + 7e + 3t, so entity0 starts item0=510 (coin-seeded),
+// item1=13, item2=16, item3=19. r0 = {2*item0 + 1*item1} -> {1*item2}; r1 = {3*item2} -> {1*item3}.
+// We craft a batch of item2 (obj0), then craft item3 tools (obj1 + obj2 at >=5), interleaving txns/
+// trades/ticks so the stream exercises EVERY command tag. The chain completes across the run's ticks.
+inline std::vector<EconCommand> MakeShowcaseCommandStream() {
+    std::vector<EconCommand> s;
+    auto craft = [](uint32_t recipeId, uint32_t entity, uint32_t count) {
+        EconCommand c{}; c.tag = kCraftCmd; c.craft = CraftOrder{ recipeId, entity, count }; return c;
+    };
+    auto txn = [](Command cmd) { EconCommand c{}; c.tag = kTxnCmd;  c.txn   = cmd; return c; };
+    auto trade = [](TradeOrder o){ EconCommand c{}; c.tag = kTradeCmd; c.trade = o;   return c; };
+    auto tick = []() { EconCommand c{}; c.tag = kTickCmd; return c; };
+    auto nop  = []() { EconCommand c{}; c.tag = kNopCmd;  return c; };
+
+    // tick 0:  craft r0 x6 on entity0 (ore+fuel -> ingot): item2 16 -> 22; obj0 (>=1 item2) will complete.
+    s.push_back(craft(0, 0, 6));
+    // tick 1:  a ledger txn (mint 4 item1 onto entity0) — exercises kTxnCmd; obj0 already complete, obj1
+    //          activates this tick (prereq0 complete) but item3=19 already >= 1 so obj1 completes too.
+    s.push_back(txn(Command{ kAdd, 0, 0, 1, 4 }));
+    // tick 2:  craft r1 x6 on entity0 (3*item2 -> 1*item3): item2 22 -> 4 (6 crafts), item3 19 -> 25;
+    //          obj2 (>=5 item3) activates (prereq1 complete) — 25 >= 5 so it completes -> CHAIN DONE.
+    s.push_back(craft(1, 0, 6));
+    // tick 3:  a trade (e0 buys 3x item2 from e1 @12 = 36 coin) — exercises kTradeCmd.
+    s.push_back(trade(TradeOrder{ 0, 1, 2, 3 }));
+    // tick 4:  an economy tick — exercises kTickCmd (producers/consumers flow one step).
+    s.push_back(tick());
+    // tick 5:  a transfer txn (move 2 item0 from e0 -> e3).
+    s.push_back(txn(Command{ kTransfer, 0, 3, 0, 2 }));
+    // tick 6:  a no-op — exercises kNopCmd (the quest advance still runs, idempotent here).
+    s.push_back(nop());
+    // tick 7:  a second economy tick (the economy keeps evolving; quests already all complete).
+    s.push_back(tick());
+    return s;
+}
+
 }  // namespace hf::econ

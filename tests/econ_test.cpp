@@ -447,6 +447,187 @@ int main() {
               "econ-s4: RollRange is reproducible (same seed+index -> same value; a fixed roll sequence digests to a pinned uint64) and stays in [lo,hi]");
     }
 
+    // =================================================================================================
+    // ECON-S5 -- Quest state machine + lockstep/rollback/desync capstone (APPEND-ONLY below S4). HEADLINE.
+    // =================================================================================================
+    // The flagship headline: wrap the ENTIRE economy + a chained integer quest FSM in net::Session and
+    // PROVE the moat -- two peers fed only the command stream re-derive a BIT-IDENTICAL economy+quests
+    // (RunLockstep + DigestTrace), a mispredicted command ROLLS BACK to the authority state
+    // (RollbackSession over a ScriptedTransport), and a divergence is LOCATED at the exact tick
+    // (DesyncDetector). Pure-CPU INTEGER, reuses the net::* netcode machinery verbatim.
+
+    using hf::net::InputRing;
+    using hf::net::RunLockstep;
+    using hf::net::DigestTrace;
+    using hf::net::RollbackSession;
+    using hf::net::ScriptedTransport;
+    using hf::net::RunWithTransport;
+    using hf::net::DesyncDetector;
+    using hf::net::ChecksumPacket;
+    using hf::net::Schedule;
+    using hf::net::RecordLocal;
+    using hf::net::IngestRemote;
+
+    // The STATIC config captured by the step lambda: rules/recipes/graph (NOT snapshotted state).
+    const RecipeSet s5Recipes = MakeShowcaseRecipes();
+    const QuestGraph s5Graph  = MakeShowcaseQuests();
+    const EconRules  s5Rules  = MakeShowcaseRules(MakeShowcaseWorld(kEntities, kItems));
+
+    // The net::Session step: apply EVERY command this tick in array order, THEN AdvanceQuests ONCE (so the
+    // quest FSM stays lockstep-aligned -- one fixed-order pass per tick after the tick's economy commands).
+    auto step = [&](EconState& wst, const std::vector<EconCommand>& cmds, uint32_t /*tick*/) {
+        for (const EconCommand& c : cmds) ApplyEconCommand(wst, c, s5Rules, s5Recipes);
+        AdvanceQuests(wst.ledger, s5Graph, wst.quests);
+    };
+    auto econDigest = [&](const EconState& wst) { return DigestEconState(wst); };
+
+    // Build the per-tick input ring from the fixed command stream (one command per tick; T = length).
+    const std::vector<EconCommand> s5Stream = MakeShowcaseCommandStream();
+    const uint32_t T = static_cast<uint32_t>(s5Stream.size());
+    InputRing<EconCommand> s5Ring;
+    for (uint32_t t = 0; t < T; ++t) s5Ring.AddInput(t, s5Stream[t]);
+
+    // ---- PART A -- lockstep over net::Session (the determinism invariant). ----------------------------
+    {
+        // (1) LOCKSTEP INVARIANT: two independent DigestTrace runs from the same init+ring are EQUAL at
+        //     EVERY tick (two peers fed the same inputs re-derive the bit-identical economy+quests).
+        const std::vector<uint64_t> traceA = DigestTrace(MakeShowcaseState(), s5Ring, T, step, econDigest);
+        const std::vector<uint64_t> traceB = DigestTrace(MakeShowcaseState(), s5Ring, T, step, econDigest);
+        bool everyTickEqual = (traceA.size() == traceB.size());
+        for (std::size_t i = 0; i < traceA.size() && everyTickEqual; ++i)
+            if (traceA[i] != traceB[i]) everyTickEqual = false;
+        check(everyTickEqual,
+              "econ-s5: two peers from the same command stream have EQUAL DigestEconState at EVERY tick (lockstep invariant)");
+
+        // (2) PINNED FINAL: RunLockstep final econ-state digest == a hard-pinned uint64.
+        const uint64_t s5Lockstep = RunLockstep(MakeShowcaseState(), s5Ring, T, step, econDigest);
+        std::printf("econ-s5: lockstep final econ-state digest = 0x%016llx  (T=%u ticks)\n",
+                    static_cast<unsigned long long>(s5Lockstep), T);
+        const uint64_t kPinnedS5Lockstep = 0xf27b85103a413a43ull;  // PINNED on first run (MSVC == clang)
+        check(s5Lockstep == kPinnedS5Lockstep,
+              "econ-s5: net::RunLockstep final digest == pinned uint64 (two peers re-derive the bit-identical economy+quests)");
+
+        // (3) QUEST COMPLETION: advance a Session manually to the end + assert every status == kComplete.
+        EconState wq5 = MakeShowcaseState();
+        for (uint32_t t = 0; t < T; ++t) step(wq5, s5Ring.At(t), t);
+        bool allComplete = !wq5.quests.status.empty();
+        for (const uint8_t st : wq5.quests.status)
+            if (st != static_cast<uint8_t>(kComplete)) allComplete = false;
+        check(allComplete && wq5.quests.status.size() == 3,
+              "econ-s5: the quest chain COMPLETES deterministically (final QuestState == all kComplete, pinned 3 objectives)");
+    }
+
+    // ---- PART B -- rollback correctness (the GGPO proof for gameplay state). --------------------------
+    // Model two peers: local[t] is THIS peer's per-tick command, remote[t] is the OTHER peer's. The TRUE
+    // per-tick input is {local[t], remote[t]} (the step applies both in array order). The authority is a
+    // RunLockstep over the true combined inputs; the rollback session must converge to it under an
+    // adversarial transport that DELAYS a remote command past its origin tick (forcing a mispredict).
+    {
+        // local[t] = the showcase stream (the economy-driving commands). remote[t] = a SECONDARY stream
+        // of cheap txns (mint 1 item1 onto entity1 each tick) so the combined authority is well-defined.
+        std::vector<EconCommand> local = s5Stream;
+        std::vector<EconCommand> remote(T);
+        for (uint32_t t = 0; t < T; ++t) {
+            EconCommand c{}; c.tag = kTxnCmd; c.txn = Command{ kAdd, 0, 1, 1, 1 };  // mint 1 item1 -> entity1
+            remote[t] = c;
+        }
+        // Make the DELAYED remote command (tick 3) GENUINELY DIFFERENT from the prediction so the mispredict
+        // is real: a bigger mint. Prediction = lastConfirmed (remote[2], the +1 mint) -> differs -> rollback.
+        remote[3] = EconCommand{}; remote[3].tag = kTxnCmd; remote[3].txn = Command{ kAdd, 0, 1, 1, 7 };
+
+        // AUTHORITY: RunLockstep over the TRUE combined per-tick inputs {local[t], remote[t]}.
+        InputRing<EconCommand> authRing;
+        for (uint32_t t = 0; t < T; ++t) {
+            authRing.AddInput(t, local[t]);   // local first (the step applies array order: local then remote)
+            authRing.AddInput(t, remote[t]);
+        }
+        const uint64_t authority = RunLockstep(MakeShowcaseState(), authRing, T, step, econDigest);
+        std::printf("econ-s5: rollback authority digest = 0x%016llx\n",
+                    static_cast<unsigned long long>(authority));
+
+        // ROLLBACK SESSION via the scripted transport. Every remote[t] is delivered ON TIME at tick t,
+        // EXCEPT remote[3] which is DELAYED to deliver at tick 5 (>3) -- so ticks 3..4 are simulated with a
+        // PREDICTION (lastConfirmed = remote[2], the +1 mint), and when remote[3] (the +7 mint) finally
+        // arrives at tick 5 it mispredicts tick 3 -> a genuine ROLLBACK fires + re-sims 3..current.
+        ScriptedTransport<EconCommand> tx;
+        for (uint32_t t = 0; t < T; ++t) {
+            if (t == 3) Schedule(tx, /*deliverTick=*/5, /*forTick=*/3, remote[3]);  // DELAYED past its origin
+            else        Schedule(tx, /*deliverTick=*/t, /*forTick=*/t, remote[t]);  // on-time
+        }
+        RollbackSession<EconState, EconCommand> rb;
+        rb.world = MakeShowcaseState();
+        RunWithTransport(rb, local, tx, T, step);
+        const uint64_t rollbackDigest = DigestEconState(rb.world);
+        std::printf("econ-s5: rollback final digest = 0x%016llx, didRollback = %d\n",
+                    static_cast<unsigned long long>(rollbackDigest), rb.didRollback ? 1 : 0);
+
+        // (4) ROLLBACK == AUTHORITY (== a pinned uint64): the mispredicted command rolled back to the
+        //     BIT-IDENTICAL authority economy+quest state.
+        const uint64_t kPinnedS5Authority = 0x687feef8556f9949ull;  // PINNED on first run (MSVC == clang)
+        check(rollbackDigest == authority && authority == kPinnedS5Authority,
+              "econ-s5: a mispredicted command rolls back to the BIT-IDENTICAL authority economy+quest state (== pinned uint64)");
+
+        // (5) DIDROLLBACK: a real misprediction fired.
+        check(rb.didRollback,
+              "econ-s5: rollback actually fired (didRollback == true)");
+
+        // (6) ADVERSARIAL CONVERGENCE: a HEAVIER delay/reorder schedule still converges to the SAME pinned
+        //     authority digest (the NS4 proof applied to gameplay state). Delay remote[3] to tick 6 AND
+        //     remote[1] to tick 4 (reorder), confirm they still both mispredict + converge.
+        ScriptedTransport<EconCommand> tx2;
+        for (uint32_t t = 0; t < T; ++t) {
+            if (t == 3)      Schedule(tx2, /*deliverTick=*/6, /*forTick=*/3, remote[3]);  // delayed further
+            else if (t == 1) Schedule(tx2, /*deliverTick=*/4, /*forTick=*/1, remote[1]);  // delayed + reordered
+            else             Schedule(tx2, /*deliverTick=*/t, /*forTick=*/t, remote[t]);
+        }
+        RollbackSession<EconState, EconCommand> rb2;
+        rb2.world = MakeShowcaseState();
+        RunWithTransport(rb2, local, tx2, T, step);
+        check(DigestEconState(rb2.world) == authority && rb2.didRollback,
+              "econ-s5: the adversarial (delayed/reordered) schedule converges to the SAME pinned authority digest");
+    }
+
+    // ---- PART C -- desync localization (the NS5 detector over gameplay state). ------------------------
+    // Two command streams identical except tick K's command differs -> traces match for t<K, diverge at K;
+    // DesyncDetector latches the exact tick.
+    {
+        const uint32_t K = 4;  // PINNED: the tick whose command is mutated to inject the desync
+        // streamA = the showcase stream; streamB = identical except tick K's command differs (a craft vs
+        // its original tick-4 economy-tick -> a real ledger divergence at tick K, none before).
+        InputRing<EconCommand> ringA = s5Ring;
+        InputRing<EconCommand> ringB;
+        std::vector<EconCommand> streamB = s5Stream;
+        { EconCommand c{}; c.tag = kCraftCmd; c.craft = CraftOrder{ 0, 0, 1 }; streamB[K] = c; }  // differ @K
+        for (uint32_t t = 0; t < T; ++t) ringB.AddInput(t, streamB[t]);
+
+        const std::vector<uint64_t> traceA  = DigestTrace(MakeShowcaseState(), ringA, T, step, econDigest);
+        const std::vector<uint64_t> traceA2 = DigestTrace(MakeShowcaseState(), ringA, T, step, econDigest);
+        const std::vector<uint64_t> traceB  = DigestTrace(MakeShowcaseState(), ringB, T, step, econDigest);
+
+        // (7) CLEAN: DesyncDetector over (traceA vs traceA) reports NO desync.
+        {
+            DesyncDetector d;
+            for (uint32_t t = 0; t < T; ++t) RecordLocal(d, t, traceA[t]);
+            for (uint32_t t = 0; t < T; ++t) IngestRemote(d, ChecksumPacket{ t, traceA2[t] });
+            check(!d.desynced,
+                  "econ-s5: identical command streams report NO desync (clean)");
+        }
+
+        // (8) LOCATED: traceA vs traceB (tick K changed) -> d.desynced && d.desyncTick == K, traces equal
+        //     for t < K. Pin K.
+        {
+            bool equalBeforeK = true;
+            for (uint32_t t = 0; t < K; ++t) if (traceA[t] != traceB[t]) equalBeforeK = false;
+            DesyncDetector d;
+            for (uint32_t t = 0; t < T; ++t) RecordLocal(d, t, traceA[t]);
+            for (uint32_t t = 0; t < T; ++t) IngestRemote(d, ChecksumPacket{ t, traceB[t] });
+            std::printf("econ-s5: desync injected at tick K=%u, detector latched tick=%u\n",
+                        K, d.desyncTick);
+            check(d.desynced && d.desyncTick == K && equalBeforeK,
+                  "econ-s5: a one-command divergence is LOCATED at the exact tick K (net::DesyncDetector), traces match for t<K");
+        }
+    }
+
     if (g_fail == 0) { std::printf("econ_test: ALL PASS\n"); return 0; }
     std::printf("econ_test: %d FAIL\n", g_fail);
     return 1;
