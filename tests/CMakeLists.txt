@@ -191,6 +191,18 @@ hf_add_pure_test(profiler_view_test)
 # load-bearing), an exact linear midpoint, and the clamp-low/clamp-high holds. The golden is the pinned
 # hash IN the test (NO image, NO render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(seq_test)
+# Cinematic-sequencer TIMELINE VIEW + EDIT data models (issue #25, the GUI half of the Cinematic
+# Sequencer): engine/editor/seq_editor_data.h lays a hf::seq::Sequence out as a timeline — one horizontal
+# TRACK LANE per ScalarTrack on a shared time axis, KEYFRAME markers (time->X, value->Y) as positioned
+# diamonds, the bit-exact SampleScalar interpolation as a per-track polyline (curveSteps+1 vertices), and a
+# PLAYHEAD. A pure, ImGui-free, backend-free VIEW whose hand-LE FNV-1a-64 DigestSeqTimelineView is bit-
+# identical run-to-run AND MSVC-vs-Apple-clang (every coordinate is a pure-INTEGER map of the Q16.16 runtime
+# — no float on the layout path). engine/editor/seq_edit_ops.h adds AddKeyframe/MoveKeyframe/DeleteKeyframe
+# preserving the strictly-ascending-times invariant. Asserts the lane count == track count, the keyframe +
+# curve-point counts, the pinned view digest, replay-stability, and that an AddKeyframe edit changes the
+# digest deterministically. The golden is the pinned hash IN the test (NO image, NO render-bake). Pure CPU
+# (hf_core), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(seq_editor_test)
 # SELF-CONTAINED, CLEAN-ROOM Draco mesh decoder substrate (Slice DRACO-DR1, issue #36 — load
 # KHR_draco_mesh_compression glTF): engine/asset/draco_decode.h — a header-only, SELF-CONTAINED (only
 # <cstddef>/<cstdint>/<vector> + net/session.h) bitstream substrate: a bounds-checked little-endian byte

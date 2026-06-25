@@ -1240,6 +1240,10 @@ add_executable(visual_test
     ${HF_ROOT}/engine/editor/editor_panels.cpp
     ${HF_ROOT}/engine/editor/flow_editor_panels.cpp
     ${HF_ROOT}/engine/editor/profiler_view_panels.cpp
+    # Issue #25: the cinematic-sequencer timeline editor panels (ImGui over the pure SeqTimelineView).
+    # MUST be listed here so the Metal --seq-editor-shot link resolves BuildSeqEditorUI (the #31 link-gap
+    # lesson — a panel .cpp wired only into the Vulkan editor lib breaks the Metal headless link).
+    ${HF_ROOT}/engine/editor/seq_editor_panels.cpp
     ${HF_ROOT}/engine/editor/imgui_renderer.cpp
     ${HF_ROOT}/third_party/imgui/imgui.cpp
     ${HF_ROOT}/third_party/imgui/imgui_draw.cpp

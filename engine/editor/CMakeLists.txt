@@ -27,6 +27,7 @@ add_library(hf_editor STATIC
   editor_panels.cpp
   flow_editor_panels.cpp
   profiler_view_panels.cpp
+  seq_editor_panels.cpp
 )
 target_link_libraries(hf_editor PUBLIC hf_engine hf_imgui)
 target_include_directories(hf_editor PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
