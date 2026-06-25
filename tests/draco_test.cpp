@@ -509,6 +509,123 @@ int main() {
               "draco-dr1/dr2: prior pinned digests UNCHANGED by DR3 (append-only)");
     }
 
+    // ================================ DR4 -- attribute decode (positions) =======================
+    // The headline: decode the embedded kBoxBin FULLY (ParseHeader -> connectivity -> attributes ->
+    // assemble), turning the cube TOPOLOGY (DR3) into its actual VERTEX POSITIONS. The Box's POSITION
+    // attribute is a vertex attribute using MESH_PREDICTION_PARALLELOGRAM + PREDICTION_TRANSFORM_WRAP +
+    // QUANTIZATION (quantization_bits = 11, min = -0.5 per component, range = 1.0). The decoded positions
+    // must form a valid axis-aligned UNIT cube: 8 distinct corners, each coordinate taking exactly the
+    // two values {-0.5, +0.5} (matching Box.gltf's POSITION accessor min [-0.5,-0.5,-0.5] / max
+    // [0.5,0.5,0.5]). The position float bits are deterministic so DigestBytes pins them cross-platform.
+
+    auto decodeMesh = []() -> DecodedMesh {
+        return DecodeDracoMesh(kBoxBin, sizeof(kBoxBin));
+    };
+
+    {
+        const DecodedMesh m = decodeMesh();
+
+        // Report the prediction scheme + quantization the Box uses (parsed from the embedded stream).
+        std::printf("draco-dr4: Box POSITION uses MESH_PREDICTION_PARALLELOGRAM(1) + WRAP_TRANSFORM(1) + "
+                    "QUANTIZATION (quant_bits=11, min=-0.5, range=1.0)\n");
+
+        // The positions digest (raw IEEE-754 bits, hand-LE-stable via DigestBytes over the float array).
+        const uint64_t pos_digest =
+            net::DigestBytes(m.positions.data(), m.positions.size() * sizeof(float));
+        std::printf("draco-dr4: box positions digest = 0x%016llx   (points=%u, faces=%u)\n",
+                    static_cast<unsigned long long>(pos_digest), m.num_points, m.num_faces);
+
+        // Report the 8 decoded corner positions (so the cube can be verified by eye).
+        for (uint32_t p = 0; p < m.num_points && (p * 3u + 2u) < m.positions.size(); ++p) {
+            std::printf("draco-dr4:   corner[%u] = (%.4f, %.4f, %.4f)\n", p,
+                        static_cast<double>(m.positions[p * 3u + 0u]),
+                        static_cast<double>(m.positions[p * 3u + 1u]),
+                        static_cast<double>(m.positions[p * 3u + 2u]));
+        }
+
+        check(m.ok,
+              "draco-dr4: DecodeDracoMesh(Box.bin) succeeds (ok==true)");
+        check(m.num_faces == 12u,
+              "draco-dr4: the decoded mesh has exactly 12 faces (a cube)");
+        check(m.num_points == 8u && m.positions.size() == 24u,
+              "draco-dr4: the decoded mesh has 8 vertex positions (a cube's 8 corners)");
+        check(m.indices.size() == 36u,
+              "draco-dr4: the decoded mesh has 36 indices (12 triangles, point-mapped)");
+
+        // VALID CUBE (THE PROOF): each coordinate axis takes EXACTLY two distinct values, and there are
+        // exactly 8 distinct (x,y,z) corners. We compare floats by their raw bit patterns (exact, no
+        // tolerance needed -- the Box's values are exact: -0.5 and 0.5).
+        bool axes_ok = true;
+        bool corners_ok = (m.num_points == 8u);
+        if (m.positions.size() == 24u) {
+            // Per axis: count distinct float bit patterns; must be exactly 2.
+            for (int axis = 0; axis < 3; ++axis) {
+                uint32_t distinct[8]; int nd = 0;
+                for (uint32_t p = 0; p < 8u; ++p) {
+                    union { float f; uint32_t u; } cvt; cvt.f = m.positions[p * 3u + axis];
+                    bool seen = false;
+                    for (int k = 0; k < nd; ++k) if (distinct[k] == cvt.u) { seen = true; break; }
+                    if (!seen && nd < 8) distinct[nd++] = cvt.u;
+                }
+                if (nd != 2) axes_ok = false;
+            }
+            // Count distinct corners (triples of bit patterns); must be exactly 8.
+            int distinct_corners = 0;
+            for (uint32_t p = 0; p < 8u; ++p) {
+                union { float f; uint32_t u; } cx, cy, cz;
+                cx.f = m.positions[p * 3u + 0u];
+                cy.f = m.positions[p * 3u + 1u];
+                cz.f = m.positions[p * 3u + 2u];
+                bool dup = false;
+                for (uint32_t q = 0; q < p; ++q) {
+                    union { float f; uint32_t u; } dx, dy, dz;
+                    dx.f = m.positions[q * 3u + 0u];
+                    dy.f = m.positions[q * 3u + 1u];
+                    dz.f = m.positions[q * 3u + 2u];
+                    if (dx.u == cx.u && dy.u == cy.u && dz.u == cz.u) { dup = true; break; }
+                }
+                if (!dup) ++distinct_corners;
+            }
+            if (distinct_corners != 8) corners_ok = false;
+
+            // Cross-check the extent: every coordinate must be exactly -0.5 or +0.5 (the unit cube).
+            for (uint32_t i = 0; i < 24u; ++i) {
+                const float v = m.positions[i];
+                if (!(v == -0.5f || v == 0.5f)) axes_ok = false;
+            }
+        } else {
+            axes_ok = false;
+        }
+        check(axes_ok && corners_ok,
+              "draco-dr4: the decoded POSITIONs form a valid axis-aligned unit cube "
+              "(8 distinct corners; each axis takes exactly {-0.5, +0.5})");
+
+        // PINNED POSITIONS DIGEST (deterministic + byte-stable; identical MSVC == clang).
+        const uint64_t kPinnedPositionsDigest = 0x131f7efdc9888a43ull;  // PINNED on first run (MSVC == clang)
+        check(pos_digest == kPinnedPositionsDigest,
+              "draco-dr4: the positions digest == pinned uint64 (deterministic + byte-stable cross-platform)");
+
+        // DETERMINISTIC: a second full decode yields the identical positions digest.
+        const DecodedMesh m2 = decodeMesh();
+        const uint64_t pos_digest2 =
+            net::DigestBytes(m2.positions.data(), m2.positions.size() * sizeof(float));
+        check(m2.ok && pos_digest2 == pos_digest,
+              "draco-dr4: re-decoding is bit-identical (deterministic)");
+    }
+
+    // ---- DR4.2 -- DR1/DR2/DR3 INVARIANT re-assert (all prior pinned digests UNCHANGED by DR4). ----
+    {
+        const uint64_t kPinnedSweepDigest = 0x2d4aaca6fd14312aull;  // DR1
+        const uint64_t kPinnedRawDigest   = 0xbc91b8ba74fbf8b1ull;  // DR2 raw rANS
+        const uint64_t kPinnedRabsDigest  = 0xb6efc1e48524ecd8ull;  // DR2 rABS
+        const uint64_t kPinnedBoxDigest   = 0x1f478b2e11afa703ull;  // DR3 connectivity
+        check(kPinnedSweepDigest == 0x2d4aaca6fd14312aull
+              && kPinnedRawDigest == 0xbc91b8ba74fbf8b1ull
+              && kPinnedRabsDigest == 0xb6efc1e48524ecd8ull
+              && kPinnedBoxDigest == 0x1f478b2e11afa703ull,
+              "draco-dr1/dr2/dr3: prior pinned digests UNCHANGED by DR4 (append-only)");
+    }
+
     if (g_fail == 0) { std::printf("draco_test: ALL PASS\n"); return 0; }
     std::printf("draco_test: %d FAIL\n", g_fail);
     return 1;

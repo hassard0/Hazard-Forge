@@ -1092,4 +1092,458 @@ inline Connectivity DecodeConnectivity(ByteReader& r, const DracoHeader& h) {
     return Connectivity{};
 }
 
+// ================================ DR4 -- attribute decode (positions) ============================
+// APPEND-ONLY: nothing above this line is touched. DR1's varint digest 0x2d4aaca6fd14312a, DR2's rANS
+// (0xbc91b8ba74fbf8b1) / rABS (0xb6efc1e48524ecd8), and DR3's connectivity (0x1f478b2e11afa703) stay
+// frozen. DR4 turns the DR3 cube TOPOLOGY into the cube's actual VERTEX POSITIONS: it parses the
+// attribute-decoder metadata, walks the corner table to order the encoded attribute values
+// (EdgeBreakerTraverser_ProcessCorner), decodes the quantized integer POSITION residuals through the DR2
+// rANS, runs the PARALLELOGRAM prediction + WRAP transform to reconstruct the integer values, and
+// dequantizes them (the ONE float step). Implemented spec-driven, clean-room, from the published Draco
+// spec (attributes.decoder.md, sequential.decoder.md, sequential.integer.attribute.decoder.md,
+// sequential.quantization.attribute.decoder.md, prediction.decoder.md, prediction.parallelogram.decoder.md,
+// prediction.wrap.transform.md, edgebreaker.traversal.md, boundary.decoder.md, corner.md,
+// variable.descriptions.md). We implement from the SPEC pseudocode; we do NOT copy any draco source.
+//
+// SCOPE: the Box (and the overwhelmingly common glTF case) has ONE vertex POSITION attribute decoder
+// (decoder 0: MESH_VERTEX_ATTRIBUTE, SEQUENTIAL_ATTRIBUTE_ENCODER_QUANTIZATION, MESH_PREDICTION_PARALLELOGRAM
+// + PREDICTION_TRANSFORM_WRAP). POSITION is the headline and is fully decoded. Additional decoders
+// (e.g. a MESH_CORNER_ATTRIBUTE NORMAL with attribute seams) are parsed but their values are decoded
+// best-effort; the position decode never depends on them. Every read is bounds-checked: a malformed or
+// unsupported stream sets ok=false and never reads out of range / never crashes.
+
+// ---- DR4 constants (variable.descriptions.md -- FROZEN) -----------------------------------------
+constexpr uint8_t  kSeqAttEncGeneric      = 0;   // SEQUENTIAL_ATTRIBUTE_ENCODER_GENERIC
+constexpr uint8_t  kSeqAttEncInteger      = 1;   // SEQUENTIAL_ATTRIBUTE_ENCODER_INTEGER
+constexpr uint8_t  kSeqAttEncQuantization = 2;   // SEQUENTIAL_ATTRIBUTE_ENCODER_QUANTIZATION
+constexpr uint8_t  kSeqAttEncNormals      = 3;   // SEQUENTIAL_ATTRIBUTE_ENCODER_NORMALS
+
+constexpr uint8_t  kMeshVertexAttribute = 0;     // att_dec_decoder_type MESH_VERTEX_ATTRIBUTE
+constexpr uint8_t  kMeshCornerAttribute = 1;     // att_dec_decoder_type MESH_CORNER_ATTRIBUTE
+
+constexpr uint8_t  kMeshTraversalDepthFirst       = 0;  // MESH_TRAVERSAL_DEPTH_FIRST
+constexpr uint8_t  kMeshTraversalPredictionDegree = 1;  // MESH_TRAVERSAL_PREDICTION_DEGREE
+
+constexpr int8_t   kPredictionNone           = -2;  // PREDICTION_NONE
+constexpr int8_t   kPredictionDifference     = 0;   // PREDICTION_DIFFERENCE
+constexpr int8_t   kMeshPredParallelogram    = 1;   // MESH_PREDICTION_PARALLELOGRAM
+constexpr int8_t   kMeshPredConstrainedMulti = 4;   // MESH_PREDICTION_CONSTRAINED_MULTI_PARALLELOGRAM
+
+constexpr int8_t   kPredTransformWrap   = 1;   // PREDICTION_TRANSFORM_WRAP
+constexpr int8_t   kPredTransformNormal = 3;   // PREDICTION_TRANSFORM_NORMAL_OCTAHEDRON_CANONICALIZED
+
+constexpr uint8_t  kAttPosition = 0;   // att_dec_att_type GeometryAttribute::POSITION
+constexpr uint8_t  kAttNormal   = 1;   // att_dec_att_type GeometryAttribute::NORMAL
+
+// ---- Per-attribute parsed metadata (attributes.decoder.md ParseAttributeDecodersData) -----------
+struct DracoAttribute {
+    uint8_t  att_type = 0;        // POSITION / NORMAL / ...
+    uint8_t  data_type = 0;       // DT_* (9 == DT_FLOAT32 for the Box)
+    uint8_t  num_components = 0;  // 3 for a position
+    uint8_t  normalized = 0;
+    uint32_t unique_id = 0;
+    uint8_t  seq_att_dec_decoder_type = 0;  // SEQUENTIAL_ATTRIBUTE_ENCODER_*
+};
+
+struct DracoAttributeDecoder {
+    uint8_t data_id = 0;
+    uint8_t decoder_type = 0;     // MESH_VERTEX_ATTRIBUTE / MESH_CORNER_ATTRIBUTE
+    uint8_t traversal_method = 0; // MESH_TRAVERSAL_DEPTH_FIRST / ...
+    std::vector<DracoAttribute> attributes;
+};
+
+// ---- ParseAttributeDecodersData (attributes.decoder.md, exact) ----------------------------------
+// `r` is positioned just past the connectivity data. For MESH_EDGEBREAKER each decoder carries
+// data_id/decoder_type/traversal_method; then per decoder the attribute count + per-attribute
+// type/data_type/num_components/normalized/unique_id; then the per-attribute seq decoder types.
+inline bool ParseAttributeDecodersData(ByteReader& r, uint8_t encoder_method,
+                                       std::vector<DracoAttributeDecoder>& out) {
+    const uint32_t num_decoders = r.U8();
+    if (r.error) return false;
+    out.assign(num_decoders, DracoAttributeDecoder{});
+    if (encoder_method == kMeshEdgebreaker) {
+        for (uint32_t i = 0; i < num_decoders; ++i) {
+            out[i].data_id          = r.U8();
+            out[i].decoder_type     = r.U8();
+            out[i].traversal_method = r.U8();
+        }
+    }
+    for (uint32_t i = 0; i < num_decoders; ++i) {
+        const uint32_t na = r.VarU32();
+        if (r.error) return false;
+        out[i].attributes.assign(na, DracoAttribute{});
+        for (uint32_t j = 0; j < na; ++j) {
+            out[i].attributes[j].att_type       = r.U8();
+            out[i].attributes[j].data_type      = r.U8();
+            out[i].attributes[j].num_components  = r.U8();
+            out[i].attributes[j].normalized      = r.U8();
+            out[i].attributes[j].unique_id       = r.VarU32();
+        }
+        for (uint32_t j = 0; j < na; ++j) {
+            out[i].attributes[j].seq_att_dec_decoder_type = r.U8();
+        }
+    }
+    return !r.error;
+}
+
+// ---- ConvertSymbolToSignedInt (sequential.integer.attribute.decoder.md, exact) ------------------
+// is_positive = !(val & 1); val >>= 1; positive -> val ; else -val - 1.
+inline int32_t ConvertSymbolToSignedInt(uint32_t val) {
+    const bool is_positive = (val & 1u) == 0u;
+    val >>= 1;
+    if (is_positive) return static_cast<int32_t>(val);
+    return -static_cast<int32_t>(val) - 1;
+}
+
+// ---- The position-attribute traversal + integer reconstruction (the DR4 core) -------------------
+// All maps live in this transient struct, built ONLY for curr_att_dec=0 (the vertex POSITION). The
+// corner-table data (face_to_vertex, opposite_corners_, vertex_corners_) comes from the DR3
+// EdgebreakerDecoder, which we re-run with its state retained (see DecodeDracoMesh).
+struct PositionDecodeState {
+    const EdgebreakerDecoder* d = nullptr;
+    uint32_t num_vertices = 0;   // num_encoded_vertices + num_encoded_split_symbols
+    uint32_t num_faces = 0;
+
+    // GenerateSequence outputs (attributes.decoder.md / edgebreaker.traversal.md).
+    std::vector<int> encoded_value_index_to_corner_map;       // push order during the walk
+    std::vector<int> vertex_to_encoded_attribute_value_index; // [num_vertices] -> encoded index
+    std::vector<uint8_t> is_face_visited;
+    std::vector<uint8_t> is_vertex_visited;
+    int vertex_visited_point_ids = 0;
+    std::vector<int> corner_traversal_stack;
+    bool ok = true;
+
+    // ---- corner helpers (corner.md, position attribute att_dec=0) ----
+    bool FaceVisited(int face) const {
+        if (face < 0) return true;
+        if (static_cast<std::size_t>(face) >= is_face_visited.size()) return true;
+        return is_face_visited[face] != 0u;
+    }
+    int PosOpp(int c) const { return d->PosOpposite(c); }
+    int GetLeftCorner(int c) const {
+        if (c < 0) return kInvalidCornerIndex;
+        return PosOpp(EdgebreakerDecoder::Previous(c));
+    }
+    int GetRightCorner(int c) const {
+        if (c < 0) return kInvalidCornerIndex;
+        return PosOpp(EdgebreakerDecoder::Next(c));
+    }
+    int CornerToVert0(int c) const { return d->CornerToVert(0, c); }
+
+    // IsOnPositionBoundary(vert) (boundary.decoder.md): a hole vertex (no representative corner) is a
+    // boundary; otherwise (no decoder-0 attribute seams in the supported case) it is interior.
+    bool IsOnPositionBoundary(int v) const {
+        if (v < 0) return true;
+        if (static_cast<std::size_t>(v) >= d->vertex_corners_.size()) return true;
+        return d->vertex_corners_[v] < 0;
+    }
+
+    // OnNewVertexVisited (edgebreaker.traversal.md).
+    void OnNewVertexVisited(int vert, int corner) {
+        if (vert < 0 || static_cast<std::size_t>(vert) >= vertex_to_encoded_attribute_value_index.size()) {
+            ok = false; return;
+        }
+        encoded_value_index_to_corner_map.push_back(corner);
+        vertex_to_encoded_attribute_value_index[vert] = vertex_visited_point_ids;
+        ++vertex_visited_point_ids;
+    }
+
+    // EdgeBreakerTraverser_ProcessCorner (edgebreaker.traversal.md, DEPTH_FIRST, exact).
+    void ProcessCorner(int corner_id) {
+        int face = corner_id / 3;
+        if (FaceVisited(face)) return;
+        corner_traversal_stack.push_back(corner_id);
+        if (static_cast<std::size_t>(face) >= d->face_to_vertex[0].size()) { ok = false; return; }
+        const int next_vert = d->face_to_vertex[1][face];
+        const int prev_vert = d->face_to_vertex[2][face];
+        if (next_vert >= 0 && static_cast<std::size_t>(next_vert) < is_vertex_visited.size()
+            && !is_vertex_visited[next_vert]) {
+            is_vertex_visited[next_vert] = 1u;
+            OnNewVertexVisited(next_vert, EdgebreakerDecoder::Next(corner_id));
+        }
+        if (prev_vert >= 0 && static_cast<std::size_t>(prev_vert) < is_vertex_visited.size()
+            && !is_vertex_visited[prev_vert]) {
+            is_vertex_visited[prev_vert] = 1u;
+            OnNewVertexVisited(prev_vert, EdgebreakerDecoder::Previous(corner_id));
+        }
+        int guard = 0;
+        while (!corner_traversal_stack.empty()) {
+            corner_id = corner_traversal_stack.back();
+            int face_id = corner_id / 3;
+            if (corner_id < 0 || FaceVisited(face_id)) {
+                corner_traversal_stack.pop_back();
+                continue;
+            }
+            while (true) {
+                face_id = corner_id / 3;
+                if (face_id < 0 || static_cast<std::size_t>(face_id) >= is_face_visited.size()) { ok = false; return; }
+                is_face_visited[face_id] = 1u;
+                const int vert_id = CornerToVert0(corner_id);
+                if (vert_id >= 0 && static_cast<std::size_t>(vert_id) < is_vertex_visited.size()
+                    && !is_vertex_visited[vert_id]) {
+                    const bool on_boundary = IsOnPositionBoundary(vert_id);
+                    is_vertex_visited[vert_id] = 1u;
+                    OnNewVertexVisited(vert_id, corner_id);
+                    if (!ok) return;
+                    if (!on_boundary) {
+                        corner_id = GetRightCorner(corner_id);
+                        if (++guard > 100000000) { ok = false; return; }
+                        continue;
+                    }
+                }
+                const int right_corner_id = GetRightCorner(corner_id);
+                const int left_corner_id  = GetLeftCorner(corner_id);
+                const int right_face_id = right_corner_id < 0 ? -1 : right_corner_id / 3;
+                const int left_face_id  = left_corner_id  < 0 ? -1 : left_corner_id  / 3;
+                if (FaceVisited(right_face_id)) {
+                    if (FaceVisited(left_face_id)) {
+                        corner_traversal_stack.pop_back();
+                        break;
+                    } else {
+                        corner_id = left_corner_id;
+                    }
+                } else {
+                    if (FaceVisited(left_face_id)) {
+                        corner_id = right_corner_id;
+                    } else {
+                        corner_traversal_stack.back() = left_corner_id;
+                        corner_traversal_stack.push_back(right_corner_id);
+                        break;
+                    }
+                }
+                if (++guard > 100000000) { ok = false; return; }
+            }
+        }
+    }
+
+    // GenerateSequence (DEPTH_FIRST): EdgeBreakerTraverser_ProcessCorner over every 3*i.
+    void GenerateSequence() {
+        is_face_visited.assign(num_faces, 0u);
+        is_vertex_visited.assign(num_vertices, 0u);
+        vertex_to_encoded_attribute_value_index.assign(num_vertices, -1);
+        encoded_value_index_to_corner_map.clear();
+        vertex_visited_point_ids = 0;
+        corner_traversal_stack.clear();
+        for (uint32_t i = 0; i < num_faces; ++i) {
+            ProcessCorner(3 * static_cast<int>(i));
+            if (!ok) return;
+        }
+    }
+};
+
+// ---- The decoded mesh + the full decode entry ---------------------------------------------------
+struct DecodedMesh {
+    uint32_t num_faces = 0, num_points = 0;
+    std::vector<float>    positions;   // num_points * 3 (the dequantized cube corners)
+    std::vector<float>    normals;     // num_points * 3 (if present; best-effort)
+    std::vector<uint32_t> indices;     // num_faces * 3 (from DR3 face_to_vertex, point-mapped)
+    bool ok = false;
+};
+
+// Re-run the DR3 edgebreaker decode but RETAIN the full corner-table state (DR4 needs vertex_corners_,
+// opposite_corners_, face_to_vertex). This duplicates DecodeEdgebreakerConnectivityData's body but does
+// NOT modify it (append-only). On success the returned decoder's face_to_vertex[k] hold the topology.
+inline bool DecodeEdgebreakerFull(ByteReader& r, EdgebreakerDecoder& d) {
+    ParseEdgebreakerConnectivityData(r, d);
+    if (!d.ok) return false;
+    DecodeTopologySplitEvents(r, d);
+    if (!d.ok) return false;
+    EdgebreakerTraversalStart(r, d);
+    if (!d.ok) return false;
+    d.DecodeEdgeBreakerConnectivity();
+    if (!d.ok) return false;
+    return static_cast<uint32_t>(d.face_to_vertex[0].size()) == d.num_faces;
+}
+
+// DecodeDracoMesh: ParseHeader (DR1) -> DecodeEdgebreaker connectivity with retained state (DR3) ->
+// DecodeAttributeData for the POSITION (DR4) -> assemble positions + indices. Returns ok=false (never
+// crashes) on any malformed / unsupported input. Only MESH_EDGEBREAKER with a vertex POSITION attribute
+// using PARALLELOGRAM + WRAP + QUANTIZATION is fully supported (the Box / common glTF case).
+inline DecodedMesh DecodeDracoMesh(const uint8_t* bytes, std::size_t n) {
+    DecodedMesh mesh;
+    ByteReader r{ bytes, n, 0, false };
+    const DracoHeader h = ParseHeader(r);
+    if (!h.valid || h.encoderMethod != kMeshEbEncoding) return mesh;
+
+    EdgebreakerDecoder d;
+    if (!DecodeEdgebreakerFull(r, d)) return mesh;
+
+    const uint32_t num_vertices = d.num_encoded_vertices + d.num_encoded_split_symbols;
+    const uint32_t num_faces = static_cast<uint32_t>(d.face_to_vertex[0].size());
+
+    // ---- ParseAttributeDecodersData ----
+    std::vector<DracoAttributeDecoder> decoders;
+    if (!ParseAttributeDecodersData(r, h.encoderMethod, decoders)) return mesh;
+    if (decoders.empty() || decoders[0].attributes.empty()) return mesh;
+
+    // We support a vertex POSITION decoder as decoder 0 (the Box layout). Anything else -> ok=false.
+    const DracoAttributeDecoder& dec0 = decoders[0];
+    const DracoAttribute& att0 = dec0.attributes[0];
+    if (dec0.decoder_type != kMeshVertexAttribute) return mesh;
+    if (att0.att_type != kAttPosition) return mesh;
+    if (att0.num_components == 0) return mesh;
+    if (dec0.traversal_method != kMeshTraversalDepthFirst) return mesh;
+    if (att0.seq_att_dec_decoder_type != kSeqAttEncQuantization) return mesh;
+    const uint32_t num_components = att0.num_components;
+
+    // ---- GenerateSequence for the POSITION (curr_att_dec = 0) ----
+    // (DecodeAttributeSeams / RecomputeVerticesInternal apply to non-position decoders only; for the
+    //  vertex POSITION the per-vertex map below is the full mapping.)
+    PositionDecodeState ps;
+    ps.d = &d;
+    ps.num_vertices = num_vertices;
+    ps.num_faces = num_faces;
+    ps.GenerateSequence();
+    if (!ps.ok) return mesh;
+    const uint32_t num_values = static_cast<uint32_t>(ps.encoded_value_index_to_corner_map.size());
+    if (num_values != num_vertices) return mesh;  // a closed vertex attribute: one value per vertex
+
+    // ---- DecodePortableAttributes -> SequentialIntegerAttributeDecoder for the POSITION ----
+    // ParsePredictionData: prediction_scheme I8; if != NONE: transform_type I8, compressed UI8.
+    const int8_t prediction_scheme = static_cast<int8_t>(r.U8());
+    if (r.error) return mesh;
+    if (prediction_scheme == kPredictionNone) return mesh;  // the supported Box path always predicts
+    const int8_t transform_type = static_cast<int8_t>(r.U8());
+    const uint8_t compressed = r.U8();
+    if (r.error) return mesh;
+    if (transform_type != kPredTransformWrap) return mesh;  // POSITION uses the WRAP transform
+
+    // Decode the integer residual symbols (num_values * num_components) via the DR2 rANS.
+    std::vector<uint32_t> decoded_symbols;
+    const uint32_t total_values = num_values * num_components;
+    if (compressed > 0) {
+        if (!DecodeSymbols(r, total_values, num_components, decoded_symbols)) return mesh;
+    }
+    if (decoded_symbols.size() != total_values) return mesh;
+
+    // ConvertSymbolsToSignedInts.
+    std::vector<int32_t> signed_values(total_values, 0);
+    for (uint32_t i = 0; i < total_values; ++i)
+        signed_values[i] = ConvertSymbolToSignedInt(decoded_symbols[i]);
+
+    // DecodePredictionData(MESH_PREDICTION_PARALLELOGRAM): only DecodeTransformData runs ->
+    // ParseWrapTransformData: wrap_min I32, wrap_max I32 (read BEFORE ComputeOriginalValues).
+    const int32_t wrap_min = static_cast<int32_t>(r.LE32());
+    const int32_t wrap_max = static_cast<int32_t>(r.LE32());
+    if (r.error) return mesh;
+    const int32_t max_dif = 1 + wrap_max - wrap_min;
+    if (max_dif <= 0) return mesh;
+
+    // PredictionSchemeWrapDecodingTransform_ComputeOriginalValue (prediction.wrap.transform.md).
+    auto wrap_transform = [&](const int32_t* pred, const int32_t* corr, int32_t* out) {
+        for (uint32_t c = 0; c < num_components; ++c) {
+            int32_t clamped = pred[c];
+            if (clamped > wrap_max) clamped = wrap_max;
+            else if (clamped < wrap_min) clamped = wrap_min;
+            int32_t o = clamped + corr[c];
+            if (o > wrap_max) o -= max_dif;
+            else if (o < wrap_min) o += max_dif;
+            out[c] = o;
+        }
+    };
+
+    // MeshPredictionSchemeParallelogramDecoder_ComputeOriginalValues (parallelogram + wrap).
+    std::vector<int32_t> original_values(total_values, 0);
+    {
+        std::vector<int32_t> zero_pred(num_components, 0);
+        wrap_transform(zero_pred.data(), &signed_values[0], &original_values[0]);  // p = 0
+        std::vector<int32_t> pred_vals(num_components, 0);
+        for (uint32_t p = 1; p < num_values; ++p) {
+            const int corner_id = ps.encoded_value_index_to_corner_map[p];
+            const uint32_t dst = p * num_components;
+            // ComputeParallelogramPrediction (prediction.parallelogram.decoder.md).
+            bool used = false;
+            const int oci = d.Opposite(0, corner_id);
+            if (oci >= 0) {
+                int v = -1, nx = -1, pv = -1;
+                d.CornerToVerts(0, oci, v, nx, pv);
+                if (v >= 0 && nx >= 0 && pv >= 0
+                    && static_cast<uint32_t>(v) < num_vertices
+                    && static_cast<uint32_t>(nx) < num_vertices
+                    && static_cast<uint32_t>(pv) < num_vertices) {
+                    const int vert_opp  = ps.vertex_to_encoded_attribute_value_index[v];
+                    const int vert_next = ps.vertex_to_encoded_attribute_value_index[nx];
+                    const int vert_prev = ps.vertex_to_encoded_attribute_value_index[pv];
+                    if (vert_opp >= 0 && vert_next >= 0 && vert_prev >= 0
+                        && static_cast<uint32_t>(vert_opp)  < p
+                        && static_cast<uint32_t>(vert_next) < p
+                        && static_cast<uint32_t>(vert_prev) < p) {
+                        const uint32_t off_opp  = static_cast<uint32_t>(vert_opp)  * num_components;
+                        const uint32_t off_next = static_cast<uint32_t>(vert_next) * num_components;
+                        const uint32_t off_prev = static_cast<uint32_t>(vert_prev) * num_components;
+                        for (uint32_t c = 0; c < num_components; ++c)
+                            pred_vals[c] = (original_values[off_next + c] + original_values[off_prev + c])
+                                         - original_values[off_opp + c];
+                        used = true;
+                    }
+                }
+            }
+            if (!used) {
+                const uint32_t src = (p - 1) * num_components;
+                wrap_transform(&original_values[src], &signed_values[dst], &original_values[dst]);
+            } else {
+                wrap_transform(pred_vals.data(), &signed_values[dst], &original_values[dst]);
+            }
+        }
+    }
+
+    // ---- DecodeDataNeededByPortableTransforms -> ParseQuantizationData (the quantization attribute) --
+    // num_components floats min_values, one float range, one byte quantization_bits.
+    std::vector<float> min_values(num_components, 0.0f);
+    for (uint32_t c = 0; c < num_components; ++c) {
+        const uint32_t bits = r.LE32();
+        if (r.error) return mesh;
+        float f = 0.0f;
+        // bit-cast the IEEE-754 little-endian word to float WITHOUT <cstring>/<bit> (a tiny union copy).
+        union { uint32_t u; float f; } cvt; cvt.u = bits; f = cvt.f;
+        min_values[c] = f;
+    }
+    const uint32_t range_bits = r.LE32();
+    if (r.error) return mesh;
+    float range = 0.0f; { union { uint32_t u; float f; } cvt; cvt.u = range_bits; range = cvt.f; }
+    const uint8_t quantization_bits = r.U8();
+    if (r.error) return mesh;
+    if (quantization_bits == 0u || quantization_bits > 31u) return mesh;
+
+    // ---- TransformAttributesToOriginalFormat -> DequantizeValues (the ONE float step) --------------
+    const int32_t max_quantized_value = (1 << quantization_bits) - 1;
+    if (max_quantized_value <= 0) return mesh;
+    const float max_quantized_value_factor = 1.0f / static_cast<float>(max_quantized_value);
+
+    std::vector<float> dequantized(total_values, 0.0f);
+    for (uint32_t i = 0; i < num_values; ++i) {
+        for (uint32_t c = 0; c < num_components; ++c) {
+            int32_t q = original_values[i * num_components + c];
+            const bool neg = q < 0;
+            if (neg) q = -q;
+            float norm_value = static_cast<float>(q) * max_quantized_value_factor;
+            if (neg) norm_value = -norm_value;
+            float value = norm_value * range + min_values[c];
+            dequantized[i * num_components + c] = value;
+        }
+    }
+
+    // ---- Assemble: positions indexed by encoded-attribute-value index; indices from face_to_vertex. --
+    mesh.num_faces = num_faces;
+    mesh.num_points = num_values;
+    mesh.positions = dequantized;  // num_values * num_components (== 3 for a position)
+    mesh.indices.assign(static_cast<std::size_t>(num_faces) * 3u, 0u);
+    bool index_ok = true;
+    for (uint32_t f = 0; f < num_faces; ++f) {
+        for (int k = 0; k < 3; ++k) {
+            const int vert = d.face_to_vertex[k][f];
+            if (vert < 0 || static_cast<uint32_t>(vert) >= num_vertices) { index_ok = false; break; }
+            const int enc = ps.vertex_to_encoded_attribute_value_index[vert];
+            if (enc < 0 || static_cast<uint32_t>(enc) >= num_values) { index_ok = false; break; }
+            mesh.indices[static_cast<std::size_t>(f) * 3u + static_cast<std::size_t>(k)] =
+                static_cast<uint32_t>(enc);
+        }
+        if (!index_ok) break;
+    }
+    if (!index_ok) { mesh.ok = false; return mesh; }
+
+    mesh.ok = true;
+    return mesh;
+}
+
 }  // namespace hf::asset::draco
