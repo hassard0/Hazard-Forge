@@ -260,6 +260,19 @@ hf_add_pure_test(obj_loader_test)
 # at different addresses -> the same key). The golden is the pinned hash IN the test (NO image, NO
 # render-bake). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(asset_compiler_test)
+# glTF FORMAT-COVERAGE closer (issue #16): engine/asset/gltf_compile.h — CompileGltf parses a glTF / glb
+# from memory via cgltf and emits the EXACT SAME canonical Q16.16 CompiledMesh blob CompileObj produces, so
+# a glTF and an OBJ of equivalent geometry compile to the byte-identical artifact (the format-parity
+# headline, proven in the test against the S1 OBJ fixture). DETERMINISTIC: same bytes -> byte-identical blob,
+# identical MSVC + Windows-clang + Mac/clang. cgltf's CGLTF_IMPLEMENTATION already lives in hf_core's
+# gltf_loader.cpp, so this test (which links hf_core) must NOT emit a second copy -> HF_GLTF_TEST_NO_IMPL
+# suppresses it; a pure standalone clang compile (no hf_core) omits the define and the test TU emits the impl
+# itself. NOT via hf_add_pure_test because that helper adds no per-target define.
+add_executable(asset_gltf_compile_test asset_gltf_compile_test.cpp)
+target_link_libraries(asset_gltf_compile_test PRIVATE hf_core)
+target_compile_definitions(asset_gltf_compile_test PRIVATE HF_GLTF_TEST_NO_IMPL)
+hf_apply_sanitizer(asset_gltf_compile_test)
+add_test(NAME asset_gltf_compile_test COMMAND asset_gltf_compile_test)
 # fpx collision EVENTS (issue #44): the additive event API (FxHitEvent / CollectContacts / a 5-arg StepWorld
 # overload) for sample authors who drive the raw deterministic core. APPEND-ONLY to fpx.h — the test proves
 # the 5-arg StepWorld is byte-identical physics to the frozen 4-arg, so every fpx golden is invariant.
