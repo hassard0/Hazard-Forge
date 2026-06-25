@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "net/session.h"  // hf::net::DigestBytes (FNV-1a-64) — the tree-digest currency
+#include "seq/seq.h"       // S4: hf::seq::ScalarTrack + SampleScalar (the Q16.16 keyframe sampler) — the ONLY new include
 
 namespace hf::ui {
 
@@ -401,6 +402,80 @@ inline std::vector<Binding> MakeShowcaseBindings() {
         Binding{ /*src*/2, /*dst footer*/3, kPropHeight     },  // footer.height    <- model[2]=48
         Binding{ /*src*/4, /*dst header*/1, kPropHeight     },  // header.height <- model[4]=99 — LAST-WRITE-WINS
     };
+}
+
+// =====================================================================================================
+// Slice WIDGET-S4 — Widget animation via seq.h (issue #30). APPEND-ONLY below S3. The composition: a
+// seq::ScalarTrack (Q16.16 keyframe curve + easing, proven bit-exact in seq.h) is bound to a widget
+// property; sampled at a tick and QUANTIZED to integer pixels, it drives the property — so the animated
+// tree + layout are byte-identical cross-platform AND (S5) lockstep/scrub-able. This is UMG's float
+// animation curves rebuilt on the seq Q16.16 sampler. THE Q16.16 -> PIXEL BOUNDARY (the one place
+// fixed-point touches the integer box model): SampleScalar returns Q16.16; the box model is integer
+// pixels; the conversion is a single documented round-nearest quantize px = (v + 0x8000) >> 16
+// (arithmetic right shift, well-defined for signed in C++20). Track values are therefore Q16.16 PIXEL
+// values (100px == 100*seq::kOne). Reuses seq::SampleScalar + S3's SetProp VERBATIM (zero new animation
+// math, zero new property-write code). Pure integer on the bit-exact path, NO recursion, ONE new include
+// (seq/seq.h, above). STILL NO <cmath>/float/RNG/clock/<unordered_*>/<map>/std::hash/<algorithm>/<string>.
+// =====================================================================================================
+
+// --- The property animation --------------------------------------------------------------------------
+// Bind a seq Q16.16 ScalarTrack to a widget property (reuses S3's WidgetProp ids — kPropWidth/kPropHeight/
+// kPropFlexWeight). The track's values are Q16.16 PIXEL values (100px == 100*seq::kOne).
+struct PropAnim {
+    WidgetId         widget = 0;
+    uint32_t         prop   = 0;   // a WidgetProp value
+    seq::ScalarTrack track;        // the Q16.16 keyframe curve (seq.h)
+};
+
+// --- The Q16.16 -> pixel quantizer + ApplyAnims ------------------------------------------------------
+// Round-nearest Q16.16 -> integer pixels. The ONE documented quantization (arithmetic >> 16 is C++20-
+// defined for signed). Used everywhere a sampled animation value writes the integer box model.
+inline int32_t QuantizePx(seq::fx v) { return (int32_t)((v + (seq::fx)0x8000) >> 16); }
+
+// ApplyAnims: sample each animation at time `tSeconds` (Q16.16 seconds) and write the quantized pixel
+// value into its widget property via S3's SetProp. Applied in ASCENDING anim-index order (the Propagate
+// discipline — last-write-wins for two anims on the same (widget,prop)). Pure of side effects beyond the
+// tree. Reuses the proven seq sampler + S3's writer verbatim.
+inline void ApplyAnims(Tree& t, const std::vector<PropAnim>& anims, seq::fx tSeconds) {
+    for (std::size_t i = 0; i < anims.size(); ++i) {
+        const PropAnim& a = anims[i];
+        const seq::fx v = seq::SampleScalar(a.track, tSeconds);
+        SetProp(t, a.widget, a.prop, QuantizePx(v));
+    }
+}
+
+// --- Fixture (FIXED forever — the golden pins it) ----------------------------------------------------
+// MakeShowcaseAnims: a fixed set over the MakeLayoutShowcase widgets (root=0, header=1, body=2, footer=3,
+// left=4, right=5, title=6). At t = seq::kOne/2 (0.5s):
+//   - header.kPropHeight     <- track times{0,kOne} values{64*kOne,128*kOne} Linear  -> 96*kOne  -> 96
+//   - left.kPropFlexWeight   <- track times{0,kOne} values{1*kOne, 5*kOne}   Linear  ->  3*kOne  ->  3
+//   - right.kPropFlexWeight  <- track times{0,kOne} values{2*kOne, 2*kOne}   Linear  ->  2*kOne  ->  2 (a
+//     control that does not change). Keep FIXED forever — the golden pins the animated state at a fixed tick.
+inline std::vector<PropAnim> MakeShowcaseAnims() {
+    std::vector<PropAnim> anims;
+
+    PropAnim header;                                   // header.height 64 -> 128 over [0,1]s (Linear)
+    header.widget = 1; header.prop = kPropHeight;
+    header.track.times  = {0, seq::kOne};
+    header.track.values = {64 * seq::kOne, 128 * seq::kOne};
+    header.track.easing = seq::Easing::Linear;
+    anims.push_back(header);
+
+    PropAnim left;                                     // left.flexWeight 1 -> 5 over [0,1]s (Linear)
+    left.widget = 4; left.prop = kPropFlexWeight;
+    left.track.times  = {0, seq::kOne};
+    left.track.values = {1 * seq::kOne, 5 * seq::kOne};
+    left.track.easing = seq::Easing::Linear;
+    anims.push_back(left);
+
+    PropAnim right;                                    // right.flexWeight constant 2 (a control)
+    right.widget = 5; right.prop = kPropFlexWeight;
+    right.track.times  = {0, seq::kOne};
+    right.track.values = {2 * seq::kOne, 2 * seq::kOne};
+    right.track.easing = seq::Easing::Linear;
+    anims.push_back(right);
+
+    return anims;
 }
 
 }  // namespace hf::ui

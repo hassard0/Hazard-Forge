@@ -286,6 +286,75 @@ int main() {
               "widget-s3: Propagate is deterministic — re-applying yields the identical digest");
     }
 
+    // =================================================================================================
+    // Slice WIDGET-S4 — Widget animation via seq.h. Seven assertions (spec). A seq::ScalarTrack (Q16.16
+    // keyframe curve) is sampled at a tick, quantized round-nearest to integer pixels (px = (v+0x8000)>>16),
+    // and written via S3's SetProp. The animated tree = MakeLayoutShowcase() then ApplyAnims(..., kOne/2).
+    // =================================================================================================
+
+    // Animated tree: MakeLayoutShowcase() then ApplyAnims(MakeShowcaseAnims(), hf::seq::kOne/2). Same topology.
+    const std::vector<PropAnim> anims = MakeShowcaseAnims();
+    Tree animTree = MakeLayoutShowcase();
+    ApplyAnims(animTree, anims, hf::seq::kOne / 2);
+
+    const WidgetId A_header = animTree.widgets[animTree.root].firstChild;          // 1
+    const WidgetId A_body   = animTree.widgets[A_header].nextSibling;              // 2
+    const WidgetId A_left   = animTree.widgets[A_body].firstChild;                // 4
+    const WidgetId A_right  = animTree.widgets[A_left].nextSibling;               // 5
+
+    const uint64_t animTreeDigest = DigestTree(animTree);
+    const std::vector<Rect> animSolved = SolveLayout(animTree, kViewport);
+    const uint64_t animRectsDigest = DigestRects(animSolved);
+
+    std::printf("widget-s4: animated tree digest = 0x%016llx   animated rects digest = 0x%016llx  (t = 0.5s)\n",
+                static_cast<unsigned long long>(animTreeDigest),
+                static_cast<unsigned long long>(animRectsDigest));
+
+    // ---- (S4-1) PRIOR INVARIANT — S1 tree + S2 rects + S3 bound-tree + bound-rects ALL UNCHANGED. -----
+    check(DigestTree(MakeShowcaseTree()) == 0x53da0581a48f615eull
+       && DigestRects(SolveLayout(MakeLayoutShowcase(), kViewport)) == 0x95da64c52733eb16ull
+       && DigestTree(boundTree) == 0xbb31678bf35c1a37ull
+       && DigestRects(SolveLayout(boundTree, kViewport)) == 0xc93bdcf2c0b473a3ull,
+          "widget-s1/s2/s3: prior digests STILL green — 0x53da0581a48f615e + 0x95da64c52733eb16 + 0xbb31678bf35c1a37 + 0xc93bdcf2c0b473a3 UNCHANGED");
+
+    // ---- (S4-2) QUANTIZER — round-nearest Q16.16 -> px. ----------------------------------------------
+    check(QuantizePx(96 * hf::seq::kOne) == 96
+       && QuantizePx(hf::seq::kOne / 2) == 1     // 0.5 rounds to 1 (round-nearest)
+       && QuantizePx(0) == 0
+       && QuantizePx(hf::seq::kOne) == 1,
+          "widget-s4: the quantizer is round-nearest — QuantizePx(96*kOne)==96, QuantizePx(kOne/2)==1, QuantizePx(0)==0");
+
+    // ---- (S4-3) ANIMATED VALUE — at t=0.5s the header height animates to 96 + left flex weight to 3. -
+    check(GetProp(animTree, A_header, kPropHeight) == 96
+       && GetProp(animTree, A_left, kPropFlexWeight) == 3,
+          "widget-s4: at t=0.5s the header height animates to 96 (the 64->128 linear track sampled + quantized)");
+
+    // ---- (S4-4) PINNED ANIMATED TREE — DigestTree after ApplyAnims == pinned uint64, DIFFERS from unbound.
+    const uint64_t kPinnedAnimTree = 0x0fb90c2346c92ca4ull;  // PINNED on first run (MSVC == clang)
+    check(animTreeDigest == kPinnedAnimTree && animTreeDigest != 0x53da0581a48f615eull,
+          "widget-s4: DigestTree after ApplyAnims(t=0.5s) == pinned uint64 (animated tree, byte-stable cross-platform)");
+
+    // ---- (S4-5) PINNED ANIMATED RECTS — the animation flowed through to the layout. -------------------
+    const uint64_t kPinnedAnimRects = 0x494e7ff0ecd098deull;  // PINNED on first run (MSVC == clang)
+    check(animRectsDigest == kPinnedAnimRects,
+          "widget-s4: DigestRects(SolveLayout(animated tree)) == pinned uint64 (animation flowed through to layout)");
+
+    // ---- (S4-6) TIME LOAD-BEARING — a different tick (t=0.25s) yields a DIFFERENT animated tree digest.
+    {
+        Tree animTree2 = MakeLayoutShowcase();
+        ApplyAnims(animTree2, anims, hf::seq::kOne / 4);
+        check(DigestTree(animTree2) != animTreeDigest,
+              "widget-s4: a different tick (t=0.25s) yields a DIFFERENT digest (animation is load-bearing on time)");
+    }
+
+    // ---- (S4-7) DETERMINISTIC — re-applying at the same tick (fresh tree) is bit-identical. -----------
+    {
+        Tree animTreeAgain = MakeLayoutShowcase();
+        ApplyAnims(animTreeAgain, anims, hf::seq::kOne / 2);
+        check(DigestTree(animTreeAgain) == animTreeDigest,
+              "widget-s4: ApplyAnims is deterministic — re-applying at the same tick is bit-identical");
+    }
+
     if (g_fail == 0) { std::printf("widget_test: ALL PASS\n"); return 0; }
     std::printf("widget_test: %d FAIL\n", g_fail);
     return 1;
