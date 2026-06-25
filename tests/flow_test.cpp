@@ -97,6 +97,116 @@ int main() {
               "flow-s1: kSelect routes on its predicate (a hand-checked node value is correct)");
     }
 
+    // ==================================================================================================
+    // Slice FLOW-S2 — STATEFUL nodes + the per-tick StepGraph. Append-only (S1 above stays green).
+    // The golden = a PINNED per-tick DigestState trace (8 ticks) over MakeShowcaseStateGraph() +
+    // MakeShowcaseInputStream(), bit-identical Windows/MSVC vs Mac/clang via the standalone compile.
+    // ==================================================================================================
+
+    const Graph stateGraph = MakeShowcaseStateGraph();
+    const std::vector<std::vector<Reg>> inputStream = MakeShowcaseInputStream();
+    const std::vector<uint64_t> trace = RunGraphTrace(stateGraph, inputStream, 8);
+
+    std::printf("flow-s2: per-tick trace (8 ticks):\n");
+    for (std::size_t t = 0; t < trace.size(); ++t)
+        std::printf("  tick %zu digest = 0x%016llx\n", t,
+                    static_cast<unsigned long long>(trace[t]));
+    std::printf("flow-s2: per-tick trace (8 ticks) final digest = 0x%016llx\n",
+                static_cast<unsigned long long>(trace.empty() ? 0ull : trace.back()));
+
+    // ---- (1) PINNED TRACE — the cross-platform make-or-break (identical on MSVC + clang). ------------
+    // PINNED on first run (MSVC == clang). The full per-tick DigestState trace of the showcase state-graph.
+    const uint64_t kPinnedTrace[8] = {
+        0x326199e9ea68bd71ull,  // tick 0
+        0xe4d4018ceff11885ull,  // tick 1
+        0x1a597abc7d1e83f1ull,  // tick 2
+        0xfe34dea0d3e2304dull,  // tick 3
+        0x4fd9f7635c8ca621ull,  // tick 4
+        0xfb4733c14fd84378ull,  // tick 5
+        0xbc99994fb746cde5ull,  // tick 6
+        0x670cf80b235bdafdull,  // tick 7
+    };
+    {
+        bool match = (trace.size() == 8);
+        for (std::size_t t = 0; match && t < 8; ++t)
+            if (trace[t] != kPinnedTrace[t]) match = false;
+        check(match,
+              "flow-s2: RunGraphTrace digest trace == pinned uint64[] (every tick, deterministic)");
+    }
+
+    // ---- (2) REPLAY-STABLE — a second run reproduces the IDENTICAL trace. ---------------------------
+    {
+        const std::vector<uint64_t> trace2 = RunGraphTrace(stateGraph, inputStream, 8);
+        check(trace2 == trace,
+              "flow-s2: re-running the same graph+inputs is bit-identical");
+    }
+
+    // ---- (3) FEEDBACK NOT A CYCLE — TopoOrder of the feedback graph succeeds; the accumulator (n2)
+    //          produces the expected running sum (acc += input each tick). n2 = Add(n0=Input, n1=Delay(n2)).
+    {
+        std::vector<NodeId> order;
+        const bool topoOk = TopoOrder(stateGraph, order);  // must be TRUE despite n2<->n1 feedback
+        // Hand-step the accumulator (n2) and check the running sum for the first few ticks.
+        GraphState st = MakeState(stateGraph);
+        std::vector<Reg> r0 = StepGraph(stateGraph, st, inputStream[0], 0);  // input 5 -> acc 5
+        std::vector<Reg> r1 = StepGraph(stateGraph, st, inputStream[1], 1);  // input 2 -> acc 7
+        std::vector<Reg> r2 = StepGraph(stateGraph, st, inputStream[2], 2);  // input 7 -> acc 14
+        std::vector<Reg> r3 = StepGraph(stateGraph, st, inputStream[3], 3);  // input 0 -> acc 14
+        const bool accOk = (r0[2] == 5) && (r1[2] == 7) && (r2[2] == 14) && (r3[2] == 14);
+        check(topoOk && accOk,
+              "flow-s2: the kDelay feedback loop is NOT a topo cycle (TopoOrder succeeds) and accumulates correctly");
+    }
+
+    // ---- (4) COUNTER — n3 = kCounter(+3): its value after tick t is (t+1)*3 (3,6,9,12,...). ----------
+    {
+        GraphState st = MakeState(stateGraph);
+        bool counterOk = true;
+        for (uint32_t t = 0; t < 8; ++t) {
+            std::vector<Reg> r = StepGraph(stateGraph, st, inputStream[t], t);
+            if (r[3] != static_cast<Reg>((t + 1) * 3)) counterOk = false;  // accumulates by constArg=3
+        }
+        check(counterOk,
+              "flow-s2: kCounter increments by constArg each tick (hand-checked sequence)");
+    }
+
+    // ---- (5) DELAY LAG — n1 = kDelay(a=n2): n1 at tick t == n2's value at tick t-1 (0 at tick 0). ----
+    {
+        GraphState st = MakeState(stateGraph);
+        Reg prevN2 = 0;          // n2 had no previous value before tick 0 -> the delay reads 0 at tick 0
+        bool delayOk = true;
+        for (uint32_t t = 0; t < 8; ++t) {
+            std::vector<Reg> r = StepGraph(stateGraph, st, inputStream[t], t);
+            if (r[1] != prevN2) delayOk = false;   // n1(this tick) must equal n2(previous tick)
+            prevN2 = r[2];                          // remember n2 for the next tick's expected delay
+        }
+        check(delayOk,
+              "flow-s2: kDelay outputs the previous tick's input value (1-tick lag, hand-checked)");
+    }
+
+    // ---- (6) LATCH HOLD — n6 = kLatch(a=n2, c=n5): holds across predicate-0 ticks, updates when nonzero.
+    // Predicate n5 = Min(input, counter); on tick 3 the input is 0 -> n5==0 -> n6 HOLDS tick 2's capture.
+    {
+        GraphState st = MakeState(stateGraph);
+        std::vector<Reg> r0 = StepGraph(stateGraph, st, inputStream[0], 0);  // pred Min(5,3)=3 !=0 -> capture n2=5
+        std::vector<Reg> r1 = StepGraph(stateGraph, st, inputStream[1], 1);  // pred !=0 -> capture n2=7
+        std::vector<Reg> r2 = StepGraph(stateGraph, st, inputStream[2], 2);  // pred !=0 -> capture n2=14
+        std::vector<Reg> r3 = StepGraph(stateGraph, st, inputStream[3], 3);  // input 0 -> pred 0 -> HOLD 14
+        std::vector<Reg> r4 = StepGraph(stateGraph, st, inputStream[4], 4);  // input 3 -> pred !=0 -> capture n2=17
+        const bool latchOk =
+            (r0[6] == 5) && (r1[6] == 7) && (r2[6] == 14) &&
+            (r3[6] == 14) &&                       // HELD across the predicate-0 tick (== tick 2's value)
+            (r3[5] == 0)  &&                        // confirm the predicate really was 0 that tick
+            (r4[6] == 17);                          // updated when the predicate re-fired
+        check(latchOk,
+              "flow-s2: kLatch holds its value until the predicate re-fires (hand-checked)");
+    }
+
+    // ---- (7) S1 INVARIANT — the EdgeMask refinement is byte-identical for S1 graphs. -----------------
+    {
+        check(DigestGraph(Evaluate(MakeShowcaseGraph())) == kPinnedDigest,
+              "flow-s2: S1's pinned digest 0x0e5b8ec26f0d8730 is UNCHANGED (the EdgeMask refinement is byte-identical for S1 graphs)");
+    }
+
     if (g_fail == 0) { std::printf("flow_test: ALL PASS\n"); return 0; }
     std::printf("flow_test: %d FAIL\n", g_fail);
     return 1;
