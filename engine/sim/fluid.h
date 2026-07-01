@@ -991,5 +991,210 @@ inline std::vector<math::Mat4> FluidToRenderInstances(const std::vector<FluidPar
     return out;
 }
 
+// ===== Slice FL7 — XSPH VISCOSITY (the Track-R R2 refinement: water that behaves like water) ==========
+// FLAGSHIP #9 shipped with a DOCUMENTED fidelity gap: the FL4 solve is net-repulsive with NO viscosity, so
+// the fluid spreads like dry foam instead of flowing like liquid. FL7 closes it with XSPH viscosity (the
+// standard PBF companion, Macklin & Müller 2013 §4.3), in pure Q16.16 integer:
+//   v_i  = (pos_i − prev_i) / dt                       (the implicit PBF velocity, per-axis fxdiv)
+//   v'_i = v_i + c · Σ_{j∈neighbors(i)} (v_j − v_i) · W[bin(r_ij²)]
+// where W is the SAME host-snapped FL3 poly6 kernel LUT (kernel.W — REUSED, no new LUT, NO runtime
+// transcendentals), c is the Q16.16 viscosity coefficient (small, ~kOne/100..kOne/10), and the neighbor
+// set/order is the EXISTING FL2 grid-hash iteration (fixed order -> deterministic). The state is then
+// RE-ENCODED: vel = v'_i and prev = pos − v'_i·dt — the particle state STAYS (pos, prev, vel), so the FL5
+// snapshot/lockstep machinery applies UNCHANGED (byte-compatible; SnapshotFluid captures the whole array).
+//
+// THE JACOBI DISCIPLINE (the FL4 twin): pass 1 computes ALL smoothed velocities v'_i from the OLD
+// (pos, prev) state into a SEPARATE scratch buffer (every thread reads its neighbours' state read-only,
+// writes only its OWN v'_i — race-free, multi-thread, one thread per particle, NO single-thread, NO TDR);
+// pass 2 rewrites vel/prev for ALL. NO prev is rewritten before every v' is computed.
+//
+// THE IDENTITY-AT-ZERO DISCIPLINE (every HF lobe's off-switch contract): c == 0 -> StepFluidViscosity is
+// an EXACT no-op (early return before ANY state is touched), so StepFluidVisc(c=0) is BIT-IDENTICAL to the
+// pre-FL7 StepFluid. (This is why the pass does NOT "apply a zero correction": post-StepFluid the stored
+// vel/prev of a COLLIDED particle differ from the re-derived (pos−prev)/dt re-encode, so re-encoding at
+// c=0 would NOT be byte-neutral — the early-out is the exact identity.)
+//
+// INTEGER WIDTH + THE METAL SPLIT (the FL4 convention, MATCHED): the velocity fxdiv + RadiusSq/BinOf use
+// int64 -> the two GPU passes (fluid_visc.comp + fluid_visc_apply.comp) are VULKAN-SPIR-V-ONLY (DXC
+// compiles int64; glslc — the Metal HLSL frontend — cannot parse it; NOT in the Metal hf_gen_msl list);
+// the Metal --fl7-visc showcase runs THIS CPU reference (byte-identical to the Vulkan GPU result BY
+// CONSTRUCTION — the fluid_dp.comp/fluid_collide.comp convention).
+//
+// OVERFLOW BOUND (documented like FL4): ΣW over a rest-lattice neighbourhood is < kOne (the poly6 LUT at
+// h=2/spacing=1 sums to ~0.81·kOne), so the smoothing is a CONTRACTION for c <= kOne and the int32
+// accumulator holds: |Σ fxmul(dv, W)| <= maxNbrs·|dv|max·W[0] ~ 124·(32·kOne)·0.2 << 2^31.
+//
+// HONEST CAVEATS: XSPH is pairwise-antisymmetric so total momentum is conserved in EXACT arithmetic; the
+// fxmul floor-truncation breaks exact pair cancellation by <= 1 LSB per pair per axis, so the momentum
+// drift is a small DETERMINISTIC nonzero bound (pinned in tests/fluid_test.cpp), not exactly zero. The
+// smoothing is dissipative BY DESIGN (viscosity removes relative kinetic energy). This section sits below
+// the FL6 float render helpers for the append-only discipline; it is pure-integer sim code (NO float).
+
+// ----- ComputeXsphVelocity: pass 1 — ALL smoothed velocities v'_i into a scratch buffer (JACOBI) --------
+// For each particle i: derive v_i = (pos_i − prev_i)/dt per axis (fxdiv), then gather the XSPH correction
+// over the FL2 neighbour list: accum += fxmul(v_j − v_i, W[bin(r_ij²)]) per axis (v_j re-derived from
+// (pos_j − prev_j)/dt — a pure function, identical wherever evaluated), then v'_i = v_i + fxmul(c, accum).
+// STATIC particles -> v'_i = 0 (they never move; their prev == pos so their v_j contribution is 0 too).
+// Reads ONLY the (pos, prev) state (read-only) + writes only velOut[i] -> race-free, deterministic (the
+// fixed FL2 neighbour order). The shader fluid_visc.comp copies THIS body VERBATIM. int64 (fxdiv + the
+// RadiusSq/BinOf) -> Vulkan-only shader; Metal runs this CPU reference (the FL4 convention).
+inline void ComputeXsphVelocity(const std::vector<FluidParticle>& particles,
+                                const FluidNeighborList& list, const FluidKernel& k,
+                                fx c, fx dt, std::vector<FxVec3>& velOut) {
+    const uint32_t n = (uint32_t)particles.size();
+    const int64_t h2 = H2Of(k.h);
+    velOut.assign((size_t)n, FxVec3{0, 0, 0});
+    for (uint32_t i = 0; i < n; ++i) {
+        const FluidParticle& pi = particles[(size_t)i];
+        if (pi.flags & kFlagStatic) continue;                       // static -> v' = 0 (never re-encoded)
+        // v_i = (pos − prev) / dt (the implicit PBF velocity; fxdiv(x, 0) == 0 by the fpx contract).
+        const fx vix = fxdiv(pi.pos.x - pi.prev.x, dt);
+        const fx viy = fxdiv(pi.pos.y - pi.prev.y, dt);
+        const fx viz = fxdiv(pi.pos.z - pi.prev.z, dt);
+        fx ax = 0, ay = 0, az = 0;   // Σ_j (v_j − v_i)·W[bin] (the pre-c accumulate, int32 like fluid_dp)
+        const uint32_t s0 = list.neighborStart[i], s1 = list.neighborStart[i + 1u];
+        for (uint32_t s = s0; s < s1; ++s) {
+            const uint32_t j = list.neighbors[s];
+            const FluidParticle& pj = particles[(size_t)j];
+            const int bin = BinOf(RadiusSq(pi.pos, pj.pos), h2, k.bins);
+            if (bin >= k.bins) continue;                            // r >= h -> zero kernel weight
+            const fx w = k.W[(size_t)bin];
+            // v_j re-derived from (pos_j − prev_j)/dt (identical to i's derivation — a pure function).
+            const fx vjx = fxdiv(pj.pos.x - pj.prev.x, dt);
+            const fx vjy = fxdiv(pj.pos.y - pj.prev.y, dt);
+            const fx vjz = fxdiv(pj.pos.z - pj.prev.z, dt);
+            ax += fxmul(vjx - vix, w);
+            ay += fxmul(vjy - viy, w);
+            az += fxmul(vjz - viz, w);
+        }
+        // v'_i = v_i + c · accum (the XSPH blend toward the neighbourhood mean).
+        velOut[(size_t)i] = FxVec3{vix + fxmul(c, ax), viy + fxmul(c, ay), viz + fxmul(c, az)};
+    }
+}
+
+// ----- ApplyXsphVelocity: pass 2 — re-encode (vel, prev) from the smoothed velocities -------------------
+// For each NON-static particle: vel = v'_i and prev = pos − v'_i·dt (per-axis fxmul) — pos is UNTOUCHED,
+// so the state stays the (pos, prev, vel) triple and vel ≈ (pos − prev)/dt is re-established (up to the
+// documented fxmul truncation). Runs ONLY after pass 1 computed EVERY v'_i (the Jacobi two-pass split —
+// no particle's prev is read by pass 1 after pass 2 starts). Static particles are untouched. The shader
+// fluid_visc_apply.comp copies THIS body VERBATIM.
+inline void ApplyXsphVelocity(std::vector<FluidParticle>& particles,
+                              const std::vector<FxVec3>& vel, fx dt) {
+    const size_t n = particles.size() < vel.size() ? particles.size() : vel.size();   // bounds-checked
+    for (size_t i = 0; i < n; ++i) {
+        FluidParticle& p = particles[i];
+        if (p.flags & kFlagStatic) continue;
+        p.vel = vel[i];
+        p.prev = FxVec3{p.pos.x - fxmul(vel[i].x, dt),
+                        p.pos.y - fxmul(vel[i].y, dt),
+                        p.pos.z - fxmul(vel[i].z, dt)};
+    }
+}
+
+// ----- StepFluidViscosity: ONE full XSPH smoothing pass (neighbours -> pass 1 -> pass 2) ----------------
+// Builds the FL2 neighbour list from the CURRENT positions (MakeGrid + BuildCellTable + BuildNeighborList
+// — the same deterministic helpers StepFluid uses), then the two Jacobi passes. THE IDENTITY-AT-ZERO
+// early-out: c == 0 (viscosity off) or dt == 0 (no velocity to derive) -> EXACT no-op, zero bytes touched
+// (see the section comment for why the early-out, not a zero-correction re-encode, is the exact identity).
+inline void StepFluidViscosity(std::vector<FluidParticle>& particles, const FluidKernel& kernel,
+                               fx c, fx dt) {
+    if (c == 0 || dt == 0) return;                     // identity-at-zero: viscosity off = EXACT no-op
+    const FluidGrid grid = MakeGrid(particles, kernel.h);
+    const FluidCellTable table = BuildCellTable(particles, grid);
+    const FluidNeighborList list = BuildNeighborList(particles, grid, table, kernel.h);
+    std::vector<FxVec3> smoothed;
+    ComputeXsphVelocity(particles, list, kernel, c, dt, smoothed);   // pass 1: ALL v' from OLD state
+    ApplyXsphVelocity(particles, smoothed, dt);                      // pass 2: re-encode (vel, prev)
+}
+
+// ----- StepFluidVisc: the composed VISCOUS tick (FL4 solve -> XSPH smooth), ONE composable step ---------
+// StepFluid (predict -> neighbours -> iters JACOBI density iterations -> velocity -> collide, the FL4
+// reference UNTOUCHED) then StepFluidViscosity (velocity derivation -> XSPH smooth -> prev re-encode).
+// c == 0 -> BIT-IDENTICAL to StepFluid (the identity-at-zero). State shape unchanged -> FL5's lockstep/
+// snapshot machinery drives this exactly like StepFluid. Returns StepFluid's contact count.
+inline int StepFluidVisc(std::vector<FluidParticle>& particles, const FluidKernel& kernel,
+                         const std::vector<SphereCollider>& spheres, const FxVec3& gravity, fx dt,
+                         fx groundY, int iters, fx c) {
+    const int contacts = StepFluid(particles, kernel, spheres, gravity, dt, groundY, iters);
+    StepFluidViscosity(particles, kernel, c, dt);
+    return contacts;
+}
+
+// ----- StepFluidViscSteps: run K composed viscous steps (the showcase / GPU K-step driver) --------------
+inline int StepFluidViscSteps(std::vector<FluidParticle>& particles, const FluidKernel& kernel,
+                              const std::vector<SphereCollider>& spheres, const FxVec3& gravity, fx dt,
+                              fx groundY, int iters, fx c, int steps) {
+    int contacts = 0;
+    for (int s = 0; s < steps; ++s)
+        contacts = StepFluidVisc(particles, kernel, spheres, gravity, dt, groundY, iters, c);
+    return contacts;
+}
+
+// ----- SimFluidTickVisc / RunFluidLockstepVisc: the FL5 harness over the VISCOUS step -------------------
+// The FL5 machinery applies VERBATIM (the state shape is unchanged); only the step fn is swapped
+// (StepFluid -> StepFluidVisc). A peer fed the input stream alone re-derives the VISCOUS fluid
+// bit-for-bit — the lockstep property extends to the smoothed fluid. c == 0 -> identical to
+// SimFluidTick/RunFluidLockstep by the identity-at-zero.
+inline void SimFluidTickVisc(std::vector<FluidParticle>& particles, const FluidKernel& kernel,
+                             const std::vector<SphereCollider>& spheres,
+                             const std::vector<FluidCommand>& stream, uint32_t tick,
+                             const FxVec3& gravity, fx dt, fx groundY, int iters, fx c) {
+    for (const FluidCommand& cmd : stream)
+        if (cmd.tick == tick) ApplyFluidCommand(particles, cmd);
+    StepFluidVisc(particles, kernel, spheres, gravity, dt, groundY, iters, c);
+}
+
+inline std::vector<FluidParticle> RunFluidLockstepVisc(const std::vector<FluidParticle>& init,
+                                                       const FluidKernel& kernel,
+                                                       const std::vector<SphereCollider>& spheres,
+                                                       const std::vector<FluidCommand>& stream, int ticks,
+                                                       const FxVec3& gravity, fx dt, fx groundY,
+                                                       int iters, fx c) {
+    std::vector<FluidParticle> particles = init;
+    for (int t = 0; t < ticks; ++t)
+        SimFluidTickVisc(particles, kernel, spheres, stream, (uint32_t)t, gravity, dt, groundY, iters, c);
+    return particles;
+}
+
+// ----- VelocitySpread: the deterministic integer relative-velocity metric (the FL7 physics proof) -------
+// Σ_i Σ_axis |vel_i.axis − mean.axis| over all particles, where mean is the int64 truncating per-axis mean
+// velocity. A viscous fluid's neighbours move TOGETHER -> the spread around the mean is strictly lower
+// than the inviscid run after the same ticks (the pinned c=0-vs-c>0 contrast). Pure int64 integer ->
+// bit-exact everywhere. Empty -> 0.
+inline int64_t VelocitySpread(const std::vector<FluidParticle>& particles) {
+    if (particles.empty()) return 0;
+    int64_t sx = 0, sy = 0, sz = 0;
+    for (const FluidParticle& p : particles) { sx += p.vel.x; sy += p.vel.y; sz += p.vel.z; }
+    const int64_t n = (int64_t)particles.size();
+    const int64_t mx = sx / n, my = sy / n, mz = sz / n;   // truncating integer mean (deterministic)
+    int64_t spread = 0;
+    for (const FluidParticle& p : particles) {
+        const int64_t dx = (int64_t)p.vel.x - mx, dy = (int64_t)p.vel.y - my, dz = (int64_t)p.vel.z - mz;
+        spread += (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) + (dz < 0 ? -dz : dz);
+    }
+    return spread;
+}
+
+// ----- FluidDigest: the deterministic FNV-1a-64 digest of the whole particle state (the pin) ------------
+// Hashes every particle's 11 int32 words FIELD-WISE (pos/prev/vel/invMass/flags, little-endian byte order
+// by explicit shifts — NO reinterpret_cast, so the digest is layout/padding-independent and identical on
+// every compiler/platform). The golden-discipline pin the FL7 tests + showcases print.
+inline uint64_t FluidDigest(const std::vector<FluidParticle>& particles) {
+    uint64_t h = 1469598103934665603ull;                    // FNV-1a 64 offset basis
+    auto mix = [&h](uint32_t v) {
+        for (int b = 0; b < 4; ++b) {
+            h ^= (uint64_t)((v >> (b * 8)) & 0xFFu);
+            h *= 1099511628211ull;                          // FNV-1a 64 prime
+        }
+    };
+    for (const FluidParticle& p : particles) {
+        mix((uint32_t)p.pos.x);  mix((uint32_t)p.pos.y);  mix((uint32_t)p.pos.z);
+        mix((uint32_t)p.prev.x); mix((uint32_t)p.prev.y); mix((uint32_t)p.prev.z);
+        mix((uint32_t)p.vel.x);  mix((uint32_t)p.vel.y);  mix((uint32_t)p.vel.z);
+        mix((uint32_t)p.invMass); mix(p.flags);
+    }
+    return h;
+}
+
 }  // namespace fluid
 }  // namespace hf::sim

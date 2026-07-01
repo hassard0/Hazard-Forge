@@ -1175,6 +1175,20 @@ hf_compile_shaders(
     "shaders/fluid_dp.comp.hlsl:cs"
     "shaders/fluid_apply.comp.hlsl:cs"
     "shaders/fluid_collide.comp.hlsl:cs"
+    # Deterministic GPU Fluid Slice 7 (Slice FL7, the Track-R R2 refinement of FLAGSHIP #9): XSPH
+    # VISCOSITY. fluid_visc.comp: ONE thread per particle derives v_i = (pos−prev)/dt then the smoothed
+    # v'_i = v_i + c·Σ_{j∈neighbors} (v_j−v_i)·W[bin(r_ij²)] over the FL2 neighbour list via the REUSED
+    # FL3 poly6 W LUT, into a SEPARATE vout[] scratch buffer (the Jacobi double-buffer — the fluid_dp
+    # pattern); fluid_visc_apply.comp: ONE thread per particle re-encodes vel = v'_i and
+    # prev = pos − v'·dt (pos untouched — the state stays the (pos,prev,vel) triple so the FL5 lockstep
+    # machinery applies unchanged). Both copied VERBATIM from engine/sim/fluid.h::ComputeXsphVelocity /
+    # ApplyXsphVelocity. Per-particle INDEPENDENT -> MULTI-THREAD, NO atomics, NO TDR. Because the
+    # velocity fxdiv + RadiusSq/BinOf use int64, both are VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc
+    # cannot) -> NOT in the Metal hf_gen_msl list; the Metal --fl7-visc showcase runs the CPU
+    # fluid::StepFluidViscSteps (byte-identical by construction, the FL4 convention). NO new RHI;
+    # FL1-FL6 shaders + goldens untouched.
+    "shaders/fluid_visc.comp.hlsl:cs"
+    "shaders/fluid_visc_apply.comp.hlsl:cs"
     # Deterministic GPU Cloth Slice 2 (Slice CL2, the 2nd slice of FLAGSHIP #8): the DISTANCE-CONSTRAINT
     # GRAPH BUILD (the FPX2/MC3 count->scan->emit on lattice particles). cloth_edge_count.comp: ONE thread
     # per particle counts its OWNED forward edges in bounds (right/down structural, the two cell diagonals

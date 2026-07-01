@@ -911,6 +911,217 @@ int main() {
               "FL6 FluidToRenderInstances: empty pool -> empty (the empty no-op)");
     }
 
+    // ============================ Slice FL7 — XSPH VISCOSITY ========================================
+    // The Track-R R2 refinement: the FL4 solve is net-repulsive without viscosity (the documented gap);
+    // FL7 adds the XSPH velocity smooth v' = v + c·Σ(v_j−v_i)·W[bin] + the (vel, prev) re-encode. These
+    // cases pin: (a) the FL1-FL6 PINNED DIGESTS (the append-only proof — canonical pre-FL7 scenes must
+    // hash to the exact same state after FL7 lands); (b) FL7 determinism (two runs byte-identical); (c)
+    // the IDENTITY-AT-ZERO (c=0 -> StepFluidVisc BIT-IDENTICAL to the pre-FL7 StepFluid) + THE PHYSICS
+    // PROOF (c>0 strictly reduces the velocity spread after the same ticks — pinned metric values); (d)
+    // MOMENTUM (XSPH is pairwise-antisymmetric; the fxmul truncation leaves a small pinned integer drift
+    // bound, honest — not exactly zero); (e) the FL7 pinned digest (identical MSVC + clang); (f) LOCKSTEP
+    // (the FL5 harness over the viscous step — a peer re-derives the viscous fluid bit-for-bit).
+    // NOTE: GPU==CPU for the FL7 shaders is proven by the --fl7-visc-shot Vulkan memcmp (this test is
+    // pure CPU, no backend symbols — the FL1-FL4 convention).
+    {
+        // --- (a) the FL1-FL6 pinned digests (the append-only proof) --------------------------------
+        // FL1: the 10x10x10 showcase block integrated 120 steps (the FL1 determinism scene).
+        {
+            fluid::FluidBlock blk; blk.W = 10; blk.H = 10; blk.D = 10; blk.spacing = kOne;
+            blk.origin = fluid::FxVec3{0, FromInt(24), 0};
+            std::vector<fluid::FluidParticle> ps = fluid::InitBlock(blk);
+            fluid::IntegrateFluidSteps(ps, kGravity, kDt, 0, 120);
+            const uint64_t d = fluid::FluidDigest(ps);
+            std::printf("FL7 pin: FL1 integrate digest = 0x%016llx\n", (unsigned long long)d);
+            check(d == 0x1b8817deae8de6e3ull, "FL7 pin(a): FL1 integrate digest UNCHANGED");
+        }
+        // FL4: a 6x6x6 splash block through the composed StepFluidSteps (the pre-FL7 composed step).
+        fluid::FluidBlock splash;
+        splash.W = 6; splash.H = 6; splash.D = 6; splash.spacing = kOne;
+        splash.origin = fluid::FxVec3{0, FromInt(6), 0};
+        const std::vector<fluid::FluidParticle> splashInit = fluid::InitBlock(splash);
+        const fluid::FluidKernel splashK = makeKernel(splashInit, (fx)(2 * (int)kOne));
+        const std::vector<fluid::SphereCollider> noSpheres;
+        const int kIters = 4, kSteps = 12;
+        {
+            std::vector<fluid::FluidParticle> ps = splashInit;
+            fluid::StepFluidSteps(ps, splashK, noSpheres, kGravity, kDt, 0, kIters, kSteps);
+            const uint64_t d = fluid::FluidDigest(ps);
+            std::printf("FL7 pin: FL4 StepFluidSteps digest = 0x%016llx\n", (unsigned long long)d);
+            check(d == 0x14b287dbbcb72b60ull, "FL7 pin(a): FL4 composed-step digest UNCHANGED");
+        }
+        // FL5: the lockstep authority over the FL5 test scene (5x5x5 + the auth stream).
+        {
+            fluid::FluidBlock blk;
+            blk.W = 5; blk.H = 5; blk.D = 5; blk.spacing = kOne; blk.origin = fluid::FxVec3{0, kOne * 6, 0};
+            const std::vector<fluid::FluidParticle> init = fluid::InitBlock(blk);
+            const fluid::FluidKernel k = makeKernel(init, (fx)(2 * (int)kOne));
+            const int wIdx = fluid::ParticleIndex(blk, 2, 4, 2);
+            const std::vector<fluid::FluidCommand> authStream{
+                fluid::FluidCommand{2,  fluid::kCmdWind, (uint32_t)wIdx, fluid::FxVec3{FromInt(8), 0, 0}},
+                fluid::FluidCommand{6,  fluid::kCmdPush, (uint32_t)wIdx, fluid::FxVec3{0, 0, FromInt(2)}},
+                fluid::FluidCommand{10, fluid::kCmdWind, (uint32_t)wIdx, fluid::FxVec3{FromInt(4), 0, 0}},
+            };
+            const std::vector<fluid::FluidParticle> authority =
+                fluid::RunFluidLockstep(init, k, noSpheres, authStream, 16, kGravity, kDt, 0, 4);
+            const uint64_t d = fluid::FluidDigest(authority);
+            std::printf("FL7 pin: FL5 lockstep authority digest = 0x%016llx\n", (unsigned long long)d);
+            check(d == 0x093534019d8076b0ull, "FL7 pin(a): FL5 lockstep-authority digest UNCHANGED");
+        }
+
+        const fx kVisc = kOne / 16;   // c = 0.0625 (the showcase coefficient; small, well under the <1 bound)
+
+        // --- (b) FL7 determinism: two viscous runs byte-identical ----------------------------------
+        {
+            std::vector<fluid::FluidParticle> a = splashInit, b = splashInit;
+            fluid::StepFluidViscSteps(a, splashK, noSpheres, kGravity, kDt, 0, kIters, kVisc, kSteps);
+            fluid::StepFluidViscSteps(b, splashK, noSpheres, kGravity, kDt, 0, kIters, kVisc, kSteps);
+            check(a.size() == b.size() &&
+                  std::memcmp(a.data(), b.data(), a.size() * sizeof(fluid::FluidParticle)) == 0,
+                  "FL7 determinism: two viscous runs BYTE-IDENTICAL");
+        }
+
+        // --- (c) the IDENTITY-AT-ZERO + THE PHYSICS PROOF ------------------------------------------
+        {
+            // c = 0 -> StepFluidViscSteps BIT-IDENTICAL to the pre-FL7 StepFluidSteps (the exact no-op).
+            std::vector<fluid::FluidParticle> off = splashInit, pre = splashInit;
+            fluid::StepFluidViscSteps(off, splashK, noSpheres, kGravity, kDt, 0, kIters, /*c=*/0, kSteps);
+            fluid::StepFluidSteps(pre, splashK, noSpheres, kGravity, kDt, 0, kIters, kSteps);
+            check(off.size() == pre.size() &&
+                  std::memcmp(off.data(), pre.data(), off.size() * sizeof(fluid::FluidParticle)) == 0,
+                  "FL7 identity-at-zero: c=0 viscous step BIT-IDENTICAL to the pre-FL7 StepFluid");
+
+            // c > 0 measurably reduces the velocity spread after the same ticks (the physics proof).
+            std::vector<fluid::FluidParticle> on = splashInit;
+            fluid::StepFluidViscSteps(on, splashK, noSpheres, kGravity, kDt, 0, kIters, kVisc, kSteps);
+            const int64_t spreadOff = fluid::VelocitySpread(pre);
+            const int64_t spreadOn  = fluid::VelocitySpread(on);
+            std::printf("FL7 physics: velocity spread c=0 -> %lld, c=%d -> %lld\n",
+                        (long long)spreadOff, (int)kVisc, (long long)spreadOn);
+            check(spreadOn < spreadOff,
+                  "FL7 physics: c>0 velocity spread STRICTLY BELOW the inviscid run (the smooth works)");
+            // The two metric values pinned (the golden discipline; identical MSVC + clang). HONEST: the
+            // end-to-end reduction is MODEST (~2% at c=kOne/16 — the scattering splash is dominated by
+            // ballistic fliers with thin kernel overlap, and each FL4 solve re-adds relative velocity);
+            // it is MONOTONE in c (probed ~7% at c=kOne/2). The direct single-pass proof below isolates
+            // the smooth itself.
+            check(spreadOff == 193218718ll, "FL7 physics pin: inviscid spread == 193218718");
+            check(spreadOn == 189409556ll, "FL7 physics pin: viscous spread == 189409556");
+
+            // The DIRECT single-pass proof: one StepFluidViscosity on a mid-splash state leaves positions
+            // untouched (the SAME neighbour-pair set) and STRICTLY reduces the summed neighbour relative
+            // speed Σ_{i,j∈nbr(i)} Σ_axis |v_i − v_j| — the exact quantity XSPH damps, apples-to-apples.
+            std::vector<fluid::FluidParticle> mid = splashInit;
+            fluid::StepFluidSteps(mid, splashK, noSpheres, kGravity, kDt, 0, kIters, kSteps / 2);
+            auto pairRelSpeed = [&](const std::vector<fluid::FluidParticle>& ps, int64_t& pairsOut) {
+                const fluid::FluidGrid pg = fluid::MakeGrid(ps, splashK.h);
+                const fluid::FluidCellTable pt = fluid::BuildCellTable(ps, pg);
+                const fluid::FluidNeighborList pl = fluid::BuildNeighborList(ps, pg, pt, splashK.h);
+                int64_t total = 0; pairsOut = 0;
+                for (uint32_t i = 0; i < (uint32_t)ps.size(); ++i)
+                    for (uint32_t s = pl.neighborStart[i]; s < pl.neighborStart[i + 1]; ++s) {
+                        const uint32_t j = pl.neighbors[s];
+                        const int64_t dx = (int64_t)ps[i].vel.x - (int64_t)ps[j].vel.x;
+                        const int64_t dy = (int64_t)ps[i].vel.y - (int64_t)ps[j].vel.y;
+                        const int64_t dz = (int64_t)ps[i].vel.z - (int64_t)ps[j].vel.z;
+                        total += (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) + (dz < 0 ? -dz : dz);
+                        ++pairsOut;
+                    }
+                return total;
+            };
+            int64_t pairsBefore = 0, pairsAfter = 0;
+            const int64_t relBefore = pairRelSpeed(mid, pairsBefore);
+            std::vector<fluid::FluidParticle> sm = mid;
+            fluid::StepFluidViscosity(sm, splashK, kVisc, kDt);
+            const int64_t relAfter = pairRelSpeed(sm, pairsAfter);
+            std::printf("FL7 physics: single-pass neighbour rel-speed %lld -> %lld (%lld pairs)\n",
+                        (long long)relBefore, (long long)relAfter, (long long)pairsBefore);
+            check(pairsBefore == pairsAfter,
+                  "FL7 physics: the smooth leaves positions untouched (same neighbour-pair set)");
+            check(relAfter < relBefore,
+                  "FL7 physics: ONE smooth STRICTLY reduces the neighbour relative speed (same pairs)");
+            check(relBefore == 1669569668ll && relAfter == 1647200224ll && pairsBefore == 2680ll,
+                  "FL7 physics pin: single-pass rel-speed 1669569668 -> 1647200224 over 2680 pairs");
+        }
+
+        // --- (d) MOMENTUM: the XSPH smooth's total-momentum drift within a tiny pinned bound --------
+        // XSPH is pairwise-antisymmetric (i and j see equal-and-opposite (v_j−v_i)·W terms — the same bin
+        // both ways since RadiusSq is symmetric and the FL2 list is mutual), so total momentum is conserved
+        // in EXACT arithmetic. fxmul truncates toward −inf, so each pair cancels to within 1 LSB per axis:
+        // the drift bound is (pairs · 1 LSB) scaled by c — HONEST: small deterministic nonzero, NOT zero.
+        {
+            // Mid-splash state (non-trivial velocities), one smoothing pass measured in isolation.
+            std::vector<fluid::FluidParticle> mid = splashInit;
+            fluid::StepFluidSteps(mid, splashK, noSpheres, kGravity, kDt, 0, kIters, kSteps / 2);
+            const fluid::FluidGrid g = fluid::MakeGrid(mid, splashK.h);
+            const fluid::FluidCellTable t = fluid::BuildCellTable(mid, g);
+            const fluid::FluidNeighborList nl = fluid::BuildNeighborList(mid, g, t, splashK.h);
+            std::vector<fluid::FxVec3> smoothed;
+            fluid::ComputeXsphVelocity(mid, nl, splashK, kVisc, kDt, smoothed);
+            int64_t dx = 0, dy = 0, dz = 0;   // Σ(v' − v_base) per axis == the smooth's momentum drift
+            for (size_t i = 0; i < mid.size(); ++i) {
+                const fluid::FxVec3 d = fluid::FxSub(mid[i].pos, mid[i].prev);
+                dx += (int64_t)smoothed[i].x - (int64_t)fluid::fxdiv(d.x, kDt);
+                dy += (int64_t)smoothed[i].y - (int64_t)fluid::fxdiv(d.y, kDt);
+                dz += (int64_t)smoothed[i].z - (int64_t)fluid::fxdiv(d.z, kDt);
+            }
+            const int64_t adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy, adz = dz < 0 ? -dz : dz;
+            std::printf("FL7 momentum: XSPH smooth drift per axis = (%lld, %lld, %lld) LSBs\n",
+                        (long long)dx, (long long)dy, (long long)dz);
+            // The pinned integer bound: |drift| <= 256 velocity LSBs per axis (~0.004 world units/s over
+            // 216 particles — the fxmul-truncation residue; measured (-169, -163, -169)).
+            const int64_t kMomentumBound = 256;
+            check(adx <= kMomentumBound && ady <= kMomentumBound && adz <= kMomentumBound,
+                  "FL7 momentum: XSPH drift within the pinned 256-LSB/axis truncation bound");
+        }
+
+        // --- (e) the FL7 pinned digest (the golden pin; identical MSVC + local clang) ---------------
+        {
+            std::vector<fluid::FluidParticle> on = splashInit;
+            fluid::StepFluidViscSteps(on, splashK, noSpheres, kGravity, kDt, 0, kIters, kVisc, kSteps);
+            const uint64_t d = fluid::FluidDigest(on);
+            std::printf("FL7 pin: FL7 viscous digest = 0x%016llx\n", (unsigned long long)d);
+            check(d == 0x50164148ce72cf3eull, "FL7 pin(e): viscous-run digest == the pinned value");
+        }
+
+        // --- (f) LOCKSTEP over the viscous step (the FL5 machinery verbatim, step fn swapped) -------
+        {
+            const int wIdx = fluid::ParticleIndex(splash, 3, 5, 3);
+            const std::vector<fluid::FluidCommand> stream{
+                fluid::FluidCommand{2, fluid::kCmdWind, (uint32_t)wIdx, fluid::FxVec3{FromInt(8), 0, 0}},
+                fluid::FluidCommand{6, fluid::kCmdPush, (uint32_t)wIdx, fluid::FxVec3{0, 0, FromInt(2)}},
+            };
+            const std::vector<fluid::FluidParticle> authority = fluid::RunFluidLockstepVisc(
+                splashInit, splashK, noSpheres, stream, 12, kGravity, kDt, 0, kIters, kVisc);
+            const std::vector<fluid::FluidParticle> replica = fluid::RunFluidLockstepVisc(
+                splashInit, splashK, noSpheres, stream, 12, kGravity, kDt, 0, kIters, kVisc);
+            check(authority.size() == replica.size() &&
+                  std::memcmp(authority.data(), replica.data(),
+                              authority.size() * sizeof(fluid::FluidParticle)) == 0,
+                  "FL7 lockstep: viscous replica == authority BIT-EXACT (inputs-only re-sim)");
+            // c=0 through the viscous harness == the pre-FL7 harness (the identity composes).
+            const std::vector<fluid::FluidParticle> off = fluid::RunFluidLockstepVisc(
+                splashInit, splashK, noSpheres, stream, 12, kGravity, kDt, 0, kIters, /*c=*/0);
+            const std::vector<fluid::FluidParticle> pre = fluid::RunFluidLockstep(
+                splashInit, splashK, noSpheres, stream, 12, kGravity, kDt, 0, kIters);
+            check(off.size() == pre.size() &&
+                  std::memcmp(off.data(), pre.data(), off.size() * sizeof(fluid::FluidParticle)) == 0,
+                  "FL7 lockstep identity: c=0 viscous harness == the pre-FL7 RunFluidLockstep");
+        }
+
+        // --- the snapshot machinery is byte-compatible (state shape unchanged) ----------------------
+        {
+            std::vector<fluid::FluidParticle> ps = splashInit;
+            fluid::StepFluidViscSteps(ps, splashK, noSpheres, kGravity, kDt, 0, kIters, kVisc, 4);
+            const std::vector<fluid::FluidParticle> snap = fluid::SnapshotFluid(ps);
+            fluid::StepFluidVisc(ps, splashK, noSpheres, kGravity, kDt, 0, kIters, kVisc);   // mutate
+            fluid::RestoreFluid(ps, snap);
+            check(ps.size() == snap.size() &&
+                  std::memcmp(ps.data(), snap.data(), snap.size() * sizeof(fluid::FluidParticle)) == 0,
+                  "FL7 snapshot: the FL5 SnapshotFluid/RestoreFluid round-trip holds over the viscous state");
+        }
+    }
+
     if (g_fail == 0) std::printf("fluid_test: ALL PASS\n");
     else std::printf("fluid_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;
