@@ -33,12 +33,21 @@ public:
     VkAccelerationStructureKHR handle() const { return accel_; }
     VkDeviceAddress deviceAddress() const { return address_; }
 
+    // Issue #34 / fix-rhi-binding13: the REGULAR descriptor set holding this TLAS for the GRAPHICS
+    // (fragment RayQuery) path, lazily allocated + written on first bind and cached here (an immutable
+    // set — never updated while bound in a recording command buffer). Replaces the former push-descriptor
+    // accel set, which made the RT-graphics pipeline layout carry TWO push-descriptor set layouts
+    // (VUID-VkPipelineLayoutCreateInfo-pSetLayouts-00293) and clobbered cluster binding 13. Freed back
+    // to the device's accel pool in the dtor.
+    VkDescriptorSet graphicsSet(uint32_t slot);
+
 private:
     VulkanDevice& device_;
     VkAccelerationStructureKHR accel_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VmaAllocation alloc_ = VK_NULL_HANDLE;
     VkDeviceAddress address_ = 0;
+    VkDescriptorSet graphicsSet_ = VK_NULL_HANDLE;  // cached RT-graphics TLAS set (fix-rhi-binding13)
 };
 
 } // namespace hf::rhi::vk

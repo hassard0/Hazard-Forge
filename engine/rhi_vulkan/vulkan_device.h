@@ -160,12 +160,22 @@ public:
 
     // RT-graphics accel set layout (a DEDICATED set, FRAGMENT stage, Issue #34): ONE
     // ACCELERATION_STRUCTURE_KHR binding at the slot the desc requests, so a ps_6_5 RayQuery fragment
-    // shader can trace rays. PUSH_DESCRIPTOR so the TLAS is bound inline via BindAccelStructure at
-    // VK_PIPELINE_BIND_POINT_GRAPHICS (no pool — mirrors the compute accel + cluster SSBO paths). Separate
-    // from every other set layout so existing pipelines are byte-for-byte unchanged. The binding slot is
-    // baked at create (the RT graphics frag declares it at binding `slot`). Lazily created (depends on the
-    // rayQuery device feature; nullptr if RT is unavailable).
+    // shader can trace rays. A REGULAR (pool-allocated) set, NOT push-descriptor: the cluster set (set 3)
+    // is already the pipeline layout's one allowed push-descriptor set layout
+    // (VUID-VkPipelineLayoutCreateInfo-pSetLayouts-00293); the original push-flagged accel layout made
+    // TWO push sets in the RT-graphics pipeline layout — undefined behavior that clobbered the first
+    // cluster push descriptor (set-3 binding 13). Separate from every other set layout so existing
+    // pipelines are byte-for-byte unchanged. The binding slot is baked at create (the RT graphics frag
+    // declares it at binding `slot`). Lazily created (depends on the rayQuery device feature; nullptr if
+    // RT is unavailable).
     VkDescriptorSetLayout accelGraphicsSetLayout(uint32_t slot);
+
+    // Issue #34 / fix-rhi-binding13: allocate + write a REGULAR descriptor set holding `tlas` at binding
+    // `slot` of the RT-graphics accel set layout, from a small dedicated lazily-created pool (FREE bit).
+    // Cached per-TLAS by VulkanAccelStructure::graphicsSet; returned via freeAccelGraphicsSet in the
+    // TLAS dtor. BindAccelStructure binds it with vkCmdBindDescriptorSets on the graphics bind point.
+    VkDescriptorSet allocateAccelGraphicsSet(VkAccelerationStructureKHR tlas, uint32_t slot);
+    void freeAccelGraphicsSet(VkDescriptorSet set);
 
     // Return (building + caching on first use) the descriptor set for a full-PBR material — the
     // wider set 1 pointing at the five textures' views. Keyed on the base-texture pointer (a
@@ -236,6 +246,7 @@ private:
     VkDescriptorSetLayout bindlessSetLayout_ = VK_NULL_HANDLE;     // dedicated set 4 for bindless textures (Slice BZ)
     VkDescriptorSetLayout accelGraphicsSetLayout_ = VK_NULL_HANDLE; // dedicated set for RT-graphics accel (Issue #34)
     uint32_t              accelGraphicsSlot_ = 0;                  // the accel binding slot baked into the layout
+    VkDescriptorPool      accelDescriptorPool_ = VK_NULL_HANDLE;   // tiny pool for RT-graphics accel sets (fix-rhi-binding13)
     VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;
 
     // 1x1 flat tangent-space normal map (RGBA 128,128,255,255 -> (0,0,1) after decode), used as the

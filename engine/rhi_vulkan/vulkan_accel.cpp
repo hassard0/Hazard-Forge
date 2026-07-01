@@ -59,9 +59,17 @@ VulkanAccelStructure::VulkanAccelStructure(VulkanDevice& device, VkAccelerationS
     : device_(device), accel_(accel), buffer_(buffer), alloc_(alloc), address_(address) {}
 
 VulkanAccelStructure::~VulkanAccelStructure() {
+    device_.freeAccelGraphicsSet(graphicsSet_);  // no-op if never bound to a graphics pipeline
     if (accel_ && device_.destroyAccelStructFn())
         device_.destroyAccelStructFn()(device_.device(), accel_, nullptr);
     if (buffer_) vmaDestroyBuffer(device_.allocator(), buffer_, alloc_);
+}
+
+VkDescriptorSet VulkanAccelStructure::graphicsSet(uint32_t slot) {
+    // Lazily allocate + write the graphics TLAS set once; re-binds reuse the immutable cached set.
+    if (graphicsSet_ == VK_NULL_HANDLE)
+        graphicsSet_ = device_.allocateAccelGraphicsSet(accel_, slot);
+    return graphicsSet_;
 }
 
 // --- CreateBlas: a procedural-AABB bottom-level accel structure -------------------------------------

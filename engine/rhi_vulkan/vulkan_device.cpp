@@ -243,9 +243,16 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
 
 VkDescriptorSetLayout VulkanDevice::accelGraphicsSetLayout(uint32_t slot) {
     // Issue #34 — lazily create the dedicated RT-graphics accel set layout: ONE
-    // ACCELERATION_STRUCTURE_KHR binding at `slot`, FRAGMENT stage, PUSH_DESCRIPTOR (the TLAS is pushed
-    // inline at VK_PIPELINE_BIND_POINT_GRAPHICS via BindAccelStructure — no pool, mirrors the compute
-    // accel path). One slot is used per run; assert it stays stable. Returns null if RT is unavailable.
+    // ACCELERATION_STRUCTURE_KHR binding at `slot`, FRAGMENT stage. A REGULAR (pool-allocated) set, NOT
+    // a push-descriptor layout: a `usesLightClusters` graphics pipeline already carries the cluster
+    // push-descriptor set (set 3), and a VkPipelineLayout may contain AT MOST ONE push-descriptor set
+    // layout (VUID-VkPipelineLayoutCreateInfo-pSetLayouts-00293). The original push-flagged version
+    // violated that in the RT-graphics pipeline (cluster set 3 + accel set 4 both push) — undefined
+    // behavior that CLOBBERED the first descriptor of the cluster push (set-3 binding 13 read garbage
+    // while 14/15 worked; see docs/superpowers/specs/2026-06-23-rt-graphics-reflect-design.md and the
+    // --probe-binding13 regression probe). The TLAS set is now allocated from a small dedicated pool and
+    // bound via vkCmdBindDescriptorSets (see allocateAccelGraphicsSet / VulkanAccelStructure::graphicsSet).
+    // One slot is used per run; assert it stays stable. Returns null if RT is unavailable.
     if (accelGraphicsSetLayout_ != VK_NULL_HANDLE) return accelGraphicsSetLayout_;
     VkDescriptorSetLayoutBinding as{};
     as.binding = slot;
@@ -253,13 +260,57 @@ VkDescriptorSetLayout VulkanDevice::accelGraphicsSetLayout(uint32_t slot) {
     as.descriptorCount = 1;
     as.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo slci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    slci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     slci.bindingCount = 1;
     slci.pBindings = &as;
     Check(vkCreateDescriptorSetLayout(device_, &slci, nullptr, &accelGraphicsSetLayout_),
           "vkCreateDescriptorSetLayout(accelGraphics)");
     accelGraphicsSlot_ = slot;
     return accelGraphicsSetLayout_;
+}
+
+VkDescriptorSet VulkanDevice::allocateAccelGraphicsSet(VkAccelerationStructureKHR tlas, uint32_t slot) {
+    // Issue #34 / fix-rhi-binding13 — allocate + write a REGULAR descriptor set holding the TLAS for the
+    // graphics (fragment RayQuery) path, replacing the second push-descriptor set that violated
+    // VUID-VkPipelineLayoutCreateInfo-pSetLayouts-00293 (see accelGraphicsSetLayout). The pool is lazily
+    // created (RT-only; tiny — one set per TLAS, cached by VulkanAccelStructure) with the FREE bit so a
+    // destroyed TLAS returns its set.
+    if (accelDescriptorPool_ == VK_NULL_HANDLE) {
+        VkDescriptorPoolSize ps{};
+        ps.type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        ps.descriptorCount = 16;
+        VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        pci.maxSets = 16;
+        pci.poolSizeCount = 1;
+        pci.pPoolSizes = &ps;
+        Check(vkCreateDescriptorPool(device_, &pci, nullptr, &accelDescriptorPool_),
+              "vkCreateDescriptorPool(accelGraphics)");
+    }
+    VkDescriptorSetLayout layout = accelGraphicsSetLayout(slot);
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = accelDescriptorPool_;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    Check(vkAllocateDescriptorSets(device_, &ai, &set), "vkAllocateDescriptorSets(accelGraphics)");
+
+    VkWriteDescriptorSetAccelerationStructureKHR asInfo{
+        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+    asInfo.accelerationStructureCount = 1;
+    asInfo.pAccelerationStructures = &tlas;
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.pNext = &asInfo;
+    write.dstSet = set;
+    write.dstBinding = slot;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    return set;
+}
+
+void VulkanDevice::freeAccelGraphicsSet(VkDescriptorSet set) {
+    if (set != VK_NULL_HANDLE && accelDescriptorPool_ != VK_NULL_HANDLE)
+        vkFreeDescriptorSets(device_, accelDescriptorPool_, 1, &set);
 }
 
 VulkanDevice::~VulkanDevice() {
@@ -806,6 +857,8 @@ void VulkanDevice::DestroyTextureResources() {
     if (perDrawSetLayout_) vkDestroyDescriptorSetLayout(device_, perDrawSetLayout_, nullptr);
     if (bindlessSetLayout_) vkDestroyDescriptorSetLayout(device_, bindlessSetLayout_, nullptr);
     if (accelGraphicsSetLayout_) vkDestroyDescriptorSetLayout(device_, accelGraphicsSetLayout_, nullptr);
+    if (accelDescriptorPool_) vkDestroyDescriptorPool(device_, accelDescriptorPool_, nullptr);
+    accelDescriptorPool_ = VK_NULL_HANDLE;
     if (defaultSampler_) vkDestroySampler(device_, defaultSampler_, nullptr);
     if (shadowSampler_) vkDestroySampler(device_, shadowSampler_, nullptr);
     if (environmentSampler_) vkDestroySampler(device_, environmentSampler_, nullptr);

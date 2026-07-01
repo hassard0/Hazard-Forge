@@ -408,12 +408,18 @@ void VulkanCommandBuffer::BindAccelStructure(IAccelStructure& tlas, uint32_t slo
     write.dstBinding = slot;
     write.descriptorCount = 1;
     write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-    // Issue #34: when a GRAPHICS pipeline with the dedicated accel set is bound, push the TLAS at the
-    // graphics bind point against the graphics layout's appended accel set (the FRAGMENT-stage RayQuery
-    // path). Otherwise push at COMPUTE (set 0) — the existing RT compute path, byte-for-byte unchanged.
+    // Issue #34: when a GRAPHICS pipeline with the dedicated accel set is bound, bind the TLAS's REGULAR
+    // descriptor set at the graphics layout's appended accel set index (the FRAGMENT-stage RayQuery
+    // path). NOT a push: the cluster set (set 3) is the pipeline layout's one allowed push-descriptor
+    // set layout (VUID-VkPipelineLayoutCreateInfo-pSetLayouts-00293) — the former push-descriptor accel
+    // set made TWO push layouts in one pipeline layout, undefined behavior that clobbered the FIRST
+    // descriptor of the cluster push (set-3 binding 13 read garbage while 14/15 worked; proven +
+    // regression-guarded by --probe-binding13). Otherwise push at COMPUTE (set 0) — the existing RT
+    // compute path (a single push set layout there), byte-for-byte unchanged.
     if (boundHasAccelSet_) {
-        device_.pushDescriptorFn()(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
-                                   boundAccelGraphicsSet_, 1, &write);
+        VkDescriptorSet s = a.graphicsSet(slot);
+        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                                boundAccelGraphicsSet_, 1, &s, 0, nullptr);
     } else {
         device_.pushDescriptorFn()(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, boundComputeLayout_,
                                    /*set=*/0, 1, &write);

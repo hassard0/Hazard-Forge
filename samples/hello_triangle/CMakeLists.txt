@@ -615,6 +615,14 @@ hf_compile_shaders(
     # -> DXC SPIR-V RayQueryKHR). VULKAN-SPIR-V-ONLY (RayQuery + int64) -> NOT in the Metal MSL list; on
     # Metal --rt-reflect-graphics runs the CPU rtrace::RenderSceneReflected (byte-identical by construction).
     "shaders/rt_reflect_graphics.frag.hlsl:psrq"
+    # fix-rhi-binding13 REGRESSION PROBE (--probe-binding13, hidden): probe_binding13.frag reads the
+    # cluster-set SSBOs at set-3 bindings 13/14/15 from a GRAPHICS pipeline that ALSO declares the
+    # Issue-#34 graphics accel set — the exact layout shape that used to clobber cluster binding 13
+    # (TWO push-descriptor set layouts in one pipeline layout, VUID-VkPipelineLayoutCreateInfo-
+    # pSetLayouts-00293). :psrq (ps_6_5 RayQuery), Vulkan-SPIR-V-only, NOT in the Metal MSL list.
+    # probe_binding13_ctl.frag is the accel-less CONTROL (one push set — the always-worked shape).
+    "shaders/probe_binding13.frag.hlsl:psrq"
+    "shaders/probe_binding13_ctl.frag.hlsl:ps"
     # Hardware Ray Tracing Slice 6 (Slice RT6, FLAGSHIP #28, the MONEY-SHOT CAPSTONE): rt_hero.comp is the LIT
     # HERO kernel — it COPIES the rt_reflect.comp body VERBATIM (primary closest-hit + primary shadow + the
     # one-bounce reflection + reflected shadow + the integer blend) with the ONE change that every MISS color
