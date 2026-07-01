@@ -773,5 +773,444 @@ inline void ClothToRenderMesh(const ClothGrid& grid, const std::vector<ClothPart
     }
 }
 
+// ===== Slice CL7 — Deterministic GPU Cloth: SELF-COLLISION (the Track-R R3 refinement) ================
+// FLAGSHIP #8 shipped with a DOCUMENTED fidelity gap: NO self-collision — a folding cloth passes through
+// itself. CL7 closes it with a PBD particle-particle separation pass in pure Q16.16 integer, and the
+// headline is real: a DETERMINISTIC SELF-COLLIDING CLOTH, bit-identical CPU<->Vulkan<->Metal AND
+// lockstep-replayable, is something no major engine ships (UE5 Chaos Cloth self-collision is float /
+// non-deterministic). Three pieces, all APPEND-ONLY below CL6 (CL1-CL6 byte-unchanged):
+//   (1) EXCLUSION: verts sharing a CL2 distance constraint (structural/shear/bend) must NOT self-collide
+//       (a constrained pair sits at restLen by design — structural neighbours are ALWAYS closer than any
+//       useful thickness and colliding them would fight the CL3 solver). A CSR adjacency table built once
+//       from the constraint list is the exclusion set. NOTE this "constraint ring" already includes the
+//       2-away BEND pairs (bend is a plain distance constraint in CL2), so the exclusion is the full
+//       constraint 1-ring which spans lattice distance <= 2 along rows/columns.
+//   (2) BROADPHASE: the FL2 grid-hash discipline (engine/sim/fluid.h), cloth-LOCAL twin (cloth.h cannot
+//       include fluid.h mid-namespace and FluidParticle != ClothParticle): a bounded dense int32 grid at
+//       cell-size == thickness, count->scan->emit cell table, per-vert candidates from the 27-cell stencil
+//       in the FIXED (dz,dy,dx ascending, then ascending j) order, box-accepted per axis (|d| < thickness,
+//       PURE INT32 — the exact radial cull happens in the solve, the FL2/FL3 split). Candidates are
+//       exclusion-filtered AT BUILD so the solve (and the GPU shader) never needs the adjacency table.
+//   (3) PROJECTION (the JACOBI discipline, the FL7 twin): pass 1 computes EVERY vert's correction from the
+//       OLD positions into a SEPARATE scratch buffer (each vert i gathers over its candidates: pair closer
+//       than thickness -> push i away along the pair axis by its inverse-mass share of the penetration —
+//       exactly the CL3 SolveDistanceConstraint / fpx ResolvePair split, pinned share 0); pass 2 applies
+//       all corrections + the ground clamp. Race-free, MULTI-THREADABLE per vert (one GPU thread per vert,
+//       NO single-thread, NO TDR — this pass chips at the documented single-thread TDR ceiling), and the
+//       per-vert correction is an INTEGER SUM so it is independent of candidate enumeration order.
+//
+// COMPOSITION (the FL7 StepFluidVisc mold, documented choice): StepClothSelf = the CL4 StepClothCollide
+// VERBATIM (integrate + Gauss-Seidel constraints + ground + spheres) THEN `selfIters` Jacobi self-collision
+// iterations against a candidate list built ONCE per step from the post-CL4 positions (the FL4 "neighbour
+// list once per step" discipline — candidates are re-tested against CURRENT positions each iteration, the
+// broadphase set is per-step). The self pass runs AFTER the constraint projection (the CL4 house order:
+// cohesion first, contacts second); the constraints re-absorb the self-push next step.
+//
+// THE IDENTITY-AT-ZERO DISCIPLINE (every HF lobe's off-switch contract): thickness == 0 (or selfIters == 0)
+// -> StepClothSelf early-returns BEFORE any self-collision state is touched -> BIT-IDENTICAL to the
+// pre-CL7 StepClothCollide (and RunClothLockstepSelf == RunClothLockstep through the harness).
+//
+// INTEGER WIDTH + THE METAL SPLIT (the CL3/CL4/FL7 convention, MATCHED): the projection uses FxLength/
+// FxNormalize/fxdiv (int64) -> the two GPU passes (cloth_self.comp + cloth_self_apply.comp) are
+// VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc — the Metal HLSL frontend — cannot; NOT in the Metal
+// hf_gen_msl list); the Metal --cl7-self showcase runs THIS CPU reference (byte-identical to the Vulkan
+// GPU result BY CONSTRUCTION — the cloth_solve.comp/cloth_collide.comp convention).
+//
+// OVERFLOW BOUND (documented like FL7): each candidate contributes < thickness to the per-axis correction
+// sum; with showcase-scale vert counts (hundreds) even a fully-degenerate coincident cluster stays
+// |corr| < n_candidates * thickness << 2^31 for thickness ~ kOne/2. The accumulation is int32 like the
+// FL7 XSPH accumulate.
+//
+// HONEST CAVEATS: PBD self-collision is ITERATIVE — after `selfIters` Jacobi passes the residual pair
+// penetration is DETERMINISTIC but NOT analytically zero (the tests count penetrating pairs with a small
+// documented slack and pin the min pair distance honestly); a pair moving more than ~thickness in one step
+// can still tunnel (velocities are bounded in the pinned scenes so they don't — a CCD pass is future work);
+// candidates are per-STEP (a pair entering thickness mid-selfIters is caught next step, the FL4 discipline).
+
+// Bring the fpx grid primitives into the cloth namespace (read-only, the FL2 usings' twin).
+using fpx::FloorDiv;    // deterministic floor-division (correct for negative coords)
+using fpx::FxCell;      // the int3 cell coordinate
+using fpx::CellId;      // the flat cell linearization
+
+// ----- ClothAdjacency: the CSR constraint-neighbour table (the self-collision EXCLUSION set) ----------
+// adj[start[i]..start[i+1]) = every vert sharing a CL2 constraint with i (both directions of every edge),
+// grouped by vert in the FIXED constraint-list order (deterministic count->scan->emit, the FL2 shape).
+struct ClothAdjacency {
+    std::vector<uint32_t> start;   // particleCount+1 exclusive prefix-sum offsets (CSR)
+    std::vector<uint32_t> adj;     // constraint-connected neighbour indices grouped by vert
+};
+
+// BuildClothAdjacency(particleCount, constraints): count->scan->emit both directions of every constraint
+// edge. Out-of-range endpoints are skipped (bounds-checked, deterministic no-op). Built ONCE per cloth
+// (the constraint graph is static), like BuildConstraints.
+inline ClothAdjacency BuildClothAdjacency(size_t particleCount,
+                                          const std::vector<Constraint>& constraints) {
+    const uint32_t n = (uint32_t)particleCount;
+    ClothAdjacency a;
+    // (1) COUNT: each in-range constraint adds one neighbour to BOTH endpoints.
+    std::vector<uint32_t> counts((size_t)n, 0u);
+    for (const Constraint& c : constraints) {
+        if (c.i >= n || c.j >= n) continue;              // bounds-checked skip
+        ++counts[c.i];
+        ++counts[c.j];
+    }
+    // (2) SCAN: exclusive prefix-sum -> start (n+1 entries; the last == total).
+    a.start.assign((size_t)n + 1u, 0u);
+    uint32_t running = 0;
+    for (uint32_t i = 0; i < n; ++i) { a.start[i] = running; running += counts[i]; }
+    a.start[n] = running;
+    // (3) EMIT: scatter each edge's two directions at the per-vert cursors (fixed constraint order).
+    a.adj.assign((size_t)running, 0u);
+    std::vector<uint32_t> cursor((size_t)n, 0u);
+    for (const Constraint& c : constraints) {
+        if (c.i >= n || c.j >= n) continue;
+        a.adj[a.start[c.i] + cursor[c.i]] = c.j; ++cursor[c.i];
+        a.adj[a.start[c.j] + cursor[c.j]] = c.i; ++cursor[c.j];
+    }
+    return a;
+}
+
+// IsConstraintConnected(a, i, j): true iff verts i and j share a CL2 constraint (a linear scan of i's
+// CSR slice — the per-vert degree is <= 12 on the lattice, so this is a handful of compares). Bounds-safe.
+inline bool IsConstraintConnected(const ClothAdjacency& a, uint32_t i, uint32_t j) {
+    if ((size_t)i + 1u >= a.start.size()) return false;
+    for (uint32_t s = a.start[i]; s < a.start[i + 1u]; ++s)
+        if (a.adj[s] == j) return true;
+    return false;
+}
+
+// ----- The self-collision broadphase: the FL2 bounded-dense-grid twin over cloth verts ----------------
+// Cell size == thickness: any pair with FxLength < thickness is within one cell per axis, so the 27-cell
+// stencil is COMPLETE (the FL2 cell-size==h argument). Pure int32 throughout (FloorDiv + index arithmetic).
+struct ClothSelfGrid {
+    fx     cell = 0;      // Q16.16 cell size (== the self-collision thickness)
+    FxCell cellMin;       // the integer cell coord of the grid's (0,0,0) corner
+    FxCell gridDim;       // the grid extent in cells per axis
+};
+
+// SelfCellOf(p, cell): the integer grid cell of a position (FloorDiv per axis — the fluid::CellOf twin).
+inline FxCell SelfCellOf(const FxVec3& p, fx cell) {
+    return FxCell{FloorDiv(p.x, cell), FloorDiv(p.y, cell), FloorDiv(p.z, cell)};
+}
+
+// kMaxSelfCells: the dense-grid size cap. A pathological extent/thickness ratio would blow the dense cell
+// table; past the cap BuildSelfCandidates falls back to the brute-force all-pairs enumeration — the SAME
+// accept predicate over the SAME pair set, and the per-vert correction is an integer SUM (order-free), so
+// the fallback is BIT-IDENTICAL in effect, just slower (a bounds-safety valve, deterministic either way).
+inline constexpr int64_t kMaxSelfCells = (int64_t)1 << 22;   // 4M cells
+
+// ----- ClothSelfList: per-vert self-collision candidates (CSR, exclusion-filtered at build) -----------
+// cand[start[i]..start[i+1]) = every vert j != i with |pos_i - pos_j| < thickness PER AXIS (the FL2 box
+// accept — over-inclusive; the exact radial cull happens in the solve) and NOT constraint-connected to i.
+// BOTH directions are present (j in i's slice AND i in j's slice) — each vert gathers its OWN correction.
+struct ClothSelfList {
+    std::vector<uint32_t> start;   // particleCount+1 exclusive prefix-sum offsets (CSR)
+    std::vector<uint32_t> cand;    // candidate j indices grouped by i (fixed stencil order)
+};
+
+// SelfBoxAccept(a, b, t): the PURE INT32 per-axis |d| < t candidate test (the fluid::NeighborAccept twin).
+inline bool SelfBoxAccept(const FxVec3& a, const FxVec3& b, fx t) {
+    fx dx = a.x - b.x; if (dx < 0) dx = -dx;
+    fx dy = a.y - b.y; if (dy < 0) dy = -dy;
+    fx dz = a.z - b.z; if (dz < 0) dz = -dz;
+    return dx < t && dy < t && dz < t;
+}
+
+// BuildSelfCandidates(particles, excl, thickness): the per-step broadphase (the FL2 MakeGrid +
+// BuildCellTable + BuildNeighborList discipline, fused). thickness <= 0 or fewer than 2 verts -> an empty
+// list (the off-switch). Grid path: bucket verts into the dense grid (count->scan->emit), then per vert
+// scan the 27-cell stencil in the FIXED (dz,dy,dx ascending; ascending j within a cell) order, box-accept,
+// exclusion-filter. Oversized grid (see kMaxSelfCells) -> brute-force ascending-j fallback (same set).
+inline ClothSelfList BuildSelfCandidates(const std::vector<ClothParticle>& particles,
+                                         const ClothAdjacency& excl, fx thickness) {
+    const uint32_t n = (uint32_t)particles.size();
+    ClothSelfList list;
+    list.start.assign((size_t)n + 1u, 0u);
+    if (thickness <= 0 || n < 2u) return list;           // empty candidate list (self-collision off)
+
+    // Grid bounds over the vert positions (the fluid::MakeGrid twin).
+    ClothSelfGrid grid;
+    grid.cell = thickness;
+    FxCell lo = SelfCellOf(particles[0].pos, thickness), hi = lo;
+    for (uint32_t i = 1; i < n; ++i) {
+        const FxCell c = SelfCellOf(particles[(size_t)i].pos, thickness);
+        if (c.x < lo.x) lo.x = c.x; if (c.x > hi.x) hi.x = c.x;
+        if (c.y < lo.y) lo.y = c.y; if (c.y > hi.y) hi.y = c.y;
+        if (c.z < lo.z) lo.z = c.z; if (c.z > hi.z) hi.z = c.z;
+    }
+    grid.cellMin = lo;
+    grid.gridDim = FxCell{hi.x - lo.x + 1, hi.y - lo.y + 1, hi.z - lo.z + 1};
+    const int64_t cells64 = (int64_t)grid.gridDim.x * grid.gridDim.y * grid.gridDim.z;
+
+    if (cells64 > kMaxSelfCells) {
+        // Brute-force fallback (deterministic; the same accept predicate -> the same candidate SET; the
+        // solve's per-vert sum is order-independent over the set). O(n^2) — the bounds-safety valve.
+        std::vector<uint32_t> counts((size_t)n, 0u);
+        for (uint32_t i = 0; i < n; ++i)
+            for (uint32_t j = 0; j < n; ++j) {
+                if (j == i) continue;
+                if (!SelfBoxAccept(particles[(size_t)i].pos, particles[(size_t)j].pos, thickness)) continue;
+                if (IsConstraintConnected(excl, i, j)) continue;
+                ++counts[i];
+            }
+        uint32_t running = 0;
+        for (uint32_t i = 0; i < n; ++i) { list.start[i] = running; running += counts[i]; }
+        list.start[n] = running;
+        list.cand.assign((size_t)running, 0u);
+        for (uint32_t i = 0; i < n; ++i) {
+            uint32_t local = 0;
+            for (uint32_t j = 0; j < n; ++j) {
+                if (j == i) continue;
+                if (!SelfBoxAccept(particles[(size_t)i].pos, particles[(size_t)j].pos, thickness)) continue;
+                if (IsConstraintConnected(excl, i, j)) continue;
+                list.cand[list.start[i] + local] = j;
+                ++local;
+            }
+        }
+        return list;
+    }
+
+    // Dense cell table: count->scan->emit vert indices into cells (the fluid::BuildCellTable twin).
+    const uint32_t cells = (uint32_t)cells64;
+    auto flatId = [&grid](const FxCell& c) {
+        const FxCell local{c.x - grid.cellMin.x, c.y - grid.cellMin.y, c.z - grid.cellMin.z};
+        return CellId(local, grid.gridDim);
+    };
+    std::vector<uint32_t> cellStart((size_t)cells + 1u, 0u);
+    {
+        std::vector<uint32_t> counts((size_t)cells, 0u);
+        for (uint32_t i = 0; i < n; ++i) ++counts[flatId(SelfCellOf(particles[(size_t)i].pos, thickness))];
+        uint32_t running = 0;
+        for (uint32_t c = 0; c < cells; ++c) { cellStart[c] = running; running += counts[c]; }
+        cellStart[cells] = running;
+    }
+    std::vector<uint32_t> cellVerts((size_t)n, 0u);
+    {
+        std::vector<uint32_t> cursor((size_t)cells, 0u);
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t c = flatId(SelfCellOf(particles[(size_t)i].pos, thickness));
+            cellVerts[cellStart[c] + cursor[c]] = i;   // ascending i within a cell (the ascending loop)
+            ++cursor[c];
+        }
+    }
+
+    // Per-vert candidates over the 27-cell stencil (count then emit, the fluid::BuildNeighborList twin).
+    auto scanStencil = [&](uint32_t i, uint32_t* emitAt) -> uint32_t {
+        const FxCell ci = SelfCellOf(particles[(size_t)i].pos, thickness);
+        uint32_t local = 0;
+        for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const FxCell nc{ci.x + dx, ci.y + dy, ci.z + dz};
+            if (nc.x < grid.cellMin.x || nc.x >= grid.cellMin.x + grid.gridDim.x) continue;
+            if (nc.y < grid.cellMin.y || nc.y >= grid.cellMin.y + grid.gridDim.y) continue;
+            if (nc.z < grid.cellMin.z || nc.z >= grid.cellMin.z + grid.gridDim.z) continue;
+            const uint32_t cell = flatId(nc);
+            for (uint32_t s = cellStart[cell]; s < cellStart[cell + 1u]; ++s) {
+                const uint32_t j = cellVerts[s];
+                if (j == i) continue;                                     // NO self
+                if (!SelfBoxAccept(particles[(size_t)i].pos, particles[(size_t)j].pos, thickness)) continue;
+                if (IsConstraintConnected(excl, i, j)) continue;          // the exclusion ring
+                if (emitAt) emitAt[local] = j;
+                ++local;
+            }
+        }
+        return local;
+    };
+    {
+        std::vector<uint32_t> counts((size_t)n, 0u);
+        for (uint32_t i = 0; i < n; ++i) counts[i] = scanStencil(i, nullptr);
+        uint32_t running = 0;
+        for (uint32_t i = 0; i < n; ++i) { list.start[i] = running; running += counts[i]; }
+        list.start[n] = running;
+        list.cand.assign((size_t)running, 0u);
+        for (uint32_t i = 0; i < n; ++i)
+            if (list.start[i + 1u] > list.start[i]) scanStencil(i, &list.cand[list.start[i]]);
+    }
+    return list;
+}
+
+// ----- SolveSelfCollision: ONE Jacobi self-collision iteration (the bit-exact core) -------------------
+// PASS 1 (gather, from OLD positions): for each vert i (skipping PINNED — share 0, never moves), for each
+// candidate j in the FIXED list order: d = pos_i - pos_j; dist = FxLength(d); pair closer than thickness ->
+//   pen  = thickness - dist                (> 0, the pair overlap)
+//   n    = FxNormalize(d)                  (the push-apart axis, pointing i AWAY from j); dist == 0 ->
+//          the deterministic INDEX tie-break (i < j ? +Y : -Y) so a coincident pair separates (the raw
+//          FxNormalize fallback would push both the SAME way — documented deviation from CollideParticleSphere)
+//   wsum = invMass_i + invMass_j; wsum == 0 -> skip; wi = fxdiv(invMass_i, wsum)   (the CL3/ResolvePair split)
+//   corr_i += n * fxmul(pen, wi)           (i accumulates ONLY ITS OWN half; j's half is computed when j
+//                                           gathers — the pairwise math is symmetric over the OLD state)
+// PASS 2 (apply): every non-pinned vert: pos += corr; then the ground clamp (pos.y >= groundY). Pass 1
+// reads positions READ-ONLY and writes only corr[i] -> race-free, MULTI-THREADABLE per vert (the Jacobi
+// discipline; the GPU cloth_self.comp / cloth_self_apply.comp copy the two passes VERBATIM). Returns the
+// number of (i, candidate) projections gathered (a deterministic coverage stat). int64-backed (FxLength/
+// FxNormalize/fxdiv) -> Vulkan-only shaders; Metal runs THIS reference (the CL3/CL4 convention).
+inline int SolveSelfCollision(std::vector<ClothParticle>& particles, const ClothSelfList& list,
+                              fx thickness, fx groundY) {
+    const uint32_t n = (uint32_t)particles.size();
+    if (thickness <= 0 || list.start.size() != (size_t)n + 1u) return 0;   // bounds-checked no-op
+    std::vector<FxVec3> corr((size_t)n, FxVec3{0, 0, 0});
+    int projections = 0;
+    // PASS 1: gather every correction from the OLD positions (read-only) into the scratch buffer.
+    for (uint32_t i = 0; i < n; ++i) {
+        const ClothParticle& pi = particles[(size_t)i];
+        if (pi.flags & kFlagPinned) continue;                    // pinned share 0 -> corr stays 0
+        FxVec3 acc{0, 0, 0};
+        for (uint32_t s = list.start[i]; s < list.start[i + 1u]; ++s) {
+            const uint32_t j = list.cand[s];
+            if (j >= n) continue;                                // bounds-checked skip
+            const ClothParticle& pj = particles[(size_t)j];
+            const fx wsum = pi.invMass + pj.invMass;
+            if (wsum == 0) continue;                             // both pinned -> skip (mirrors CL3)
+            const FxVec3 d = FxSub(pi.pos, pj.pos);
+            const fx dist = FxLength(d);
+            if (dist >= thickness) continue;                     // the exact radial cull (FL3's role)
+            const fx pen = thickness - dist;
+            // The push-apart axis: coincident pair -> the deterministic INDEX tie-break (+Y for the lower
+            // index, -Y for the higher) so the pair actually separates.
+            const FxVec3 axis = (dist == 0)
+                ? (i < j ? FxVec3{0, kOne, 0} : FxVec3{0, -kOne, 0})
+                : FxNormalize(d);
+            const fx wi = fxdiv(pi.invMass, wsum);
+            const FxVec3 push = FxScale(axis, fxmul(pen, wi));
+            acc = FxAdd(acc, push);
+            ++projections;
+        }
+        corr[(size_t)i] = acc;
+    }
+    // PASS 2: apply all corrections, then the ground clamp (pinned untouched).
+    for (uint32_t i = 0; i < n; ++i) {
+        ClothParticle& p = particles[(size_t)i];
+        if (p.flags & kFlagPinned) continue;
+        p.pos = FxAdd(p.pos, corr[(size_t)i]);
+        if (p.pos.y < groundY) p.pos.y = groundY;
+    }
+    return projections;
+}
+
+// ----- StepClothSelf: the composed SELF-COLLIDING step (CL4 step -> per-step candidates -> K Jacobi) ---
+// StepClothCollide VERBATIM (the pre-CL7 composed step, UNTOUCHED), then — iff thickness > 0 AND
+// selfIters > 0 — build the candidate list ONCE from the post-step positions and run `selfIters`
+// SolveSelfCollision Jacobi iterations. thickness == 0 (or selfIters == 0) -> EARLY RETURN before any
+// self-collision state is touched -> BIT-IDENTICAL to StepClothCollide (the identity-at-zero). State
+// shape unchanged (positions only) -> the CL5 snapshot/lockstep machinery applies VERBATIM. Returns the
+// CL4 contact count (the sphere-contact stat, unchanged semantics).
+inline int StepClothSelf(const ClothGrid& grid, std::vector<ClothParticle>& particles,
+                         const std::vector<Constraint>& constraints, const ClothAdjacency& excl,
+                         const std::vector<SphereCollider>& spheres,
+                         const FxVec3& gravity, fx dt, fx groundY, int iters,
+                         fx thickness, int selfIters) {
+    const int contacts = StepClothCollide(grid, particles, constraints, spheres,
+                                          gravity, dt, groundY, iters);
+    if (thickness <= 0 || selfIters <= 0) return contacts;   // identity-at-zero: EXACT no-op
+    const ClothSelfList list = BuildSelfCandidates(particles, excl, thickness);
+    for (int k = 0; k < selfIters; ++k)
+        SolveSelfCollision(particles, list, thickness, groundY);
+    return contacts;
+}
+
+// ----- StepClothSelfSteps: run K composed self-colliding steps (the showcase / GPU K-step driver) ------
+inline int StepClothSelfSteps(const ClothGrid& grid, std::vector<ClothParticle>& particles,
+                              const std::vector<Constraint>& constraints, const ClothAdjacency& excl,
+                              const std::vector<SphereCollider>& spheres,
+                              const FxVec3& gravity, fx dt, fx groundY, int iters,
+                              fx thickness, int selfIters, int steps) {
+    int contacts = 0;
+    for (int s = 0; s < steps; ++s)
+        contacts = StepClothSelf(grid, particles, constraints, excl, spheres,
+                                 gravity, dt, groundY, iters, thickness, selfIters);
+    return contacts;
+}
+
+// ----- SimClothTickSelf / RunClothLockstepSelf: the CL5 harness over the SELF-COLLIDING step -----------
+// The CL5 machinery applies VERBATIM (the state shape is unchanged); only the step fn is swapped
+// (StepClothCollide -> StepClothSelf), the FL7 SimFluidTickVisc/RunFluidLockstepVisc mold. A peer fed the
+// input stream alone re-derives the SELF-COLLIDING cloth bit-for-bit. thickness == 0 -> identical to
+// SimClothTick/RunClothLockstep by the identity-at-zero.
+inline void SimClothTickSelf(const ClothGrid& grid, std::vector<ClothParticle>& particles,
+                             const std::vector<Constraint>& constraints, const ClothAdjacency& excl,
+                             const std::vector<SphereCollider>& spheres,
+                             const std::vector<ClothCommand>& stream, uint32_t tick,
+                             const FxVec3& gravity, fx dt, fx groundY, int iters,
+                             fx thickness, int selfIters) {
+    for (const ClothCommand& c : stream)
+        if (c.tick == tick) ApplyClothCommand(particles, c);
+    StepClothSelf(grid, particles, constraints, excl, spheres, gravity, dt, groundY, iters,
+                  thickness, selfIters);
+}
+
+inline std::vector<ClothParticle> RunClothLockstepSelf(const ClothGrid& grid,
+                                                       const std::vector<ClothParticle>& init,
+                                                       const std::vector<Constraint>& constraints,
+                                                       const ClothAdjacency& excl,
+                                                       const std::vector<SphereCollider>& spheres,
+                                                       const std::vector<ClothCommand>& stream, int ticks,
+                                                       const FxVec3& gravity, fx dt, fx groundY, int iters,
+                                                       fx thickness, int selfIters) {
+    std::vector<ClothParticle> particles = init;
+    for (int t = 0; t < ticks; ++t)
+        SimClothTickSelf(grid, particles, constraints, excl, spheres, stream, (uint32_t)t,
+                         gravity, dt, groundY, iters, thickness, selfIters);
+    return particles;
+}
+
+// ----- CountSelfPenetrating: the deterministic self-penetration metric (the CL7 physics proof) --------
+// The number of unordered vert pairs (i < j), NOT constraint-connected, with FxLength(pos_i - pos_j) <
+// thickness - slack. Deliberately BRUTE-FORCE O(n^2) (a test/diagnostic helper, NOT the sim path) so the
+// metric does NOT share the grid broadphase with the solver — a broadphase bug shows up here. `slack` is
+// the honest PBD-residual tolerance (the solve is iterative; pairs settle a few LSBs under thickness —
+// pass 0 for the raw count, a small slack for the "resolved" count; the tests pin BOTH). Pure integer.
+inline int CountSelfPenetrating(const std::vector<ClothParticle>& particles,
+                                const ClothAdjacency& excl, fx thickness, fx slack) {
+    const uint32_t n = (uint32_t)particles.size();
+    const fx bar = thickness - slack;
+    int pen = 0;
+    for (uint32_t i = 0; i < n; ++i)
+        for (uint32_t j = i + 1u; j < n; ++j) {
+            if (IsConstraintConnected(excl, i, j)) continue;
+            const FxVec3 d = FxSub(particles[(size_t)i].pos, particles[(size_t)j].pos);
+            if (FxLength(d) < bar) ++pen;
+        }
+    return pen;
+}
+
+// MinSelfDistance(particles, excl): the minimum FxLength over all non-constraint-connected unordered
+// pairs (the pinned "how separated did CL7 leave the cloth" stat). Brute-force O(n^2) diagnostic like
+// CountSelfPenetrating. No such pair (tiny/fully-connected cloth) -> INT32_MAX (deterministic sentinel).
+inline fx MinSelfDistance(const std::vector<ClothParticle>& particles, const ClothAdjacency& excl) {
+    const uint32_t n = (uint32_t)particles.size();
+    fx best = INT32_MAX;
+    for (uint32_t i = 0; i < n; ++i)
+        for (uint32_t j = i + 1u; j < n; ++j) {
+            if (IsConstraintConnected(excl, i, j)) continue;
+            const FxVec3 d = FxSub(particles[(size_t)i].pos, particles[(size_t)j].pos);
+            const fx len = FxLength(d);
+            if (len < best) best = len;
+        }
+    return best;
+}
+
+// ----- ClothDigest: the deterministic FNV-1a-64 digest of the whole particle state (the pin) -----------
+// Hashes every particle's 11 int32 words FIELD-WISE (pos/prev/vel/invMass/flags, little-endian byte order
+// by explicit shifts — NO reinterpret_cast, so the digest is layout/padding-independent and identical on
+// every compiler/platform). The golden-discipline pin the CL7 tests + showcases print (the fluid.h::
+// FluidDigest twin over ClothParticle).
+inline uint64_t ClothDigest(const std::vector<ClothParticle>& particles) {
+    uint64_t h = 1469598103934665603ull;                    // FNV-1a 64 offset basis
+    auto mix = [&h](uint32_t v) {
+        for (int b = 0; b < 4; ++b) {
+            h ^= (uint64_t)((v >> (b * 8)) & 0xFFu);
+            h *= 1099511628211ull;                          // FNV-1a 64 prime
+        }
+    };
+    for (const ClothParticle& p : particles) {
+        mix((uint32_t)p.pos.x);  mix((uint32_t)p.pos.y);  mix((uint32_t)p.pos.z);
+        mix((uint32_t)p.prev.x); mix((uint32_t)p.prev.y); mix((uint32_t)p.prev.z);
+        mix((uint32_t)p.vel.x);  mix((uint32_t)p.vel.y);  mix((uint32_t)p.vel.z);
+        mix((uint32_t)p.invMass); mix(p.flags);
+    }
+    return h;
+}
+
 }  // namespace cloth
 }  // namespace hf::sim

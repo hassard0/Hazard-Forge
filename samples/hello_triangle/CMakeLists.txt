@@ -1303,6 +1303,21 @@ hf_compile_shaders(
     # integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU particle array + cross-backend, proven memcmp.
     # NO new RHI; CL1-CL3 shaders + goldens untouched.
     "shaders/cloth_collide.comp.hlsl:cs"
+    # Deterministic GPU Cloth Slice 7 (Slice CL7, the Track-R R3 refinement of FLAGSHIP #8): SELF-COLLISION.
+    # cloth_self.comp: ONE thread per cloth vert gathers its Jacobi self-collision correction over the
+    # host-built, exclusion-filtered FL2-grid candidate list (pair closer than `thickness` -> push apart
+    # along the pair axis by the inverse-mass share; coincident pair -> the deterministic index tie-break;
+    # PINNED share 0) into a SEPARATE gCorr scratch buffer (the fluid_visc.comp Jacobi double-buffer
+    # pattern); cloth_self_apply.comp: ONE thread per vert applies pos += corr + the ground clamp. Both
+    # copied VERBATIM from engine/sim/cloth.h::SolveSelfCollision. Per-vert INDEPENDENT -> MULTI-THREAD,
+    # NO atomics, NO TDR (unlike the Gauss-Seidel cloth_solve/cloth_collide single-thread passes — this
+    # chips at the documented single-thread ceiling for the self pass). Because FxLength/FxISqrt/fxdiv use
+    # int64, both are VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl
+    # list; the Metal --cl7-self showcase runs the CPU cloth::StepClothSelfSteps (byte-identical by
+    # construction, the cloth_solve/cloth_collide convention). thickness=0/enabled=0 -> the passes touch
+    # nothing (the identity-at-zero). NO new RHI; CL1-CL6 shaders + goldens untouched.
+    "shaders/cloth_self.comp.hlsl:cs"
+    "shaders/cloth_self_apply.comp.hlsl:cs"
     # Deterministic Fixed-Point Physics Slice 2 (Slice FPX2): the integer-AABB BROADPHASE candidate-pair
     # generator (the MC3 count->scan->emit on bodies). fpx_pair_count.comp: ONE thread per body i scans j>i
     # and writes perBodyCount[i]=Σ AabbOverlap(BodyAabb(i),BodyAabb(j)) (each unordered pair counted once,

@@ -774,6 +774,367 @@ int main() {
         check(sv.size() == 5 && si.empty(), "CL6 ClothToRenderMesh: 1xN strip -> verts but 0 triangles");
     }
 
+    // ============================ Slice CL7 — SELF-COLLISION ========================================
+    // The Track-R R3 refinement: closes the documented "no self-collision" gap of FLAGSHIP #8. CL7 adds
+    // the constraint-ring exclusion (ClothAdjacency), the FL2-twin grid broadphase (BuildSelfCandidates),
+    // the Jacobi projection (SolveSelfCollision) and the composed StepClothSelf + lockstep twin. These
+    // cases pin: (a) the CL1-CL5 PINNED DIGESTS (the append-only proof — canonical pre-CL7 scenes must
+    // hash to the exact same state after CL7 lands); (b) the exclusion/broadphase/projection units
+    // (hand-checked exact Q16.16); (c) THE PHYSICS PROOF (a cloth folded flat onto itself over the
+    // ground: WITHOUT CL7 the top layer falls through the bottom layer [penetrating pairs > 0]; WITH CL7
+    // it RESTS ON it [slack-count 0, min pair distance pinned]); (d) the IDENTITY-AT-ZERO (thickness=0
+    // -> StepClothSelf BIT-IDENTICAL to the pre-CL7 StepClothCollide, incl. through the lockstep
+    // harness); (e) determinism + the CL7 pinned digest (identical MSVC + clang); (f) LOCKSTEP (a peer
+    // re-derives the self-colliding cloth bit-for-bit) + the snapshot round-trip; (g) pinned-vert respect.
+    // NOTE: GPU==CPU for the CL7 shaders is proven by the --cl7-self-shot Vulkan memcmp (this test is
+    // the pure-CPU reference half, the FL7 split).
+
+    // --- (a) the CL1-CL5 pinned digests (the append-only proof) --------------------------------------
+    {
+        // CL1: the 8x8 integrate determinism scene (grav -10, dt=1/60, groundY 0, K=60).
+        {
+            cloth::ClothGrid grid; grid.W = 8; grid.H = 8; grid.spacing = kOne;
+            grid.origin = cloth::FxVec3{0, FromInt(12), 0};
+            std::vector<cloth::ClothParticle> ps = cloth::InitGrid(grid);
+            cloth::IntegrateParticlesSteps(grid, ps, cloth::FxVec3{0, FromInt(-10), 0}, kOne / 60, 0, 60);
+            const uint64_t d = cloth::ClothDigest(ps);
+            std::printf("CL7 pin: CL1 integrate digest = 0x%016llx\n", (unsigned long long)d);
+            check(d == 0xe5f6cb88ab55f877ull, "CL7 pin(a): CL1 integrate digest UNCHANGED");
+        }
+        // CL4: the 12x12 sheet-over-sphere composed scene (iters=6, steps=40).
+        {
+            cloth::ClothGrid grid; grid.W = 12; grid.H = 12; grid.spacing = kOne;
+            grid.origin = cloth::FxVec3{FromInt(-6), FromInt(8), 0};
+            std::vector<cloth::ClothParticle> ps = cloth::InitGrid(grid);
+            std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, ps);
+            std::vector<cloth::SphereCollider> spheres{
+                cloth::SphereCollider{cloth::FxVec3{0, FromInt(2), 0}, FromInt(3)}};
+            cloth::StepClothCollideSteps(grid, ps, es, spheres, cloth::FxVec3{0, FromInt(-10), 0},
+                                         kOne / 60, FromInt(-1000), 6, 40);
+            const uint64_t d = cloth::ClothDigest(ps);
+            std::printf("CL7 pin: CL4 StepClothCollideSteps digest = 0x%016llx\n", (unsigned long long)d);
+            check(d == 0x239a5b28da38e100ull, "CL7 pin(a): CL4 composed-step digest UNCHANGED");
+        }
+        // CL5: the 12x12 lockstep authority (the wind/pin command stream, ticks=16).
+        {
+            cloth::ClothGrid grid; grid.W = 12; grid.H = 12; grid.spacing = kOne;
+            grid.origin = cloth::FxVec3{0, FromInt(12), 0};
+            const std::vector<cloth::ClothParticle> init = cloth::InitGrid(grid);
+            const std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, init);
+            std::vector<cloth::SphereCollider> noSpheres;
+            const int wIdx = cloth::ParticleIndex(grid, 6, 6);
+            const std::vector<cloth::ClothCommand> authStream{
+                cloth::ClothCommand{2,  cloth::kCmdWind, (uint32_t)wIdx, cloth::FxVec3{FromInt(4), 0, 0}},
+                cloth::ClothCommand{6,  cloth::kCmdWind, (uint32_t)wIdx, cloth::FxVec3{0, 0, FromInt(3)}},
+                cloth::ClothCommand{10, cloth::kCmdPin,  (uint32_t)wIdx, {}},
+            };
+            const std::vector<cloth::ClothParticle> authority =
+                cloth::RunClothLockstep(grid, init, es, noSpheres, authStream, 16,
+                                        cloth::FxVec3{0, FromInt(-10), 0}, kOne / 60, FromInt(-1000), 4);
+            const uint64_t d = cloth::ClothDigest(authority);
+            std::printf("CL7 pin: CL5 lockstep authority digest = 0x%016llx\n", (unsigned long long)d);
+            check(d == 0xa6185f21f17b68a2ull, "CL7 pin(a): CL5 lockstep-authority digest UNCHANGED");
+        }
+    }
+
+    // --- (b1) BuildClothAdjacency: the 2x2 grid hand-checked (every pair constraint-connected) --------
+    {
+        cloth::ClothGrid grid; grid.W = 2; grid.H = 2; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(4), 0};
+        std::vector<cloth::ClothParticle> ps = cloth::InitGrid(grid);
+        std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, ps);
+        cloth::ClothAdjacency a = cloth::BuildClothAdjacency(ps.size(), es);
+        // 6 edges x 2 directions = 12 adjacency entries; every vert has degree 3 (connected to the others).
+        check(a.start.size() == 5 && a.start[4] == 12, "CL7 adjacency 2x2: 12 directed entries");
+        bool allConnected = true;
+        for (uint32_t i = 0; i < 4; ++i)
+            for (uint32_t j = 0; j < 4; ++j)
+                if (i != j && !cloth::IsConstraintConnected(a, i, j)) allConnected = false;
+        check(allConnected, "CL7 adjacency 2x2: every pair constraint-connected (struct+shear)");
+        check(!cloth::IsConstraintConnected(a, 0, 99), "CL7 adjacency: out-of-range j is not connected");
+        // A fully-connected cloth can never self-penetrate by the metric (every pair excluded).
+        check(cloth::CountSelfPenetrating(ps, a, FromInt(10), 0) == 0,
+              "CL7 metric: fully-connected 2x2 has zero countable pairs");
+        check(cloth::MinSelfDistance(ps, a) == INT32_MAX,
+              "CL7 metric: no non-connected pair -> MinSelfDistance sentinel");
+    }
+
+    // --- (b2) BuildSelfCandidates: near pair accepted, connected pair excluded, off-switch empty ------
+    {
+        // Two free verts 0.25 apart (thickness 0.5): each lists the other.
+        std::vector<cloth::ClothParticle> ps(2);
+        ps[0].pos = {0, 0, 0}; ps[0].prev = ps[0].pos; ps[0].invMass = kOne; ps[0].flags = 0;
+        ps[1].pos = {kOne / 4, 0, 0}; ps[1].prev = ps[1].pos; ps[1].invMass = kOne; ps[1].flags = 0;
+        const cloth::ClothAdjacency none = cloth::BuildClothAdjacency(ps.size(), {});
+        cloth::ClothSelfList list = cloth::BuildSelfCandidates(ps, none, kOne / 2);
+        check(list.start.size() == 3 && list.start[2] == 2 &&
+              list.cand.size() == 2 && list.cand[0] == 1u && list.cand[1] == 0u,
+              "CL7 candidates: a near free pair lists each other (both directions)");
+        // thickness = 0 -> the empty off-switch list.
+        cloth::ClothSelfList off = cloth::BuildSelfCandidates(ps, none, 0);
+        check(off.start.size() == 3 && off.start[2] == 0 && off.cand.empty(),
+              "CL7 candidates: thickness=0 -> empty list (off-switch)");
+        // The same pair constraint-connected -> excluded from the candidates.
+        std::vector<cloth::Constraint> es{cloth::Constraint{0u, 1u, kOne / 4, cloth::kConstraintStructural}};
+        const cloth::ClothAdjacency conn = cloth::BuildClothAdjacency(ps.size(), es);
+        cloth::ClothSelfList excl = cloth::BuildSelfCandidates(ps, conn, kOne / 2);
+        check(excl.start[2] == 0 && excl.cand.empty(),
+              "CL7 candidates: a constraint-connected pair is EXCLUDED");
+        // A far pair (2.0 apart, thickness 0.5) -> no candidates (the box reject).
+        std::vector<cloth::ClothParticle> far = ps;
+        far[1].pos.x = FromInt(2); far[1].prev = far[1].pos;
+        cloth::ClothSelfList farList = cloth::BuildSelfCandidates(far, none, kOne / 2);
+        check(farList.start[2] == 0, "CL7 candidates: a far pair is rejected (grid/box)");
+    }
+
+    // --- (b3) SolveSelfCollision micro: exact shares, pinned respect, coincident tie-break ------------
+    {
+        const fx thickness = kOne / 2;
+        const fx groundY = FromInt(-1000);
+        const cloth::ClothAdjacency none = cloth::BuildClothAdjacency(3, {});
+        // PINNED obstacle: A pinned at 0, B free at x=0.25 -> B takes the FULL push to exactly x=0.5;
+        // A is BYTE-UNTOUCHED (pinned-vert respect, hand-checked exact Q16.16: FxNormalize(+x)=kOne,
+        // wi = fxdiv(kOne,kOne) = kOne, push = fxmul(pen=0.25, kOne) = 0.25).
+        {
+            std::vector<cloth::ClothParticle> ps(3);
+            ps[0].pos = {0, 0, 0}; ps[0].prev = ps[0].pos; ps[0].invMass = 0; ps[0].flags = cloth::kFlagPinned;
+            ps[1].pos = {kOne / 4, 0, 0}; ps[1].prev = ps[1].pos; ps[1].invMass = kOne; ps[1].flags = 0;
+            ps[2].pos = {FromInt(9), FromInt(9), 0}; ps[2].prev = ps[2].pos; ps[2].invMass = kOne; ps[2].flags = 0;
+            const cloth::ClothParticle pinBefore = ps[0];
+            cloth::ClothSelfList list = cloth::BuildSelfCandidates(ps, none, thickness);
+            const int proj = cloth::SolveSelfCollision(ps, list, thickness, groundY);
+            check(proj == 1, "CL7 micro: exactly ONE projection gathered (the free side of the pair)");
+            check(std::memcmp(&ps[0], &pinBefore, sizeof(cloth::ClothParticle)) == 0,
+                  "CL7 micro: a PINNED vert in a self-contact is BYTE-UNTOUCHED");
+            check(ps[1].pos.x == kOne / 2 && ps[1].pos.y == 0 && ps[1].pos.z == 0,
+                  "CL7 micro: the free vert takes the FULL push to exactly thickness (0.5)");
+            check(std::memcmp(&ps[2].pos, &ps[2].prev, sizeof(cloth::FxVec3)) == 0,
+                  "CL7 micro: the far vert is untouched");
+        }
+        // EQUAL-MASS split: two free verts 0.25 apart -> each moves pen/2 = 0.125 -> exactly 0.5 apart.
+        {
+            std::vector<cloth::ClothParticle> ps(2);
+            ps[0].pos = {0, 0, 0}; ps[0].prev = ps[0].pos; ps[0].invMass = kOne; ps[0].flags = 0;
+            ps[1].pos = {kOne / 4, 0, 0}; ps[1].prev = ps[1].pos; ps[1].invMass = kOne; ps[1].flags = 0;
+            const cloth::ClothAdjacency none2 = cloth::BuildClothAdjacency(2, {});
+            cloth::ClothSelfList list = cloth::BuildSelfCandidates(ps, none2, thickness);
+            cloth::SolveSelfCollision(ps, list, thickness, groundY);
+            check(ps[0].pos.x == -(kOne / 8) && ps[1].pos.x == kOne / 4 + kOne / 8,
+                  "CL7 micro: equal-mass pair splits the push (each pen/2) to exactly thickness apart");
+        }
+        // COINCIDENT tie-break: two free verts at the SAME position -> the lower index pushed +Y, the
+        // higher -Y, each by pen/2 = thickness/2/2 -> exactly thickness apart along Y (deterministic).
+        {
+            std::vector<cloth::ClothParticle> ps(2);
+            ps[0].pos = {FromInt(3), FromInt(3), FromInt(3)}; ps[0].prev = ps[0].pos; ps[0].invMass = kOne;
+            ps[1].pos = ps[0].pos; ps[1].prev = ps[1].pos; ps[1].invMass = kOne;
+            const cloth::ClothAdjacency none2 = cloth::BuildClothAdjacency(2, {});
+            cloth::ClothSelfList list = cloth::BuildSelfCandidates(ps, none2, thickness);
+            cloth::SolveSelfCollision(ps, list, thickness, groundY);
+            check(ps[0].pos.y == FromInt(3) + kOne / 4 && ps[1].pos.y == FromInt(3) - kOne / 4 &&
+                  ps[0].pos.x == FromInt(3) && ps[1].pos.x == FromInt(3),
+                  "CL7 micro: a coincident pair separates along +/-Y by the index tie-break");
+        }
+    }
+
+    // --- the CL7 FOLD scene builder (shared by the physics/identity/determinism/lockstep cases) -------
+    // A cloth strip FOLDED FLAT onto itself over the ground: rows 0..mid are the BOTTOM layer lying ON
+    // the ground (y=0, z = mid-r), rows mid+1..H-1 the TOP layer folded back over it (y = 0.25, z =
+    // r-mid) — gravity presses the top layer INTO the bottom layer. Constraints (rest lengths) come from
+    // the FLAT rest sheet (the fold is an isometry of the lattice except the crease). The two far-end
+    // bottom corners (row 0, col 0 / W-1) are pinned. Without CL7 the top layer falls THROUGH the bottom
+    // layer to the ground (they coincide); with CL7 it RESTS ON it ~thickness above.
+    const auto buildFold = [](cloth::ClothGrid& grid, std::vector<cloth::ClothParticle>& ps,
+                              std::vector<cloth::Constraint>& es, cloth::ClothAdjacency& excl) {
+        grid.W = 6; grid.H = 17; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(20), 0};
+        ps = cloth::InitGrid(grid);
+        es = cloth::BuildConstraints(grid, ps);          // rest lengths from the FLAT sheet
+        excl = cloth::BuildClothAdjacency(ps.size(), es);
+        const int mid = grid.H / 2;                      // the crease row (8)
+        const fx gap = kOne / 4;                         // the initial layer gap (0.25 < thickness 0.5)
+        for (int r = 0; r < grid.H; ++r)
+            for (int c = 0; c < grid.W; ++c) {
+                cloth::ClothParticle& p = ps[(size_t)cloth::ParticleIndex(grid, r, c)];
+                if (r <= mid) p.pos = cloth::FxVec3{(fx)(c * (int)kOne), 0,   (fx)((mid - r) * (int)kOne)};
+                else          p.pos = cloth::FxVec3{(fx)(c * (int)kOne), gap, (fx)((r - mid) * (int)kOne)};
+                p.prev = p.pos;
+                p.vel = cloth::FxVec3{0, 0, 0};
+                p.invMass = kOne;
+                p.flags = 0;
+            }
+        // Pin the two far-end bottom corners (row 0, on the ground at z = mid).
+        for (int c : {0, grid.W - 1}) {
+            cloth::ClothParticle& p = ps[(size_t)cloth::ParticleIndex(grid, 0, c)];
+            p.invMass = 0;
+            p.flags = cloth::kFlagPinned;
+        }
+    };
+    const cloth::FxVec3 kFoldGrav{0, FromInt(-10), 0};
+    const fx kFoldDt = kOne / 60;
+    const fx kFoldGroundY = 0;
+    const int kFoldIters = 6, kFoldSteps = 60, kFoldSelfIters = 4;
+    const fx kFoldThickness = kOne / 2;
+    // The honest PBD-residual slack for the "resolved" count: the Jacobi solve is iterative and gravity
+    // re-penetrates each step, so settled pairs sit a few hundred LSBs under thickness (measured + pinned
+    // below) — kOne/16 (0.0625 world units) comfortably brackets the residual without masking a real miss.
+    const fx kFoldSlack = kOne / 16;
+
+    // --- (c) THE PHYSICS PROOF: without CL7 the fold self-penetrates; with CL7 it rests separated ------
+    {
+        cloth::ClothGrid grid;
+        std::vector<cloth::ClothParticle> init;
+        std::vector<cloth::Constraint> es;
+        cloth::ClothAdjacency excl;
+        buildFold(grid, init, es, excl);
+        std::vector<cloth::SphereCollider> noSpheres;
+
+        // WITHOUT CL7 (the pre-CL7 composed step): the top layer falls through the bottom layer.
+        std::vector<cloth::ClothParticle> without = init;
+        cloth::StepClothCollideSteps(grid, without, es, noSpheres, kFoldGrav, kFoldDt, kFoldGroundY,
+                                     kFoldIters, kFoldSteps);
+        const int penWithout = cloth::CountSelfPenetrating(without, excl, kFoldThickness, 0);
+        const fx minWithout = cloth::MinSelfDistance(without, excl);
+        std::printf("CL7 physics: WITHOUT self-collision %d pairs < thickness (min dist %d LSBs)\n",
+                    penWithout, (int)minWithout);
+        check(penWithout > 0, "CL7 physics: WITHOUT CL7 the folded cloth SELF-PENETRATES (pairs > 0)");
+        check(penWithout == 30 && minWithout == 603,
+              "CL7 physics pin: without-CL7 pairs == 30, min dist == 603 (the layers nearly coincide)");
+
+        // WITH CL7: the top layer rests ON the bottom layer ~thickness apart.
+        std::vector<cloth::ClothParticle> with = init;
+        cloth::StepClothSelfSteps(grid, with, es, excl, noSpheres, kFoldGrav, kFoldDt, kFoldGroundY,
+                                  kFoldIters, kFoldThickness, kFoldSelfIters, kFoldSteps);
+        const int penRaw   = cloth::CountSelfPenetrating(with, excl, kFoldThickness, 0);
+        const int penSlack = cloth::CountSelfPenetrating(with, excl, kFoldThickness, kFoldSlack);
+        const fx minWith   = cloth::MinSelfDistance(with, excl);
+        std::printf("CL7 physics: WITH self-collision raw %d, slack(%d) %d pairs (min dist %d LSBs)\n",
+                    penRaw, (int)kFoldSlack, penSlack, (int)minWith);
+        // HONEST: PBD is iterative + the FxNormalize/fxmul push truncates, so the raw count is NOT forced
+        // to zero — the settled contact pairs sit EXACTLY 1 LSB under thickness (min dist 32767 vs
+        // thickness 32768, the fixed-point snap truncation — the kCollideEps reality). The slack count IS
+        // zero (the layers are cleanly separated) and the min pair distance is pinned.
+        check(penSlack == 0, "CL7 physics: WITH CL7 zero pairs below thickness - slack (layers separated)");
+        check(minWith >= kFoldThickness - kFoldSlack,
+              "CL7 physics: min pair distance >= thickness - slack");
+        check(penRaw == 14 && minWith == 32767,
+              "CL7 physics pin: with-CL7 raw pairs == 14 (all at 1 LSB under thickness), min dist == 32767");
+
+        // The pinned far-end corners NEVER moved (pinned-vert respect in the composed scene).
+        const size_t pinA = (size_t)cloth::ParticleIndex(grid, 0, 0);
+        const size_t pinB = (size_t)cloth::ParticleIndex(grid, 0, grid.W - 1);
+        check(std::memcmp(&with[pinA], &init[pinA], sizeof(cloth::ClothParticle)) == 0 &&
+              std::memcmp(&with[pinB], &init[pinB], sizeof(cloth::ClothParticle)) == 0,
+              "CL7 physics: both pinned corners byte-untouched through the self-colliding run");
+    }
+
+    // --- (d) IDENTITY-AT-ZERO: thickness=0 (or selfIters=0) == the pre-CL7 step BIT-IDENTICAL ---------
+    {
+        cloth::ClothGrid grid;
+        std::vector<cloth::ClothParticle> init;
+        std::vector<cloth::Constraint> es;
+        cloth::ClothAdjacency excl;
+        buildFold(grid, init, es, excl);
+        std::vector<cloth::SphereCollider> noSpheres;
+
+        std::vector<cloth::ClothParticle> pre = init;
+        cloth::StepClothCollideSteps(grid, pre, es, noSpheres, kFoldGrav, kFoldDt, kFoldGroundY,
+                                     kFoldIters, kFoldSteps);
+        std::vector<cloth::ClothParticle> zeroT = init;
+        cloth::StepClothSelfSteps(grid, zeroT, es, excl, noSpheres, kFoldGrav, kFoldDt, kFoldGroundY,
+                                  kFoldIters, /*thickness*/0, kFoldSelfIters, kFoldSteps);
+        check(zeroT.size() == pre.size() &&
+              std::memcmp(zeroT.data(), pre.data(), pre.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL7 identity-at-zero: thickness=0 == the pre-CL7 StepClothCollide BIT-IDENTICAL");
+        std::vector<cloth::ClothParticle> zeroI = init;
+        cloth::StepClothSelfSteps(grid, zeroI, es, excl, noSpheres, kFoldGrav, kFoldDt, kFoldGroundY,
+                                  kFoldIters, kFoldThickness, /*selfIters*/0, kFoldSteps);
+        check(zeroI.size() == pre.size() &&
+              std::memcmp(zeroI.data(), pre.data(), pre.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL7 identity-at-zero: selfIters=0 == the pre-CL7 StepClothCollide BIT-IDENTICAL");
+
+        // ... and through the CL5 lockstep harness (the composed identity).
+        const std::vector<cloth::ClothCommand> stream{
+            cloth::ClothCommand{3, cloth::kCmdWind, (uint32_t)cloth::ParticleIndex(grid, 12, 2),
+                                cloth::FxVec3{FromInt(2), 0, FromInt(-1)}},
+        };
+        const std::vector<cloth::ClothParticle> lsPre =
+            cloth::RunClothLockstep(grid, init, es, noSpheres, stream, 12, kFoldGrav, kFoldDt,
+                                    kFoldGroundY, kFoldIters);
+        const std::vector<cloth::ClothParticle> lsZero =
+            cloth::RunClothLockstepSelf(grid, init, es, excl, noSpheres, stream, 12, kFoldGrav, kFoldDt,
+                                        kFoldGroundY, kFoldIters, /*thickness*/0, kFoldSelfIters);
+        check(lsZero.size() == lsPre.size() &&
+              std::memcmp(lsZero.data(), lsPre.data(), lsPre.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL7 identity-at-zero: RunClothLockstepSelf(thickness=0) == RunClothLockstep BIT-IDENTICAL");
+    }
+
+    // --- (e) determinism + the CL7 pinned digest --------------------------------------------------------
+    {
+        cloth::ClothGrid grid;
+        std::vector<cloth::ClothParticle> init;
+        std::vector<cloth::Constraint> es;
+        cloth::ClothAdjacency excl;
+        buildFold(grid, init, es, excl);
+        std::vector<cloth::SphereCollider> noSpheres;
+
+        std::vector<cloth::ClothParticle> a = init, b = init;
+        cloth::StepClothSelfSteps(grid, a, es, excl, noSpheres, kFoldGrav, kFoldDt, kFoldGroundY,
+                                  kFoldIters, kFoldThickness, kFoldSelfIters, kFoldSteps);
+        cloth::StepClothSelfSteps(grid, b, es, excl, noSpheres, kFoldGrav, kFoldDt, kFoldGroundY,
+                                  kFoldIters, kFoldThickness, kFoldSelfIters, kFoldSteps);
+        check(a.size() == b.size() &&
+              std::memcmp(a.data(), b.data(), a.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL7 determinism: two self-colliding runs BYTE-IDENTICAL");
+        const uint64_t d = cloth::ClothDigest(a);
+        std::printf("CL7 pin: CL7 self-colliding fold digest = 0x%016llx\n", (unsigned long long)d);
+        check(d == 0x8f95a44b3595b7faull, "CL7 pin(e): self-colliding-fold digest == the pinned value");
+    }
+
+    // --- (f) LOCKSTEP: a peer re-derives the self-colliding cloth bit-for-bit + snapshot round-trip ----
+    {
+        cloth::ClothGrid grid;
+        std::vector<cloth::ClothParticle> init;
+        std::vector<cloth::Constraint> es;
+        cloth::ClothAdjacency excl;
+        buildFold(grid, init, es, excl);
+        std::vector<cloth::SphereCollider> noSpheres;
+        const int ticks = 20;
+        const std::vector<cloth::ClothCommand> stream{
+            cloth::ClothCommand{4,  cloth::kCmdWind, (uint32_t)cloth::ParticleIndex(grid, 14, 3),
+                                cloth::FxVec3{FromInt(3), 0, FromInt(-2)}},
+            cloth::ClothCommand{9,  cloth::kCmdWind, (uint32_t)cloth::ParticleIndex(grid, 16, 1),
+                                cloth::FxVec3{0, FromInt(2), FromInt(1)}},
+            cloth::ClothCommand{13, cloth::kCmdPin,  (uint32_t)cloth::ParticleIndex(grid, 16, 5), {}},
+        };
+        const std::vector<cloth::ClothParticle> authority =
+            cloth::RunClothLockstepSelf(grid, init, es, excl, noSpheres, stream, ticks, kFoldGrav,
+                                        kFoldDt, kFoldGroundY, kFoldIters, kFoldThickness, kFoldSelfIters);
+        const std::vector<cloth::ClothParticle> replica =
+            cloth::RunClothLockstepSelf(grid, init, es, excl, noSpheres, stream, ticks, kFoldGrav,
+                                        kFoldDt, kFoldGroundY, kFoldIters, kFoldThickness, kFoldSelfIters);
+        check(authority.size() == replica.size() &&
+              std::memcmp(authority.data(), replica.data(),
+                          authority.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL7 lockstep: self-colliding replica == authority BIT-EXACT (inputs-only re-sim)");
+        const uint64_t d = cloth::ClothDigest(authority);
+        std::printf("CL7 pin: CL7 lockstep authority digest = 0x%016llx\n", (unsigned long long)d);
+        check(d == 0x9e9bb329fcd0f709ull, "CL7 pin(f): self-colliding lockstep digest == the pinned value");
+
+        // The CL5 SnapshotCloth/RestoreCloth round-trip holds over the self-colliding state (the state
+        // shape is unchanged — the CL5 machinery applies VERBATIM).
+        std::vector<cloth::ClothParticle> ps = authority;
+        const std::vector<cloth::ClothParticle> snap = cloth::SnapshotCloth(ps);
+        cloth::StepClothSelf(grid, ps, es, excl, noSpheres, kFoldGrav, kFoldDt, kFoldGroundY,
+                             kFoldIters, kFoldThickness, kFoldSelfIters);
+        check(std::memcmp(ps.data(), snap.data(), snap.size() * sizeof(cloth::ClothParticle)) != 0,
+              "CL7 snapshot: a self-colliding step actually mutated the cloth (control)");
+        cloth::RestoreCloth(ps, snap);
+        check(ps.size() == snap.size() &&
+              std::memcmp(ps.data(), snap.data(), snap.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL7 snapshot: the CL5 round-trip holds over the self-colliding state BIT-EXACT");
+    }
+
     if (g_fail == 0) std::printf("cloth_test: ALL PASS\n");
     else std::printf("cloth_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;
