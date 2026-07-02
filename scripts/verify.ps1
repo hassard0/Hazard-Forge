@@ -397,6 +397,7 @@ $Goldens = @(
     @{ Name = 'nav7_ml';       Flag = '--nav7-ml' }          # NAV7 multi-layer navmesh (superiority R8; crossing under/over paths, digest 0x14cf524e6e089c37)
     @{ Name = 'rt7_instanced'; Flag = '--rt7-instanced' }    # RT7 real multi-instance TLAS on Metal (superiority R9; HW==CPU byte-equal, counts 1156/716/1157)
     @{ Name = 'jt7_machine';   Flag = '--jt7-machine' }      # JT7 motorized crank-slider (superiority R12; lockstep actuation, digest 0xf947a5e58a21d4ac)
+    @{ Name = 'rtd1_softshadow'; Flag = '--rtd1-softshadow' } # RTD1 deterministic stochastic RT soft shadows + SVGF-lite denoise (superiority S9; integer digests 0xf38663819426b236/0xc93c6d134aa489aa cross-platform exact; the denoised image is the float-class golden)
 )
 
 $winResult = 'SKIP'
