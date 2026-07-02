@@ -922,6 +922,493 @@ int main() {
         check(posed, "JT6 palette: collapsed palette != bind palette (ragdoll posed the mesh)");
     }
 
+    // =============================================================================================
+    // ===== Slice JT7 — HINGE + PRISMATIC + MOTORIZED JOINTS (Track-R R12) ========================
+    // =============================================================================================
+    // FNV-1a-64 over raw bytes (the digest pin — identical MSVC + clang by pure-integer construction).
+    auto fnv1a = [](const void* data, size_t len, uint64_t h) {
+        const uint8_t* p = (const uint8_t*)data;
+        for (size_t i = 0; i < len; ++i) { h ^= (uint64_t)p[i]; h *= 1099511628211ull; }
+        return h;
+    };
+    auto digestWorld = [&](const joint::FxWorld& w, uint64_t h) {
+        return fnv1a(w.bodies.data(), w.bodies.size() * sizeof(fpx::FxBody), h);
+    };
+    const uint64_t kFnvSeed = 1469598103934665603ull;
+    auto absfx = [](joint::fx v) { return v < 0 ? -v : v; };
+    const joint::fx kGravY78 = (joint::fx)(-9.8 * (double)joint::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const joint::fx kDt = joint::kOne / 60;
+    const std::vector<joint::FxJoint> noBalls;
+    const std::vector<joint::FxHingeJoint> noHinges;
+    const std::vector<joint::FxPrismaticJoint> noPrisms;
+    const std::vector<joint::FxAngularLimit> noLimits;
+    const std::vector<joint::FxJointMotor> noMotors;
+
+    // ================= JT7 (b) HINGE: the door swings, the axis stays locked =================
+    // A pinned frame + a door hinged about Z at the frame centre, the door seeded a TWIST spin (about the
+    // Z hinge axis — the swing drive; the JT1 translation-only ball exerts no torque, so the swing comes
+    // from angVel, the documented JT1 split) PLUS an OFF-AXIS spin (about X — it would tilt the Z axis).
+    // WITH the hinge the max axis misalignment over the run stays within a pinned LSB band while the door
+    // ORBITS the pivot (the ball repins its -X end each pass as the twist rotates it — the swing); the
+    // BALL-ONLY control (same scene, same seed, plain JT1 ball) lets the axis tumble to a large error
+    // (the negative control). The trajectory digest (every tick's body bytes folded) is pinned.
+    {
+        auto buildDoor = [&]() {
+            joint::FxWorld w;
+            w.gravity = joint::FxVec3{0, kGravY78, 0};
+            w.groundY = (joint::fx)(-1000 * (int)joint::kOne);
+            fpx::FxBody frame = pinned(0, 10, 0);
+            fpx::FxBody door = dyn(1, 10, 0);
+            // TWIST about Z (the hinge-permitted swing drive) + an OFF-AXIS spin about X (the hinge kills it).
+            door.angVel = joint::FxVec3{joint::kOne, 0, joint::kOne * 3 / 2};
+            w.bodies = {frame, door};
+            return w;
+        };
+        joint::FxHingeJoint h;
+        h.bodyA = 0; h.bodyB = 1;
+        h.anchorA = joint::FxVec3{0, 0, 0};
+        h.anchorB = joint::FxVec3{-(joint::fx)joint::kOne, 0, 0};   // the door's pivot at its -X end
+        h.axisA = joint::FxVec3{0, 0, joint::kOne};
+        h.axisB = joint::FxVec3{0, 0, joint::kOne};
+        const std::vector<joint::FxHingeJoint> hinges = {h};
+        const int kTicks = 180, kIters = 8, kSolveIters = 2;   // 180 ticks x 1.5 rad/s = 4.5 rad of swing
+
+        // WITH the hinge: tick-by-tick, folding the trajectory digest + the max axis error.
+        joint::FxWorld w = buildDoor();
+        uint64_t trajDigest = kFnvSeed;
+        joint::fx maxAxisErrHinge = 0;
+        joint::fx minDoorY = w.bodies[1].pos.y, minDoorX = w.bodies[1].pos.x;
+        for (int t = 0; t < kTicks; ++t) {
+            joint::StepArticulatedJT7(w, noBalls, hinges, noPrisms, noLimits, noMotors, kDt, kIters,
+                                      kSolveIters);
+            trajDigest = digestWorld(w, trajDigest);
+            const joint::fx e = joint::HingeAxisError(w, h);
+            if (e > maxAxisErrHinge) maxAxisErrHinge = e;
+            if (w.bodies[1].pos.y < minDoorY) minDoorY = w.bodies[1].pos.y;
+            if (w.bodies[1].pos.x < minDoorX) minDoorX = w.bodies[1].pos.x;
+        }
+        // The door SWUNG about the axis: over the 120-tick / 3-radian twist it orbits the pivot — its
+        // centre passes well BELOW the pivot height and past the vertical (pos.x goes negative).
+        check(minDoorY < (joint::fx)(10 * (int)joint::kOne) - joint::kOne / 2,
+              "JT7 hinge: the door swung below the pivot (the angle about the axis changed)");
+        check(minDoorX < 0, "JT7 hinge: the door swung past vertical (pos.x went negative)");
+        check(w.bodies[0].pos.x == 0 && w.bodies[0].pos.y == (joint::fx)(10 * (int)joint::kOne),
+              "JT7 hinge: the pinned frame holds exactly");
+        // The pivot held (the ball part of the hinge).
+        {
+            joint::FxJoint pivot;
+            pivot.bodyA = 0; pivot.bodyB = 1;
+            pivot.anchorA = h.anchorA; pivot.anchorB = h.anchorB;
+            check(joint::AnchorGap(w, pivot) < joint::kOne / 8,
+                  "JT7 hinge: the pivot anchor gap stays small (the ball part held)");
+        }
+        // THE AXIS-LOCK PROOF: the max axis misalignment over the run within the pinned LSB band.
+        std::printf("JT7 hinge: maxAxisErrHinge=%d LSB, trajDigest=0x%016llx\n",
+                    maxAxisErrHinge, (unsigned long long)trajDigest);
+        check(maxAxisErrHinge <= 700, "JT7 hinge: axis misalignment within the pinned band (<= 700 LSB)");
+        check(trajDigest == 0x5bdd77f0964a1a27ull, "JT7 hinge: pinned trajectory digest (MSVC==clang)");
+
+        // The BALL-ONLY negative control: same scene + seed, plain JT1 ball -> the axis tumbles.
+        joint::FxWorld wc = buildDoor();
+        std::vector<joint::FxJoint> ballOnly;
+        {
+            joint::FxJoint j;
+            j.bodyA = 0; j.bodyB = 1;
+            j.anchorA = h.anchorA; j.anchorB = h.anchorB;
+            j.kind = joint::kJointBall;
+            ballOnly.push_back(j);
+        }
+        joint::fx maxAxisErrBall = 0;
+        for (int t = 0; t < kTicks; ++t) {
+            joint::StepArticulatedJT7(wc, ballOnly, noHinges, noPrisms, noLimits, noMotors, kDt, kIters,
+                                      kSolveIters);
+            const joint::fx e = joint::HingeAxisError(wc, h);   // the same axis metric, no hinge solved
+            if (e > maxAxisErrBall) maxAxisErrBall = e;
+        }
+        std::printf("JT7 hinge control: maxAxisErrBall=%d LSB (ball-only tumbles)\n", maxAxisErrBall);
+        // The composite {X,Z} spin precesses about a FIXED axis, so the Z-axis error oscillates rather
+        // than reaching the full 2.0 flip — > kOne/4 (0.25) is the honest tumbled bound (measured ~0.61).
+        check(maxAxisErrBall > joint::kOne / 4,
+              "JT7 hinge: the ball-only control DOES misalign (> 0.25, the negative control)");
+        check(maxAxisErrBall > 100 * maxAxisErrHinge,
+              "JT7 hinge: the hinge is >100x tighter than the ball-only control");
+    }
+
+    // ================= JT7 (c) PRISMATIC: on the line, slide-clamped, orientation-locked =============
+    // A pinned rail + a piston on a horizontal X rail under gravity (pulling PERPENDICULAR to the rail),
+    // seeded a +X slide velocity AND a tumble spin (angVel about Z — the orientation lock must hold it).
+    // The piston stays ON the line (max perp offset within a pinned band), the slide CLAMPS at maxSlide
+    // (and at minSlide with the reversed seed), and the orientation deviation stays within a pinned band.
+    {
+        auto buildPiston = [&](joint::fx vx) {
+            joint::FxWorld w;
+            w.gravity = joint::FxVec3{0, kGravY78, 0};
+            w.groundY = (joint::fx)(-1000 * (int)joint::kOne);
+            fpx::FxBody rail = pinned(0, 5, 0);
+            fpx::FxBody piston = dyn(2, 5, 0);
+            piston.vel = joint::FxVec3{vx, 0, 0};
+            piston.angVel = joint::FxVec3{0, 0, joint::kOne / 2};   // tumble seed (the lock must hold)
+            w.bodies = {rail, piston};
+            return w;
+        };
+        joint::FxPrismaticJoint p;
+        p.bodyA = 0; p.bodyB = 1;
+        p.axisA = joint::FxVec3{joint::kOne, 0, 0};
+        p.anchorA = joint::FxVec3{0, 0, 0};
+        p.anchorB = joint::FxVec3{0, 0, 0};
+        p.minSlide = joint::kOne;
+        p.maxSlide = 3 * (int)joint::kOne;
+        p.restOrient = fpx::FxQuat{0, 0, 0, joint::kOne};
+        const std::vector<joint::FxPrismaticJoint> prisms = {p};
+        const int kTicks = 90, kIters = 8, kSolveIters = 2;
+
+        // Forward seed -> clamps at maxSlide.
+        joint::FxWorld w = buildPiston(2 * (int)joint::kOne);
+        joint::fx maxPerp = 0, maxOrientErr = 0;
+        uint64_t trajDigest = kFnvSeed;
+        for (int t = 0; t < kTicks; ++t) {
+            joint::StepArticulatedJT7(w, noBalls, noHinges, prisms, noLimits, noMotors, kDt, kIters,
+                                      kSolveIters);
+            trajDigest = digestWorld(w, trajDigest);
+            const joint::fx pe = joint::PrismaticPerpError(w, p);
+            const joint::fx oe = joint::PrismaticOrientError(w, p);
+            if (pe > maxPerp) maxPerp = pe;
+            if (oe > maxOrientErr) maxOrientErr = oe;
+        }
+        const joint::fx slideMaxEnd = joint::PrismaticSlide(w, p);
+        std::printf("JT7 prismatic: maxPerp=%d LSB, maxOrientErr=%d LSB, slideAtMax=%d (maxSlide=%d), "
+                    "trajDigest=0x%016llx\n",
+                    maxPerp, maxOrientErr, slideMaxEnd, p.maxSlide, (unsigned long long)trajDigest);
+        // ON THE LINE: the max perpendicular offset (measured post-step, gravity fighting it every tick).
+        check(maxPerp <= 96, "JT7 prismatic: the piston stays on the line (max perp <= 96 LSB)");
+        // ORIENTATION LOCKED despite the tumble seed.
+        check(maxOrientErr <= 96, "JT7 prismatic: orientation locked (max quat deviation <= 96 LSB)");
+        // SLIDE CLAMP at maxSlide (a small deterministic overshoot band — the piston keeps pushing).
+        check(absfx(slideMaxEnd - p.maxSlide) <= joint::kOne / 16,
+              "JT7 prismatic: the slide clamps at maxSlide (within kOne/16)");
+        check(trajDigest == 0x2a6e7129d3ebd85eull, "JT7 prismatic: pinned trajectory digest (MSVC==clang)");
+
+        // Reversed seed -> clamps at minSlide.
+        joint::FxWorld w2 = buildPiston(-2 * (int)joint::kOne);
+        joint::StepArticulatedJT7Steps(w2, noBalls, noHinges, prisms, noLimits, noMotors, kDt, kIters,
+                                       kSolveIters, kTicks);
+        const joint::fx slideMinEnd = joint::PrismaticSlide(w2, p);
+        std::printf("JT7 prismatic: slideAtMin=%d (minSlide=%d)\n", slideMinEnd, p.minSlide);
+        check(absfx(slideMinEnd - p.minSlide) <= joint::kOne / 16,
+              "JT7 prismatic: the slide clamps at minSlide (within kOne/16)");
+    }
+
+    // ================= JT7 (d) MOTOR: reach + hold, the torque-limit ramp, stall-vs-gravity, off==none ==
+    {
+        // --- The motorized hinge WHEEL: an ample-impulse motor reaches targetVel in a pinned tick count
+        // and HOLDS it (a pinned band) — the frame is pinned, the wheel spins about Z at the setpoint. ---
+        auto buildWheel = [&]() {
+            joint::FxWorld w;
+            w.gravity = joint::FxVec3{0, kGravY78, 0};
+            w.groundY = (joint::fx)(-1000 * (int)joint::kOne);
+            w.bodies = {pinned(0, 5, 0), dyn(0, 5, 0)};   // frame + wheel, coincident centres, radius 0
+            return w;
+        };
+        joint::FxHingeJoint h;
+        h.bodyA = 0; h.bodyB = 1;
+        h.anchorA = joint::FxVec3{0, 0, 0};
+        h.anchorB = joint::FxVec3{0, 0, 0};
+        h.axisA = joint::FxVec3{0, 0, joint::kOne};
+        h.axisB = joint::FxVec3{0, 0, joint::kOne};
+        const std::vector<joint::FxHingeJoint> hinges = {h};
+        const joint::fx kTarget = 2 * (int)joint::kOne;
+        const joint::fx kBand = joint::kOne / 64;
+        const int kIters = 8, kSolveIters = 2;
+
+        {
+            const std::vector<joint::FxJointMotor> motors = {
+                joint::FxJointMotor{joint::kMotorHinge, 0u, kTarget, 8 * (int)joint::kOne}};
+            joint::FxWorld w = buildWheel();
+            int reachTick = -1;
+            joint::fx heldMin = 0, heldMax = 0;
+            for (int t = 0; t < 40; ++t) {
+                joint::StepArticulatedJT7(w, noBalls, hinges, noPrisms, noLimits, motors, kDt, kIters,
+                                          kSolveIters);
+                const joint::fx v = joint::JointRelVel(w, motors[0], hinges, noPrisms);
+                if (reachTick < 0 && absfx(v - kTarget) <= kBand) reachTick = t;
+                if (t >= 20) {   // the hold window
+                    if (heldMin == 0 && heldMax == 0) { heldMin = v; heldMax = v; }
+                    if (v < heldMin) heldMin = v;
+                    if (v > heldMax) heldMax = v;
+                }
+            }
+            std::printf("JT7 motor: reachTick=%d, holdBand=[%d,%d] around target %d\n",
+                        reachTick, heldMin, heldMax, kTarget);
+            check(reachTick == 0, "JT7 motor: ample impulse reaches targetVel on the FIRST tick (pinned)");
+            check(absfx(heldMin - kTarget) <= kBand && absfx(heldMax - kTarget) <= kBand,
+                  "JT7 motor: holds targetVel over ticks 20..39 (within the pinned band)");
+        }
+
+        // --- The TORQUE-LIMIT RAMP (honest): an under-powered angular motor has NO opposing torque in
+        // this model (no inertia tensor; gravity acts on vel, not angVel) so it does not stall forever —
+        // it RAMPS at maxImpulse per tick. At tick 8 (0-based tick index 7) it is pinned BELOW target. ---
+        {
+            const joint::fx kSmall = joint::kOne / 8;    // 0.125 impulse budget/tick vs target 2.0
+            const std::vector<joint::FxJointMotor> motors = {
+                joint::FxJointMotor{joint::kMotorHinge, 0u, kTarget, kSmall}};
+            joint::FxWorld w = buildWheel();
+            for (int t = 0; t < 8; ++t)
+                joint::StepArticulatedJT7(w, noBalls, hinges, noPrisms, noLimits, motors, kDt, kIters,
+                                          kSolveIters);
+            const joint::fx v8 = joint::JointRelVel(w, motors[0], hinges, noPrisms);
+            std::printf("JT7 motor ramp: relVel at tick 8 = %d (target %d, budget %d/tick)\n",
+                        v8, kTarget, kSmall);
+            check(v8 < kTarget - joint::kOne / 2,
+                  "JT7 motor ramp: the torque-limited motor is well below target at tick 8");
+            check(absfx(v8 - 8 * kSmall) <= kBand,
+                  "JT7 motor ramp: relVel == 8 ticks x maxImpulse (the exact clamp ramp, pinned)");
+        }
+
+        // --- THE STALL PROOF (the honest torque-limit beat): a LINEAR motor lifting a piston up a
+        // vertical rail AGAINST gravity. Ample impulse (kOne >= g*dt) -> the piston climbs to maxSlide.
+        // Under-powered (kOne/16 < g*dt ~ 0.1633*kOne) -> gravity outruns the budget every tick, the
+        // piston sinks and STALLS at minSlide, far below target — the motor genuinely loses. ---
+        {
+            auto buildLift = [&]() {
+                joint::FxWorld w;
+                w.gravity = joint::FxVec3{0, kGravY78, 0};
+                w.groundY = (joint::fx)(-1000 * (int)joint::kOne);
+                w.bodies = {pinned(0, 2, 0), dyn(0, 4, 0)};   // rail + piston, slide starts at +2
+                return w;
+            };
+            joint::FxPrismaticJoint rail;
+            rail.bodyA = 0; rail.bodyB = 1;
+            rail.axisA = joint::FxVec3{0, joint::kOne, 0};
+            rail.anchorA = joint::FxVec3{0, 0, 0};
+            rail.anchorB = joint::FxVec3{0, 0, 0};
+            rail.minSlide = 0;
+            rail.maxSlide = 6 * (int)joint::kOne;
+            rail.restOrient = fpx::FxQuat{0, 0, 0, joint::kOne};
+            const std::vector<joint::FxPrismaticJoint> prisms = {rail};
+            // 320 ticks: the semi-implicit integrate runs BEFORE the motor pass, so the effective climb
+            // rate is (target − g·dt)/tick ≈ 0.837 units/s — 4 units of travel needs ~287 ticks.
+            const int kLiftTicks = 320;
+
+            // POWERED: budget kOne/tick >= g*dt -> climbs to maxSlide and holds.
+            const std::vector<joint::FxJointMotor> powered = {
+                joint::FxJointMotor{joint::kMotorPrismatic, 0u, joint::kOne, joint::kOne}};
+            joint::FxWorld wp = buildLift();
+            joint::StepArticulatedJT7Steps(wp, noBalls, noHinges, prisms, noLimits, powered, kDt, kIters,
+                                           kSolveIters, kLiftTicks);
+            const joint::fx slidePow = joint::PrismaticSlide(wp, rail);
+            // UNDER-POWERED: budget kOne/16 < g*dt -> sinks + stalls at minSlide despite the same target.
+            const std::vector<joint::FxJointMotor> weak = {
+                joint::FxJointMotor{joint::kMotorPrismatic, 0u, joint::kOne, joint::kOne / 16}};
+            joint::FxWorld ww = buildLift();
+            joint::StepArticulatedJT7Steps(ww, noBalls, noHinges, prisms, noLimits, weak, kDt, kIters,
+                                           kSolveIters, kLiftTicks);
+            const joint::fx slideWeak = joint::PrismaticSlide(ww, rail);
+            const joint::fx vWeak = joint::JointRelVel(ww, weak[0], noHinges, prisms);
+            std::printf("JT7 motor stall: powered slide=%d (maxSlide=%d), weak slide=%d (minSlide=%d), "
+                        "weak relVel=%d (target %d)\n",
+                        slidePow, rail.maxSlide, slideWeak, rail.minSlide, vWeak, joint::kOne);
+            check(absfx(slidePow - rail.maxSlide) <= joint::kOne / 16,
+                  "JT7 motor stall: the POWERED lift reaches maxSlide (within kOne/16)");
+            check(absfx(slideWeak - rail.minSlide) <= joint::kOne / 16,
+                  "JT7 motor stall: the UNDER-POWERED lift stalls at minSlide (the torque-limit proof)");
+            check(vWeak < 0, "JT7 motor stall: the stalled motor's relVel is below zero (gravity won)");
+        }
+
+        // --- MOTOR OFF == NO MOTOR, bit-identical (identity-at-zero): maxImpulse=0 (targetVel irrelevant)
+        // must produce the EXACT step of an empty motor list. ---
+        {
+            const std::vector<joint::FxJointMotor> offMotor = {
+                joint::FxJointMotor{joint::kMotorHinge, 0u, 3 * (int)joint::kOne, 0}};
+            joint::FxWorld wa = buildWheel(), wb = buildWheel();
+            wa.bodies[1].angVel = joint::FxVec3{0, joint::kOne / 2, joint::kOne / 3};   // a live spin seed
+            wb.bodies[1].angVel = joint::FxVec3{0, joint::kOne / 2, joint::kOne / 3};
+            joint::StepArticulatedJT7Steps(wa, noBalls, hinges, noPrisms, noLimits, offMotor, kDt, kIters,
+                                           kSolveIters, 60);
+            joint::StepArticulatedJT7Steps(wb, noBalls, hinges, noPrisms, noLimits, noMotors, kDt, kIters,
+                                           kSolveIters, 60);
+            check(wa.bodies.size() == wb.bodies.size() &&
+                  std::memcmp(wa.bodies.data(), wb.bodies.data(),
+                              wa.bodies.size() * sizeof(fpx::FxBody)) == 0,
+                  "JT7 motor: maxImpulse=0 == the unmotorized step BIT-IDENTICAL (identity-at-zero)");
+        }
+    }
+
+    // ================= JT7 (e) THE MACHINE: determinism + pinned digest + lockstep + rollback =========
+    // The crank-slider (== the --jt7-machine-shot scene): a motorized hinge WHEEL + a connecting ROD +
+    // a PISTON on a prismatic rail — the wheel spins at the motor setpoint, the rod converts the rotation
+    // into the piston's oscillating stroke. Commands SET THE MOTOR SETPOINT mid-run (the actuation IS the
+    // input stream); a peer re-derives the running machine bit-for-bit; a rollback corrects a wrong
+    // setpoint prediction.
+    {
+        auto fi78 = [](double v) { return (joint::fx)(v * (double)joint::kOne + (v < 0 ? -0.5 : 0.5)); };
+        auto buildMachine = [&](joint::JT7Machine& m, std::vector<joint::FxJoint>& balls,
+                                std::vector<joint::FxHingeJoint>& hinges,
+                                std::vector<joint::FxPrismaticJoint>& prisms) {
+            // ZERO-G bench rig (the honest scene call): the family is positional PBD with NO velocity
+            // reconciliation, so a suspended closed-loop machine under gravity accumulates unbounded
+            // constraint-fighting velocity and the Gauss-Seidel equilibrium drifts to the slide clamp.
+            // The machine runs on a zero-g bench; the door/piston/lift cases above keep gravity.
+            m.world.gravity = joint::FxVec3{0, 0, 0};
+            m.world.groundY = 0;
+            auto at = [&](double x, double y, bool dynB) {
+                fpx::FxBody b;
+                b.pos = joint::FxVec3{fi78(x), fi78(y), 0};
+                b.vel = joint::FxVec3{0, 0, 0};
+                b.invMass = dynB ? joint::kOne : 0;
+                b.flags = dynB ? fpx::kFlagDynamic : 0u;
+                b.radius = 0;                              // radius-0 machine: the contact block is inert
+                b.orient = fpx::FxQuat{0, 0, 0, joint::kOne};
+                b.angVel = joint::FxVec3{0, 0, 0};
+                return b;
+            };
+            m.world.bodies = {
+                at(3.0, 3.0, false),   // 0 frame (pinned)
+                at(3.0, 3.0, true),    // 1 wheel (the crank)
+                at(5.0, 3.0, true),    // 2 rod (rim (3.8,3) -> slider (6.2,3), length 2.4)
+                at(6.2, 3.0, true),    // 3 piston/slider
+                at(6.2, 4.5, false),   // 4 rail (pinned, the line origin 1.5 below its centre)
+            };
+            balls.clear(); hinges.clear(); prisms.clear();
+            {   // rim <-> rod end1
+                joint::FxJoint j;
+                j.bodyA = 1; j.bodyB = 2;
+                j.anchorA = joint::FxVec3{fi78(0.8), 0, 0};
+                j.anchorB = joint::FxVec3{fi78(-1.2), 0, 0};
+                j.kind = joint::kJointBall;
+                balls.push_back(j);
+            }
+            {   // rod end2 <-> piston centre
+                joint::FxJoint j;
+                j.bodyA = 2; j.bodyB = 3;
+                j.anchorA = joint::FxVec3{fi78(1.2), 0, 0};
+                j.anchorB = joint::FxVec3{0, 0, 0};
+                j.kind = joint::kJointBall;
+                balls.push_back(j);
+            }
+            {   // frame <-> wheel hinge about Z
+                joint::FxHingeJoint hh;
+                hh.bodyA = 0; hh.bodyB = 1;
+                hh.anchorA = joint::FxVec3{0, 0, 0};
+                hh.anchorB = joint::FxVec3{0, 0, 0};
+                hh.axisA = joint::FxVec3{0, 0, joint::kOne};
+                hh.axisB = joint::FxVec3{0, 0, joint::kOne};
+                hinges.push_back(hh);
+            }
+            {   // rail <-> piston prismatic along X (the line 1.5 below the rail body)
+                joint::FxPrismaticJoint pp;
+                pp.bodyA = 4; pp.bodyB = 3;
+                pp.axisA = joint::FxVec3{joint::kOne, 0, 0};
+                pp.anchorA = joint::FxVec3{0, fi78(-1.5), 0};
+                pp.anchorB = joint::FxVec3{0, 0, 0};
+                // The natural crank stroke: the rod BODY is orientation-frozen (translation-only balls
+                // exert no torque — the JT1 split), so piston.x = rimX + 2.4 exactly and the stroke is
+                // the crank DIAMETER [-1.6, 0] in slide units. The range is set wide so the clamp never
+                // engages here (the clamp proof is the dedicated prismatic case above).
+                pp.minSlide = -2 * (int)joint::kOne;
+                pp.maxSlide = (joint::fx)joint::kOne;
+                pp.restOrient = fpx::FxQuat{0, 0, 0, joint::kOne};
+                prisms.push_back(pp);
+            }
+            m.motors = {joint::FxJointMotor{joint::kMotorHinge, 0u, 0, 4 * (int)joint::kOne}};
+        };
+        joint::JT7Machine init;
+        std::vector<joint::FxJoint> balls;
+        std::vector<joint::FxHingeJoint> hinges;
+        std::vector<joint::FxPrismaticJoint> prisms;
+        buildMachine(init, balls, hinges, prisms);
+        const int kIters = 12, kSolveIters = 2, kTicks = 240, kMispredictTick = 60;
+
+        // The actuation stream: spin up at tick 0, REVERSE at tick 120, plus a mid-run impulse poke.
+        const std::vector<fpx::FxCommand> authStream = {
+            fpx::FxCommand{0u, joint::kCmdSetMotorTarget, 0u, joint::FxVec3{2 * (int)joint::kOne, 0, 0}},
+            fpx::FxCommand{120u, joint::kCmdSetMotorTarget, 0u,
+                           joint::FxVec3{-2 * (int)joint::kOne, 0, 0}},
+            fpx::FxCommand{80u, fpx::kCmdImpulse, 2u, joint::FxVec3{0, joint::kOne / 2, 0}},
+        };
+        auto machineEqual = [&](const joint::JT7Machine& x, const joint::JT7Machine& y) {
+            return x.world.bodies.size() == y.world.bodies.size() &&
+                   std::memcmp(x.world.bodies.data(), y.world.bodies.data(),
+                               x.world.bodies.size() * sizeof(fpx::FxBody)) == 0 &&
+                   x.motors.size() == y.motors.size() &&
+                   std::memcmp(x.motors.data(), y.motors.data(),
+                               x.motors.size() * sizeof(joint::FxJointMotor)) == 0;
+        };
+
+        // LOCKSTEP: authority == replica BIT-EXACT (two runs from the SAME init+stream, inputs only).
+        // The authority loop is the RunJT7Lockstep control flow spelled out tick-by-tick so it can ALSO
+        // track the piston's stroke envelope (the machine-genuinely-cranks proof).
+        joint::JT7Machine authority = init;
+        joint::fx strokeMin = joint::PrismaticSlide(authority.world, prisms[0]);
+        joint::fx strokeMax = strokeMin;
+        joint::fx runMaxGap = 0;   // the worst ball anchor gap over the WHOLE run (the honest residual)
+        for (int t = 0; t < kTicks; ++t) {
+            joint::SimJT7Tick(authority, balls, hinges, prisms, noLimits, authStream, (uint32_t)t, kDt,
+                              kIters, kSolveIters);
+            const joint::fx s = joint::PrismaticSlide(authority.world, prisms[0]);
+            if (s < strokeMin) strokeMin = s;
+            if (s > strokeMax) strokeMax = s;
+            const joint::fx g = joint::MaxAnchorGap(authority.world, balls);
+            if (g > runMaxGap) runMaxGap = g;
+        }
+        const joint::JT7Machine replica = joint::RunJT7Lockstep(init, balls, hinges, prisms, noLimits,
+                                                                authStream, kTicks, kDt, kIters,
+                                                                kSolveIters);
+        check(machineEqual(authority, replica),
+              "JT7 lockstep: authority == replica BIT-EXACT (bodies + motor setpoints)");
+        // The crank GENUINELY drives the piston: the stroke envelope spans more than a full unit.
+        std::printf("JT7 machine: stroke=[%d,%d] (span %d LSB)\n", strokeMin, strokeMax,
+                    strokeMax - strokeMin);
+        check(strokeMax - strokeMin > (joint::fx)joint::kOne,
+              "JT7 machine: the piston strokes (envelope span > 1 unit — the crank does the work)");
+        // THE HONEST RESIDUAL (documented, pinned): the crank-slider is OVER-CONSTRAINED under the
+        // family's translation-only projections — the rod body cannot pivot (balls exert no torque, the
+        // JT1 split), so the rim height (3 + 0.8·sinθ) vs the piston's locked line (y=3) is INCONSISTENT
+        // by up to 0.8 units and the Gauss-Seidel equilibrium SPLITS it across the two ball anchor gaps
+        // (a Scotch-yoke-like mechanism in effect: the x-coupling cranks the piston through the full
+        // stroke while the y-inconsistency parks as a deterministic ball residual — NOT hidden).
+        std::printf("JT7 machine: run-max ballAnchorGap=%d LSB (the over-constrained-linkage residual)\n",
+                    runMaxGap);
+        check(runMaxGap <= joint::kOne * 3 / 5,
+              "JT7 machine: the linkage ball residual within the documented band (<= 0.6 over the run)");
+
+        // The machine RAN: the wheel spun (relVel at the reversed setpoint) + the piston stroked.
+        const joint::fx wheelVel = joint::JointRelVel(authority.world, authority.motors[0], hinges, prisms);
+        check(absfx(wheelVel - (-2 * (int)joint::kOne)) <= joint::kOne / 16,
+              "JT7 machine: the wheel holds the REVERSED setpoint at the final tick");
+        const joint::fx pistonSlide = joint::PrismaticSlide(authority.world, prisms[0]);
+        // 120 ticks at +2 rad/s then 120 at -2 rad/s -> net crank angle ~0 -> the piston is back near
+        // its top-dead-centre (slide ~0) at the final tick.
+        check(absfx(pistonSlide) <= joint::kOne / 4,
+              "JT7 machine: the piston returned near top-dead-centre after the reversed run");
+
+        // Pinned final-state digest (MSVC == clang — the cross-compiler pin).
+        const uint64_t machineDigest = digestWorld(authority.world, kFnvSeed);
+        std::printf("JT7 machine: finalDigest=0x%016llx, wheelVel=%d, pistonSlide=%d\n",
+                    (unsigned long long)machineDigest, wheelVel, pistonSlide);
+        check(machineDigest == 0xf189f923b7ca265dull, "JT7 machine: pinned final digest (MSVC==clang)");
+
+        // ROLLBACK: a WRONG setpoint prediction at kMispredictTick is corrected EXACTLY.
+        std::vector<fpx::FxCommand> mispredictStream = authStream;
+        mispredictStream.push_back(fpx::FxCommand{(uint32_t)kMispredictTick, joint::kCmdSetMotorTarget, 0u,
+                                                  joint::FxVec3{6 * (int)joint::kOne, 0, 0}});
+        const joint::JT7Machine rolledBack =
+            joint::RunJT7Rollback(init, balls, hinges, prisms, noLimits, authStream, mispredictStream,
+                                  kTicks, kMispredictTick, kDt, kIters, kSolveIters);
+        const joint::JT7Machine mispredicted =
+            joint::RunJT7Lockstep(init, balls, hinges, prisms, noLimits, mispredictStream, kTicks, kDt,
+                                  kIters, kSolveIters);
+        check(machineEqual(rolledBack, authority), "JT7 rollback: corrected == authority BIT-EXACT");
+        check(!machineEqual(mispredicted, authority),
+              "JT7 rollback: the mispredicted setpoint DIVERGED (non-vacuous proof)");
+
+        // The actuation stream does work: no-command machine != the driven authority.
+        const std::vector<fpx::FxCommand> noStream;
+        const joint::JT7Machine idle = joint::RunJT7Lockstep(init, balls, hinges, prisms, noLimits,
+                                                             noStream, kTicks, kDt, kIters, kSolveIters);
+        check(!machineEqual(idle, authority),
+              "JT7 machine: the motor-command stream changed the trajectory (the stream does work)");
+    }
+
     if (g_fail == 0) std::printf("joint_test: ALL PASS\n");
     else std::printf("joint_test: %d FAILURE(S)\n", g_fail);
     return g_fail ? 1 : 0;

@@ -782,5 +782,447 @@ inline fpx::FxWorld RunRagdollRollback(const fpx::FxWorld& init, const std::vect
     return w;
 }
 
+// ====================================================================================================
+// Slice JT7 — HINGE + PRISMATIC + MOTORIZED JOINTS (Track-R R12, closing the flagship-#15 "ball+cone
+// limits only" caveat). Three NEW joint primitives, all pure integer, ADDITIVE below JT1-JT6 (which stay
+// byte-FROZEN — the JT2 FxAngularLimit separate-struct discipline: NEW structs, no changes to existing):
+//   (1) FxHingeJoint  — a hinge as a JOINT TYPE: the JT1 ball projection (REUSED AS-IS via SolveBallJoint)
+//       pins the pivot + an AXIS-ALIGNMENT constraint keeps the two bodies' body-local hinge axes (rotated
+//       to world) PARALLEL. The alignment is the shortest-arc quaternion between the two world axes —
+//       q = normalize({cross(axisWB, axisWA), kOne + dot(axisWA, axisWB)}) (the half-angle-free
+//       shortest-arc identity: cross/dot products ONLY, ZERO runtime transcendentals — the JT2 discipline)
+//       — nlerp-applied inverse-mass-weighted (the SolveAngularLimit apply, mirrored). A door swings
+//       freely ABOUT the axis (twist is untouched) but cannot yaw/pitch its axis off it. NOTE the JT2
+//       relationship (the honest overlap): a ball FxJoint + FxAngularLimit(kAngularHinge) already locks
+//       the FULL swing when axisB(local) == axisA(local) at rest (vehicle.h VH2 uses exactly that for the
+//       wheel axles); FxHingeJoint GENERALIZES it to DISTINCT body-local axes (axisA on A, axisB on B) and
+//       packages pivot+axis as ONE record — the missing joint TYPE.
+//   (2) FxPrismaticJoint — a slider: bodyB's anchor is constrained to the LINE through bodyA's anchor
+//       along A's body-local axis (the PERPENDICULAR offset projected to zero — no normalize needed, the
+//       perp vector IS the correction), the slide distance CLAMPED to [minSlide, maxSlide], and the
+//       relative orientation LOCKED to a rest orientation (the JT2 nlerp toward qA·restOrient — a
+//       kAngularHinge-style lock but of the WHOLE relative orientation, not just the swing). A piston
+//       slides on its rail, no rotation.
+//   (3) FxJointMotor — DETERMINISTIC ACTUATION: a velocity-target motor on a hinge (angular about the
+//       hinge axis) or a prismatic (linear along the slide axis). Each Gauss-Seidel iteration adds a
+//       velocity-bias impulse toward targetVel, ACCUMULATED and clamped to ±maxImpulse per tick (the
+//       classic accumulated-impulse clamp — the torque/force limit that makes an under-powered motor
+//       STALL honestly). maxImpulse == 0 -> the applied impulse is ALWAYS 0 -> bit-identical to the
+//       unmotorized step (identity-at-zero, provable). This is the GENERAL version of vehicle.h VH3's
+//       kCmdDriveTorque (which adds a raw angVel increment: kinematic, no target, no clamp) and
+//       active.h's FxAngularDrive (which servos toward a target POSE, not a velocity).
+//
+// THE LOCKED PASS ORDER (StepArticulatedJT7, one tick):
+//   (1) IntegrateBodyFull all (FPX4 6-DOF, real dt)
+//   (2) K Gauss-Seidel iterations, EACH: all SolveBallJoint -> all SolveHingeJoint -> all
+//       SolvePrismaticJoint -> all SolveAngularLimit -> all SolveJointMotor (motors LAST, inside the
+//       loop, after the joint projections — the spec order balls->hinges->prismatic->limits->motors).
+//       Motor accumulators are reset ONCE per tick (before the iteration loop).
+//   (3) contacts as a TRAILING block (the JT3 mold): BuildPairs ONCE + fpx::StepWorld(dt=0, solveIters)
+//       (ground clamp + FPX3 sphere contacts).
+// PURE CPU on BOTH backends (the GR5/CL7/PS7/NAV7 Track-R precedent): the hinge/prismatic solves are
+// int64 (fxmul/fxdiv/FxISqrt) which glslc cannot parse, and the JT3 lesson showed whole-step shader
+// composition is brittle — so JT7 ships NO new shader, NO new RHI; the Vulkan and Metal showcases run
+// THIS identical header-only code -> bit-identical cross-backend BY CONSTRUCTION.
+//
+// HONEST CAVEATS (the JT1/JT2 caveat shape, carried forward): (a) the ball/hinge/prismatic projections
+// are translation-only positionally (the JT1 split — no lever-arm/inertia coupling), so the hinge locks
+// the ORIENTATION axis; a deliberate off-plane POSITIONAL force still swings the door out of plane like
+// a pendulum (plane confinement is emergent, not enforced). (b) Gauss-Seidel residuals are
+// deterministic-but-nonzero (axis error / perp offset / orientation deviation settle to within-band
+// LSB values, pinned by the tests — not analytic zeros). (c) the motor has no inertia tensor to fight:
+// an angular motor's only "load" is the impulse clamp itself (it ramps at maxImpulse/tick); the honest
+// STALL-UNDER-LOAD proof is the LINEAR motor against gravity (gravity acts on vel). (d) quaternion
+// nlerp is the small-angle apply (the JT2 caveat) — near-antiparallel axes (dot ~ -kOne) degenerate to
+// a deterministic skip.
+
+// The motor kinds: angular about a hinge's axis / linear along a prismatic's axis.
+inline constexpr uint32_t kMotorHinge     = 0u;
+inline constexpr uint32_t kMotorPrismatic = 1u;
+
+// The JT7-local command kind (the VH3 convention: NEW kinds live in the slice header, ABOVE the existing
+// ranges — fpx uses 0/1, vehicle uses 100/101; joint JT7 uses 200). bodyId = the MOTOR index (not a body);
+// arg.x = the new Q16.16 targetVel. Applied ONLY by ApplyJT7Command (fpx::ApplyCommand ignores it).
+inline constexpr uint32_t kCmdSetMotorTarget = 200u;
+
+// ----- FxHingeJoint: pivot (ball) + axis alignment (the hinge as a joint TYPE) -------------------------
+// bodyA/bodyB indices + body-local pivot anchors (the JT1 FxJoint anchor convention) + body-local UNIT
+// hinge axes on EACH body (axisA on A, axisB on B — the generalization over JT2's single A-local axis).
+// std430-packable as plain int32s: 2 x uint32 + 4 x FxVec3 = 14 x 4-byte = 56 bytes, no padding holes.
+struct FxHingeJoint {
+    uint32_t bodyA = 0;   // index of the frame body
+    uint32_t bodyB = 0;   // index of the swinging body
+    FxVec3   anchorA;     // Q16.16 body-local pivot on bodyA
+    FxVec3   anchorB;     // Q16.16 body-local pivot on bodyB
+    FxVec3   axisA;       // UNIT body-local hinge axis on bodyA
+    FxVec3   axisB;       // UNIT body-local hinge axis on bodyB (aligned with A's when held)
+};
+
+// ----- FxPrismaticJoint: a slider (line + slide clamp + orientation lock) ------------------------------
+// bodyB's world anchor rides the LINE through bodyA's world anchor along A's world-rotated axisA; the
+// signed slide distance along the axis is clamped to [minSlide, maxSlide]; the relative orientation
+// qA⁻¹·qB is locked to restOrient (identity by default — set it to the build-time relative orientation).
+struct FxPrismaticJoint {
+    uint32_t bodyA = 0;      // index of the rail body
+    uint32_t bodyB = 0;      // index of the sliding body
+    FxVec3   axisA;          // UNIT body-local slide axis on bodyA
+    FxVec3   anchorA;        // Q16.16 body-local line origin on bodyA
+    FxVec3   anchorB;        // Q16.16 body-local anchor on bodyB (the point held to the line)
+    fx       minSlide = 0;   // Q16.16 slide-range clamp (signed distance along the axis)
+    fx       maxSlide = 0;
+    FxQuat   restOrient;     // the LOCKED relative orientation qA⁻¹·qB (default identity)
+};
+
+// ----- FxJointMotor: the deterministic velocity-target actuator ----------------------------------------
+// kind selects the joint list (kMotorHinge -> hinges[jointIndex], kMotorPrismatic -> prismatics[
+// jointIndex]). targetVel is the target RELATIVE velocity (angular rad/s about the hinge axis / linear
+// units/s along the slide axis, Q16.16). maxImpulse is the per-TICK accumulated-impulse clamp (the
+// torque/force limit); 0 == motor OFF (bit-identical to no motor).
+struct FxJointMotor {
+    uint32_t kind = kMotorHinge;   // kMotorHinge / kMotorPrismatic
+    uint32_t jointIndex = 0;       // index into the matching joint list
+    fx       targetVel = 0;        // Q16.16 target relative velocity (the actuation setpoint)
+    fx       maxImpulse = 0;       // Q16.16 per-tick accumulated-impulse clamp (0 = off)
+};
+
+// ----- SolveHingeJoint: ONE hinge projection (ball pivot + shortest-arc axis alignment) ----------------
+// (1) the pivot: SolveBallJoint REUSED AS-IS over a synthesized kJointBall record (byte-for-byte the JT1
+//     projection — the hinge IS a ball at the pivot, positionally).
+// (2) the axis alignment: worldAxisA = FxRotate(qA, axisA), worldAxisB = FxRotate(qB, axisB); the
+//     shortest-arc correction rotating worldAxisB onto worldAxisA is q = normalize({cross(axisWB,
+//     axisWA), kOne + dot}) (cross/dot + FxQuatNormalize ONLY — zero transcendentals; near-antiparallel
+//     axes give a ~zero quaternion -> FxQuatNormalize's len==0 identity fallback or a tiny normalized
+//     correction, both deterministic). Applied world-frame: qBtarget = qcorr·qB (rotates B's axis toward
+//     A's), qAtarget = qcorr⁻¹·qA (rotates A's the other way), each nlerp'd by its inverse-mass share
+//     (the SolveAngularLimit apply, mirrored — a pinned body is NOT rotated). int64 throughout.
+inline void SolveHingeJoint(FxWorld& world, const FxHingeJoint& h) {
+    const size_t n = world.bodies.size();
+    if (h.bodyA >= (uint32_t)n || h.bodyB >= (uint32_t)n) return;   // out-of-range -> skip
+    // (1) the pivot — the JT1 ball projection REUSED AS-IS.
+    FxJoint ball;
+    ball.bodyA = h.bodyA; ball.bodyB = h.bodyB;
+    ball.anchorA = h.anchorA; ball.anchorB = h.anchorB;
+    ball.kind = kJointBall;
+    SolveBallJoint(world, ball);
+    // (2) the axis alignment.
+    FxBody& a = world.bodies[(size_t)h.bodyA];
+    FxBody& b = world.bodies[(size_t)h.bodyB];
+    const fx wsum = a.invMass + b.invMass;
+    if (wsum == 0) return;                              // both pinned -> skip
+    const FxQuat qA = a.orient;
+    const FxQuat qB = b.orient;
+    const FxVec3 axisWA = FxRotate(qA, h.axisA);
+    const FxVec3 axisWB = FxRotate(qB, h.axisB);
+    // cross(axisWB, axisWA): the rotation axis taking B's world axis onto A's (each term int64 fxmul).
+    const FxVec3 c{
+        fxmul(axisWB.y, axisWA.z) - fxmul(axisWB.z, axisWA.y),
+        fxmul(axisWB.z, axisWA.x) - fxmul(axisWB.x, axisWA.z),
+        fxmul(axisWB.x, axisWA.y) - fxmul(axisWB.y, axisWA.x),
+    };
+    const fx d = FxDot(axisWA, axisWB);
+    if (c.x == 0 && c.y == 0 && c.z == 0 && d <= 0) return;   // antiparallel degenerate -> deterministic skip
+    const FxQuat qcorr = FxQuatNormalize(FxQuat{c.x, c.y, c.z, kOne + d});   // shortest arc, half-angle-free
+    const FxQuat qBtarget = FxQuatNormalize(FxQuatMul(qcorr, qB));           // world-frame pre-multiply
+    const FxQuat qAtarget = FxQuatNormalize(FxQuatMul(QConj(qcorr), qA));
+    const fx wA = fxdiv(a.invMass, wsum);
+    const fx wB = fxdiv(b.invMass, wsum);
+    b.orient = FxQuatNormalize(QNlerp(qB, qBtarget, wB));   // a pinned body (w 0) is NOT rotated
+    a.orient = FxQuatNormalize(QNlerp(qA, qAtarget, wA));
+}
+
+// ----- HingeAxisError: kOne − dot(worldAxisA, worldAxisB) — the axis-lock metric (0 = parallel) ---------
+// A held hinge keeps this within a small deterministic LSB band; a ball-only control under an off-axis
+// spin lets it grow (the negative-control proof). Pure integer (FxRotate + FxDot), bit-exact.
+inline fx HingeAxisError(const FxWorld& world, const FxHingeJoint& h) {
+    const size_t n = world.bodies.size();
+    if (h.bodyA >= (uint32_t)n || h.bodyB >= (uint32_t)n) return 0;
+    const FxVec3 axisWA = FxRotate(world.bodies[(size_t)h.bodyA].orient, h.axisA);
+    const FxVec3 axisWB = FxRotate(world.bodies[(size_t)h.bodyB].orient, h.axisB);
+    return kOne - FxDot(axisWA, axisWB);
+}
+
+// ----- SolvePrismaticJoint: ONE slider projection (line + slide clamp + orientation lock) ---------------
+// axisW = FxRotate(qA, axisA); d = worldAnchorB − worldAnchorA; slide = dot(d, axisW);
+// perp = d − axisW·slide (the off-line offset — the correction IS the perp vector, no normalize):
+//   a.pos += perp·wa; b.pos −= perp·wb           (B's anchor projected onto the line)
+// slide clamp: err = slide − min/maxSlide when outside the range; a.pos += axisW·err·wa; b.pos −= ·wb.
+// orientation lock: qBtarget = qA·restOrient, qAtarget = qB·restOrient⁻¹, nlerp'd by inverse-mass share
+// (the JT2 apply — a pinned body is NOT rotated). int64 (FxRotate/FxDot/fxmul/fxdiv/FxQuat*).
+inline void SolvePrismaticJoint(FxWorld& world, const FxPrismaticJoint& p) {
+    const size_t n = world.bodies.size();
+    if (p.bodyA >= (uint32_t)n || p.bodyB >= (uint32_t)n) return;   // out-of-range -> skip
+    FxBody& a = world.bodies[(size_t)p.bodyA];
+    FxBody& b = world.bodies[(size_t)p.bodyB];
+    const fx wsum = a.invMass + b.invMass;
+    if (wsum == 0) return;                              // both pinned -> skip
+    const fx wa = fxdiv(a.invMass, wsum);
+    const fx wb = fxdiv(b.invMass, wsum);
+    const FxVec3 axisW = FxRotate(a.orient, p.axisA);
+    const FxVec3 pa = WorldAnchor(a, p.anchorA);
+    const FxVec3 pb = WorldAnchor(b, p.anchorB);
+    const FxVec3 d = FxSub(pb, pa);
+    const fx slide = FxDot(d, axisW);
+    // (1) project the perpendicular offset to zero (the line constraint).
+    const FxVec3 along = FxScale(axisW, slide);
+    const FxVec3 perp = FxSub(d, along);
+    a.pos = FxAdd(a.pos, FxScale(perp, wa));
+    b.pos = FxSub(b.pos, FxScale(perp, wb));
+    // (2) the slide-range clamp along the axis.
+    fx err = 0;
+    if (slide < p.minSlide) err = slide - p.minSlide;
+    else if (slide > p.maxSlide) err = slide - p.maxSlide;
+    if (err != 0) {
+        const FxVec3 corr = FxScale(axisW, err);
+        a.pos = FxAdd(a.pos, FxScale(corr, wa));
+        b.pos = FxSub(b.pos, FxScale(corr, wb));
+    }
+    // (3) the orientation lock: qrel -> restOrient (the JT2 nlerp inverse-mass apply).
+    const FxQuat qA = a.orient;
+    const FxQuat qB = b.orient;
+    const FxQuat qBtarget = FxQuatNormalize(FxQuatMul(qA, p.restOrient));
+    const FxQuat qAtarget = FxQuatNormalize(FxQuatMul(qB, QConj(p.restOrient)));
+    b.orient = FxQuatNormalize(QNlerp(qB, qBtarget, wb));   // a pinned body (w 0) is NOT rotated
+    a.orient = FxQuatNormalize(QNlerp(qA, qAtarget, wa));
+}
+
+// ----- PrismaticSlide / PrismaticPerpError / PrismaticOrientError: the slider metrics -------------------
+// slide  : the signed distance of B's anchor along the rail axis (the clamp proof reads this).
+// perp   : |d − axisW·slide| — the off-line offset (a held slider keeps this within an LSB band).
+// orient : kOne − |(restOrient⁻¹·(qA⁻¹·qB)).w| — the locked-orientation deviation (0 = exactly locked).
+inline fx PrismaticSlide(const FxWorld& world, const FxPrismaticJoint& p) {
+    const size_t n = world.bodies.size();
+    if (p.bodyA >= (uint32_t)n || p.bodyB >= (uint32_t)n) return 0;
+    const FxBody& a = world.bodies[(size_t)p.bodyA];
+    const FxBody& b = world.bodies[(size_t)p.bodyB];
+    const FxVec3 axisW = FxRotate(a.orient, p.axisA);
+    return FxDot(FxSub(WorldAnchor(b, p.anchorB), WorldAnchor(a, p.anchorA)), axisW);
+}
+inline fx PrismaticPerpError(const FxWorld& world, const FxPrismaticJoint& p) {
+    const size_t n = world.bodies.size();
+    if (p.bodyA >= (uint32_t)n || p.bodyB >= (uint32_t)n) return 0;
+    const FxBody& a = world.bodies[(size_t)p.bodyA];
+    const FxBody& b = world.bodies[(size_t)p.bodyB];
+    const FxVec3 axisW = FxRotate(a.orient, p.axisA);
+    const FxVec3 d = FxSub(WorldAnchor(b, p.anchorB), WorldAnchor(a, p.anchorA));
+    return FxLength(FxSub(d, FxScale(axisW, FxDot(d, axisW))));
+}
+inline fx PrismaticOrientError(const FxWorld& world, const FxPrismaticJoint& p) {
+    const size_t n = world.bodies.size();
+    if (p.bodyA >= (uint32_t)n || p.bodyB >= (uint32_t)n) return 0;
+    const FxQuat qrel = FxQuatMul(QConj(world.bodies[(size_t)p.bodyA].orient),
+                                  world.bodies[(size_t)p.bodyB].orient);
+    const FxQuat qerr = FxQuatMul(QConj(p.restOrient), qrel);
+    const fx aw = qerr.w < 0 ? -qerr.w : qerr.w;        // double-cover: |w| (q and −q are the same rotation)
+    return kOne - aw;
+}
+
+// ----- JointRelVel: the current relative velocity a motor regulates (the motor-held proof metric) -------
+// kMotorHinge: dot(angVelB − angVelA, worldAxisA) (the relative spin about the hinge axis).
+// kMotorPrismatic: dot(velB − velA, worldAxisA) (the relative slide speed along the rail axis).
+inline fx JointRelVel(const FxWorld& world, const FxJointMotor& m,
+                      const std::vector<FxHingeJoint>& hinges,
+                      const std::vector<FxPrismaticJoint>& prismatics) {
+    const size_t n = world.bodies.size();
+    if (m.kind == kMotorHinge) {
+        if (m.jointIndex >= hinges.size()) return 0;
+        const FxHingeJoint& h = hinges[(size_t)m.jointIndex];
+        if (h.bodyA >= (uint32_t)n || h.bodyB >= (uint32_t)n) return 0;
+        const FxBody& a = world.bodies[(size_t)h.bodyA];
+        const FxBody& b = world.bodies[(size_t)h.bodyB];
+        return FxDot(FxSub(b.angVel, a.angVel), FxRotate(a.orient, h.axisA));
+    }
+    if (m.jointIndex >= prismatics.size()) return 0;
+    const FxPrismaticJoint& p = prismatics[(size_t)m.jointIndex];
+    if (p.bodyA >= (uint32_t)n || p.bodyB >= (uint32_t)n) return 0;
+    const FxBody& a = world.bodies[(size_t)p.bodyA];
+    const FxBody& b = world.bodies[(size_t)p.bodyB];
+    return FxDot(FxSub(b.vel, a.vel), FxRotate(a.orient, p.axisA));
+}
+
+// ----- SolveJointMotor: ONE motor iteration (velocity bias toward targetVel, accumulated-impulse clamp) -
+// err = targetVel − vRel; the WANTED impulse is the full err; the ACCUMULATED impulse this tick is clamped
+// to ±maxImpulse; only the delta (applied = clampedAcc − acc) lands this iteration. The impulse splits by
+// inverse-mass share so it changes the RELATIVE velocity by exactly `applied` (wA + wB == kOne within the
+// fxdiv LSB), landing on angVel (hinge) or vel (prismatic). maxImpulse == 0 -> applied is ALWAYS 0 ->
+// ZERO state mutation (bit-identical to no motor — identity-at-zero by construction). `acc` is the
+// per-motor per-tick accumulator the step owns (reset each tick). int64 (FxRotate/FxDot/fxmul/fxdiv).
+inline void SolveJointMotor(FxWorld& world, const FxJointMotor& m,
+                            const std::vector<FxHingeJoint>& hinges,
+                            const std::vector<FxPrismaticJoint>& prismatics, fx& acc) {
+    const size_t n = world.bodies.size();
+    uint32_t ia, ib;
+    FxVec3 axisLocalA;
+    if (m.kind == kMotorHinge) {
+        if (m.jointIndex >= hinges.size()) return;
+        const FxHingeJoint& h = hinges[(size_t)m.jointIndex];
+        ia = h.bodyA; ib = h.bodyB; axisLocalA = h.axisA;
+    } else if (m.kind == kMotorPrismatic) {
+        if (m.jointIndex >= prismatics.size()) return;
+        const FxPrismaticJoint& p = prismatics[(size_t)m.jointIndex];
+        ia = p.bodyA; ib = p.bodyB; axisLocalA = p.axisA;
+    } else {
+        return;                                          // unknown kind -> deterministic no-op
+    }
+    if (ia >= (uint32_t)n || ib >= (uint32_t)n) return;  // out-of-range -> skip
+    FxBody& a = world.bodies[(size_t)ia];
+    FxBody& b = world.bodies[(size_t)ib];
+    const fx wsum = a.invMass + b.invMass;
+    if (wsum == 0) return;                               // both pinned -> skip
+    const FxVec3 axisW = FxRotate(a.orient, axisLocalA);
+    const fx vRel = (m.kind == kMotorHinge) ? FxDot(FxSub(b.angVel, a.angVel), axisW)
+                                            : FxDot(FxSub(b.vel, a.vel), axisW);
+    const fx err = m.targetVel - vRel;
+    // accumulated-impulse clamp: the tick's total impulse never exceeds ±maxImpulse.
+    fx newAcc = acc + err;
+    if (newAcc > m.maxImpulse) newAcc = m.maxImpulse;
+    if (newAcc < -m.maxImpulse) newAcc = -m.maxImpulse;
+    const fx applied = newAcc - acc;
+    acc = newAcc;
+    const fx wA = fxdiv(a.invMass, wsum);
+    const fx wB = fxdiv(b.invMass, wsum);
+    if (m.kind == kMotorHinge) {
+        b.angVel = FxAdd(b.angVel, FxScale(axisW, fxmul(applied, wB)));
+        a.angVel = FxSub(a.angVel, FxScale(axisW, fxmul(applied, wA)));
+    } else {
+        b.vel = FxAdd(b.vel, FxScale(axisW, fxmul(applied, wB)));
+        a.vel = FxSub(a.vel, FxScale(axisW, fxmul(applied, wA)));
+    }
+}
+
+// ----- StepArticulatedJT7: ONE full machine tick (the locked pass order documented above) ---------------
+// (1) integrate -> (2) K Gauss-Seidel iters EACH {balls | hinges | prismatics | limits | motors} with the
+// motor accumulators reset per tick -> (3) contacts trailing block (BuildPairs once + fpx::StepWorld dt=0:
+// ground clamp + FPX3 sphere contacts — the JT3 mold; a radius-0 machine makes this block inert except the
+// ground clamp, the deterministic no-contact configuration). Pure integer, fixed op order -> two-run
+// bit-identical AND bit-identical cross-backend (pure CPU on both — no GPU dispatch anywhere in JT7).
+inline void StepArticulatedJT7(FxWorld& world, const std::vector<FxJoint>& joints,
+                               const std::vector<FxHingeJoint>& hinges,
+                               const std::vector<FxPrismaticJoint>& prismatics,
+                               const std::vector<FxAngularLimit>& angularLimits,
+                               const std::vector<FxJointMotor>& motors, fx dt, int iters, int solveIters) {
+    const size_t n = world.bodies.size();
+    // (1) integrate one step (6-DOF: translation gated by kFlagDynamic, orientation for every body).
+    for (size_t i = 0; i < n; ++i)
+        fpx::IntegrateBodyFull(world.bodies[i], world.gravity, dt);
+    // (2) K Gauss-Seidel passes in the LOCKED order; motor accumulators reset ONCE per tick.
+    std::vector<fx> acc(motors.size(), 0);
+    for (int it = 0; it < iters; ++it) {
+        for (size_t e = 0; e < joints.size(); ++e)
+            SolveBallJoint(world, joints[e]);
+        for (size_t e = 0; e < hinges.size(); ++e)
+            SolveHingeJoint(world, hinges[e]);
+        for (size_t e = 0; e < prismatics.size(); ++e)
+            SolvePrismaticJoint(world, prismatics[e]);
+        for (size_t e = 0; e < angularLimits.size(); ++e)
+            SolveAngularLimit(world, angularLimits[e]);
+        for (size_t e = 0; e < motors.size(); ++e)
+            SolveJointMotor(world, motors[e], hinges, prismatics, acc[e]);
+    }
+    // (3) contacts as a trailing block (FPX2 broadphase ONCE + FPX3 ground/sphere contacts, dt=0).
+    std::vector<uint32_t> perBodyOffset;
+    std::vector<fpx::FxPair> pairs;
+    fpx::BuildPairs(world, perBodyOffset, pairs);
+    fpx::StepWorld(world, std::span<const fpx::FxPair>(pairs), /*dt=*/0, solveIters);
+}
+
+// ----- StepArticulatedJT7Steps: run K machine ticks (the showcase / test driver) ------------------------
+inline void StepArticulatedJT7Steps(FxWorld& world, const std::vector<FxJoint>& joints,
+                                    const std::vector<FxHingeJoint>& hinges,
+                                    const std::vector<FxPrismaticJoint>& prismatics,
+                                    const std::vector<FxAngularLimit>& angularLimits,
+                                    const std::vector<FxJointMotor>& motors, fx dt, int iters,
+                                    int solveIters, int steps) {
+    for (int s = 0; s < steps; ++s)
+        StepArticulatedJT7(world, joints, hinges, prismatics, angularLimits, motors, dt, iters, solveIters);
+}
+
+// ====================================================================================================
+// JT7 LOCKSTEP + ROLLBACK (the JT5/FPX5 mold over the motorized machine). THE VH5 LESSON APPLIED: the
+// motor targetVels are LIVE REPLAYABLE STATE (kCmdSetMotorTarget mutates them and the step reads them),
+// so the snapshot captures BOTH the body world (fpx::SnapshotWorld VERBATIM) AND the motor list. The
+// joints/hinges/prismatics/limits are CONSTANT topology (const-ref, not snapshotted). The actuation IS
+// the input stream: a peer fed only {init, commands} re-derives the running machine bit-for-bit.
+
+// ApplyJT7Command: kCmdSetMotorTarget sets motors[bodyId].targetVel = arg.x (bodyId is the MOTOR index;
+// out-of-range -> deterministic no-op); every other kind is delegated to fpx::ApplyCommand VERBATIM
+// (kCmdImpulse / kCmdSetAngVel / unknown no-op).
+inline void ApplyJT7Command(fpx::FxWorld& world, std::vector<FxJointMotor>& motors,
+                            const fpx::FxCommand& c) {
+    if (c.kind == kCmdSetMotorTarget) {
+        if (c.bodyId < (uint32_t)motors.size()) motors[(size_t)c.bodyId].targetVel = c.arg.x;
+        return;
+    }
+    fpx::ApplyCommand(world, c);
+}
+
+// JT7Machine: the MUTABLE machine state a peer replays (bodies + motor setpoints). The lockstep/rollback
+// harnesses return this pair; the topology lists stay outside (constant).
+struct JT7Machine {
+    fpx::FxWorld              world;    // the body world (fpx::SnapshotWorld deep-copies it)
+    std::vector<FxJointMotor> motors;   // the motor list (targetVel is command-mutable state)
+};
+
+// SimJT7Tick: apply this tick's commands in ARRAY ORDER (the deterministic input-order contract), then one
+// StepArticulatedJT7. Pure integer, fixed order -> bit-identical on every peer/platform.
+inline void SimJT7Tick(JT7Machine& m, const std::vector<FxJoint>& joints,
+                       const std::vector<FxHingeJoint>& hinges,
+                       const std::vector<FxPrismaticJoint>& prismatics,
+                       const std::vector<FxAngularLimit>& angularLimits,
+                       const std::vector<fpx::FxCommand>& stream, uint32_t tick, fx dt, int iters,
+                       int solveIters) {
+    for (const fpx::FxCommand& c : stream)
+        if (c.tick == tick) ApplyJT7Command(m.world, m.motors, c);
+    StepArticulatedJT7(m.world, joints, hinges, prismatics, angularLimits, m.motors, dt, iters, solveIters);
+}
+
+// RunJT7Lockstep: THE peer entry point (the JT5 control flow over SimJT7Tick). Run `ticks` from a COPY of
+// `init` applying the command stream -> the converged machine. authority == replica from the SAME
+// {init, stream} (INPUTS ONLY) -> BIT-IDENTICAL by determinism (the proof memcmps bodies + motors).
+inline JT7Machine RunJT7Lockstep(const JT7Machine& init, const std::vector<FxJoint>& joints,
+                                 const std::vector<FxHingeJoint>& hinges,
+                                 const std::vector<FxPrismaticJoint>& prismatics,
+                                 const std::vector<FxAngularLimit>& angularLimits,
+                                 const std::vector<fpx::FxCommand>& stream, int ticks, fx dt, int iters,
+                                 int solveIters) {
+    JT7Machine m = init;
+    for (int t = 0; t < ticks; ++t)
+        SimJT7Tick(m, joints, hinges, prismatics, angularLimits, stream, (uint32_t)t, dt, iters, solveIters);
+    return m;
+}
+
+// RunJT7Rollback: the rollback harness (the JT5 control flow; the snapshot carries bodies + MOTORS — the
+// VH5 lesson). (1) advance 0..mispredictTick with authStream; (2) snapshot (a JT7Machine value copy —
+// fpx::SnapshotWorld semantics for the bodies + a motor-list deep copy); (2b) speculate <=3 ticks with the
+// MISPREDICTED stream (e.g. a wrong motor setpoint); (3) restore + re-simulate with the CORRECT stream.
+// The proof asserts the result == RunJT7Lockstep(init, ..., authStream, ticks) AND that the speculative
+// state genuinely diverged.
+inline JT7Machine RunJT7Rollback(const JT7Machine& init, const std::vector<FxJoint>& joints,
+                                 const std::vector<FxHingeJoint>& hinges,
+                                 const std::vector<FxPrismaticJoint>& prismatics,
+                                 const std::vector<FxAngularLimit>& angularLimits,
+                                 const std::vector<fpx::FxCommand>& authStream,
+                                 const std::vector<fpx::FxCommand>& mispredictStream, int ticks,
+                                 int mispredictTick, fx dt, int iters, int solveIters) {
+    JT7Machine m = init;
+    // (1) advance 0..mispredictTick with the authoritative stream.
+    for (int t = 0; t < mispredictTick; ++t)
+        SimJT7Tick(m, joints, hinges, prismatics, angularLimits, authStream, (uint32_t)t, dt, iters,
+                   solveIters);
+    // (2) SAVE the snapshot at mispredictTick (bodies + motor setpoints — the mutable machine state).
+    const JT7Machine snap = m;
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (bounded to the remaining ticks).
+    int specTicks = ticks - mispredictTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimJT7Tick(m, joints, hinges, prismatics, angularLimits, mispredictStream,
+                   (uint32_t)(mispredictTick + s), dt, iters, solveIters);
+    // (3) ROLLBACK: restore + re-simulate mispredictTick..ticks with the CORRECT stream.
+    m = snap;
+    for (int t = mispredictTick; t < ticks; ++t)
+        SimJT7Tick(m, joints, hinges, prismatics, angularLimits, authStream, (uint32_t)t, dt, iters,
+                   solveIters);
+    return m;
+}
+
 }  // namespace joint
 }  // namespace hf::sim

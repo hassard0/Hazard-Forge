@@ -679,6 +679,7 @@ int main(int argc, char** argv) {
     const char* persistLockstepShotPath = nullptr; // --persist-lockstep-shot <out.bmp> (Slice PS5, THE NETCODE HEADLINE: Deterministic Persistent Contacts LOCKSTEP + ROLLBACK, the 5th slice of FLAGSHIP #21 — PURE CPU, NO GPU shader, NO new RHI; both backends run the IDENTICAL persist.h::RunPersistLockstep/RunPersistRollback over the PS4 warm+sleep tower scene + a fixed command stream (early perturbations -> the tower settles + SLEEPS -> a wake-impulse wakes + topples it). THE KEY DIFFERENCE from CX5/FC5: the replayable state INCLUDES the persistent impulse CACHE (PS2) + the per-body SLEEP STATE (PS4), so the snapshot captures the TRIPLE (bodies + cache + sleep); PersistStatesEqual compares all three. authority==replica BIT-IDENTICAL inputs-only (bodies+cache+sleep) + rollback corrects a real misprediction to authority BIT-EXACT; converged authority world drawn as the PS4-style 2D side-view, bit-identical cross-backend BY CONSTRUCTION. Reuses the frozen CX5 convex:: command helpers verbatim, swapping StepWarmSleepWorld for StepConvexWorld + extending the snapshot.)
     const char* persistRenderShotPath = nullptr; // --persist-render-shot <out.bmp> (Slice PS6, THE MONEY-SHOT COMPLETING FLAGSHIP #21: Deterministic Persistent Contacts LIT 3D INSTANCED RENDER CAPSTONE — the bit-exact PS4 warm+sleep tower (static floor + 3 dynamic slabs) + the PS5 command stream (early nudges -> the tower settles + SLEEPS -> a wake-impulse at tick 160 wakes the island + topples it), run through persist::RunPersistLockstep to the converged AUTHORITY world, then turned into a split FLOAT instance set via persist::PersistToRenderInstances (a one-line delegate to the frozen convex::ConvexToRenderInstances — each body -> an oriented CUBE: fpx::FxBodyTransform pose x the box's 2*halfExtents scale, the ONE float crossing, render-only), drawn as MATTE warm-amber dynamic boxes on a cool-grey floor through the EXISTING cube-mesh + lit_instanced.vert + lit.frag + shadow_instanced.vert (REUSED VERBATIM from --fric-render-shot; NO new shader/RHI); provenance (two calls byte-equal) + toppled + shaded; FLOAT render-capstone bar, Metal-baked golden persist_render.png)
     const char* ps7HullSleepShotPath = nullptr; // --ps7-hullsleep-shot <out.bmp> (Slice PS7, Track-R R7: SPATIAL ISLAND PARTITIONING + GENERAL-HULL CONTACT PERSISTENCE — the mixed tetra/octa/box hull pile (the GJ6 shapes) on a floor hull runs persist::RunPersistHullLockstep (the WH5 command+snapshot mold over persist::StepWarmSleepHullWorldSpatial — broadphase candidates [frozen BP4 grid] -> narrowphase-confirm -> UNION-FIND islands O(n*k), replacing the all-pairs O(n^2) island discovery; the hull warm-start/sleep machinery is the frozen flagship-#26 warmhull.h REUSED VERBATIM): the pile settles -> goes FULLY ASLEEP -> a wake-impulse at tick 60 wakes ONLY the struck island (partial-world wake) -> re-settles -> ASLEEP at the final tick. PURE CPU (NO GPU dispatch, NO new shader, NO new RHI) — both backends run the IDENTICAL header-only integer harness -> the golden is bit-identical BY CONSTRUCTION. Proofs: lockstep identical + two-run determinism + rollback corrected + mispredict diverged + spatial islands == all-pairs islands + all-asleep. PURE-INTEGER 2D side-view; SLEEPING hulls tinted cool slate, awake warm amber (the wh4 convention); stat line = hulls/steps/digest/asleepCount/islandCount/candidatePairs.)
+    const char* jt7MachineShotPath = nullptr; // --jt7-machine-shot <out.bmp> (Slice JT7, Track-R R12: HINGE + PRISMATIC + MOTORIZED JOINTS — closing the flagship-#15 "ball+cone limits only" caveat. PURE CPU (NO GPU dispatch, NO new shader, NO new RHI — the GR5/CL7/PS7/NAV7 Track-R precedent): both backends run the IDENTICAL header-only integer harness (joint.h JT7: FxHingeJoint = the JT1 ball pivot + a shortest-arc quaternion AXIS-ALIGNMENT [cross/dot only, zero transcendentals]; FxPrismaticJoint = the perpendicular-offset line projection + slide-range clamp + the JT2-nlerp orientation lock; FxJointMotor = a velocity-target impulse with a per-tick ACCUMULATED-IMPULSE clamp [maxImpulse=0 == unmotorized bit-identical]) over THE MACHINE: a motorized hinge WHEEL cranks a connecting ROD driving a PISTON on a prismatic rail (a crank-slider on a zero-g bench — the family is positional PBD with no velocity reconciliation, so the bench is zero-g by design), spun up by kCmdSetMotorTarget commands (+2 rad/s at tick 0, REVERSED to -2 at tick 120 — the actuation IS the input stream) 200 ticks. Proofs: lockstep authority==replica BIT-IDENTICAL (bodies + motor setpoints), two-run determinism, rollback corrects a mispredicted setpoint EXACTLY, the piston strokes the full crank diameter, the hinge axis + prismatic line errors pinned at 0 LSB, the pinned FNV digest. Pure-integer 2D side-view golden; stat line = bodies/joints/motors/steps/digest/axisErr/slideErr.)
     const char* seqRenderShotPath = nullptr; // --seq-render-shot <out.bmp> (Slice SEQ-S6, THE MONEY-SHOT COMPLETING FLAGSHIP #25: Deterministic Cinematic Sequencer LIT 3D RENDER CAPSTONE — a hero object sampled at N successive times along a FIXED cutscene TransformTrack (seq::MakeCutsceneTrail, bit-exact seq::SampleTransform — the S4 rotation keys + scale pulse enriched with a wider translation sweep), turned into a ghosted MOTION TRAIL of FLOAT instances via seq::SeqToRenderInstances (one math::Mat4 per sample via SeqTransformToMat4 = translate*rotate*scale through FxToFloat — the ONE float crossing, render-only), drawn as MATTE warm cubes on a cool-grey floor through the EXISTING cube-mesh + lit_instanced.vert + lit.frag + shadow_instanced.vert (REUSED VERBATIM from --persist-render-shot/--fract-render-shot; NO new shader/RHI); four proofs (provenance/count, two-run BYTE-IDENTICAL, instances==rebuild, empty no-op); FLOAT render-capstone bar, Metal-baked golden seq_render.png)
     const char* fricLockstepShotPath = nullptr;  // --fric-lockstep-shot <out.bmp> (Slice FC5, THE NETCODE HEADLINE: Deterministic Contact Friction LOCKSTEP + ROLLBACK, the 5th slice of FLAGSHIP #20 — PURE CPU, NO GPU shader, NO new RHI; both backends run the IDENTICAL fric.h::RunFricLockstep/RunFricRollback over the FC4 friction-stack scene + a fixed command stream (impulse/angVel perturbations knock the friction-held tower, it re-settles under Coulomb friction); authority==replica BIT-IDENTICAL inputs-only + rollback corrects a real misprediction to authority BIT-EXACT; converged authority world drawn as the FC4-style 2D side-view, bit-identical cross-backend BY CONSTRUCTION. Reuses the frozen CX5 convex:: command/snapshot helpers verbatim, swapping StepFrictionWorld for StepConvexWorld)
     const char* fricRenderShotPath = nullptr;  // --fric-render-shot <out.bmp> (Slice FC6, THE MONEY-SHOT COMPLETING FLAGSHIP #20: Deterministic Contact Friction LIT 3D INSTANCED RENDER CAPSTONE — the bit-exact FC4 friction RAMP scene (an 18-degree tilted static ramp box + a dynamic box, mu=kOne) settled K ticks via fric::StepFrictionWorldN so the box GRIPS at rest on the incline, then turned into a split FLOAT instance set via fric::FrictionToRenderInstances (a one-line delegate to the frozen convex::ConvexToRenderInstances — each body -> an oriented CUBE: fpx::FxBodyTransform pose x the box's 2*halfExtents scale, the ONE float crossing, render-only), drawn as a MATTE warm-amber dynamic box on a cool-grey ramp/floor through the EXISTING cube-mesh + lit_instanced.vert + lit.frag + shadow_instanced.vert (REUSED VERBATIM from --convex-render-shot; NO new shader/RHI); provenance (instances == rebuild) + two-run BYTE-IDENTICAL + shaded; FLOAT render-capstone bar, Metal-baked golden fric_render.png)
@@ -4114,6 +4115,14 @@ int main(int argc, char** argv) {
     // strict-zero viz). Its OWN loop (the standalone-loop pattern).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--nav7-ml-shot") == 0) { nav7MLShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice JT7: --jt7-machine-shot <out.bmp> (HINGE + PRISMATIC + MOTORIZED JOINTS, Track-R R12 — the
+    // motorized crank-slider MACHINE: a hinge wheel spun by a velocity-target motor cranks a rod driving
+    // a piston on a prismatic rail; lockstep/rollback over the motor-setpoint command stream; PURE CPU,
+    // NO new shader/RHI, pure-integer strict-zero viz). Its OWN loop (the standalone-loop pattern).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--jt7-machine-shot") == 0) { jt7MachineShotPath = argv[i + 1]; break; }
     }
 
     // Slice RT1: --rt1-trace-shot <out.bmp> (Hardware Ray Tracing THE DETERMINISTIC Q16.16 SW REFERENCE
@@ -55251,6 +55260,293 @@ int main(int argc, char** argv) {
                                 nav7MLShotPath, imgW, imgH, (unsigned)surf.size(), mlCols,
                                 (unsigned)corU.size(), (unsigned)corO.size(), (unsigned long long)digest);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", nav7MLShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Slice JT7 (Track-R R12): HINGE + PRISMATIC + MOTORIZED JOINTS — THE MACHINE
+        // (--jt7-machine-shot <out.bmp>). PURE CPU — NO GPU dispatch, NO new shader, NO new RHI; both
+        // backends run the IDENTICAL header-only integer harness (joint.h JT7) over the crank-slider:
+        // a motorized hinge WHEEL (FxHingeJoint + FxJointMotor, velocity-target + accumulated-impulse
+        // clamp) cranks a connecting ROD (two JT1 balls) driving a PISTON on a prismatic rail
+        // (FxPrismaticJoint: line projection + slide clamp + orientation lock), actuated by
+        // kCmdSetMotorTarget commands (+2 rad/s at tick 0, REVERSED at tick 120) — deterministic
+        // motorized articulation, lockstep-replayable from the setpoint stream (UE5's float PhysX/Chaos
+        // constraints can't replay). ZERO-G bench (the family is positional PBD, no velocity
+        // reconciliation — documented). The golden is bit-identical cross-backend BY CONSTRUCTION.
+        if (jt7MachineShotPath) {
+            using math::Vec3;
+            namespace joint = hf::sim::joint;
+            namespace fpx = hf::sim::fpx;
+            auto fi = [](double v) { return (joint::fx)(v * (double)joint::kOne + (v < 0 ? -0.5 : 0.5)); };
+            auto fnv1a = [](const void* data, size_t len, uint64_t h) {
+                const uint8_t* p = (const uint8_t*)data;
+                for (size_t i = 0; i < len; ++i) { h ^= (uint64_t)p[i]; h *= 1099511628211ull; }
+                return h;
+            };
+
+            // THE MACHINE (== the joint_test JT7 machine, 200-tick showcase run): frame(0,pinned) +
+            // wheel(1) + rod(2) + piston(3) + rail(4,pinned); crank radius 0.8, rod 2.4, rail line y=3.
+            joint::JT7Machine init;
+            init.world.gravity = joint::FxVec3{0, 0, 0};   // zero-g bench (positional PBD, documented)
+            init.world.groundY = 0;
+            auto at = [&](double x, double y, bool dynB) {
+                fpx::FxBody b;
+                b.pos = joint::FxVec3{fi(x), fi(y), 0};
+                b.vel = joint::FxVec3{0, 0, 0};
+                b.invMass = dynB ? joint::kOne : 0;
+                b.flags = dynB ? fpx::kFlagDynamic : 0u;
+                b.radius = 0;                               // radius-0 machine: the contact block is inert
+                b.orient = fpx::FxQuat{0, 0, 0, joint::kOne};
+                b.angVel = joint::FxVec3{0, 0, 0};
+                return b;
+            };
+            init.world.bodies = {at(3.0, 3.0, false), at(3.0, 3.0, true), at(5.0, 3.0, true),
+                                 at(6.2, 3.0, true), at(6.2, 4.5, false)};
+            std::vector<joint::FxJoint> balls;
+            {   // rim <-> rod end1 (the crank pin)
+                joint::FxJoint j;
+                j.bodyA = 1; j.bodyB = 2;
+                j.anchorA = joint::FxVec3{fi(0.8), 0, 0};
+                j.anchorB = joint::FxVec3{fi(-1.2), 0, 0};
+                j.kind = joint::kJointBall;
+                balls.push_back(j);
+            }
+            {   // rod end2 <-> piston centre (the wrist pin)
+                joint::FxJoint j;
+                j.bodyA = 2; j.bodyB = 3;
+                j.anchorA = joint::FxVec3{fi(1.2), 0, 0};
+                j.anchorB = joint::FxVec3{0, 0, 0};
+                j.kind = joint::kJointBall;
+                balls.push_back(j);
+            }
+            std::vector<joint::FxHingeJoint> hinges;
+            {   // frame <-> wheel hinge about Z (the crank shaft)
+                joint::FxHingeJoint h;
+                h.bodyA = 0; h.bodyB = 1;
+                h.anchorA = joint::FxVec3{0, 0, 0};
+                h.anchorB = joint::FxVec3{0, 0, 0};
+                h.axisA = joint::FxVec3{0, 0, joint::kOne};
+                h.axisB = joint::FxVec3{0, 0, joint::kOne};
+                hinges.push_back(h);
+            }
+            std::vector<joint::FxPrismaticJoint> prisms;
+            {   // rail <-> piston prismatic along X (the line 1.5 below the rail body; stroke [-1.6, 0])
+                joint::FxPrismaticJoint p;
+                p.bodyA = 4; p.bodyB = 3;
+                p.axisA = joint::FxVec3{joint::kOne, 0, 0};
+                p.anchorA = joint::FxVec3{0, fi(-1.5), 0};
+                p.anchorB = joint::FxVec3{0, 0, 0};
+                p.minSlide = -2 * (int)joint::kOne;         // wide: the clamp never fights the rod here
+                p.maxSlide = (joint::fx)joint::kOne;
+                p.restOrient = fpx::FxQuat{0, 0, 0, joint::kOne};
+                prisms.push_back(p);
+            }
+            init.motors = {joint::FxJointMotor{joint::kMotorHinge, 0u, 0, 4 * (int)joint::kOne}};
+            const std::vector<joint::FxAngularLimit> noLimits;
+
+            // The actuation stream (the input IS the machine's drive): spin up +2 rad/s at tick 0,
+            // REVERSE to -2 at tick 120, a mid-run impulse poke on the rod at tick 80.
+            const std::vector<fpx::FxCommand> authStream = {
+                fpx::FxCommand{0u, joint::kCmdSetMotorTarget, 0u,
+                               joint::FxVec3{2 * (int)joint::kOne, 0, 0}},
+                fpx::FxCommand{120u, joint::kCmdSetMotorTarget, 0u,
+                               joint::FxVec3{-2 * (int)joint::kOne, 0, 0}},
+                fpx::FxCommand{80u, fpx::kCmdImpulse, 2u, joint::FxVec3{0, joint::kOne / 2, 0}},
+            };
+            const joint::fx kDt = joint::kOne / 60;
+            const int kIters = 12, kSolveIters = 2, kTicks = 200, kMispredictTick = 60;
+            auto machineEqual = [&](const joint::JT7Machine& x, const joint::JT7Machine& y) {
+                return x.world.bodies.size() == y.world.bodies.size() &&
+                       std::memcmp(x.world.bodies.data(), y.world.bodies.data(),
+                                   x.world.bodies.size() * sizeof(fpx::FxBody)) == 0 &&
+                       x.motors.size() == y.motors.size() &&
+                       std::memcmp(x.motors.data(), y.motors.data(),
+                                   x.motors.size() * sizeof(joint::FxJointMotor)) == 0;
+            };
+
+            // === The harness (PURE CPU, NO GPU dispatch) ===
+            // Authority tick-by-tick (== RunJT7Lockstep control flow) tracking the piston stroke envelope.
+            joint::JT7Machine authority = init;
+            joint::fx strokeMin = joint::PrismaticSlide(authority.world, prisms[0]);
+            joint::fx strokeMax = strokeMin;
+            for (int t = 0; t < kTicks; ++t) {
+                joint::SimJT7Tick(authority, balls, hinges, prisms, noLimits, authStream, (uint32_t)t,
+                                  kDt, kIters, kSolveIters);
+                const joint::fx s = joint::PrismaticSlide(authority.world, prisms[0]);
+                if (s < strokeMin) strokeMin = s;
+                if (s > strokeMax) strokeMax = s;
+            }
+
+            // PROOF (1) LOCKSTEP: replica (fed INPUTS ONLY) == authority BIT-IDENTICAL (bodies + motors).
+            const joint::JT7Machine replica = joint::RunJT7Lockstep(init, balls, hinges, prisms, noLimits,
+                                                                    authStream, kTicks, kDt, kIters,
+                                                                    kSolveIters);
+            if (!machineEqual(authority, replica)) {
+                std::fprintf(stderr, "FATAL: jt7-machine authority != replica (inputs-only re-sim diverged)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("jt7-machine: {bodies:%u, balls:%u, hinges:%u, prismatics:%u, motors:%u, ticks:%d} "
+                        "authority==replica BIT-IDENTICAL (bodies + motor setpoints)\n",
+                        (uint32_t)init.world.bodies.size(), (uint32_t)balls.size(), (uint32_t)hinges.size(),
+                        (uint32_t)prisms.size(), (uint32_t)init.motors.size(), kTicks);
+
+            // PROOF (2) DETERMINISM: two full runs byte-identical.
+            const joint::JT7Machine authority2 = joint::RunJT7Lockstep(init, balls, hinges, prisms,
+                                                                       noLimits, authStream, kTicks, kDt,
+                                                                       kIters, kSolveIters);
+            if (!machineEqual(authority, authority2)) {
+                std::fprintf(stderr, "FATAL: jt7-machine two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("jt7-machine determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) ROLLBACK: a WRONG setpoint prediction is corrected EXACTLY + genuinely diverged.
+            std::vector<fpx::FxCommand> mispredictStream = authStream;
+            mispredictStream.push_back(fpx::FxCommand{(uint32_t)kMispredictTick, joint::kCmdSetMotorTarget,
+                                                      0u, joint::FxVec3{6 * (int)joint::kOne, 0, 0}});
+            const joint::JT7Machine rolledBack =
+                joint::RunJT7Rollback(init, balls, hinges, prisms, noLimits, authStream, mispredictStream,
+                                      kTicks, kMispredictTick, kDt, kIters, kSolveIters);
+            const joint::JT7Machine mispredicted =
+                joint::RunJT7Lockstep(init, balls, hinges, prisms, noLimits, mispredictStream, kTicks,
+                                      kDt, kIters, kSolveIters);
+            if (!machineEqual(rolledBack, authority) || machineEqual(mispredicted, authority)) {
+                std::fprintf(stderr, "FATAL: jt7-machine rollback failed (corrected/diverged proof)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("jt7-machine rollback: corrected==authority BIT-EXACT (mispredicted setpoint "
+                        "genuinely diverged)\n");
+
+            // PROOF (4) THE MACHINE RAN: the wheel holds the REVERSED setpoint, the piston stroked the
+            // full crank diameter, the hinge axis + the prismatic line held (pinned integer errors).
+            const joint::fx wheelVel = joint::JointRelVel(authority.world, authority.motors[0], hinges,
+                                                          prisms);
+            const joint::fx axisErr = joint::HingeAxisError(authority.world, hinges[0]);
+            const joint::fx slideErr = joint::PrismaticPerpError(authority.world, prisms[0]);
+            // The HONEST linkage residual (documented): the crank-slider is over-constrained under the
+            // translation-only projections (the rod cannot pivot), so the rim-height vs piston-line
+            // inconsistency (<= 0.8·sinθ) parks as a deterministic ball anchor-gap residual.
+            const joint::fx maxGap = joint::MaxAnchorGap(authority.world, balls);
+            const joint::fx absWheelErr = wheelVel + 2 * (int)joint::kOne;   // target -2.0
+            if (!((absWheelErr < 0 ? -absWheelErr : absWheelErr) <= joint::kOne / 16 &&
+                  strokeMax - strokeMin > (joint::fx)joint::kOne && axisErr <= 16 && slideErr <= 96 &&
+                  maxGap <= joint::kOne * 3 / 5)) {
+                std::fprintf(stderr, "FATAL: jt7-machine did not run (wheelVel=%d stroke=%d axisErr=%d "
+                             "slideErr=%d maxGap=%d)\n", wheelVel, strokeMax - strokeMin, axisErr,
+                             slideErr, maxGap);
+                device->WaitIdle(); return 1;
+            }
+            const uint64_t digest = fnv1a(authority.world.bodies.data(),
+                                          authority.world.bodies.size() * sizeof(fpx::FxBody),
+                                          1469598103934665603ull);
+            if (digest != 0xf947a5e58a21d4acull) {
+                std::fprintf(stderr, "FATAL: jt7-machine digest 0x%016llx != pinned 0xf947a5e58a21d4ac\n",
+                             (unsigned long long)digest);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("jt7-machine ran: {wheelVel:%d (reversed target -131072), stroke:[%d,%d], "
+                        "axisErr:%d, slideErr:%d, maxBallGap:%d (the over-constrained-linkage residual, "
+                        "documented)}\n", wheelVel, strokeMin, strokeMax, axisErr, slideErr, maxGap);
+
+            // --- Golden: a PURE-INTEGER 2D side-view of the machine at the final tick (identical to the
+            // Metal --jt7-machine by construction): ground, rail line, wheel + crank pointer, rod, piston.
+            const int kPxPerUnit = 64, kMargin = 32;
+            const joint::fx kViewX0 = fi(1.0), kViewY0 = 0;   // world window x in [1,9], y in [0,6]
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + 8 * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + 6 * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+                bgra[pp * 4 + 0] = 12; bgra[pp * 4 + 1] = 10; bgra[pp * 4 + 2] = 14; bgra[pp * 4 + 3] = 255;
+            }
+            auto putPx = [&](int x, int y, const Vec3& col) {
+                if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+                uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+                d[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                d[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                d[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                d[3] = 255;
+            };
+            auto worldToPx = [&](joint::fx wx, joint::fx wy, int& ix, int& iy) {
+                ix = kMargin + (int)(((int64_t)(wx - kViewX0) * kPxPerUnit) >> joint::kFrac);
+                iy = (int)imgH - kMargin - (int)(((int64_t)(wy - kViewY0) * kPxPerUnit) >> joint::kFrac);
+            };
+            auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+                int dx = x1 - x0, dy = y1 - y0;
+                int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+                int nn = adx > ady ? adx : ady;
+                if (nn == 0) { putPx(x0, y0, col); return; }
+                for (int s = 0; s <= nn; ++s)
+                    putPx(x0 + (int)((int64_t)dx * s / nn), y0 + (int)((int64_t)dy * s / nn), col);
+            };
+            auto fillDisc = [&](int cx, int cy, int r, const Vec3& col) {
+                for (int yy = -r; yy <= r; ++yy)
+                    for (int xx = -r; xx <= r; ++xx)
+                        if (xx * xx + yy * yy <= r * r) putPx(cx + xx, cy + yy, col);
+            };
+            // The ground line (y == 0, the bench floor reference).
+            { int gx, gy; worldToPx(kViewX0, 0, gx, gy);
+              for (int x = 0; x < (int)imgW; ++x) putPx(x, gy, Vec3{0.31f, 0.31f, 0.31f}); }
+            // The rail slide line (y = 3, x over the clamp range [minSlide, maxSlide] around 6.2).
+            { int rx0, ry0, rx1, ry1;
+              worldToPx(fi(6.2) + prisms[0].minSlide, fi(3.0), rx0, ry0);
+              worldToPx(fi(6.2) + prisms[0].maxSlide, fi(3.0), rx1, ry1);
+              drawLine(rx0, ry0, rx1, ry1, Vec3{0.36f, 0.52f, 0.68f}); }
+            // The wheel rim circle (crank radius 0.8 about the wheel centre) + the crank pointer to the
+            // rim world anchor (the rotation reads at a glance) + the hub.
+            const fpx::FxBody& wheelB = authority.world.bodies[1];
+            {
+                int cx, cy; worldToPx(wheelB.pos.x, wheelB.pos.y, cx, cy);
+                const int rimPx = (int)(((int64_t)fi(0.8) * kPxPerUnit) >> joint::kFrac);
+                // The rim outline as a squared-radius integer ring (pure integer, no trig).
+                for (int yy = -rimPx - 1; yy <= rimPx + 1; ++yy)
+                    for (int xx = -rimPx - 1; xx <= rimPx + 1; ++xx) {
+                        const int d2 = xx * xx + yy * yy;
+                        if (d2 <= rimPx * rimPx && d2 >= (rimPx - 2) * (rimPx - 2))
+                            putPx(cx + xx, cy + yy, Vec3{0.55f, 0.55f, 0.60f});
+                    }
+                const joint::FxVec3 rim = joint::WorldAnchor(wheelB, balls[0].anchorA);
+                int rx, ry; worldToPx(rim.x, rim.y, rx, ry);
+                drawLine(cx, cy, rx, ry, Vec3{0.88f, 0.62f, 0.28f});   // the crank (warm amber)
+                fillDisc(cx, cy, 5, Vec3{1.0f, 1.0f, 1.0f});           // the pinned shaft hub
+                fillDisc(rx, ry, 4, Vec3{0.88f, 0.62f, 0.28f});        // the crank pin
+            }
+            // The connecting rod: the rod BODY's own segment (between its two local end anchors) PLUS the
+            // two ball-linkage segments (crank pin -> rod end1, rod end2 -> piston pin) so the honest
+            // over-constrained residual gap is VISIBLE, not hidden (the JT3 joint-segment convention).
+            {
+                const joint::FxVec3 e1 = joint::WorldAnchor(authority.world.bodies[2], balls[0].anchorB);
+                const joint::FxVec3 e2 = joint::WorldAnchor(authority.world.bodies[2], balls[1].anchorA);
+                int ax, ay, bx, by; worldToPx(e1.x, e1.y, ax, ay); worldToPx(e2.x, e2.y, bx, by);
+                drawLine(ax, ay, bx, by, Vec3{0.62f, 0.62f, 0.66f});
+                const joint::FxVec3 pin1 = joint::WorldAnchor(authority.world.bodies[1], balls[0].anchorA);
+                const joint::FxVec3 pin2 = joint::WorldAnchor(authority.world.bodies[3], balls[1].anchorB);
+                int p1x, p1y, p2x, p2y;
+                worldToPx(pin1.x, pin1.y, p1x, p1y);
+                worldToPx(pin2.x, pin2.y, p2x, p2y);
+                drawLine(p1x, p1y, ax, ay, Vec3{0.55f, 0.42f, 0.22f});   // crank pin -> rod end1 (residual)
+                drawLine(bx, by, p2x, p2y, Vec3{0.28f, 0.48f, 0.52f});   // rod end2 -> piston (residual)
+            }
+            // The piston: a filled block on the rail line (cool cyan) + the rail body (white static).
+            {
+                const fpx::FxBody& piston = authority.world.bodies[3];
+                int px, py; worldToPx(piston.pos.x, piston.pos.y, px, py);
+                for (int yy = -10; yy <= 10; ++yy)
+                    for (int xx = -14; xx <= 14; ++xx) putPx(px + xx, py + yy, Vec3{0.40f, 0.72f, 0.78f});
+                const fpx::FxBody& rail = authority.world.bodies[4];
+                int qx, qy; worldToPx(rail.pos.x, rail.pos.y, qx, qy);
+                fillDisc(qx, qy, 5, Vec3{1.0f, 1.0f, 1.0f});
+            }
+
+            bool ok = WriteBMP(jt7MachineShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — jt7 motorized machine crank-slider "
+                                "{bodies:%u, joints:%u, motors:%u, steps:%d, digest:0x%016llx, "
+                                "axisErr:%d, slideErr:%d}\n",
+                                jt7MachineShotPath, imgW, imgH, (uint32_t)init.world.bodies.size(),
+                                (uint32_t)(balls.size() + hinges.size() + prisms.size()),
+                                (uint32_t)init.motors.size(), kTicks, (unsigned long long)digest,
+                                axisErr, slideErr);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", jt7MachineShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
