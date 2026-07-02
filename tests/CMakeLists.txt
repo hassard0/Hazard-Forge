@@ -842,6 +842,17 @@ hf_add_pure_test(cluster_hiz_test)
 # (no sqrt) is the bit-exact GPU==CPU select the showcase proves. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(cluster_lod_test)
 
+# DETERMINISTIC AUTOMATIC LOD GENERATION (Slice LOD1, Track-S S6): integer quadric-error-metric
+# edge-collapse decimation (render/lod_gen.h — quantize-to-lattice first, int64 quadrics, total-order
+# collapse priority, boundary/link/flip/duplicate guards). Pins the welded-sphere counts + closed-
+# manifold Euler, DecimateMesh determinism (two runs byte-identical) + the CROSS-PLATFORM integer
+# digests (net::DigestBytes over qpos+indices — the same pins on MSVC/clang), the ~50%/~25% LOD
+# triangle counts, no-degenerate/index-range/Euler/AABB validity, the max-quadric-error quality
+# numbers, BuildAutoLods -> the EXISTING BuildLodMeshes/SelectLod integration (near->LOD0,
+# far->LOD2, monotonic sweep spans all 3 generated LODs), and the open-grid boundary-preservation +
+# welded-cube feature fixtures. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(lod_gen_test)
+
 # Virtual-geometry VISIBILITY BUFFER (Slice DW): the CPU side of the (clusterID, triangleID) ID packing
 # (render/visbuffer.h). Pins PackVisId/UnpackVisId round-trip over the full valid range, kTriIdBits>=7,
 # packing injective (collision-free) over [0,survivorCount)x[0,128), kVisBackground never equals a valid
