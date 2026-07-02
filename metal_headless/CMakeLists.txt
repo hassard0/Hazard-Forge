@@ -157,6 +157,11 @@ hf_gen_msl(sky.frag    sky.frag.hlsl    frag sky_fragment)
 # glslc lowers it natively — same HLSL->SPIR-V->MSL chain as sky.frag, no --msl-version needed. The
 # --sky-animated Metal showcase renders the new sky_animated.png golden (the CONTROLLER bakes it).
 hf_gen_msl(sky_animated.frag sky_animated.frag.hlsl frag sky_animated_fragment)
+# Physical atmospheric scattering (Slice AT1, Track-S S8): the Rayleigh + HG-Mie single-scattering
+# sky (render/atmosphere.h math mirrored verbatim — same constants, same 16x8 loop counts). Pure
+# float math (exp/sqrt/trig, NO int64 / RayQuery) so glslc lowers it natively — the sky_animated
+# chain. The --at1-sky Metal showcase renders the new at1_sky.png golden (the CONTROLLER bakes it).
+hf_gen_msl(atmosphere.frag atmosphere.frag.hlsl frag atmosphere_fragment)
 # GPU-driven culling + indirect draw (Slice AR): compute kernel frustum-culls a 1024-instance grid
 # and ORDER-compacts the survivors + writes the indirect draw-args. Reuses lit_instanced.vert for the
 # indirect draw. Same HLSL->SPIR-V->MSL toolchain (one workgroup, groupshared prefix sum).

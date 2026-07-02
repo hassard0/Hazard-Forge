@@ -744,6 +744,17 @@ hf_add_pure_test(clouds_test)
 # Pure CPU (render/clouds.h, header-only), ASan-eligible. The lit_cloudshadow.frag variant mirrors this.
 hf_add_pure_test(cloud_shadows_test)
 
+# Physical atmospheric scattering (Slice AT1, Track-S S8): the Rayleigh + Henyey-Greenstein-Mie
+# SINGLE-SCATTERING sky (render/atmosphere.h, mirrored verbatim in shaders/atmosphere.frag.hlsl).
+# Pins DETERMINISM (two evaluations bit-identical; an FNV-1a-64 RAW-BIT digest over a fixed
+# (viewDir, sunDir) grid, EXACT MSVC == clang thanks to atmo::DetExp + double-trig — no quantization
+# tolerance), THE PHYSICS (noon zenith BLUE B>G>R; sunset sun-ward horizon RED R>B with the R/B ratio
+# GROWING as the sun drops; the noon horizon band brighter/whiter than the zenith; transmittance
+# strictly monotone in path length with blue extincting fastest; sun-ward brighter than away-from-sun),
+# SANITY (no NaN/negative/unbounded radiance over a view x sun sweep incl. below-horizon), and the
+# phase closed forms. Pure CPU (render/atmosphere.h, header-only), ASan-eligible.
+hf_add_pure_test(atmosphere_test)
+
 # Screen-space projected decals (Slice BH): the decal-box local<->world TRS round-trip
 # (center -> local origin; center+R*halfExtents -> local corner (0.5,0.5,0.5), incl. a rotated box),
 # InsideUnitBox (boundary-inclusive), the top-down DecalUV (local.xz+0.5), and the EdgeFade falloff

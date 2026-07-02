@@ -327,6 +327,12 @@ hf_compile_shaders(
     # Existing sky/scene/volumetric shaders + goldens untouched (new path behind --clouds-shot).
     "shaders/clouds.frag.hlsl:ps"
     "shaders/clouds_composite.frag.hlsl:ps"
+    # Physical atmospheric scattering (Slice AT1, Track-S S8): the Rayleigh + HG-Mie SINGLE-SCATTERING
+    # sky (render/atmosphere.h math, mirrored in-shader — same constants, same 16x8 loop counts). A
+    # standalone fullscreen 3-panel showcase pass (noon / low / sunset sun elevations via push-constant
+    # sun dirs) writing the tonemapped physical sky directly; no FrameData, no textures. Used ONLY by
+    # --at1-sky-shot; the existing procedural sky/clouds shaders + goldens untouched.
+    "shaders/atmosphere.frag.hlsl:ps"
     # Cloud shadows on the ground (Slice CK): a VARIANT of lit.frag that ADDITIONALLY attenuates the
     # direct sun by the cloud-shadow transmittance (render/clouds.h CloudShadow, mirrored in-shader) —
     # the surface samples the SAME CH cloud field along the ray toward the sun, casting dappled cloud

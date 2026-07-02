@@ -80,6 +80,7 @@
 #include "render/ssgi.h"          // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "render/water.h"         // Slice CF: Gerstner water displacement/normal + the fixed wave set
 #include "render/clouds.h"        // Slice CH: deterministic cloud noise/density/Beer/HG (mirrored in clouds.frag)
+#include "render/atmosphere.h"    // Slice AT1: physical Rayleigh+Mie single-scattering sky (mirrored in atmosphere.frag)
 #include "render/taa.h"           // Slice AP: temporal anti-aliasing jitter + resolve-blend (pure math)
 #include "render/meshlet.h"         // Slice DS: virtual-geometry meshlet/cluster decomposition (pure CPU; shared with --meshlet-viz)
 #include "render/lod_gen.h"         // Slice LOD1: deterministic automatic LOD generation (integer QEM decimation; shared with --lod-gen-shot)
@@ -17114,6 +17115,93 @@ static int RunSkyAnimatedShowcase(const char* outPath) {
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — animated sky @ time=%.3fs (frameIndex=%d)\n",
                 outPath, cw, ch, (double)kTime, totalSteps);
+    return 0;
+}
+
+// --- Physical atmospheric scattering showcase (Slice AT1, Track-S S8). Mirrors the Vulkan
+// --at1-sky-shot path EXACTLY: a standalone fullscreen pass (atmosphere.frag — the SAME
+// engine/render/atmosphere.h Rayleigh + HG-Mie single-scattering math, mirrored verbatim, same MSL
+// from the same HLSL via hf_gen_msl) writing a 3-panel panorama directly to the swapchain at three
+// sun elevations (noon / low / sunset, push-constant sun dirs from the documented atmo constants):
+// the zenith blue, the horizon whitening and the SUNSET REDDENING all emerge from the physics.
+// DETERMINISTIC (fixed constants, fixed 16x8 sample counts, no clock/RNG, no textures) -> two runs
+// byte-identical. Prints the SAME stat lines as the Vulkan side (the pinned cross-compiler digest +
+// the shared-math zenith/horizon HDR triplets). Existing sky/clouds pipelines/goldens untouched.
+static int RunAt1SkyShowcase(const char* outPath) {
+    namespace atmo = render::atmo;
+    using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto atmoFs = loadMSL("atmosphere.frag.gen.metal", "atmosphere_fragment");
+
+    // Push-constant block (matches the atmosphere.frag AtmoParams byte layout, 48 bytes).
+    struct AtmoParams {
+        float sunDirA[3]; float exposure;
+        float sunDirB[3]; float pad0;
+        float sunDirC[3]; float pad1;
+    };
+    static_assert(sizeof(AtmoParams) == 48, "AtmoParams layout drift vs atmosphere.frag");
+
+    rhi::GraphicsPipelineDesc atmoD;
+    atmoD.vertex = postVs.get(); atmoD.fragment = atmoFs.get();
+    atmoD.colorFormat = device->Swapchain().ColorFormat();
+    atmoD.depthTest = false; atmoD.fullscreen = true;
+    atmoD.fragmentPushConstants = true; atmoD.pushConstantSize = sizeof(AtmoParams);
+    auto atmoPipe = device->CreateGraphicsPipeline(atmoD);
+
+    const Vec3 sunNoon = atmo::SunDirFromElevation(atmo::kSunElevNoonRad);
+    const Vec3 sunLow  = atmo::SunDirFromElevation(atmo::kSunElevLowRad);
+    const Vec3 sunSet  = atmo::SunDirFromElevation(atmo::kSunElevSunsetRad);
+    AtmoParams ap{};
+    ap.sunDirA[0] = sunNoon.x; ap.sunDirA[1] = sunNoon.y; ap.sunDirA[2] = sunNoon.z;
+    ap.sunDirB[0] = sunLow.x;  ap.sunDirB[1] = sunLow.y;  ap.sunDirB[2] = sunLow.z;
+    ap.sunDirC[0] = sunSet.x;  ap.sunDirC[1] = sunSet.y;  ap.sunDirC[2] = sunSet.z;
+    ap.exposure = atmo::kShotExposure;
+
+    render::RenderGraph graph;
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+    graph.AddPass("atmosphere", {}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*atmoPipe);
+            cmd.PushConstants(&ap, sizeof(ap));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    // The SAME stat lines as the Vulkan showcase (shared CPU math -> identical values).
+    const float kDeg = atmo::kPi / 180.0f;
+    Vec3 zenNoon = atmo::SkyColor(Vec3{0.0f, 1.0f, 0.0f}, sunNoon);
+    Vec3 horNoon = atmo::SkyColor(
+        atmo::PanoramaViewDir(0.5f + (90.0f * kDeg) / atmo::kPanelAzSpanRad,
+                              3.0f * kDeg / atmo::kPanelElevMaxRad), sunNoon);
+    Vec3 sunsetHor = atmo::SkyColor(
+        atmo::PanoramaViewDir(0.5f, 1.0f * kDeg / atmo::kPanelElevMaxRad), sunSet);
+    std::printf("at1-sky: {digest:0x%016llx, zenithNoon:(%.6f,%.6f,%.6f), "
+                "horizonNoon:(%.6f,%.6f,%.6f), sunsetSunward:(%.6f,%.6f,%.6f)}\n",
+                (unsigned long long)atmo::SkyDigest(),
+                (double)zenNoon.x, (double)zenNoon.y, (double)zenNoon.z,
+                (double)horNoon.x, (double)horNoon.y, (double)horNoon.z,
+                (double)sunsetHor.x, (double)sunsetHor.y, (double)sunsetHor.z);
+    std::printf("at1-sky panels: {elev:(70,15,2) deg, samples:%dx%d, exposure:%g}\n",
+                atmo::kViewSamples, atmo::kSunSamples, (double)atmo::kShotExposure);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — at1 physical sky, 3 panels (noon/low/sunset)\n",
+                outPath, cw, ch);
     return 0;
 }
 
@@ -79246,6 +79334,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--sky-animated") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_sky_animated.png";
             try { return RunSkyAnimatedShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --at1-sky <out.png>: physical atmospheric scattering showcase (Slice AT1, Track-S S8) — the
+        // Rayleigh + HG-Mie single-scattering 3-panel sky (atmosphere.frag, render/atmosphere.h math
+        // mirrored verbatim) at noon / low / sunset sun elevations: the sunset reddening progression.
+        // Mirrors the Vulkan --at1-sky-shot exactly. Renders the new at1_sky.png golden.
+        if (argc > 1 && std::strcmp(argv[1], "--at1-sky") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_at1_sky.png";
+            try { return RunAt1SkyShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --cloud-shadows <out.png>: cloud shadows on the ground showcase (Slice CK) — the SAME

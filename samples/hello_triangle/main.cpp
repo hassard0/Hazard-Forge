@@ -117,6 +117,7 @@
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "render/water.h"  // Slice CF: Gerstner water displacement/normal + the fixed showcase wave set
 #include "render/clouds.h" // Slice CH: deterministic cloud noise/density/Beer/HG (mirrored in clouds.frag)
+#include "render/atmosphere.h" // Slice AT1: physical Rayleigh+Mie single-scattering sky (mirrored in atmosphere.frag)
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"
@@ -501,6 +502,7 @@ int main(int argc, char** argv) {
     const char* we5StormShotPath = nullptr;  // --we5-storm-shot <out.bmp> (Slice WE5: WEATHER COMPOSITED over the PT5 eroded-valley meadow — drifting clouds (WE4) + rain streaks (WE2 GenPrecip -> weather::RainToRenderInstances) + time-of-day sun (WE3 SunSky); the flagship's COMPOSITION slice — two-run byte-identical + provenance (plants seated + drift/precip/sun recompute) + no-op)
     const char* we6HeroShotPath = nullptr;  // --we6-hero-shot <out.bmp> (Slice WE6, FLAGSHIP #27 CAPSTONE: the storm-hero money-shot — WE5 weather TUNED into a dramatic golden-hour storm you're standing in (low/near cinematic camera, heavier overcast, a visible foreground downpour) — two-run byte-identical + provenance (plants seated + drift/precip/sun recompute) + no-op)
     const char* skyAnimatedShotPath = nullptr; // --sky-animated-shot <out.bmp> (issue #5: the TIME-CHANNEL demo — a drifting cloud band driven by FrameData.skyParams.z=time, captured at a FIXED 2.0s so the golden is reproducible)
+    const char* at1SkyShotPath = nullptr; // --at1-sky-shot <out.bmp> (Slice AT1, Track-S S8: PHYSICAL ATMOSPHERIC SCATTERING — the Rayleigh + HG-Mie single-scattering sky (render/atmosphere.h, mirrored verbatim in atmosphere.frag), a standalone fullscreen 3-panel panorama at three sun elevations noon/low/sunset: the zenith blue, the horizon whitening, the SUNSET REDDENING all emerge from the wavelength-dependent physics. Deterministic: fixed constants, fixed 16x8 sample counts, no clock/RNG -> two runs byte-identical. Stat line pins the cross-compiler-exact SkyDigest + the zenith/horizon RGB triplets. STANDALONE arg-parse loop (the FR1 C1061 lesson). Existing sky/clouds shaders + goldens untouched)
     const char* cloudShadowsShotPath = nullptr; // --cloud-shadows-shot <out.bmp> (Slice CK: cloud shadows on the ground)
     const char* probeShotPath = nullptr;     // --probe-shot <out.bmp> (Slice AK: reflection/irradiance probes)
     const char* reflProbeShotPath = nullptr; // --reflprobe-shot <out.bmp> (Slice DA: box-projected cubemap reflections)
@@ -3322,6 +3324,13 @@ int main(int argc, char** argv) {
     // — NOT the big else-if ladder, the C1061 nested-block limit). NO new shader, NO new RHI.
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--fract-render-shot") == 0) { fractRenderShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice AT1: --at1-sky-shot <out.bmp> (PHYSICAL ATMOSPHERIC SCATTERING — the Rayleigh + HG-Mie
+    // single-scattering 3-panel sky showcase). Its OWN loop (the standalone-loop pattern — NOT the big
+    // else-if ladder, the C1061 nested-block limit).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--at1-sky-shot") == 0) { at1SkyShotPath = argv[i + 1]; break; }
     }
 
     // Slice FR7: --fract-recursive-shot <out.bmp> (Issue #37, RECURSIVE FRACTURE-ON-IMPACT). PURE-CPU host
@@ -89344,6 +89353,96 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — animated sky @ time=%.3fs (frameIndex=%d)\n",
                                     skyAnimatedShotPath, cw, ch2, kTime, totalSteps);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", skyAnimatedShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Physical atmospheric scattering showcase (--at1-sky-shot, Slice AT1, Track-S S8): a
+        // standalone fullscreen pass (atmosphere.frag — render/atmosphere.h mirrored VERBATIM, same
+        // constants + same fixed 16x8 sample counts) writing a 3-panel panorama directly to the
+        // swapchain: noon / low / sunset sun elevations (push-constant sun dirs computed from the
+        // documented atmo constants). Wavelength-dependent Rayleigh + HG-Mie single scattering: the
+        // zenith blue, the horizon whitening and the sunset REDDENING all emerge from the physics.
+        // DETERMINISTIC (fixed constants, fixed sample counts, no clock/RNG, no textures) -> two runs
+        // byte-identical. The stat line pins the cross-compiler-exact SkyDigest + the CPU-evaluated
+        // zenith/horizon HDR triplets (the SAME shared math the shader runs). Existing sky/clouds
+        // shaders + goldens untouched (new standalone pass + shader).
+        if (at1SkyShotPath) {
+            namespace atmo = render::atmo;
+            using math::Vec3;
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto atmoFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/atmosphere.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto atmoFsM = device->CreateShaderModule({std::span<const uint32_t>(atmoFsW)});
+
+            // Push-constant block (matches the atmosphere.frag AtmoParams byte layout, 48 bytes).
+            struct AtmoParams {
+                float sunDirA[3]; float exposure;
+                float sunDirB[3]; float pad0;
+                float sunDirC[3]; float pad1;
+            };
+            static_assert(sizeof(AtmoParams) == 48, "AtmoParams layout drift vs atmosphere.frag");
+
+            rhi::GraphicsPipelineDesc atmoD;
+            atmoD.vertex = postVsM.get(); atmoD.fragment = atmoFsM.get();
+            atmoD.colorFormat = device->Swapchain().ColorFormat();
+            atmoD.depthTest = false; atmoD.fullscreen = true;
+            atmoD.fragmentPushConstants = true; atmoD.pushConstantSize = sizeof(AtmoParams);
+            auto atmoPipe = device->CreateGraphicsPipeline(atmoD);
+
+            const Vec3 sunNoon = atmo::SunDirFromElevation(atmo::kSunElevNoonRad);
+            const Vec3 sunLow  = atmo::SunDirFromElevation(atmo::kSunElevLowRad);
+            const Vec3 sunSet  = atmo::SunDirFromElevation(atmo::kSunElevSunsetRad);
+            AtmoParams ap{};
+            ap.sunDirA[0] = sunNoon.x; ap.sunDirA[1] = sunNoon.y; ap.sunDirA[2] = sunNoon.z;
+            ap.sunDirB[0] = sunLow.x;  ap.sunDirB[1] = sunLow.y;  ap.sunDirB[2] = sunLow.z;
+            ap.sunDirC[0] = sunSet.x;  ap.sunDirC[1] = sunSet.y;  ap.sunDirC[2] = sunSet.z;
+            ap.exposure = atmo::kShotExposure;
+
+            render::RenderGraph graph;
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+            graph.AddPass("atmosphere", {}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*atmoPipe);
+                    cmd.PushConstants(&ap, sizeof(ap));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            // Stat line: the pinned cross-compiler-exact digest + the shared-math HDR triplets (the
+            // physics money proofs: zenith BLUE, horizon whiter, sunset sun-ward RED).
+            const float kDeg = atmo::kPi / 180.0f;
+            Vec3 zenNoon = atmo::SkyColor(Vec3{0.0f, 1.0f, 0.0f}, sunNoon);
+            Vec3 horNoon = atmo::SkyColor(
+                atmo::PanoramaViewDir(0.5f + (90.0f * kDeg) / atmo::kPanelAzSpanRad,
+                                      3.0f * kDeg / atmo::kPanelElevMaxRad), sunNoon);
+            Vec3 sunsetHor = atmo::SkyColor(
+                atmo::PanoramaViewDir(0.5f, 1.0f * kDeg / atmo::kPanelElevMaxRad), sunSet);
+            std::printf("at1-sky: {digest:0x%016llx, zenithNoon:(%.6f,%.6f,%.6f), "
+                        "horizonNoon:(%.6f,%.6f,%.6f), sunsetSunward:(%.6f,%.6f,%.6f)}\n",
+                        (unsigned long long)atmo::SkyDigest(),
+                        (double)zenNoon.x, (double)zenNoon.y, (double)zenNoon.z,
+                        (double)horNoon.x, (double)horNoon.y, (double)horNoon.z,
+                        (double)sunsetHor.x, (double)sunsetHor.y, (double)sunsetHor.z);
+            std::printf("at1-sky panels: {elev:(70,15,2) deg, samples:%dx%d, exposure:%g}\n",
+                        atmo::kViewSamples, atmo::kSunSamples, (double)atmo::kShotExposure);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(at1SkyShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — at1 physical sky, 3 panels (noon/low/sunset)\n",
+                                    at1SkyShotPath, cw, ch2);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", at1SkyShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }
