@@ -2,6 +2,8 @@
 
 #include "imgui.h"
 
+#include "editor/flow_edit_ops.h"   // Slice ED2: the pure-CPU write path the palette/canvas clicks drive.
+
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -36,11 +38,21 @@ ImU32 KindColor(uint32_t kind) {
     }
 }
 
+// Record the LAST-submitted item's screen rect into a probe slot (no-op with a null slot; the ED1
+// CaptureItemRect twin — editor_panels.cpp keeps its own static, so each panel TU carries a copy).
+void CaptureItemRect(UiRect* slot) {
+    if (!slot) return;
+    const ImVec2 mn = ImGui::GetItemRectMin();
+    const ImVec2 mx = ImGui::GetItemRectMax();
+    *slot = UiRect{mn.x, mn.y, mx.x, mx.y, true};
+}
+
 }  // namespace
 
 void BuildFlowEditorUI(const flow::Graph& graph, const FlowGraphView& view,
-                       uint32_t fbWidth, uint32_t fbHeight, const FlowLayout& layout) {
-    (void)layout;
+                       uint32_t fbWidth, uint32_t fbHeight, const FlowLayout& layout,
+                       flow::Graph* editGraph, FlowEditorState* editState,
+                       FlowEditorUIProbe* probe) {
     const float fbW = static_cast<float>(fbWidth);
     const float fbH = static_cast<float>(fbHeight);
 
@@ -62,8 +74,12 @@ void BuildFlowEditorUI(const flow::Graph& graph, const FlowGraphView& view,
     const float canvasX = paletteW;
     const float canvasW = fbW - paletteW;
 
-    // --- Node PALETTE (left strip): the addable node kinds. Clicking a row is the editor's "add node"
-    // affordance (flow_edit_ops::AddFlowNode); headless capture just shows the menu. ---
+    // --- Node PALETTE (left strip): the addable node kinds. Clicking a row IS the editor's "add node"
+    // affordance (Slice ED2): the SAME Selectable the static shot draws now reports its click, and in
+    // edit mode that click calls flow_edit_ops::AddFlowNode(kind) — the node lands at the deterministic
+    // layout position when the caller re-runs BuildFlowGraphView. No new visual element -> the static
+    // golden is byte-identical (a Selectable's pixels don't change from having its return value read). ---
+    if (probe) probe->paletteEntries.clear();
     if (BeginDocked("Node Palette", ImVec2(0.0f, top), ImVec2(paletteW, bodyH))) {
         ImGui::TextUnformatted("Add Node");
         ImGui::Separator();
@@ -72,8 +88,15 @@ void BuildFlowEditorUI(const flow::Graph& graph, const FlowGraphView& view,
                                    flow::kDelay, flow::kLatch };
         for (uint32_t k : kinds) {
             ImGui::PushStyleColor(ImGuiCol_Header, KindColor(k));
-            // Selectable as a button-like palette entry (selected=false; the headless shot just lists them).
-            ImGui::Selectable(KindLabel(k), false);
+            // Selectable as a button-like palette entry; fires on click release (edit mode adds a node).
+            if (ImGui::Selectable(KindLabel(k), false)) {
+                if (editGraph) AddFlowNode(*editGraph, k, /*constArg=*/0);
+            }
+            if (probe) {
+                UiRect r;
+                CaptureItemRect(&r);
+                probe->paletteEntries.push_back(r);
+            }
             ImGui::PopStyleColor();
         }
         ImGui::Separator();
@@ -108,11 +131,21 @@ void BuildFlowEditorUI(const flow::Graph& graph, const FlowGraphView& view,
         }
 
         // Node boxes: a filled rounded rect + border, the kind label, and the constArg for source kinds.
+        if (probe) {
+            probe->nodeBoxes.assign(view.nodes.size(), UiRect{});
+            probe->inputSlots.assign(view.nodes.size() * 3u, UiRect{});
+        }
         for (const FlowNodeView& nv : view.nodes) {
             const ImVec2 tl = P(nv.x, nv.y);
             const ImVec2 br = P(nv.x + layout.boxW, nv.y + layout.boxH);
             dl->AddRectFilled(tl, br, KindColor(nv.kind), 6.0f);
             dl->AddRect(tl, br, IM_COL32(225, 230, 240, 255), 6.0f, 0, 1.5f);
+            // Slice ED2: the canvas-selection highlight — drawn ONLY in edit mode with a live selection,
+            // so the static --flow-editor-shot (editState == nullptr) stays byte-identical.
+            if (editState && editState->selectedNode == static_cast<int>(nv.id)) {
+                dl->AddRect(ImVec2(tl.x - 2.0f, tl.y - 2.0f), ImVec2(br.x + 2.0f, br.y + 2.0f),
+                            IM_COL32(255, 210, 80, 255), 7.0f, 0, 2.5f);
+            }
             // Title.
             char title[64];
             std::snprintf(title, sizeof(title), "%s  #%u", nv.label.c_str(), nv.id);
@@ -127,6 +160,77 @@ void BuildFlowEditorUI(const flow::Graph& graph, const FlowGraphView& view,
             char tag[32];
             std::snprintf(tag, sizeof(tag), "c%d r%d", nv.col, nv.row);
             dl->AddText(ImVec2(tl.x + 8.0f, br.y - 18.0f), IM_COL32(200, 205, 215, 200), tag);
+            // Probe rects: the node box + its input-slot anchors (the SAME slot geometry the wire
+            // endpoints use: left edge, y = top + (slot+1)*boxH/4 — the data builder's inAnchor).
+            if (probe) {
+                const std::size_t ni = static_cast<std::size_t>(nv.id);
+                if (ni < probe->nodeBoxes.size())
+                    probe->nodeBoxes[ni] = UiRect{tl.x, tl.y, br.x, br.y, true};
+                const uint32_t mask = flow::EdgeMask(nv.kind);
+                for (uint32_t slot = 0; slot < 3u; ++slot) {
+                    if (!(mask & (1u << slot))) continue;
+                    const ImVec2 c = P(nv.x, nv.y + static_cast<int>(slot + 1u) * layout.boxH / 4);
+                    const std::size_t si = ni * 3u + slot;
+                    if (si < probe->inputSlots.size())
+                        probe->inputSlots[si] = UiRect{c.x - 8.0f, c.y - 8.0f,
+                                                       c.x + 8.0f, c.y + 8.0f, true};
+                }
+            }
+        }
+
+        // --- Slice ED2: canvas INTERACTION (edit mode only; the static shot passes nullptrs and skips
+        // this entirely). One left click is hit-tested against the SAME deterministic geometry that was
+        // just drawn, input slots first (they sit on a box's left edge):
+        //   * a click within +/-8 px of a REAL input-slot anchor of a node OTHER than the selection,
+        //     with a selection live, wires selected -> that slot via ConnectFlow (source stays selected);
+        //   * otherwise a click inside a node box selects that node (lowest NodeId wins on overlap —
+        //     boxes never overlap in the grid layout, this is just a deterministic tie-break);
+        //   * a click on empty canvas clears the selection.
+        // The Delete key deletes the selected node via DeleteFlowNode (ids shift -> selection clears).
+        // The caller re-runs BuildFlowGraphView, so the next frame draws the post-edit layout. ---
+        if (editGraph && editState) {
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0)) {
+                const ImVec2 m = ImGui::GetMousePos();
+                bool consumed = false;
+                // 1) Input slots (only meaningful with a different node selected as the wire SOURCE).
+                if (editState->selectedNode >= 0) {
+                    for (const FlowNodeView& nv : view.nodes) {
+                        if (static_cast<int>(nv.id) == editState->selectedNode) continue;
+                        const uint32_t mask = flow::EdgeMask(nv.kind);
+                        for (uint32_t slot = 0; slot < 3u && !consumed; ++slot) {
+                            if (!(mask & (1u << slot))) continue;
+                            const ImVec2 c = P(nv.x, nv.y + static_cast<int>(slot + 1u) * layout.boxH / 4);
+                            if (m.x >= c.x - 8.0f && m.x < c.x + 8.0f &&
+                                m.y >= c.y - 8.0f && m.y < c.y + 8.0f) {
+                                ConnectFlow(*editGraph,
+                                            static_cast<flow::NodeId>(editState->selectedNode),
+                                            nv.id, slot);
+                                consumed = true;
+                            }
+                        }
+                        if (consumed) break;
+                    }
+                }
+                // 2) Node body -> select (or empty canvas -> clear).
+                if (!consumed) {
+                    int hit = -1;
+                    for (const FlowNodeView& nv : view.nodes) {
+                        const ImVec2 tl = P(nv.x, nv.y);
+                        const ImVec2 br = P(nv.x + layout.boxW, nv.y + layout.boxH);
+                        if (m.x >= tl.x && m.x < br.x && m.y >= tl.y && m.y < br.y) {
+                            hit = static_cast<int>(nv.id);
+                            break;
+                        }
+                    }
+                    editState->selectedNode = hit;
+                }
+            }
+            // Delete affordance: the Delete key on the canvas selection (no visual chrome -> the static
+            // golden is untouched; the dry-run synthesizes the key event).
+            if (editState->selectedNode >= 0 && ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
+                DeleteFlowNode(*editGraph, static_cast<flow::NodeId>(editState->selectedNode));
+                editState->selectedNode = -1;   // ids shifted -> the selection is void
+            }
         }
     }
     ImGui::End();

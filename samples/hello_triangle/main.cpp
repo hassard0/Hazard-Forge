@@ -768,6 +768,14 @@ int main(int argc, char** argv) {
     // byte-identical (deterministic UI). No capture/present — the ImGui frames are CPU-built. Implies
     // --editor. The interactive-GUI counterpart of --fly-dry-run / --material-hotswap-dry-run.
     bool ed1DryRun = false;
+    // Slice ED2 (interactive AUTHORING panels): drive the flow/sequencer/widget editor panels headlessly
+    // with synthetic ImGui io events (palette click -> AddFlowNode, node+slot clicks -> ConnectFlow,
+    // Delete key -> DeleteFlowNode; lane click -> AddKeyframe, arrow keys -> MoveKeyframe, Delete ->
+    // DeleteKeyframe; row click -> select, [+] button -> AddChildWidget, Ctrl+click-typed DragInt ->
+    // SetWidgetStyleProp, delete button -> DeleteWidget), asserting each op fired EXACTLY as a
+    // hand-called twin (bit-compare) with the expected post-edit view digests, and that two full passes
+    // are byte-identical. No capture/present — the ImGui frames are CPU-built. Implies --editor.
+    bool ed2DryRun = false;
     // Issue #24 (Blueprint-class visual scripting, editor half): render the deterministic flow-graph
     // node editor over a fixed showcase flow::Graph (FlowGraphView -> BuildFlowEditorUI), write a BMP,
     // print a `flow-editor: {...}` line. Implies --editor (the ImGui overlay path).
@@ -3084,6 +3092,15 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--ed1-dry-run") == 0) {
             editor = true;
             ed1DryRun = true;
+        }
+        // Slice ED2 (interactive authoring panels): --ed2-dry-run. A SEPARATE `if` (the else-if ladder
+        // is at MSVC's C1061 limit). Headless synthetic-input proof that the flow/sequencer/widget
+        // editor panels AUTHOR their data models through the existing edit ops (bit-compared against
+        // hand-called twins, digests re-pinned, two passes byte-identical). Prints `ed2-dry-run: ...`
+        // proof lines; exit 0/1. Implies --editor (the ImGui overlay setup).
+        if (std::strcmp(argv[i], "--ed2-dry-run") == 0) {
+            editor = true;
+            ed2DryRun = true;
         }
         // Issue #5: the TIME-CHANNEL deliverable (--sky-animated-shot <out.bmp>). A SEPARATE `if` (not
         // chained onto the else-if ladder above) because that ladder is already at MSVC's block-nesting
@@ -110169,6 +110186,422 @@ int main(int argc, char** argv) {
                         deterministic ? "yes" : "NO", a.dump.size());
             bool ok = ecsOk && saveOk && deterministic;
             std::printf("ed1-dry-run: %s\n", ok ? "PASS" : "FAIL");
+            teardownEditor();
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Slice ED2: INTERACTIVE AUTHORING PANELS dry-run — the headless proof that the flow /
+        // sequencer / widget editor panels AUTHOR their data models from clicks, the ED1 discipline
+        // applied to all three authoring editors. Each phase drives the REAL Build*EditorUI with REAL
+        // synthetic io events aimed at probe-recorded widget rects, and after every synthetic action
+        // asserts (a) the data model mutated EXACTLY as the direct edit-op call would — a bit-compare
+        // against a hand-called TWIN kept in lockstep — and (b) the deterministic view digest moved to
+        // the twin's expected post-edit digest. No capture/present: the ImGui frames are CPU-built
+        // (NewFrame -> Build*EditorUI -> Render), and the caller-owned view rebuild runs every frame
+        // (the post-edit re-layout the panels rely on). Two full passes must be byte-identical.
+        //
+        // Input routes (documented, LOCKED):
+        //   FLOW   click a palette Selectable -> AddFlowNode(kind, 0); click a node box -> canvas
+        //          selection; click a DIFFERENT node's input-slot anchor (+/-8 px) -> ConnectFlow
+        //          (selection = source); Delete key -> DeleteFlowNode(selection).
+        //   SEQ    click inside a lane -> AddKeyframe at the PINNED SeqMapXToTime x->time (value =
+        //          SampleScalar, ON the curve); click a diamond (+/-6 px) -> select; Right/Left arrow
+        //          -> MoveKeyframe(+/- kOne/8); Delete key -> DeleteKeyframe.
+        //   WIDGET click a hierarchy row -> select; click the row's edit-mode [+] -> AddChildWidget
+        //          (Style{}, kind 0); Ctrl+click-type into an inspector DragInt (the ED1 route) ->
+        //          SetWidgetStyleProp; click "Delete selected" -> DeleteWidget.
+        if (ed2DryRun) {
+            const uint32_t dw = window.FramebufferWidth();
+            const uint32_t dh = window.FramebufferHeight();
+            ImGuiIO& io = ImGui::GetIO();
+
+            // --- Generic synthetic-input helpers over a per-phase frame closure (the ED1 mold). -----
+            // A full left click at (x, y): move / press / release across frames (Selectable and
+            // ButtonBehavior fire on release, the canvas hit-test on press; one event per frame
+            // sidesteps event trickling).
+            auto clickAt = [&](auto&& frame, float x, float y) {
+                io.AddMousePosEvent(x, y);
+                frame();
+                io.AddMouseButtonEvent(0, true);
+                frame();
+                io.AddMouseButtonEvent(0, false);
+                frame();
+            };
+            // One key press (down a frame, up a frame) — IsKeyPressed(repeat=false) fires exactly once.
+            auto pressKey = [&](auto&& frame, ImGuiKey key) {
+                io.AddKeyEvent(key, true);
+                frame();
+                io.AddKeyEvent(key, false);
+                frame();
+            };
+            // Ctrl+click a drag widget, type `text` (replaces the selected old value), Enter-commit —
+            // the deterministic typed route ED1 locked (fires the value-change exactly once).
+            auto typeInto = [&](auto&& frame, const hf::editor::UiRect& r, const char* text) {
+                io.AddMousePosEvent(r.cx(), r.cy());
+                frame();
+                io.AddKeyEvent(ImGuiMod_Ctrl, true);
+                io.AddMouseButtonEvent(0, true);
+                frame();
+                io.AddMouseButtonEvent(0, false);
+                frame();
+                io.AddKeyEvent(ImGuiMod_Ctrl, false);
+                frame();
+                for (const char* c = text; *c; ++c)
+                    io.AddInputCharacter((unsigned int)(unsigned char)*c);
+                frame();
+                frame();   // flush any trickled remainder before the commit key
+                io.AddKeyEvent(ImGuiKey_Enter, true);
+                frame();
+                io.AddKeyEvent(ImGuiKey_Enter, false);
+                frame();
+            };
+            // Idle frames with the mouse parked away (settles ImGui state; defeats double-click pairing).
+            auto idle = [&](auto&& frame, int frames) {
+                io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+                for (int f = 0; f < frames; ++f) frame();
+            };
+
+            // --- Bit-compare twins (memberwise — never memcmp a padded struct). ----------------------
+            auto flowEq = [](const flow::Graph& x, const flow::Graph& y) {
+                if (x.nodes.size() != y.nodes.size()) return false;
+                for (std::size_t i = 0; i < x.nodes.size(); ++i) {
+                    const flow::Node& a = x.nodes[i];
+                    const flow::Node& b = y.nodes[i];
+                    if (a.kind != b.kind || a.a != b.a || a.b != b.b || a.c != b.c ||
+                        a.constArg != b.constArg)
+                        return false;
+                }
+                return true;
+            };
+            auto seqEq = [](const seq::Sequence& x, const seq::Sequence& y) {
+                if (x.tracks.size() != y.tracks.size()) return false;
+                for (std::size_t i = 0; i < x.tracks.size(); ++i) {
+                    if (x.tracks[i].easing != y.tracks[i].easing ||
+                        x.tracks[i].times != y.tracks[i].times ||
+                        x.tracks[i].values != y.tracks[i].values)
+                        return false;
+                }
+                return true;
+            };
+            auto treeEq = [](const ui::Tree& x, const ui::Tree& y) {
+                if (x.root != y.root || x.widgets.size() != y.widgets.size()) return false;
+                for (std::size_t i = 0; i < x.widgets.size(); ++i) {
+                    const ui::Widget& a = x.widgets[i];
+                    const ui::Widget& b = y.widgets[i];
+                    if (a.parent != b.parent || a.firstChild != b.firstChild ||
+                        a.nextSibling != b.nextSibling || a.kind != b.kind)
+                        return false;
+                    const ui::Style& s = a.style;
+                    const ui::Style& t = b.style;
+                    if (s.width != t.width || s.height != t.height || s.marginL != t.marginL ||
+                        s.marginT != t.marginT || s.marginR != t.marginR || s.marginB != t.marginB ||
+                        s.padL != t.padL || s.padT != t.padT || s.padR != t.padR ||
+                        s.padB != t.padB || s.flexWeight != t.flexWeight || s.flags != t.flags)
+                        return false;
+                }
+                return true;
+            };
+
+            struct Ed2Pass {
+                // FLOW
+                bool fProbe = false, fAdd = false, fSel = false, fConn = false, fDel = false,
+                     fBase = false;
+                uint64_t fDigBase = 0, fDigAdd = 0, fDigConn = 0, fDigDel = 0;
+                // SEQ
+                bool sProbe = false, sAdd = false, sSel = false, sMove = false, sDel = false,
+                     sBase = false;
+                seq::fx sAddT = 0;
+                int sAddSlot = -1;
+                uint64_t sDigBase = 0, sDigAdd = 0, sDigMove = 0, sDigDel = 0;
+                // WIDGET
+                bool wProbe = false, wSel = false, wAdd = false, wProp = false, wDel = false,
+                     wTwin = false;
+                uint64_t wDigBase = 0, wDigAdd = 0, wDigProp = 0, wDigDel = 0;
+                std::string transcript;   // every digest/flag folded -> the pass-determinism compare
+            };
+
+            auto runPass = [&]() -> Ed2Pass {
+                Ed2Pass R;
+
+                // ============================== Phase 1: FLOW =====================================
+                {
+                    flow::Graph fg = flow::MakeShowcaseGraph();      // the panel's live graph
+                    flow::Graph ftwin = flow::MakeShowcaseGraph();   // the hand-called twin
+                    editor::FlowEditorState fst;
+                    editor::FlowEditorUIProbe fprobe;
+                    auto fframeP = [&](editor::FlowEditorUIProbe* p) {
+                        io.DisplaySize = ImVec2((float)dw, (float)dh);
+                        const editor::FlowGraphView v = editor::BuildFlowGraphView(fg, flowLayout);
+                        ImGui::NewFrame();
+                        editor::BuildFlowEditorUI(fg, v, dw, dh, flowLayout, &fg, &fst, p);
+                        ImGui::Render();
+                    };
+                    auto fframe = [&]() { fframeP(nullptr); };
+                    auto fdig = [&](const flow::Graph& g) {
+                        return editor::DigestFlowGraphView(editor::BuildFlowGraphView(g, flowLayout));
+                    };
+                    idle(fframe, 2);
+                    fframeP(&fprobe);
+                    R.fDigBase = fdig(fg);
+                    R.fProbe = fprobe.paletteEntries.size() == 11u && fprobe.paletteEntries[1].valid &&
+                               fprobe.nodeBoxes.size() == fg.nodes.size();
+                    // 1a. Palette click (entry 1 = Add) -> AddFlowNode(kAdd, 0).
+                    const flow::NodeId fNew = editor::AddFlowNode(ftwin, flow::kAdd, 0);
+                    if (R.fProbe)
+                        clickAt(fframe, fprobe.paletteEntries[1].cx(), fprobe.paletteEntries[1].cy());
+                    idle(fframe, 3);
+                    R.fAdd = flowEq(fg, ftwin) && fg.nodes.size() == 11u;
+                    R.fDigAdd = fdig(fg);
+                    // 1b. Click node #0's box (select) then the new node's input-slot 0 -> ConnectFlow.
+                    fframeP(&fprobe);   // re-probe the post-add layout
+                    const std::size_t slotIdx = (std::size_t)fNew * 3u + 0u;
+                    bool fGeom = fprobe.nodeBoxes.size() == fg.nodes.size() &&
+                                 fprobe.nodeBoxes[0].valid &&
+                                 fprobe.inputSlots.size() > slotIdx && fprobe.inputSlots[slotIdx].valid;
+                    if (fGeom) {
+                        clickAt(fframe, fprobe.nodeBoxes[0].cx(), fprobe.nodeBoxes[0].cy());
+                        R.fSel = (fst.selectedNode == 0);
+                        clickAt(fframe, fprobe.inputSlots[slotIdx].cx(), fprobe.inputSlots[slotIdx].cy());
+                    }
+                    editor::ConnectFlow(ftwin, /*from=*/0, /*to=*/fNew, /*slot=*/0);
+                    idle(fframe, 3);
+                    R.fConn = fGeom && flowEq(fg, ftwin) && R.fDigAdd != fdig(fg);
+                    R.fDigConn = fdig(fg);
+                    // 1c. Select the new node + Delete key -> DeleteFlowNode; the graph returns to base.
+                    fframeP(&fprobe);
+                    if (fprobe.nodeBoxes.size() > fNew && fprobe.nodeBoxes[fNew].valid) {
+                        clickAt(fframe, fprobe.nodeBoxes[fNew].cx(), fprobe.nodeBoxes[fNew].cy());
+                        pressKey(fframe, ImGuiKey_Delete);
+                    }
+                    editor::DeleteFlowNode(ftwin, fNew);
+                    idle(fframe, 3);
+                    R.fDel = flowEq(fg, ftwin);
+                    R.fDigDel = fdig(fg);
+                    R.fBase = (R.fDigDel == R.fDigBase) && (R.fDigAdd != R.fDigBase);
+                }
+
+                // ============================== Phase 2: SEQ ======================================
+                {
+                    seq::Sequence ss = seq::MakeShowcaseSequence();      // the panel's live sequence
+                    seq::Sequence stwin = seq::MakeShowcaseSequence();   // the hand-called twin
+                    editor::SeqEditorState sst;
+                    editor::SeqEditorUIProbe sprobe;
+                    const seq::fx sPlayhead = (seq::fx)(3 * seq::kOne / 2);   // 1.5s (the shot's value)
+                    auto sframeP = [&](editor::SeqEditorUIProbe* p) {
+                        io.DisplaySize = ImVec2((float)dw, (float)dh);
+                        const editor::SeqTimelineView v =
+                            editor::BuildSeqTimelineView(ss, sPlayhead, seqLayout);
+                        ImGui::NewFrame();
+                        editor::BuildSeqEditorUI(ss, v, dw, dh, seqLayout, &ss, &sst, p);
+                        ImGui::Render();
+                    };
+                    auto sframe = [&]() { sframeP(nullptr); };
+                    auto sdig = [&](const seq::Sequence& q) {
+                        return editor::DigestSeqTimelineView(
+                            editor::BuildSeqTimelineView(q, sPlayhead, seqLayout));
+                    };
+                    idle(sframe, 2);
+                    sframeP(&sprobe);
+                    R.sDigBase = sdig(ss);
+                    R.sProbe = sprobe.canvasOrigin.valid && sprobe.lanes.size() == ss.tracks.size() &&
+                               !sprobe.lanes.empty() && sprobe.lanes[0].valid;
+                    // 2a. Click inside lane 0 at laneLeft + 230 px (off every diamond: track 0's keys sit
+                    // at local x 60/360/660/960) -> AddKeyframe at the PINNED x->time, value ON the curve.
+                    const float sClickX = sprobe.lanes[0].x0 + 230.0f;
+                    const float sClickY = 0.5f * (sprobe.lanes[0].y0 + sprobe.lanes[0].y1);
+                    {   // the twin recomputes the panel's exact convention
+                        const editor::SeqTimelineView tv =
+                            editor::BuildSeqTimelineView(stwin, sPlayhead, seqLayout);
+                        const int lx = (int)(sClickX - sprobe.canvasOrigin.x0 + 0.5f);
+                        R.sAddT = editor::SeqMapXToTime(lx, tv.tMinFx, tv.tMaxFx, seqLayout.originX,
+                                                        tv.timeAxisW);
+                        const seq::fx addV = seq::SampleScalar(stwin.tracks[0], R.sAddT);
+                        R.sAddSlot = (int)editor::AddKeyframe(stwin.tracks[0], R.sAddT, addV);
+                    }
+                    if (R.sProbe) clickAt(sframe, sClickX, sClickY);
+                    idle(sframe, 3);
+                    R.sAdd = seqEq(ss, stwin);
+                    R.sDigAdd = sdig(ss);
+                    // 2b. Clear the selection, click the new key's diamond -> select (track 0, that slot).
+                    sst.selectedTrack = -1;
+                    sst.selectedKey = -1;
+                    sframeP(&sprobe);   // re-probe (5 keys in track 0 now)
+                    bool sKeyGeom = R.sAddSlot >= 0 && sprobe.keys.size() > (std::size_t)R.sAddSlot &&
+                                    sprobe.keys[(std::size_t)R.sAddSlot].valid;
+                    if (sKeyGeom)
+                        clickAt(sframe, sprobe.keys[(std::size_t)R.sAddSlot].cx(),
+                                sprobe.keys[(std::size_t)R.sAddSlot].cy());
+                    R.sSel = sKeyGeom && sst.selectedTrack == 0 && sst.selectedKey == R.sAddSlot;
+                    // 2c. Right arrow -> MoveKeyframe(+kOne/8); the selection follows the re-sorted key.
+                    const seq::fx sMovedT = (seq::fx)(R.sAddT + seq::kOne / 8);
+                    pressKey(sframe, ImGuiKey_RightArrow);
+                    idle(sframe, 3);
+                    {
+                        const seq::fx mv = stwin.tracks[0].values[(std::size_t)R.sAddSlot];
+                        editor::MoveKeyframe(stwin.tracks[0], (std::size_t)R.sAddSlot, sMovedT, mv);
+                    }
+                    R.sMove = seqEq(ss, stwin);
+                    R.sDigMove = sdig(ss);
+                    // 2d. Delete key -> DeleteKeyframe on the moved (still-selected) key -> back to base.
+                    pressKey(sframe, ImGuiKey_Delete);
+                    idle(sframe, 3);
+                    {
+                        int mi = -1;
+                        for (std::size_t i = 0; i < stwin.tracks[0].times.size(); ++i) {
+                            if (stwin.tracks[0].times[i] == sMovedT) { mi = (int)i; break; }
+                        }
+                        if (mi >= 0) editor::DeleteKeyframe(stwin.tracks[0], (std::size_t)mi);
+                    }
+                    R.sDel = seqEq(ss, stwin);
+                    R.sDigDel = sdig(ss);
+                    R.sBase = (R.sDigDel == R.sDigBase) && (R.sDigAdd != R.sDigBase) &&
+                              (R.sDigMove != R.sDigAdd);
+                }
+
+                // ============================== Phase 3: WIDGET ===================================
+                {
+                    ui::Tree wt = ui::MakeLayoutShowcase();      // the panel's live tree
+                    ui::Tree wtwin = ui::MakeLayoutShowcase();   // the hand-called twin
+                    editor::WidgetEditorState wst;
+                    editor::WidgetEditorUIProbe wprobe;
+                    editor::WidgetEditorView wview;   // last built view (row-index lookups)
+                    auto wframeP = [&](editor::WidgetEditorUIProbe* p) {
+                        io.DisplaySize = ImVec2((float)dw, (float)dh);
+                        wview = editor::BuildWidgetEditorView(wt, widgetViewport, wst.selected,
+                                                              widgetLayout);
+                        ImGui::NewFrame();
+                        editor::BuildWidgetEditorUI(wt, wview, dw, dh, widgetLayout, &wt, &wst, p);
+                        ImGui::Render();
+                    };
+                    auto wframe = [&]() { wframeP(nullptr); };
+                    auto wdig = [&](const ui::Tree& t, ui::WidgetId sel) {
+                        return editor::DigestWidgetEditorView(
+                            editor::BuildWidgetEditorView(t, widgetViewport, sel, widgetLayout));
+                    };
+                    idle(wframe, 2);
+                    wframeP(&wprobe);
+                    R.wDigBase = wdig(wt, wst.selected);
+                    R.wProbe = wprobe.hierarchyRows.size() == wview.rows.size() &&
+                               wview.rows.size() == wt.widgets.size();
+                    // 3a. Click the hierarchy row of widget #2 (the body container) -> selection.
+                    auto rowOf = [&](ui::WidgetId id) -> int {
+                        for (std::size_t i = 0; i < wview.rows.size(); ++i)
+                            if (wview.rows[i].id == id) return (int)i;
+                        return -1;
+                    };
+                    int ri2 = rowOf(2u);
+                    if (ri2 >= 0 && wprobe.hierarchyRows[(std::size_t)ri2].valid)
+                        clickAt(wframe, wprobe.hierarchyRows[(std::size_t)ri2].cx(),
+                                wprobe.hierarchyRows[(std::size_t)ri2].cy());
+                    R.wSel = (wst.selected == 2u);
+                    idle(wframe, 3);
+                    // 3b. Click row #2's [+] -> AddChildWidget(2, Style{}, 0).
+                    wframeP(&wprobe);   // re-probe (the selection changed the row chrome)
+                    ri2 = rowOf(2u);
+                    const ui::WidgetId wNew = editor::AddChildWidget(wtwin, 2u, ui::Style{}, 0u);
+                    bool wAddGeom = ri2 >= 0 && wprobe.addButtons.size() > (std::size_t)ri2 &&
+                                    wprobe.addButtons[(std::size_t)ri2].valid;
+                    if (wAddGeom)
+                        clickAt(wframe, wprobe.addButtons[(std::size_t)ri2].cx(),
+                                wprobe.addButtons[(std::size_t)ri2].cy());
+                    idle(wframe, 3);
+                    R.wAdd = wAddGeom && treeEq(wt, wtwin) && wt.widgets.size() == 8u;
+                    R.wDigAdd = wdig(wt, wst.selected);
+                    // 3c. Ctrl+click-type 222 into the inspector's width DragInt -> SetWidgetStyleProp.
+                    wframeP(&wprobe);
+                    editor::SetWidgetStyleProp(wtwin, 2u, editor::kWSPWidth, 222);
+                    if (!wprobe.inspectorFields.empty() && wprobe.inspectorFields[0].valid)
+                        typeInto(wframe, wprobe.inspectorFields[0], "222");
+                    idle(wframe, 3);
+                    R.wProp = treeEq(wt, wtwin) && wt.widgets.size() > 2u &&
+                              wt.widgets[2].style.width == 222;
+                    R.wDigProp = wdig(wt, wst.selected);
+                    // 3d. Select the new child row, click "Delete selected" -> DeleteWidget(child).
+                    wframeP(&wprobe);
+                    const int riC = rowOf(wNew);
+                    bool wChildSel = false;
+                    if (riC >= 0 && wprobe.hierarchyRows[(std::size_t)riC].valid) {
+                        clickAt(wframe, wprobe.hierarchyRows[(std::size_t)riC].cx(),
+                                wprobe.hierarchyRows[(std::size_t)riC].cy());
+                        wChildSel = (wst.selected == wNew);
+                    }
+                    idle(wframe, 3);
+                    wframeP(&wprobe);   // re-probe the delete button with the child selected
+                    if (wprobe.deleteButton.valid)
+                        clickAt(wframe, wprobe.deleteButton.cx(), wprobe.deleteButton.cy());
+                    editor::DeleteWidget(wtwin, wNew);
+                    idle(wframe, 3);
+                    R.wDel = wChildSel && treeEq(wt, wtwin) && wt.widgets.size() == 7u;
+                    R.wDigDel = wdig(wt, wst.selected);
+                    // The width edit survives the delete (7 widgets again but width 222) -> the final
+                    // digest must equal the TWIN's, and every step must have moved the digest.
+                    R.wTwin = (R.wDigDel == wdig(wtwin, ui::kNoWidget)) &&
+                              (R.wDigAdd != R.wDigBase) && (R.wDigProp != R.wDigAdd) &&
+                              (R.wDigDel != R.wDigProp);
+                }
+
+                // --- The pass transcript: every digest + flag, byte-compared across the two passes. ---
+                char tb[512];
+                std::snprintf(
+                    tb, sizeof(tb),
+                    "F %d%d%d%d%d%d %016llx %016llx %016llx %016llx | "
+                    "S %d%d%d%d%d%d t=%d slot=%d %016llx %016llx %016llx %016llx | "
+                    "W %d%d%d%d%d%d %016llx %016llx %016llx %016llx",
+                    (int)R.fProbe, (int)R.fAdd, (int)R.fSel, (int)R.fConn, (int)R.fDel, (int)R.fBase,
+                    (unsigned long long)R.fDigBase, (unsigned long long)R.fDigAdd,
+                    (unsigned long long)R.fDigConn, (unsigned long long)R.fDigDel,
+                    (int)R.sProbe, (int)R.sAdd, (int)R.sSel, (int)R.sMove, (int)R.sDel, (int)R.sBase,
+                    (int)R.sAddT, R.sAddSlot,
+                    (unsigned long long)R.sDigBase, (unsigned long long)R.sDigAdd,
+                    (unsigned long long)R.sDigMove, (unsigned long long)R.sDigDel,
+                    (int)R.wProbe, (int)R.wSel, (int)R.wAdd, (int)R.wProp, (int)R.wDel, (int)R.wTwin,
+                    (unsigned long long)R.wDigBase, (unsigned long long)R.wDigAdd,
+                    (unsigned long long)R.wDigProp, (unsigned long long)R.wDigDel);
+                R.transcript = tb;
+                return R;
+            };
+
+            // Pass A, then pass B on fresh fixtures — the transcripts must be byte-identical.
+            Ed2Pass a = runPass();
+            Ed2Pass b = runPass();
+            const bool deterministic = !a.transcript.empty() && a.transcript == b.transcript;
+
+            const bool flowOk = a.fProbe && a.fAdd && a.fSel && a.fConn && a.fDel && a.fBase;
+            const bool seqOk = a.sProbe && a.sAdd && a.sSel && a.sMove && a.sDel && a.sBase;
+            const bool widgetOk = a.wProbe && a.wSel && a.wAdd && a.wProp && a.wDel && a.wTwin;
+
+            std::printf("ed2-dry-run: FLOW palette-click AddFlowNode(Add) 10->11 twin=%s | box-click "
+                        "select #0=%s | slot-click ConnectFlow(0->10 a) twin=%s | Delete-key "
+                        "DeleteFlowNode twin=%s baseline-digest-restored=%s\n",
+                        a.fAdd ? "yes" : "NO", a.fSel ? "yes" : "NO", a.fConn ? "yes" : "NO",
+                        a.fDel ? "yes" : "NO", a.fBase ? "yes" : "NO");
+            std::printf("ed2-dry-run: FLOW digests base=0x%016llx add=0x%016llx conn=0x%016llx "
+                        "del=0x%016llx\n",
+                        (unsigned long long)a.fDigBase, (unsigned long long)a.fDigAdd,
+                        (unsigned long long)a.fDigConn, (unsigned long long)a.fDigDel);
+            std::printf("ed2-dry-run: SEQ lane-click AddKeyframe(track0 tFx=%d slot=%d, on-curve) "
+                        "twin=%s | diamond-click select=%s | RightArrow MoveKeyframe(+0.125s) twin=%s "
+                        "| Delete-key DeleteKeyframe twin=%s baseline-digest-restored=%s\n",
+                        (int)a.sAddT, a.sAddSlot, a.sAdd ? "yes" : "NO", a.sSel ? "yes" : "NO",
+                        a.sMove ? "yes" : "NO", a.sDel ? "yes" : "NO", a.sBase ? "yes" : "NO");
+            std::printf("ed2-dry-run: SEQ digests base=0x%016llx add=0x%016llx move=0x%016llx "
+                        "del=0x%016llx\n",
+                        (unsigned long long)a.sDigBase, (unsigned long long)a.sDigAdd,
+                        (unsigned long long)a.sDigMove, (unsigned long long)a.sDigDel);
+            std::printf("ed2-dry-run: WIDGET row-click select #2=%s | [+]-click AddChildWidget(#2) "
+                        "7->8 twin=%s | width Ctrl+typed 222 SetWidgetStyleProp twin=%s | "
+                        "Delete-button DeleteWidget twin=%s twin-digest-match=%s\n",
+                        a.wSel ? "yes" : "NO", a.wAdd ? "yes" : "NO", a.wProp ? "yes" : "NO",
+                        a.wDel ? "yes" : "NO", a.wTwin ? "yes" : "NO");
+            std::printf("ed2-dry-run: WIDGET digests base=0x%016llx add=0x%016llx prop=0x%016llx "
+                        "del=0x%016llx\n",
+                        (unsigned long long)a.wDigBase, (unsigned long long)a.wDigAdd,
+                        (unsigned long long)a.wDigProp, (unsigned long long)a.wDigDel);
+            std::printf("ed2-dry-run: two passes byte-identical=%s (transcript %zu bytes)\n",
+                        deterministic ? "yes" : "NO", a.transcript.size());
+            const bool ok = flowOk && seqOk && widgetOk && deterministic;
+            std::printf("ed2-dry-run: %s\n", ok ? "PASS" : "FAIL");
             teardownEditor();
             device->WaitIdle();
             return ok ? 0 : 1;

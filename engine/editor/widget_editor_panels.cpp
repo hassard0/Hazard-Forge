@@ -2,6 +2,8 @@
 
 #include "imgui.h"
 
+#include "editor/widget_edit_ops.h"   // Slice ED2: the pure-CPU write path the designer clicks drive.
+
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -46,10 +48,21 @@ const char* KindLabel(uint32_t kind, char* scratch, std::size_t cap) {
     }
 }
 
+// Record the LAST-submitted item's screen rect into a probe slot (no-op with a null slot; the ED1
+// CaptureItemRect twin — editor_panels.cpp keeps its own static, so each panel TU carries a copy).
+void CaptureItemRect(UiRect* slot) {
+    if (!slot) return;
+    const ImVec2 mn = ImGui::GetItemRectMin();
+    const ImVec2 mx = ImGui::GetItemRectMax();
+    *slot = UiRect{mn.x, mn.y, mx.x, mx.y, true};
+}
+
 }  // namespace
 
 void BuildWidgetEditorUI(const Tree& tree, const WidgetEditorView& view,
-                         uint32_t fbWidth, uint32_t fbHeight, const WidgetEditorLayout& layout) {
+                         uint32_t fbWidth, uint32_t fbHeight, const WidgetEditorLayout& layout,
+                         Tree* editTree, WidgetEditorState* editState,
+                         WidgetEditorUIProbe* probe) {
     (void)layout;
     const float fbW = static_cast<float>(fbWidth);
     const float fbH = static_cast<float>(fbHeight);
@@ -74,13 +87,23 @@ void BuildWidgetEditorUI(const Tree& tree, const WidgetEditorView& view,
     const float hierH = bodyH * 0.55f;      // hierarchy panel height inside the left column
     const float inspH = bodyH - hierH;      // inspector panel height
 
-    // --- HIERARCHY panel (top-left): the widget tree as indented, kind-labeled rows with selection. ---
+    // --- HIERARCHY panel (top-left): the widget tree as indented, kind-labeled rows with selection.
+    // Slice ED2 (edit mode only): each row grows a [+] add-child SmallButton (AddChildWidget with the
+    // PINNED payload Style{} + kind 0), the row Selectable's click drives editState->selected, and a
+    // root-guarded "Delete selected" button removes the selected subtree via DeleteWidget. All new
+    // chrome draws ONLY when editTree is non-null -> the static shot is byte-identical. ---
+    if (probe) {
+        probe->hierarchyRows.assign(view.rows.size(), UiRect{});
+        probe->addButtons.assign(view.rows.size(), UiRect{});
+        probe->deleteButton = UiRect{};
+    }
     if (BeginDocked("Hierarchy", ImVec2(0.0f, top), ImVec2(leftW, hierH))) {
         ImGui::TextUnformatted("Widget Tree");
         ImGui::SameLine();
         ImGui::TextDisabled("(%d widgets)", view.widgetCount);
         ImGui::Separator();
-        for (const WidgetTreeRow& r : view.rows) {
+        for (std::size_t ri = 0; ri < view.rows.size(); ++ri) {
+            const WidgetTreeRow& r = view.rows[ri];
             char scratch[32];
             const uint32_t kind = r.id < tree.widgets.size() ? tree.widgets[r.id].kind : r.kind;
             const char* kindName = KindLabel(kind, scratch, sizeof(scratch));
@@ -90,6 +113,18 @@ void BuildWidgetEditorUI(const Tree& tree, const WidgetEditorView& view,
             char rowlbl[80];
             std::snprintf(rowlbl, sizeof(rowlbl), "%s%s  #%u",
                           r.selected ? "> " : "  ", kindName, r.id);
+            // Edit mode: the per-row [+] add-child affordance (leading, so the Selectable keeps its
+            // span-the-rest width). Appends a child under THIS row's widget with the pinned payload.
+            if (editTree) {
+                ImGui::PushID(static_cast<int>(r.id));
+                if (ImGui::SmallButton("+")) {
+                    AddChildWidget(*editTree, r.id, hf::ui::Style{}, /*kind=*/0u);
+                }
+                if (probe && ri < probe->addButtons.size())
+                    CaptureItemRect(&probe->addButtons[ri]);
+                ImGui::PopID();
+                ImGui::SameLine();
+            }
             if (r.selected) {
                 // Selection highlight band behind the row.
                 const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -98,14 +133,37 @@ void BuildWidgetEditorUI(const Tree& tree, const WidgetEditorView& view,
                                   ImVec2(p.x + leftW, p.y + ImGui::GetTextLineHeight() + 1.0f),
                                   IM_COL32(60, 90, 130, 160), 3.0f);
             }
-            ImGui::Selectable(rowlbl, r.selected);
+            if (ImGui::Selectable(rowlbl, r.selected)) {
+                if (editState) editState->selected = r.id;   // row click -> hierarchy selection
+            }
+            if (probe && ri < probe->hierarchyRows.size())
+                CaptureItemRect(&probe->hierarchyRows[ri]);
             ImGui::PopStyleColor();
             ImGui::Unindent(static_cast<float>(r.depth) * 16.0f);
+        }
+        // Edit mode: the delete affordance (root-guarded; DeleteWidget removes the whole subtree).
+        if (editTree) {
+            ImGui::Separator();
+            if (ImGui::Button("Delete selected")) {
+                if (editState && editState->selected != hf::ui::kNoWidget &&
+                    editState->selected < editTree->widgets.size() &&
+                    editState->selected != editTree->root) {
+                    DeleteWidget(*editTree, editState->selected);
+                    editState->selected = hf::ui::kNoWidget;   // ids compacted -> selection is void
+                }
+            }
+            if (probe) CaptureItemRect(&probe->deleteButton);
         }
     }
     ImGui::End();
 
-    // --- INSPECTOR panel (bottom-left): the selected widget's Style fields as name : value rows. ---
+    // --- INSPECTOR panel (bottom-left): the selected widget's Style fields as name : value rows.
+    // Slice ED2 (edit mode only): the editable Style rows (InspectorProp 0..11, which equal the
+    // WidgetStyleProp codes by construction) become ED1-style DragInts — a value change (drag or a
+    // Ctrl+click typed Enter-commit, the dry-run route) writes through SetWidgetStyleProp; the caller
+    // rebuilds the view each frame so the widget re-reads the tree (no snap-back). The kind row (prop
+    // 12) stays read-only. Read-only mode renders the original Text rows -> static shot byte-identical. ---
+    if (probe) probe->inspectorFields.assign(view.inspector.size(), UiRect{});
     if (BeginDocked("Inspector", ImVec2(0.0f, top + hierH), ImVec2(leftW, inspH))) {
         if (view.selected == hf::ui::kNoWidget || view.inspector.empty()) {
             ImGui::TextDisabled("No widget selected");
@@ -114,10 +172,23 @@ void BuildWidgetEditorUI(const Tree& tree, const WidgetEditorView& view,
             ImGui::Separator();
             ImGui::Columns(2, "inspcols", false);
             ImGui::SetColumnWidth(0, leftW * 0.5f);
-            for (const InspectorField& f : view.inspector) {
+            for (std::size_t fi = 0; fi < view.inspector.size(); ++fi) {
+                const InspectorField& f = view.inspector[fi];
                 ImGui::TextDisabled("%s", f.name);
                 ImGui::NextColumn();
-                ImGui::Text("%d", f.value);
+                if (editTree && f.prop <= kWSPFlags) {
+                    int v = f.value;
+                    ImGui::PushID(static_cast<int>(fi));
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (ImGui::DragInt("", &v, 1.0f)) {
+                        SetWidgetStyleProp(*editTree, view.selected, f.prop, v);
+                    }
+                    if (probe && fi < probe->inspectorFields.size())
+                        CaptureItemRect(&probe->inspectorFields[fi]);
+                    ImGui::PopID();
+                } else {
+                    ImGui::Text("%d", f.value);
+                }
                 ImGui::NextColumn();
             }
             ImGui::Columns(1);

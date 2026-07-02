@@ -839,6 +839,20 @@ Write-Host '--- editor ED1: interactive inspector editing dry-run ---'
 if (-not `$ed1Ok) { Write-Host 'ED1 inspector-edit dry-run FAILED'; exit 24 }
 Write-Host 'editor ED1: inspector-edit dry-run PASS'
 
+# --- Slice ED2: interactive authoring panels dry-run. The flow / sequencer / widget editor panels
+# are driven HEADLESSLY with synthetic ImGui io events (palette click -> AddFlowNode, node + input-
+# slot clicks -> ConnectFlow, Delete key -> DeleteFlowNode; lane click -> AddKeyframe at the pinned
+# x->time, arrows -> MoveKeyframe, Delete -> DeleteKeyframe; hierarchy row click -> select, [+] ->
+# AddChildWidget, Ctrl+click-typed DragInt -> SetWidgetStyleProp, delete button -> DeleteWidget) and
+# must prove every op fired EXACTLY as a hand-called twin (bit-compare) with the expected post-edit
+# view digests, two full passes byte-identical. The ED1 discipline applied to the authoring editors. ---
+Write-Host '--- editor ED2: interactive authoring panels dry-run ---'
+`$ed2 = & `$lmExe --ed2-dry-run 2>&1
+`$ed2 | ForEach-Object { Write-Host `$_ }
+`$ed2Ok = (`$LASTEXITCODE -eq 0) -and (`$ed2 | Select-String -SimpleMatch 'ed2-dry-run: PASS')
+if (-not `$ed2Ok) { Write-Host 'ED2 authoring-panels dry-run FAILED'; exit 30 }
+Write-Host 'editor ED2: authoring-panels dry-run PASS'
+
 exit 0
 "@
 

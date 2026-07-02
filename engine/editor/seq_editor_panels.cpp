@@ -2,6 +2,8 @@
 
 #include "imgui.h"
 
+#include "editor/seq_edit_ops.h"   // Slice ED2: the pure-CPU write path the timeline clicks/keys drive.
+
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -60,7 +62,8 @@ void FormatFx(char* out, std::size_t cap, hf::seq::fx v) {
 }  // namespace
 
 void BuildSeqEditorUI(const Sequence& seq, const SeqTimelineView& view,
-                      uint32_t fbWidth, uint32_t fbHeight, const SeqLayout& layout) {
+                      uint32_t fbWidth, uint32_t fbHeight, const SeqLayout& layout,
+                      Sequence* editSeq, SeqEditorState* editState, SeqEditorUIProbe* probe) {
     const float fbW = static_cast<float>(fbWidth);
     const float fbH = static_cast<float>(fbHeight);
 
@@ -115,6 +118,23 @@ void BuildSeqEditorUI(const Sequence& seq, const SeqTimelineView& view,
         const int axisL = layout.originX;
         const int axisR = layout.originX + view.timeAxisW;
 
+        // Slice ED2: probe the canvas origin + the clickable geometry (lanes as add hit-boxes, keys as
+        // +/-6 px diamond hit-boxes) so the dry-run can aim synthetic clicks at real geometry.
+        if (probe) {
+            probe->canvasOrigin = UiRect{o.x, o.y, o.x, o.y, true};
+            probe->lanes.clear();
+            probe->keys.clear();
+            for (const SeqTrackLane& ln : view.lanes) {
+                const ImVec2 tl = P(ln.x, ln.y);
+                const ImVec2 br = P(ln.x + ln.w, ln.y + ln.h);
+                probe->lanes.push_back(UiRect{tl.x, tl.y, br.x, br.y, true});
+            }
+            for (const SeqKeyMarker& k : view.keys) {
+                const ImVec2 c = P(k.x, k.y);
+                probe->keys.push_back(UiRect{c.x - 6.0f, c.y - 6.0f, c.x + 6.0f, c.y + 6.0f, true});
+            }
+        }
+
         // Lanes: alternating background fill + a baseline midline + the track/easing label.
         for (const SeqTrackLane& ln : view.lanes) {
             const ImVec2 tl = P(ln.x, ln.y);
@@ -140,7 +160,9 @@ void BuildSeqEditorUI(const Sequence& seq, const SeqTimelineView& view,
             dl->AddLine(P(a.x, a.y), P(b.x, b.y), TrackColor(a.trackIndex), 2.0f);
         }
 
-        // Keyframe DIAMONDS: a filled rotated square at each marker, outlined for contrast.
+        // Keyframe DIAMONDS: a filled rotated square at each marker, outlined for contrast. Slice ED2:
+        // the SELECTED key (edit mode only) gets a bright ring — drawn only when editState carries a live
+        // selection, so the static --seq-editor-shot (editState == nullptr) stays byte-identical.
         for (const SeqKeyMarker& k : view.keys) {
             const ImVec2 c = P(k.x, k.y);
             const float r = 5.0f;
@@ -148,6 +170,10 @@ void BuildSeqEditorUI(const Sequence& seq, const SeqTimelineView& view,
                                     ImVec2(c.x, c.y + r), ImVec2(c.x - r, c.y) };
             dl->AddConvexPolyFilled(pts, 4, TrackColor(k.trackIndex));
             dl->AddPolyline(pts, 4, IM_COL32(245, 245, 245, 255), ImDrawFlags_Closed, 1.5f);
+            if (editState && editState->selectedTrack == static_cast<int>(k.trackIndex) &&
+                editState->selectedKey == static_cast<int>(k.keyIndex)) {
+                dl->AddCircle(c, 9.0f, IM_COL32(255, 210, 80, 255), 0, 2.0f);
+            }
         }
 
         // PLAYHEAD: a vertical line across every lane at the playhead X (bright, drawn on top).
@@ -184,6 +210,81 @@ void BuildSeqEditorUI(const Sequence& seq, const SeqTimelineView& view,
             tick(axisL, view.tMinFx);
             tick(axisL + view.timeAxisW / 2, tMid);
             tick(axisR, view.tMaxFx);
+        }
+
+        // --- Slice ED2: timeline INTERACTION (edit mode only; the static shot passes nullptrs and
+        // skips this entirely). One left click is hit-tested against the SAME deterministic geometry
+        // that was just drawn, keyframe diamonds first:
+        //   * a click within +/-6 px of a diamond selects that key (track + key index from the view);
+        //   * otherwise a click inside a track lane ADDS a key: time = the PINNED SeqMapXToTime of the
+        //     canvas-local integer pixel (lx = (int)(mouse.x - o.x + 0.5f); mouse >= o inside a lane),
+        //     value = SampleScalar at that time (the key lands ON the current curve) via AddKeyframe;
+        //     the new key becomes the selection.
+        // With a selection live: Left/Right arrows nudge its time -/+ kOne/8 (0.125 s) via MoveKeyframe
+        // (the selection follows the re-sorted key by its unique new time); Delete calls DeleteKeyframe.
+        // The caller re-runs BuildSeqTimelineView, so the next frame draws the post-edit layout. ---
+        if (editSeq && editState) {
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0)) {
+                const ImVec2 m = ImGui::GetMousePos();
+                bool consumed = false;
+                // 1) Keyframe diamonds (+/-6 px hit box, view order = (track asc, key asc)).
+                for (const SeqKeyMarker& k : view.keys) {
+                    const ImVec2 c = P(k.x, k.y);
+                    if (m.x >= c.x - 6.0f && m.x < c.x + 6.0f &&
+                        m.y >= c.y - 6.0f && m.y < c.y + 6.0f) {
+                        editState->selectedTrack = static_cast<int>(k.trackIndex);
+                        editState->selectedKey   = static_cast<int>(k.keyIndex);
+                        consumed = true;
+                        break;
+                    }
+                }
+                // 2) Lane body -> AddKeyframe at the pinned x->time convention.
+                if (!consumed) {
+                    for (const SeqTrackLane& ln : view.lanes) {
+                        const ImVec2 tl = P(ln.x, ln.y);
+                        const ImVec2 br = P(ln.x + ln.w, ln.y + ln.h);
+                        if (m.x >= tl.x && m.x < br.x && m.y >= tl.y && m.y < br.y) {
+                            if (ln.trackIndex < editSeq->tracks.size()) {
+                                const int lx = static_cast<int>(m.x - o.x + 0.5f);
+                                const fx t = SeqMapXToTime(lx, view.tMinFx, view.tMaxFx,
+                                                           layout.originX, view.timeAxisW);
+                                ScalarTrack& tr = editSeq->tracks[ln.trackIndex];
+                                const fx v = SampleScalar(tr, t);
+                                const std::size_t slot = AddKeyframe(tr, t, v);
+                                editState->selectedTrack = static_cast<int>(ln.trackIndex);
+                                editState->selectedKey   = static_cast<int>(slot);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            // Keyboard affordances on the selection (no visual chrome -> static golden untouched).
+            if (editState->selectedTrack >= 0 && editState->selectedKey >= 0 &&
+                static_cast<std::size_t>(editState->selectedTrack) < editSeq->tracks.size()) {
+                ScalarTrack& tr = editSeq->tracks[static_cast<std::size_t>(editState->selectedTrack)];
+                if (static_cast<std::size_t>(editState->selectedKey) < tr.times.size()) {
+                    int dir = 0;
+                    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) dir = +1;
+                    else if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false)) dir = -1;
+                    if (dir != 0) {
+                        const fx kNudge = static_cast<fx>(kOne / 8);   // 0.125 s per press (PINNED)
+                        const std::size_t ki = static_cast<std::size_t>(editState->selectedKey);
+                        const fx nt = static_cast<fx>(tr.times[ki] + dir * kNudge);
+                        const fx nv = tr.values[ki];
+                        MoveKeyframe(tr, ki, nt, nv);
+                        // Re-find the moved key by its (unique) new time so the selection follows it.
+                        editState->selectedKey = -1;
+                        for (std::size_t i = 0; i < tr.times.size(); ++i) {
+                            if (tr.times[i] == nt) { editState->selectedKey = static_cast<int>(i); break; }
+                        }
+                    } else if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
+                        DeleteKeyframe(tr, static_cast<std::size_t>(editState->selectedKey));
+                        editState->selectedTrack = -1;
+                        editState->selectedKey   = -1;
+                    }
+                }
+            }
         }
     }
     ImGui::End();

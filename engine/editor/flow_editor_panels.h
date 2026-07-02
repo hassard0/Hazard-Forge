@@ -11,18 +11,50 @@
 #include <cstdint>
 #include <vector>
 
+#include "editor/editor_panels.h"      // UiRect (the ED1 probe-rect currency for synthetic input)
 #include "editor/flow_editor_data.h"   // FlowGraphView / FlowLayout (the pure deterministic view)
 #include "flow/flow.h"                 // flow::Graph / flow::Reg (palette add semantics + live values)
 
 namespace hf::editor {
+
+// --- Slice ED2: the node-graph editor's INTERACTIVE state + widget-rect probe. --------------------
+// FlowEditorState is the panel's cross-frame UI state: the canvas-selected node (clicked node box).
+// The selection is the CONNECT SOURCE (click a second node's input slot to wire selected -> slot via
+// ConnectFlow) and the DELETE target (the Delete key calls DeleteFlowNode on it). Plain ints, no ImGui
+// types (this header stays imgui.h-free, the EditorState discipline).
+struct FlowEditorState {
+    int selectedNode = -1;   // canvas-selected NodeId (-1 = none): the connect source / delete target
+};
+
+// FlowEditorUIProbe (the ED1 EditorUIProbe twin): when BuildFlowEditorUI is given a non-null probe it
+// records, for THAT frame, the screen rects of every clickable affordance so the --ed2-dry-run can aim
+// REAL synthetic io events at real widget geometry (never hardcoded pixels). Rects are in ImGui screen
+// coordinates (the space io.AddMousePosEvent expects).
+struct FlowEditorUIProbe {
+    std::vector<UiRect> paletteEntries;  // one per palette Selectable, in the palette kinds[] order
+    std::vector<UiRect> nodeBoxes;       // one per view node, NodeId order (the canvas node boxes)
+    std::vector<UiRect> inputSlots;      // 3 per node (index = id*3+slot); valid only for EdgeMask slots
+};
 
 // Build the docked flow-graph editor for this frame from a pre-laid-out FlowGraphView. Call between
 // ImGui::NewFrame() and ImGui::Render(). `fbWidth`/`fbHeight` are the framebuffer size; the canvas panel
 // fills the frame and draws the node graph (boxes + wires) via the ImGui draw list, with a left palette
 // strip listing the addable node kinds and a stats line. `graph` is shown for read-back (node/kind counts);
 // the view is the authority on geometry. Deterministic given the same view (ImGui geometry is CPU-built).
+//
+// Slice ED2 (interactive authoring): when `editGraph` + `editState` are non-null the panel EDITS —
+// clicking a palette entry calls AddFlowNode(kind) (the node appears at the deterministic layout position
+// once the caller re-runs BuildFlowGraphView); clicking a node box selects it (editState->selectedNode);
+// clicking a DIFFERENT node's input-slot anchor (the wire endpoints on a box's left edge, a +/-8 px hit
+// box) wires selected -> that slot via ConnectFlow; the Delete key calls DeleteFlowNode on the selection.
+// The caller owns the post-edit view rebuild (BuildFlowGraphView re-lays-out next frame). With the
+// defaults (nullptr) the panel renders EXACTLY as before ED2 — no edit affordance draws, so the static
+// --flow-editor-shot golden is byte-identical (existing 5-arg callers compile + render unchanged).
+// `probe`, when non-null, receives this frame's widget rects (headless input synthesis).
 void BuildFlowEditorUI(const flow::Graph& graph, const FlowGraphView& view,
-                       uint32_t fbWidth, uint32_t fbHeight, const FlowLayout& layout = FlowLayout{});
+                       uint32_t fbWidth, uint32_t fbHeight, const FlowLayout& layout = FlowLayout{},
+                       flow::Graph* editGraph = nullptr, FlowEditorState* editState = nullptr,
+                       FlowEditorUIProbe* probe = nullptr);
 
 // Issue #24 — LIVE EXECUTION FEEDBACK editor: the SAME node-graph editor as BuildFlowEditorUI PLUS each
 // node's LIVE evaluated value (the flow VM output, values[node.id] from FlowLiveValues) drawn as a distinct
