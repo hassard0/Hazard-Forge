@@ -1467,6 +1467,25 @@ hf_add_pure_test(hair_test)
 # RHI). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(softbody_test)
 
+# Slice MM1 — DETERMINISTIC MOTION MATCHING (engine/anim/motion_match.h, Track-S S4 of
+# docs/SUPERIORITY_ROADMAP.md, the long-queued flagship #33): a Q16.16 pose FEATURE DATABASE extracted
+# from animation clips (the ONE documented float->integer quantize boundary — QuantizeFx at database
+# build; everything downstream is integer) + an integer weighted-L1 brute-force nearest-neighbor
+# search with the strict (cost, index) tie-break + a search-interval controller (advance -> search on
+# the interval -> HARD switch, the documented v1 transition) + CL5/FPX5-mold lockstep/rollback over
+# the 7-int32-word POD MMState. Pins: DB build determinism (two builds byte-identical +
+# DigestMotionDatabase pinned, identical MSVC + clang — the fixture clips use exact binary-fraction
+# keys so the float sampling is EXACT), analytic features (walk root vel == (0, 98304) exactly,
+# trajectory offsets 30720/61440/92160, idle foot-bob +-4096), query correctness (exact match cost 0;
+# perturbed nearest at the analytic cost; constructed AND organic equal-cost tie-breaks -> lower
+# index), THE BEHAVIOR (idle->walk at search tick 60, back to idle at 150, switches == 2, the full
+# selection-trace digest pinned), search-interval semantics (a mid-interval input change waits for
+# the next search tick — pinned switch at 70), and lockstep/rollback (replica == authority BIT-EXACT
+# from inputs alone; rollback corrects a real stop-misprediction; snapshot-completeness controls —
+# omitting the cursor OR the held input diverges). UE5's motion matching is float/non-replayable;
+# this one is a pure integer function of (database, input stream). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(motion_match_test)
+
 # Deterministic GPU Fluid Slice 1 (Slice FL1, the BEACHHEAD of FLAGSHIP #9): the Q16.16 fixed-point
 # fluid PARTICLE POOL INTEGRATOR + dam-break block core (engine/sim/fluid.h) the GPU
 # shaders/fluid_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16

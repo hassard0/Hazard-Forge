@@ -18,6 +18,7 @@
 #include "anim/animation.h"
 #include "anim/skeleton.h"
 #include "anim/state_machine.h"
+#include "anim/motion_match.h"  // Slice MM1: DETERMINISTIC MOTION MATCHING (Track-S S4 / flagship #33) — BuildMotionDatabase/MatchPose/StepMotionMatch/RunMMLockstep + the MakeMMTestRig/MakeMMIdleClip/MakeMMWalkClip fixtures, the pure-CPU --mm1-locomotion-shot harness
 #include "physics/world.h"
 #include "physics/body.h"
 #include "terrain/heightmap.h"
@@ -652,6 +653,7 @@ int main(int argc, char** argv) {
     const char* cl7SelfShotPath = nullptr;       // --cl7-self-shot <out.bmp> (Slice CL7: Deterministic GPU Cloth SELF-COLLISION, the Track-R R3 refinement of FLAGSHIP #8 — a cloth strip FOLDED FLAT onto itself over the ground (bottom layer on the ground, top layer folded back over it, gravity pressing them together) run through the composed self-colliding step StepClothSelf (CL4 collide step -> per-step FL2-twin grid-hash candidate list [exclusion = verts sharing a CL2 constraint] -> selfIters JACOBI projection passes [pass 1 gathers every vert's correction from OLD positions into a scratch buffer, pass 2 applies + ground-clamps — MULTI-THREAD per vert, NO TDR]); the GPU driver runs cloth_collide.comp (steps=1) per step + the two new Jacobi self passes (cloth_self + cloth_self_apply) x selfIters, GPU==CPU particle array bit-exact vs cloth.h::StepClothSelfSteps (memcmp); thickness=0 == the pre-CL7 StepClothCollide BIT-EXACT (the identity-at-zero); the stat line prints the vert count + the CL7 ClothDigest + the penetrating-pair contrast without vs with; integer side-view golden (the two separated layers). int64 -> Vulkan-only; Metal --cl7-self runs the CPU StepClothSelfSteps (byte-identical by construction, the CL3/CL4 convention))
     const char* hr1HairShotPath = nullptr;       // --hr1-hair-shot <out.bmp> (Slice HR1: DETERMINISTIC STRAND/HAIR SIMULATION CORE, Track-S S2 of docs/SUPERIORITY_ROADMAP.md — the ONE deterministic-sim material family still missing; UE5's Groom is float/non-deterministic. PBD rods in Q16.16 (engine/sim/hair.h, ~80% cloth.h mold-reuse READ-ONLY): strands = 1D stretch chains (CL3 SolveDistanceConstraint AS-IS) + BENDING stiffness (the bending-as-distance i..i+2 constraint, rest2 = 2*restLen, with a k_bend Q16.16 FRACTIONAL projection — pen pre-scaled by fxmul(pen, k_bend); kOne == the exact full projection, 0 == exact no-op; NO trig, stays integer) + strand<->strand collision (the CL7 pair-grid mold with the stretch+bend 1-ring exclusion -> different-strand + same-strand >= 3-apart verts closer than 2r separate, Jacobi) + the FL7 velocity re-encode (v = (pos-prev)/dt, damped). PURE CPU on BOTH backends (the CF1/FR8 precedent: NO GPU dispatch, NO new shader, NO new RHI — the int64-backed projections would be Vulkan-only anyway; cross-backend bit-identical BY CONSTRUCTION). The scene: 16 strands rooted on a bar (roots cascaded +X along a Z bar), direction-clamped HORIZONTAL (verts 0+1 pinned — bending-as-distance cannot anchor root direction with one pin), k_bend ramped 0 -> kOne across the bar so the settled shapes FAN visibly (limp hangs vertical, stiff holds farther out — the honest saturating droop). PROOFS: two runs BYTE-IDENTICAL; the stiffness fan monotone-ish tip heights (stiffest tip HIGHER than limpest by a pinned margin). Stat line: strands/verts/steps/HairDigest/maxStretchErr. Integer strict-zero side-view golden (the CL/FL dot style), CPU-colored -> identical both backends BY CONSTRUCTION. STANDALONE branch (C1061))
     const char* sb1SoftShotPath = nullptr;       // --sb1-soft-shot <out.bmp> (Slice SB1: DETERMINISTIC VOLUMETRIC SOFT BODY CORE, Track-S S3 of docs/SUPERIORITY_ROADMAP.md — deformable VOLUMES (jelly/flesh/rubber), the material family the engine lacked; UE5 has no deterministic soft body (Chaos Flesh is float/experimental). Q16.16 PBD volumetric lattice (engine/sim/softbody.h, ~80% cloth.h mold-reuse READ-ONLY): an NxNxN particle cube with STRETCH (axis edges, CL3 SolveDistanceConstraint AS-IS) + SHEAR (both face diagonals, host-snapped rest) + per-cell VOLUME preservation (the NEW physics: a signed-6-tet integer cell volume [int64 Q48.48 determinants around the c000->c111 diagonal] driving the v1 isotropic CENTROID-SCALE projection — ds = clamp((V0-V)<<16/(3*V0), +-kOne/8), s = fxmul(ds, kVol); kVol==0 == exact skip; the true per-particle gradient is the documented future refinement) + the HR1/FL7 velocity re-encode (v = (pos-prev)/dt, damped). PURE CPU on BOTH backends (the CF1/FR8/HR1 precedent: NO GPU dispatch, NO new shader, NO new RHI — the int64-backed projections/determinants would be Vulkan-only anyway; cross-backend bit-identical BY CONSTRUCTION). The scene: a free 6^3 soft cube slammed into the ground (a tall-drop-equivalent 20 u/s impact), kVol=kOne, iters=2 (a soft jelly): it SQUASHES to ~84% of its rest height on impact, RECOVERS (shape memory), and settles. PROOFS: two runs BYTE-IDENTICAL; SQUASH (min height < 7/8 rest, during the run) + RECOVER (settled height within 1/16 unit of rest). Stat line: particles/steps/SoftBodyDigest/volumeErr/maxStretchErr. Integer strict-zero side-view golden (the CL/HR dot style), CPU-colored -> identical both backends BY CONSTRUCTION. STANDALONE branch (C1061))
+    const char* mm1LocomotionShotPath = nullptr; // --mm1-locomotion-shot <out.bmp> (Slice MM1: DETERMINISTIC MOTION MATCHING, Track-S S4 of docs/SUPERIORITY_ROADMAP.md / the long-queued flagship #33 — UE5's motion matching is float/non-replayable; ours is a pure integer function of (database, input stream). A Q16.16 pose FEATURE DATABASE (engine/anim/motion_match.h: root velocity + future trajectory offsets at +10/+20/+30 frames + left/right foot positions/velocities, quantized ONCE at database build — the one documented float->integer boundary; the fixture clips use exact binary-fraction keys so the sampling is EXACT cross-compiler) + an integer weighted-L1 brute-force nearest-neighbor search with the strict (cost, index) tie-break + the search-interval controller (advance -> search every N=10 ticks -> HARD switch, the documented v1 transition — popping is honest) driven by a scripted stick: zero velocity [0,60), forward 1.5 u/s [60,150), zero [150,240). The character's root integrates the selected frame's root-velocity feature (root-motion drive). PROOFS: two runs BYTE-IDENTICAL; the selection story — idle holds under zero velocity, the switch to WALK lands EXACTLY at search tick 60, back to IDLE exactly at 150, switches == 2. Stat line: dbFrames/searches/switches/steps/trace digest. Integer strict-zero top-down path trace + per-tick selection timeline strip (idle=amber, walk=cyan, switches=gold), CPU-colored -> identical both backends BY CONSTRUCTION. PURE CPU: NO GPU dispatch, NO new shader, NO new RHI; engine/anim/ existing headers byte-UNTOUCHED (motion_match.h is additive). STANDALONE branch (C1061))
     const char* cf1CoupleShotPath = nullptr;     // --cf1-couple-shot <out.bmp> (Slice CF1: Deterministic Cloth<->Fluid Coupling — the WET-CLOTH CORE, Track-S S1 of docs/SUPERIORITY_ROADMAP.md, the FOURTH material-interaction pairing (rigid<->fluid CP, rigid<->grain CG, grain<->fluid GF shipped). PURE CPU (the GF5 --cgf-lockstep convention: NO GPU dispatch, NO new shader, NO new RHI): a 4x4x4 fluid block (64 particles) falls onto a corner-pinned 9x9 cloth HAMMOCK; couple_cf.h::StepClothFluidSteps composes fluid::StepFluidVisc + cloth::StepClothSelf AS-IS -> the shared-grid cross-query -> K Jacobi cross-pool vert-sphere CONTACT projections -> the TWO-WAY XSPH-style DRAG (v=(pos-prev)/dt both pools, prev re-encode). PROOFS: (1) two coupled runs BYTE-IDENTICAL both pools; (2) THE BARRIER — without coupling the fluid passes straight through (below-plane count == all), with coupling it is CAUGHT (porosity may leak a few, reported honestly); (3) THE TWO-WAY SAG — the cloth's mean dynamic-vert Y drops under the fluid load vs a dry control run through the SAME coupled entry (empty fluid pool — the fair-baseline lesson: the drag's velocity re-encode also damps the cloth). Stat line: verts/particles/steps/ClothDigest/FluidDigest/caught/sag. Integer side-view golden CPU-colored -> identical both backends BY CONSTRUCTION (the strict zero-differing-pixel bar); Metal --cf1-couple-shot runs the IDENTICAL CPU harness. rho0 = the probe MAX density (no PBF startup burst — the scene lesson); kernel h == coupling h == 2x spacing. cloth.h/fluid.h byte-UNTOUCHED (couple_cf.h is the additive sibling))
     const char* cp7FloatShotPath = nullptr;      // --cp7-float-shot <out.bmp> (Slice CP7: SUBMERGED-VOLUME BUOYANCY + SEALED CONTAINMENT, Track-R R5 of docs/SUPERIORITY_ROADMAP.md — closes the two documented CP caveats: (1) linear buoyancy -> the ARCHIMEDES spherical-cap submerged-volume force V(d)=(pi/3)d^2(3r-d) in pure Q16.16 (couple.h::SphereCapVolume, exact int64 triple product), fluid surface = the deterministic pool 90th-percentile quantile (couple.h::FluidSurfaceY, value-space bisection — the local max-y estimator was REJECTED: it reads a body-riding splash plume as "surface" and rockets the body), body mass from density (BodyFromDensity: invMass = 1/(rho_b*V) -> a body settles where V(d)/V == rho_b/rho_f, the floating condition); (2) leaking static-wall containment -> the hard basin-AABB seal (ClampToBasin after every StepCoupleV2 tick -> ZERO particles outside BY CONSTRUCTION; the OLD StepCouple under a hard drop leaks 343 outside / 277 escaped — the pinned negative control in couple_test). THE SCENE: the ARCHIMEDES LINEUP — THREE spheres of density 0.25/0.5/0.9 (r=1.5) dropped into one sealed 17x7 basin float at visibly different settled depths (measured window-mean d = 0.975/1.496/2.462 wu vs analytic 0.979/1.500/2.411 — the honest 0.15-wu bands; rho>=1 sinks, pinned in couple_test). StepCoupleV2 = CP4's locked order with the buoyancy exchange swapped to ONCE-per-step Archimedes (the GF4 lesson) + FL7 XSPH pool viscosity (calms the slosh) + the seal; params.legacy delegates VERBATIM to the frozen CP4 StepCouple (the identity, pinned). PURE CPU on BOTH backends (the CF1/FR8/HR1 precedent: NO GPU dispatch, NO new shader, NO new RHI — CP2's GPU path serves the OLD model untouched); integer side-view golden CPU-colored -> identical both backends BY CONSTRUCTION (the strict zero-differing-pixel bar). Stat line: bodies/particles/steps/CoupleDigest/depths. STANDALONE branch (C1061))
     const char* fpxSolveShotPath = nullptr; // --fpx-solve-shot <out.bmp> (Slice FPX3: Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver, the MAKE-OR-BREAK of FLAGSHIP #6 — a cluster falls + collides into a settled PILE over the FPX2 pairs, GPU==CPU body array bit-exact, single-thread serial Gauss-Seidel)
@@ -1619,6 +1621,20 @@ int main(int argc, char** argv) {
         // MSVC's nested-block parse limit C1061, like the other cloth/hair shots.
         if (std::strcmp(argv[i], "--sb1-soft-shot") == 0 && i + 1 < argc) {
             sb1SoftShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice MM1: --mm1-locomotion-shot <out.bmp> — DETERMINISTIC MOTION MATCHING (Track-S S4 /
+        // flagship #33: a Q16.16 pose feature database + integer weighted-L1 nearest-neighbor search
+        // + the search-interval controller; engine/anim/motion_match.h, the existing anim headers
+        // reused READ-ONLY). PURE CPU on BOTH backends (the CF1/HR1/SB1 precedent): the scripted
+        // stick drives idle -> walk -> idle; the top-down path trace + selection timeline strip make
+        // the selection sequence visible. NO GPU dispatch, NO new shader, NO new RHI; the integer
+        // viz is CPU-colored -> identical both backends BY CONSTRUCTION. STANDALONE branch (not in
+        // the --shot else-if chain) to avoid MSVC's nested-block parse limit C1061, like the other
+        // pure-CPU sim shots.
+        if (std::strcmp(argv[i], "--mm1-locomotion-shot") == 0 && i + 1 < argc) {
+            mm1LocomotionShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -42320,6 +42336,169 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — hr1 settled strand fan (%d strands, %d verts)\n",
                                 hr1HairShotPath, imgW, imgH, hs.S, kVertCount);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", hr1HairShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DETERMINISTIC MOTION MATCHING (--mm1-locomotion-shot <out.bmp>, Slice MM1, Track-S S4
+        // of docs/SUPERIORITY_ROADMAP.md / the long-queued flagship #33 — UE5's motion matching is
+        // float/non-replayable; ours is a pure integer function of (database, input stream)). PURE
+        // CPU (the CF1/HR1/SB1 convention): both Vulkan-Windows and Metal-Mac run the IDENTICAL CPU
+        // harness (motion_match.h — the Q16.16 feature database built ONCE from the fixture idle +
+        // walk clips at the one documented float->integer quantize boundary, the integer weighted-L1
+        // brute-force MatchPose with the (cost, index) tie-break, the N=10 search-interval
+        // controller with the documented v1 HARD switch) so the locomotion-trace golden is
+        // bit-identical cross-backend BY CONSTRUCTION. The scripted stick: zero velocity [0,60),
+        // forward 1.5 u/s [60,150), zero [150,240); the root integrates the selected frame's
+        // root-velocity feature (root-motion drive). PROOFS: (1) two runs BYTE-IDENTICAL (the full
+        // per-tick state+root trace memcmp'd); (2) THE SELECTION STORY — idle holds under zero
+        // velocity, the switch to WALK lands EXACTLY at search tick 60, back to IDLE exactly at
+        // tick 150, switches == 2. Viz: the top-down root path (idle=amber dwell, walk=cyan line) +
+        // the per-tick selection TIMELINE strip (switch ticks gold) — the selection sequence made
+        // visible. NO GPU dispatch, NO new shader, NO new RHI; the existing engine/anim/ headers
+        // byte-UNTOUCHED (motion_match.h is additive). STANDALONE branch (C1061). ---
+        if (mm1LocomotionShotPath) {
+            using math::Vec3;
+            namespace mm = hf::anim::mm;
+
+            // The fixture rig + clips + database (== the Metal --mm1-locomotion-shot config, == the
+            // motion_match_test conventions — the header's shared fixture builders).
+            const anim::Skeleton rig = mm::MakeMMTestRig();
+            const std::vector<anim::Animation> clips{mm::MakeMMIdleClip(), mm::MakeMMWalkClip()};
+            const mm::MotionDatabase db = mm::BuildMotionDatabase(rig, clips, mm::MMConfig{});
+            const mm::MMParams prm;                          // searchInterval = 10
+            const int kSteps = 240;
+            const mm::fx kWalkVelZ = 98304;                  // 1.5 u/s in Q16.16 (exact)
+            const std::vector<mm::MMCommand> script{
+                mm::MMCommand{60,  mm::kMMCmdSetVelocity, 0, kWalkVelZ},
+                mm::MMCommand{150, mm::kMMCmdSetVelocity, 0, 0},
+            };
+
+            // One run: the per-tick {selection state, integrated root} trace (a padding-free POD row
+            // so the two-run determinism proof is a single memcmp).
+            struct TickRec { mm::MMState st; mm::fx rootX; mm::fx rootZ; };
+            auto runOnce = [&]() {
+                std::vector<TickRec> recs;
+                recs.reserve((size_t)kSteps);
+                mm::MMState st;
+                mm::fx rx = 0, rz = 0;
+                const mm::fx tickDt = (mm::fx)(mm::kOne / db.cfg.fps);
+                for (int t = 0; t < kSteps; ++t) {
+                    mm::SimMMTick(st, db, prm, script, (uint32_t)t);
+                    mm::fx vx = 0, vz = 0;
+                    mm::MMRootVelocity(db, st, vx, vz);
+                    rx += mm::fxmul(vx, tickDt);
+                    rz += mm::fxmul(vz, tickDt);
+                    recs.push_back(TickRec{st, rx, rz});
+                }
+                return recs;
+            };
+            const std::vector<TickRec> a = runOnce();
+
+            // PROOF (1) determinism: two runs byte-identical.
+            const std::vector<TickRec> b = runOnce();
+            if (a.size() != b.size() ||
+                std::memcmp(a.data(), b.data(), a.size() * sizeof(TickRec)) != 0) {
+                std::fprintf(stderr, "FATAL: mm1-locomotion two runs differ (nondeterministic — a "
+                             "float crept past the quantize boundary?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("mm1-locomotion determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (2) the selection story: idle holds, walk lands EXACTLY at search tick 60, idle
+            // returns exactly at 150, exactly 2 clip switches.
+            bool story = a[59].st.clip == 0 && a[60].st.clip == 1 &&
+                         a[149].st.clip == 1 && a[150].st.clip == 0 &&
+                         a[(size_t)kSteps - 1].st.switches == 2u &&
+                         a[(size_t)kSteps - 1].st.lastSwitchTick == 150;
+            for (int t = 0; t < 60; ++t) if (a[(size_t)t].st.clip != 0) story = false;
+            for (int t = 60; t < 150; ++t) if (a[(size_t)t].st.clip != 1) story = false;
+            for (int t = 150; t < kSteps; ++t) if (a[(size_t)t].st.clip != 0) story = false;
+            if (!story) {
+                std::fprintf(stderr, "FATAL: mm1-locomotion selection story broken (clips at "
+                             "59/60/149/150 = %d/%d/%d/%d, switches %u, lastSwitch %d)\n",
+                             a[59].st.clip, a[60].st.clip, a[149].st.clip, a[150].st.clip,
+                             a[(size_t)kSteps - 1].st.switches,
+                             a[(size_t)kSteps - 1].st.lastSwitchTick);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("mm1-locomotion story: IDLE [0,60) -> WALK [60,150) -> IDLE [150,240) "
+                        "(switches at the search ticks 60 and 150 exactly)\n");
+
+            std::vector<mm::MMTraceEntry> trace;
+            trace.reserve(a.size());
+            for (const TickRec& r : a) trace.push_back(mm::MMTraceEntry{r.st.clip, r.st.cursor});
+            const uint64_t kDigest = mm::DigestMMTrace(trace);
+            const mm::MMState& fin = a[(size_t)kSteps - 1].st;
+            std::printf("mm1-locomotion: {dbFrames:%d, searches:%u, switches:%u, steps:%d, "
+                        "digest:0x%016llx}\n",
+                        (int)db.frames.size(), fin.searches, fin.switches, kSteps,
+                        (unsigned long long)kDigest);
+
+            // --- Golden: the top-down root path (z rightward, x up; idle=amber dwell dot, walk=cyan
+            // line) + the per-tick selection TIMELINE strip below (2 px per tick; search ticks
+            // notched white, switch ticks a gold column). Integer pixel math, CPU-colored ->
+            // identical both backends BY CONSTRUCTION (the strict zero-differing-pixel bar). ---
+            const int kMargin = 10, kPxPerTick = 2;
+            const int kPathH = 120, kStripH = 40, kStripGap = 8;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kSteps * kPxPerTick);   // 500
+            const uint32_t imgH = (uint32_t)(kPathH + kStripGap + kStripH + kMargin * 2);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto put = [&](int ix, int iy, const Vec3& col) {
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            };
+            const Vec3 kIdleCol{0.85f, 0.55f, 0.25f};        // amber (the HR1 warm end)
+            const Vec3 kWalkCol{0.22f, 0.64f, 0.97f};        // cyan (the HR1 stiff end)
+            const Vec3 kGold{0.95f, 0.80f, 0.40f};
+            // Path region: world z in [-0.5, 5.5] -> [kMargin, kMargin + 480) px (80 px/unit); world
+            // x in [-0.75, +0.75] -> the kPathH band (x up). Integer Q16.16 -> pixel shifts.
+            auto pathPx = [&](mm::fx wz, mm::fx wx, int& cx, int& cy) {
+                const int64_t loZ = -(int64_t)mm::kOne / 2, loX = -(int64_t)(3 * mm::kOne / 4);
+                cx = kMargin + (int)((((int64_t)wz - loZ) * 80) >> mm::kFrac);
+                cy = kMargin + kPathH - 1 - (int)((((int64_t)wx - loX) * 80) >> mm::kFrac);
+            };
+            for (int t = 0; t < kSteps; ++t) {
+                const TickRec& r = a[(size_t)t];
+                int cx, cy;
+                pathPx(r.rootZ, r.rootX, cx, cy);
+                const Vec3 col = (r.st.clip == 1) ? kWalkCol : kIdleCol;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) put(cx + dx, cy + dy, col);
+            }
+            {   // the start marker (gold, at the origin)
+                int cx, cy;
+                pathPx(0, 0, cx, cy);
+                for (int dy = -2; dy <= 2; ++dy)
+                    for (int dx = -2; dx <= 2; ++dx) put(cx + dx, cy + dy, kGold);
+            }
+            // The selection timeline strip: column t*2 colored by the tick-t selection.
+            const int stripY0 = kMargin + kPathH + kStripGap;
+            for (int t = 0; t < kSteps; ++t) {
+                const TickRec& r = a[(size_t)t];
+                const bool isSwitch = (r.st.lastSwitchTick == t);
+                const Vec3 col = isSwitch ? kGold : ((r.st.clip == 1) ? kWalkCol : kIdleCol);
+                for (int px = 0; px < kPxPerTick; ++px)
+                    for (int py = 0; py < kStripH; ++py)
+                        put(kMargin + t * kPxPerTick + px, stripY0 + py, col);
+                if ((t % prm.searchInterval) == 0)           // search-tick notch (white, top rows)
+                    for (int px = 0; px < kPxPerTick; ++px)
+                        for (int py = 0; py < 4; ++py)
+                            put(kMargin + t * kPxPerTick + px, stripY0 + py,
+                                Vec3{0.92f, 0.92f, 0.92f});
+            }
+            bool ok = WriteBMP(mm1LocomotionShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — mm1 motion-matched locomotion trace (%d db "
+                                "frames, %d steps)\n",
+                                mm1LocomotionShotPath, imgW, imgH, (int)db.frames.size(), kSteps);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", mm1LocomotionShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
