@@ -99,12 +99,13 @@ in fixed-point, is bit-exact — a moat feature UE5's float audio can't claim).
 These are real holes, not productization. They're later because they're larger and (for networking)
 partly break the headless-golden paradigm.
 
-### TSR — temporal super-resolution (real gap)
-Today's `taa.h` is anti-aliasing at *native* res (Halton jitter + neighborhood clamp + EMA blend) — the
-jitter beachhead exists, but there is no *upscaling*. Slices: **UP1** render-at-lower-res plumbing
-(render-target scale factor) 🟢 · **UP2** motion-vector reprojection (warp history by camera+object
-motion) 🟢 · **UP3** the upsample resolve (disocclusion handling, sharpening) 🟢. All deterministic →
-golden. Closes the TSR/FSR/DLSS-class gap on the moat's terms (a *deterministic* temporal upscaler).
+### TSR — temporal super-resolution (CORRECTION: already shipped)
+*This section was stale when written — flagship #20 (US1–US5) had already merged on 2026-06-23:*
+half-res jittered render + bilinear upscale (`--us1-upscale-shot`), history reprojection +
+disocclusion (US3, `tsr_resolve_reproject.frag.hlsl`), N=8 temporal resolve + RCAS sharpen + the
+2× hero at 960×540→1920×1080 (US2/US4/US5, `tsrDiff 1.05 < naiveDiff 2.67` pinned), goldens on
+both backends. See ARCHITECTURE.md "Temporal super-resolution (TSR) upscaling". No UP1–UP3 work
+remains; the survey behind this document missed the flagship by two days.
 
 ### Production networking (the honest paradigm exception)
 The deterministic substrate is *done* and golden: snapshots, delta-encode, jitter buffer, interpolation,
