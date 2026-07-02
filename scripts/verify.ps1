@@ -871,6 +871,20 @@ Write-Host '--- editor ED5: deterministic undo/redo command-stack dry-run ---'
 if (-not `$ed5Ok) { Write-Host 'ED5 undo/redo command-stack dry-run FAILED'; exit 41 }
 Write-Host 'editor ED5: undo/redo command-stack dry-run PASS'
 
+# --- Slice ED6: asset browser + click-to-place dry-run. The Scene Hierarchy panel's Assets section
+# (BuildEditorUI showAssets=true) lists the scene's loadable meshes/textures from SceneResources; a
+# synthetic click on a mesh's "+" place affordance must spawn a new drawable entity at the
+# deterministic default spawn transform (edit_ops2.h ApplyCreateEntity) with the chosen mesh, move
+# the selection to it, persist it through DumpScene, record exactly one ED5 EntityCreate command,
+# undo BYTE-IDENTICALLY back to the pre-place baseline via the real Ctrl+Z handling, redo
+# byte-identically via Ctrl+Y, and two full passes must be byte-identical. ---
+Write-Host '--- editor ED6: asset browser + click-to-place dry-run ---'
+`$ed6 = & `$lmExe --ed6-dry-run 2>&1
+`$ed6 | ForEach-Object { Write-Host `$_ }
+`$ed6Ok = (`$LASTEXITCODE -eq 0) -and (`$ed6 | Select-String -SimpleMatch 'ed6-dry-run: PASS')
+if (-not `$ed6Ok) { Write-Host 'ED6 asset-browser dry-run FAILED'; exit 42 }
+Write-Host 'editor ED6: asset-browser dry-run PASS'
+
 exit 0
 "@
 

@@ -29,6 +29,10 @@
 // Slice ED5 enrolls the scene ops (Transform/Material) FULLY plus the FLOW family (add/connect/
 // disconnect/delete) as the extensibility proof. The seq/widget op families (seq_edit_ops.h,
 // widget_edit_ops.h) follow the same recipe and are documented enrollment work, not wired here.
+// Slice ED6 enrolls ENTITY CREATION (the asset browser's click-to-place, edit_ops2.h) via this
+// exact recipe: EntityCreate appended to the kind enum, a meshPtr field appended to EditCommand,
+// and per-kind serialize/deserialize cases appended (existing kinds' bytes untouched, so the ED5
+// pinned digest still holds and kHistoryVersion stays 1).
 //
 // Scope/limits (documented, LOCKED):
 //   * MaterialC.baseColor is an OPAQUE POINTER (the scene_io contract): the LIVE command stores it
@@ -40,9 +44,15 @@
 //     process's SceneResources re-binds the names to that process's pointers. Without a resources
 //     table the raw 64-bit values are written (an in-process-only artifact; the header flags say
 //     which encoding a file carries, and a named artifact REQUIRES resources to deserialize).
-//   * Scene commands address entities by VIEW-ORDER INDEX (the edit_ops addressing). The index is
-//     stable for the editor's scenes (no entity create/delete ops are enrolled yet); an entity
-//     lifetime family would enroll with its own payload.
+//   * Scene commands address entities by VIEW-ORDER INDEX (the edit_ops addressing). The index
+//     stays stable under the ONE lifetime op enrolled (ED6 EntityCreate) because it only ever
+//     APPENDS: a spawn lands at the END of the drawable view (every existing index unchanged),
+//     and its undo destroys the entity only while it is STILL the last drawable (guarded by
+//     ApplyDestroyLastEntity; guaranteed by LIFO undo — every later command was undone first),
+//     which pops the last dense slot of each pool without a swap, restoring the surviving view
+//     order bit-identically. Arbitrary mid-list entity DELETION is NOT enrolled (that WOULD shift
+//     every later view index and invalidate recorded targets); a general delete family would need
+//     its own re-insertion payload, like FlowDelete's.
 //   * FlowDelete captures the severed inbound references inline (kFlowMaxCutRefs). A victim with
 //     more inbound references than fit CANNOT be recorded exactly; RecordedDeleteFlowNode then
 //     still performs the delete but CLEARS the history (a deterministic, documented invalidation —
@@ -57,6 +67,7 @@
 
 #include "ecs/ecs.h"
 #include "editor/edit_ops.h"        // the scene ops (ApplyTransformEdit/ApplyMaterialEdit)
+#include "editor/edit_ops2.h"       // the ED6 entity-creation op (ApplyCreateEntity + undo twin)
 #include "editor/flow_edit_ops.h"   // the flow ops (AddFlowNode/ConnectFlow/DeleteFlowNode)
 #include "net/session.h"            // hf::net::DigestBytes — the pinned-digest FNV-1a-64 currency
 #include "scene/components.h"       // TransformC/MaterialC (the state the scene commands snapshot)
@@ -75,6 +86,8 @@ enum class EditCmdKind : uint32_t {
     FlowConnect    = 4,   // flow: one input slot rewired (target = `to`; before/after refs)
     FlowDisconnect = 5,   // flow: one input slot reset to the sentinel (same payload as FlowConnect)
     FlowDelete     = 6,   // flow: DeleteFlowNode (target = victim; node fields + severed inbound refs)
+    EntityCreate   = 7,   // scene: ED6 click-to-place spawn (target = the new entity's view index,
+                          // always the END of the drawable view; payload = meshPtr + xAfter + mAfter)
 };
 
 // Full TransformC snapshot (9 floats, no padding). Captured bitwise; undo/redo re-applies it as an
@@ -120,6 +133,11 @@ struct EditCommand {
     uint32_t flowA = 0, flowB = 0, flowC = 0;      // FlowDelete: the victim's original input refs
     uint32_t flowCutCount = 0;                     // FlowDelete: severed inbound reference count
     FlowCutRef flowCut[kFlowMaxCutRefs] = {};      // FlowDelete: the severed references
+    // --- EntityCreate payload (ED6; appended — earlier kinds' layout/serialization untouched) ---
+    uint64_t meshPtr = 0;   // the spawned entity's scene::Mesh* as an opaque 64-bit value (the
+                            // MatState::baseColor discipline: never dereferenced; serialized as a
+                            // registered NAME under the named encoding). Spawn transform/material
+                            // ride in xAfter/mAfter (spawns carry no normal map — DefaultSpawnMaterial).
 };
 
 // The recorded history: commands[0..cursor) are APPLIED; [cursor..size) is the redo tail.
@@ -266,6 +284,33 @@ inline bool ApplyCommand(const EditCommand& c, const EditTargets& t, bool forwar
             g = out;
             return true;
         }
+        case EditCmdKind::EntityCreate: {
+            if (!t.registry) return false;
+            if (forward) {
+                // Redo/replay: re-create the entity from the recorded payload. It appends at the
+                // END of the drawable view, which under LIFO redo is exactly the recorded target
+                // index again (mirrors FlowAdd's re-append contract).
+                scene::Transform tr;
+                tr.position     = {c.xAfter.px, c.xAfter.py, c.xAfter.pz};
+                tr.eulerRadians = {c.xAfter.ex, c.xAfter.ey, c.xAfter.ez};
+                tr.scale        = {c.xAfter.sx, c.xAfter.sy, c.xAfter.sz};
+                scene::MaterialC m;
+                m.base = reinterpret_cast<rhi::ITexture*>(
+                    static_cast<uintptr_t>(c.mAfter.baseColor));
+                m.normal = nullptr;   // ED6 spawns carry no normal map (DefaultSpawnMaterial)
+                m.metallic = c.mAfter.metallic;
+                m.roughness = c.mAfter.roughness;
+                const int idx = ApplyCreateEntityRaw(
+                    *t.registry,
+                    reinterpret_cast<scene::Mesh*>(static_cast<uintptr_t>(c.meshPtr)), tr, m);
+                return idx == c.target;
+            }
+            // Undo: the spawned entity is the LAST drawable again (LIFO — every later command was
+            // undone first); destroying the last drawable pops each pool's last dense slot without
+            // a swap, so the surviving view order (and every earlier command's view-index target)
+            // is restored bit-identically. The guard inside refuses any non-last index.
+            return ApplyDestroyLastEntity(*t.registry, c.target);
+        }
         default:
             return false;
     }
@@ -340,6 +385,27 @@ inline void RecordTransformState(EditHistory& h, int entity, const XformState& b
     c.xBefore = before;
     c.xAfter = after;
     Record(h, c);
+}
+
+// The recorded twin of ApplyCreateEntity (Slice ED6 — the asset browser's click-to-place). Runs
+// the raw op, then captures the CREATED components as the AFTER payload (there is no BEFORE — the
+// entity did not exist; undo is the destroy of the appended entity). An unknown mesh name is the
+// raw op's safe no-op (-1) and records nothing.
+inline int RecordedApplyCreateEntity(EditHistory& h, ecs::Registry& registry,
+                                     const scene::SceneResources& resources,
+                                     const std::string& meshName) {
+    const int index = ApplyCreateEntity(registry, resources, meshName);
+    if (index < 0) return index;
+    ecs::Entity e = EntityAtViewIndex(registry, index);
+    EditCommand c;
+    c.kind = static_cast<uint32_t>(EditCmdKind::EntityCreate);
+    c.target = index;
+    c.xAfter = CaptureXform(registry.get<scene::TransformC>(e).t);
+    c.mAfter = CaptureMat(registry.get<scene::MaterialC>(e));
+    c.meshPtr =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(registry.get<scene::MeshC>(e).mesh));
+    Record(h, c);
+    return index;
 }
 
 // The recorded twin of AddFlowNode.
@@ -471,6 +537,20 @@ inline void PutMat(std::vector<uint8_t>& b, const MatState& s, const scene::Scen
         PutU64(b, s.baseColor);
     }
 }
+// Mesh-pointer writer (ED6 EntityCreate; the PutMat baseColor discipline): with a resources table
+// the mesh pointer is reversed to its registered NAME (u32 length + bytes; empty for
+// null/unregistered), pointer-free; without one the raw 64-bit value is written.
+inline void PutMeshPtr(std::vector<uint8_t>& b, uint64_t meshPtr,
+                       const scene::SceneResources* res) {
+    if (res) {
+        const std::string name = res->NameOfMesh(
+            reinterpret_cast<const scene::Mesh*>(static_cast<uintptr_t>(meshPtr)));
+        PutU32(b, static_cast<uint32_t>(name.size()));
+        for (char ch : name) b.push_back(static_cast<uint8_t>(ch));
+    } else {
+        PutU64(b, meshPtr);
+    }
+}
 // Bounds-checked LE readers: each returns false on underrun (the cursor is left unspecified).
 struct Reader {
     const uint8_t* p = nullptr;
@@ -514,6 +594,22 @@ struct Reader {
         rhi::ITexture* tex = res->FindTexture(name);
         if (!tex) return false;
         s.baseColor = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tex));
+        return true;
+    }
+    // Mesh-pointer reader (the PutMeshPtr mirror): named encoding resolves the name back to the
+    // caller's registered mesh pointer (empty name -> null; an unknown name is rejected — the
+    // Mat reader's discipline).
+    bool MeshPtr(uint64_t& v, const scene::SceneResources* res, bool named) {
+        if (!named) return U64(v);
+        uint32_t len = 0;
+        if (!U32(len) || at + len > n) return false;
+        std::string name(reinterpret_cast<const char*>(p + at), len);
+        at += len;
+        if (name.empty()) { v = 0; return true; }
+        if (!res) return false;
+        scene::Mesh* mesh = res->FindMesh(name);
+        if (!mesh) return false;
+        v = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mesh));
         return true;
     }
 };
@@ -567,6 +663,11 @@ inline std::vector<uint8_t> SerializeHistory(const EditHistory& h,
                     detail::PutU32(b, c.flowCut[k].node);
                     detail::PutU32(b, c.flowCut[k].slot);
                 }
+                break;
+            case EditCmdKind::EntityCreate:
+                detail::PutMeshPtr(b, c.meshPtr, res);
+                detail::PutXform(b, c.xAfter);
+                detail::PutMat(b, c.mAfter, res);
                 break;
             default:
                 break;   // unknown kinds carry no payload (forward-compat: they never serialize)
@@ -630,6 +731,11 @@ inline bool DeserializeHistory(const uint8_t* data, std::size_t size, EditHistor
                     if (!r.U32(c.flowCut[k].node) || !r.U32(c.flowCut[k].slot)) return false;
                 break;
             }
+            case EditCmdKind::EntityCreate:
+                if (!r.MeshPtr(c.meshPtr, res, named) || !r.Xform(c.xAfter) ||
+                    !r.Mat(c.mAfter, res, named))
+                    return false;
+                break;
             default:
                 return false;   // an unknown kind tag is a malformed artifact
         }

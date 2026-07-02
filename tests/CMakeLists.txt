@@ -416,6 +416,16 @@ hf_add_pure_test(editor_edit_test)
 # the artifact is hand-LE, layout-free). Pure C++ (hf_core), no RHI/backend/ImGui symbols,
 # ASan-eligible.
 hf_add_pure_test(edit_history_test)
+# Slice ED6 — asset-browser entity creation (editor/edit_ops2.h): ApplyCreateEntity spawns a
+# drawable entity for a mesh chosen BY NAME at the deterministic default spawn transform, APPENDED
+# at the end of the drawable view (existing view-index addressing untouched); unknown-name /
+# non-last-destroy safe no-ops; the ED5 EntityCreate enrollment (record -> undo destroy -> redo
+# re-spawn, dumps byte-identical incl. across the create boundary); the serialized artifact
+# round-trips digest-identically under raw AND named (mesh-pointer-as-registered-name) encodings
+# and replays byte-identically on a fresh scene; placement determinism. The --ed6-dry-run drives
+# the same op through the REAL ImGui panel; this pins the op + enrollment behind it. Pure C++
+# (hf_core), no RHI/backend/ImGui symbols, ASan-eligible.
+hf_add_pure_test(edit_ops2_test)
 # Cascaded shadow maps (Slice AD): frustum-split scheme (N increasing splits in (near,far]) +
 # per-cascade ortho fit (all 8 slice corners land inside the cascade clip volume). Pure C++
 # (render/csm.h, header-only), ASan-eligible.

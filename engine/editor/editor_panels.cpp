@@ -2,7 +2,8 @@
 
 #include "imgui.h"
 
-#include "editor/edit_ops.h"  // Slice ED1: the pure-CPU write path the inspector widgets drive.
+#include "editor/edit_ops.h"   // Slice ED1: the pure-CPU write path the inspector widgets drive.
+#include "editor/edit_ops2.h"  // Slice ED6: the entity-creation op the asset browser drives.
 #include "editor/editor_panel_data.h"
 
 #include <cstdio>
@@ -81,7 +82,7 @@ bool DragRow3(const char* label, float v[3], float speed, UiRect* r0, UiRect* r1
 
 void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resources,
                    EditorState& state, uint32_t fbWidth, uint32_t fbHeight,
-                   EditorUIProbe* probe, EditHistory* history) {
+                   EditorUIProbe* probe, EditHistory* history, bool showAssets) {
     // --- Slice ED5: the edit write paths, RECORDED when a history is wired (the recorded wrappers
     // capture before/after around the SAME raw op; with a null history the raw op runs directly, so
     // pre-ED5 callers behave byte-identically). All inspector edits below route through these. ---
@@ -161,6 +162,45 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                 state.selectedEntity = i;
             }
             if (probe) CaptureItemRect(&probe->hierarchyRows[static_cast<size_t>(i)]);
+        }
+
+        // --- Slice ED6: the ASSET BROWSER section (rendered only when the caller opts in, so the
+        // static --editor-shot golden is byte-untouched — the ED2 edit-mode-only discipline).
+        // Lists the scene's loadable assets from SceneResources; std::map iteration = sorted name
+        // order, deterministic. Each mesh row has a "+" place affordance: clicking it spawns a new
+        // drawable entity {TransformC at the deterministic default spawn spot, MeshC = this mesh,
+        // MaterialC = the LoadScene defaults} through the pure edit op (edit_ops2.h — the same
+        // function the --ed6-dry-run's hand-called twin uses), RECORDED on the undo stack when a
+        // history is wired (Ctrl+Z destroys the spawn, restoring the scene byte-identically), and
+        // moves the selection to the new entity. Textures are listed read-only (they are placed
+        // via the inspector's base-color combo, not as scene entities). ---
+        if (showAssets) {
+            ImGui::Separator();
+            ImGui::TextUnformatted("Assets");
+            ImGui::TextDisabled("Meshes (+ places into scene)");
+            if (probe) probe->assetPlaceButtons.assign(resources.meshes.size(), UiRect{});
+            int assetRow = 0;
+            for (const auto& [name, mesh] : resources.meshes) {
+                (void)mesh;
+                ImGui::PushID(assetRow);
+                if (ImGui::SmallButton("+")) {
+                    const int newIndex =
+                        history ? RecordedApplyCreateEntity(*history, registry, resources, name)
+                                : ApplyCreateEntity(registry, resources, name);
+                    if (newIndex >= 0) state.selectedEntity = newIndex;
+                }
+                if (probe)
+                    CaptureItemRect(&probe->assetPlaceButtons[static_cast<size_t>(assetRow)]);
+                ImGui::PopID();
+                ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+                ImGui::TextUnformatted(name.c_str());
+                ++assetRow;
+            }
+            ImGui::TextDisabled("Textures");
+            for (const auto& [name, tex] : resources.textures) {
+                (void)tex;
+                ImGui::BulletText("%s", name.c_str());
+            }
         }
     }
     ImGui::End();

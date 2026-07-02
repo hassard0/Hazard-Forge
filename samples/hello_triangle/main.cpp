@@ -784,6 +784,14 @@ int main(int argc, char** argv) {
     // ReplayHistory on a fresh baseline scene reproduces the edited dump byte-for-byte (the edit
     // session as a replayable artifact). Two full passes byte-identical. Implies --editor.
     bool ed5DryRun = false;
+    // Slice ED6 (asset browser + click-to-place): show the Scene Hierarchy panel's Assets section
+    // (the scene's loadable meshes/textures from SceneResources) and synthesize a click on a mesh's
+    // "+" place affordance; assert a new drawable entity spawned at the deterministic default spot
+    // with the chosen mesh, that DumpScene carries it, that the selection moved to it, that Ctrl+Z
+    // destroys it (the ED5-enrolled create command) restoring the baseline dump BYTE-IDENTICALLY,
+    // that Ctrl+Y re-spawns it bit-exactly, and that two full passes are byte-identical. Implies
+    // --editor.
+    bool ed6DryRun = false;
     // Issue #24 (Blueprint-class visual scripting, editor half): render the deterministic flow-graph
     // node editor over a fixed showcase flow::Graph (FlowGraphView -> BuildFlowEditorUI), write a BMP,
     // print a `flow-editor: {...}` line. Implies --editor (the ImGui overlay path).
@@ -3118,6 +3126,15 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--ed5-dry-run") == 0) {
             editor = true;
             ed5DryRun = true;
+        }
+        // Slice ED6 (asset browser + click-to-place): --ed6-dry-run. A SEPARATE `if` (the else-if
+        // ladder is at MSVC's C1061 limit). Headless synthetic-input proof that the Assets section
+        // lists the scene's loadable resources and that clicking a mesh's place affordance spawns
+        // a new drawable entity deterministically (undo-enrolled: Ctrl+Z removes it, dump back to
+        // the baseline bytes). Prints `ed6-dry-run: ...` proof lines; exit 0/1. Implies --editor.
+        if (std::strcmp(argv[i], "--ed6-dry-run") == 0) {
+            editor = true;
+            ed6DryRun = true;
         }
         // Issue #5: the TIME-CHANNEL deliverable (--sky-animated-shot <out.bmp>). A SEPARATE `if` (not
         // chained onto the else-if ladder above) because that ladder is already at MSVC's block-nesting
@@ -110898,6 +110915,199 @@ int main(int argc, char** argv) {
                         deterministic ? "yes" : "NO", a.transcript.size());
             const bool ok = editOk && undoOk && redoOk && artifactOk && deterministic;
             std::printf("ed5-dry-run: %s\n", ok ? "PASS" : "FAIL");
+            teardownEditor();
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Slice ED6: ASSET BROWSER + CLICK-TO-PLACE dry-run — the Scene Hierarchy panel's
+        // Assets section (BuildEditorUI showAssets=true) lists the scene's loadable resources from
+        // SceneResources; a synthetic click on a mesh's "+" place affordance must spawn a new
+        // drawable entity through the pure edit op (edit_ops2.h ApplyCreateEntity), ENROLLED on the
+        // ED5 undo stack (EntityCreate — create appends at the END of the view so every existing
+        // view-index target stays valid; undo destroys the still-last spawn, restoring view order
+        // bit-identically).
+        //
+        // PROOFS (all must hold; exit 1 otherwise):
+        //   (a) THE SECTION IS REAL: the probe records one valid place-button rect per registered
+        //       mesh (sorted name order).
+        //   (b) THE CLICK PLACES: drawable count +1; the new entity sits at the END of the view;
+        //       its MeshC resolves BY NAME to the clicked mesh; its TransformC is BITWISE equal to
+        //       DefaultSpawnTransform(pre-spawn count); the selection moved to it; DumpScene gained
+        //       exactly one object with that mesh; the history holds exactly 1 command.
+        //   (c) UNDO REMOVES THE SPAWN: Ctrl+Z through the REAL editor key handling destroys it —
+        //       count back, dump BYTE-IDENTICAL to the pre-place baseline.
+        //   (d) REDO RE-PLACES IT: Ctrl+Y re-spawns it — dump BYTE-IDENTICAL to the post-place dump.
+        //   (e) DETERMINISTIC: a second full pass (fresh registry from the baseline) yields a
+        //       byte-identical transcript.
+        if (ed6DryRun) {
+            const uint32_t dw = window.FramebufferWidth();
+            const uint32_t dh = window.FramebufferHeight();
+            ImGuiIO& io = ImGui::GetIO();
+
+            // The place target: sorted mesh-name order is {cube, duck, plane, sphere} -> row 1.
+            const int   kAssetRow = 1;
+            const char* kMeshName = "duck";
+
+            // The pre-place baseline (pass B reloads from this; it is also the undo byte-identity
+            // reference).
+            const std::string baseline = scene::DumpScene(registry, resources);
+
+            struct Ed6Pass {
+                bool assetsOk = false;     // one valid place-button rect per registered mesh
+                int countBefore = 0, countAfter = 0, countUndo = 0, countRedo = 0;
+                bool meshOk = false;       // the spawn's MeshC resolves to kMeshName
+                bool xformOk = false;      // TransformC bitwise == DefaultSpawnTransform(before)
+                bool selOk = false;        // selection moved to the new entity
+                bool dumpHasIt = false;    // DumpScene gained exactly one kMeshName object
+                std::size_t cmdCount = 0;  // recorded commands (pinned: 1)
+                bool undoDumpMatch = false;  // post-undo dump == baseline (byte-identical)
+                bool redoDumpMatch = false;  // post-redo dump == post-place dump (byte-identical)
+                std::string postDump;        // the post-place dump (the redo reference)
+                std::string transcript;      // everything folded -> the determinism compare
+            };
+
+            // Count the dump's objects referencing a mesh name (the "gained exactly one" check).
+            auto countMeshLines = [](const std::string& dump, const char* mesh) -> std::size_t {
+                const std::string needle = std::string("\"mesh\": \"") + mesh + "\"";
+                std::size_t nHits = 0;
+                for (std::size_t at = dump.find(needle); at != std::string::npos;
+                     at = dump.find(needle, at + needle.size()))
+                    ++nHits;
+                return nHits;
+            };
+
+            auto runPass = [&](ecs::Registry& reg) -> Ed6Pass {
+                Ed6Pass r;
+                editor::EditorState st;    // fresh UI selection state per pass
+                editor::EditorUIProbe probe;
+                editor::EditHistory hist;  // the ED5 stack the place enrolls on
+                // One CPU-only ImGui frame with the Assets section shown + the history wired.
+                auto uiFrame = [&](editor::EditorUIProbe* p) {
+                    io.DisplaySize = ImVec2((float)dw, (float)dh);
+                    ImGui::NewFrame();
+                    editor::BuildEditorUI(reg, resources, st, dw, dh, p, &hist,
+                                          /*showAssets=*/true);
+                    ImGui::Render();
+                };
+                // The ED1/ED5 synthetic-input helpers, verbatim, over this pass's uiFrame.
+                auto clickAt = [&](const editor::UiRect& rc) {
+                    io.AddMousePosEvent(rc.cx(), rc.cy());
+                    uiFrame(nullptr);
+                    io.AddMouseButtonEvent(0, true);
+                    uiFrame(nullptr);
+                    io.AddMouseButtonEvent(0, false);
+                    uiFrame(nullptr);
+                };
+                auto idle = [&](int frames) {
+                    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+                    for (int f = 0; f < frames; ++f) uiFrame(nullptr);
+                };
+                auto pressCtrl = [&](ImGuiKey key) {
+                    io.AddKeyEvent(ImGuiMod_Ctrl, true);
+                    uiFrame(nullptr);
+                    io.AddKeyEvent(key, true);
+                    uiFrame(nullptr);  // <- the undo/redo fires on this frame
+                    io.AddKeyEvent(key, false);
+                    uiFrame(nullptr);
+                    io.AddKeyEvent(ImGuiMod_Ctrl, false);
+                    uiFrame(nullptr);
+                };
+
+                idle(2);
+                uiFrame(&probe);
+                r.assetsOk = probe.assetPlaceButtons.size() == resources.meshes.size() &&
+                             (int)probe.assetPlaceButtons.size() > kAssetRow &&
+                             probe.assetPlaceButtons[(size_t)kAssetRow].valid;
+                if (!r.assetsOk) return r;
+                r.countBefore = editor::DrawableEntityCount(reg);
+
+                // 1. Click the mesh's "+" place affordance -> the spawn (recorded, selected).
+                clickAt(probe.assetPlaceButtons[(size_t)kAssetRow]);
+                idle(2);
+                r.countAfter = editor::DrawableEntityCount(reg);
+                r.selOk = (st.selectedEntity == r.countBefore);
+                r.cmdCount = hist.commands.size();
+                if (r.countAfter == r.countBefore + 1) {
+                    ecs::Entity e = editor::EntityAtViewIndex(reg, r.countBefore);
+                    r.meshOk = resources.NameOfMesh(reg.get<scene::MeshC>(e).mesh) == kMeshName;
+                    const editor::XformState got =
+                        editor::CaptureXform(reg.get<scene::TransformC>(e).t);
+                    const scene::Transform want =
+                        editor::DefaultSpawnTransform(r.countBefore);
+                    r.xformOk = editor::BitEqual(got, editor::CaptureXform(want));
+                }
+                r.postDump = scene::DumpScene(reg, resources);
+                r.dumpHasIt = countMeshLines(r.postDump, kMeshName) ==
+                              countMeshLines(baseline, kMeshName) + 1;
+
+                // 2. Ctrl+Z through the REAL key handling -> the spawn is destroyed; the scene is
+                // byte-identical to the pre-place baseline (the enrolled create's undo).
+                pressCtrl(ImGuiKey_Z);
+                idle(2);
+                r.countUndo = editor::DrawableEntityCount(reg);
+                r.undoDumpMatch = (scene::DumpScene(reg, resources) == baseline);
+
+                // 3. Ctrl+Y -> the spawn re-appears bit-exactly.
+                pressCtrl(ImGuiKey_Y);
+                idle(2);
+                r.countRedo = editor::DrawableEntityCount(reg);
+                r.redoDumpMatch = (scene::DumpScene(reg, resources) == r.postDump);
+
+                // The pass transcript (counts + flags + dump size folded).
+                char tb[256];
+                std::snprintf(tb, sizeof(tb),
+                              "counts %d->%d undo %d redo %d | mesh%d xform%d sel%d dump%d | "
+                              "cmds=%zu | dumps u%d r%d | post %zu bytes",
+                              r.countBefore, r.countAfter, r.countUndo, r.countRedo,
+                              (int)r.meshOk, (int)r.xformOk, (int)r.selOk, (int)r.dumpHasIt,
+                              r.cmdCount, (int)r.undoDumpMatch, (int)r.redoDumpMatch,
+                              r.postDump.size());
+                r.transcript = tb;
+                return r;
+            };
+
+            // Pass A on the live registry; pass B on a fresh registry reloaded from the baseline.
+            Ed6Pass a = runPass(registry);
+            ecs::Registry regB;
+            {
+                std::string tmpScene = std::string(std::tmpnam(nullptr)) + ".json";
+                { std::ofstream f(tmpScene, std::ios::binary); f << baseline; }
+                scene::LoadScene(regB, resources, tmpScene.c_str());
+                std::remove(tmpScene.c_str());
+            }
+            Ed6Pass b = runPass(regB);
+
+            // (a)+(b) The section is real and the click placed the entity deterministically.
+            const bool placeOk = a.assetsOk && a.countAfter == a.countBefore + 1 && a.meshOk &&
+                                 a.xformOk && a.selOk && a.dumpHasIt && a.cmdCount == 1u;
+            // (c) Undo destroyed the spawn + the dump matches the baseline bytes.
+            const bool undoOk = a.countUndo == a.countBefore && a.undoDumpMatch;
+            // (d) Redo re-spawned it + the dump matches the post-place bytes.
+            const bool redoOk = a.countRedo == a.countBefore + 1 && a.redoDumpMatch;
+            // (e) Two full passes byte-identical.
+            const bool deterministic = !a.transcript.empty() && a.transcript == b.transcript;
+
+            std::printf("ed6-dry-run: assets section probed: %zu mesh place buttons (%zu meshes, "
+                        "%zu textures registered)\n",
+                        a.assetsOk ? resources.meshes.size() : (std::size_t)0,
+                        resources.meshes.size(), resources.textures.size());
+            std::printf("ed6-dry-run: click place '%s' -> entities %d -> %d | mesh-resolves=%s "
+                        "spawn-xform-exact=%s selection->%d=%s dump-contains=%s commands=%zu "
+                        "(expected 1)\n",
+                        kMeshName, a.countBefore, a.countAfter, a.meshOk ? "yes" : "NO",
+                        a.xformOk ? "yes" : "NO", a.countBefore, a.selOk ? "yes" : "NO",
+                        a.dumpHasIt ? "yes" : "NO", a.cmdCount);
+            std::printf("ed6-dry-run: Ctrl+Z -> entities %d | "
+                        "baseline-dump-byte-identical=%s\n",
+                        a.countUndo, a.undoDumpMatch ? "yes" : "NO");
+            std::printf("ed6-dry-run: Ctrl+Y -> entities %d | "
+                        "postplace-dump-byte-identical=%s\n",
+                        a.countRedo, a.redoDumpMatch ? "yes" : "NO");
+            std::printf("ed6-dry-run: two passes byte-identical=%s (transcript %zu bytes)\n",
+                        deterministic ? "yes" : "NO", a.transcript.size());
+            const bool ok = placeOk && undoOk && redoOk && deterministic;
+            std::printf("ed6-dry-run: %s\n", ok ? "PASS" : "FAIL");
             teardownEditor();
             device->WaitIdle();
             return ok ? 0 : 1;

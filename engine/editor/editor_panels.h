@@ -49,6 +49,10 @@ struct EditorUIProbe {
     UiRect scaleX, scaleY, scaleZ;      // the three Scale drag fields.
     UiRect metallic, roughness;         // the Material scalar drag fields.
     UiRect baseColorCombo;              // the base-color texture-name combo.
+    // Slice ED6 (asset browser): one rect per mesh "place" [+] button in the Assets section of the
+    // Scene Hierarchy panel, in sorted mesh-name order (SceneResources::meshes map order). Recorded
+    // only when the section is shown (showAssets=true).
+    std::vector<UiRect> assetPlaceButtons;
 };
 
 // Build the docked editor panels for this frame from the live registry. Call between
@@ -63,8 +67,18 @@ struct EditorUIProbe {
 // stack) and the panel handles Ctrl+Z (Undo) / Ctrl+Y (Redo) while no text field is being edited.
 // With the default (nullptr) the panel behaves EXACTLY as before ED5 — raw ops, no key handling —
 // so existing callers compile + render byte-identically (the static --editor-shot golden).
+//
+// Slice ED6 (asset browser + click-to-place): when `showAssets` is true the Scene Hierarchy panel
+// gains an "Assets" section listing the scene's loadable resources from SceneResources (meshes +
+// textures, sorted map order — deterministic). Each mesh row carries a "+" place affordance:
+// clicking it spawns a new drawable entity with that mesh at the deterministic default spawn
+// transform (edit_ops2.h ApplyCreateEntity — recorded on the undo stack when `history` is wired)
+// and moves the selection to it. The ED2 edit-mode-only discipline: with the default (false) the
+// section is not rendered at all, so existing callers compile + render byte-identically (the
+// static --editor-shot / --editor-edit-shot goldens are untouched).
 void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resources,
                    EditorState& state, uint32_t fbWidth, uint32_t fbHeight,
-                   EditorUIProbe* probe = nullptr, EditHistory* history = nullptr);
+                   EditorUIProbe* probe = nullptr, EditHistory* history = nullptr,
+                   bool showAssets = false);
 
 }  // namespace hf::editor
