@@ -24,7 +24,7 @@ Every flagship shipped with an honest caveat list. Closing them converts "we hav
 | **R7** | **Persist/sleep** | Boxes-only; feature-ID approximate under sliding; islands are all-pairs. | **PS7** convex-hull contact caching + spatial island partitioning. |
 | **R8** | **Navmesh** | One surface per column (no overhangs), no hole-carving, triangles-as-polys, no inter-region portals. | **NAV7+** multi-layer heightfield + polygon merge + portals. |
 | **R9** | **Metal RT** | v1 TLAS is degenerate single-instance; fragment-stage RT is Vulkan-only. | **RT7** real multi-instance TLAS on Metal (instance transforms in `MTLAccelerationStructure`). |
-| **R10** | **Headless robustness** | Windows modal CRT/assert/WER dialogs can hang headless agents (known TODO). | Suppress via `SetErrorMode`/`_CrtSetReportMode` in every exe entry. |
+| **R10** | ~~Headless robustness~~ **ALREADY SHIPPED** | `engine/platform/crash_dialogs.h` (`DisableCrashDialogs()`) exists and is wired into main.cpp, all tests (`test_main.h`), and visual_test.mm — asserts/aborts/faults route to stderr + non-zero exit. The roadmap TODO was stale. | — |
 | **R11** | **Editor** | 60% built — panels read-only, inspector text-only, no docking. | ED1–ED6 (specced in `GAP_CLOSING_ROADMAP.md` Tier 1). |
 | **R12** | **Ragdoll/joints** | Trailing-contacts composition; ball+cone limits only. | **JT7** hinge/prismatic joint types + motorized joints (deterministic actuation). |
 
