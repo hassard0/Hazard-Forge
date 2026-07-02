@@ -826,6 +826,19 @@ Write-Host '--- live material authoring: hot-swap dry-run ---'
 if (-not `$dryOk) { Write-Host 'hot-swap dry-run FAILED'; exit 23 }
 Write-Host 'live material authoring: hot-swap dry-run PASS'
 
+# --- Slice ED1: interactive inspector editing dry-run. The docked editor's Inspector is driven
+# HEADLESSLY with synthetic ImGui io events (click a hierarchy row to select, Ctrl+click-type new
+# values into the Position-X and Metallic drag fields, Enter to commit) and must prove: (a) the ECS
+# mutated by exactly the typed values through the edit ops, (b) DumpScene persists them (the Ctrl+S
+# path), (c) two full passes are byte-identical (deterministic UI). The GUI-layer twin of the
+# --fly-dry-run / hot-swap dry-run discipline. ---
+Write-Host '--- editor ED1: interactive inspector editing dry-run ---'
+`$ed1 = & `$lmExe --ed1-dry-run 2>&1
+`$ed1 | ForEach-Object { Write-Host `$_ }
+`$ed1Ok = (`$LASTEXITCODE -eq 0) -and (`$ed1 | Select-String -SimpleMatch 'ed1-dry-run: PASS')
+if (-not `$ed1Ok) { Write-Host 'ED1 inspector-edit dry-run FAILED'; exit 24 }
+Write-Host 'editor ED1: inspector-edit dry-run PASS'
+
 exit 0
 "@
 

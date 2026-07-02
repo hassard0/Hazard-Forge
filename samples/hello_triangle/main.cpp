@@ -761,6 +761,13 @@ int main(int argc, char** argv) {
     // the EDITED docked editor frame, and round-trip through scene_io (DumpScene/LoadScene). New
     // showcase; the BT --editor-shot (unedited) golden is untouched.
     const char* editorEditShotPath = nullptr;
+    // Slice ED1 (interactive inspector editing): headless dry-run of the EDITABLE inspector. Drives
+    // the REAL docked ImGui editor with synthetic io events (click a hierarchy row to select, then
+    // Ctrl+click-type new values into the Position-X and Metallic drag fields), asserts the ECS
+    // mutated by exactly the typed values, that DumpScene persists them, and that two full passes are
+    // byte-identical (deterministic UI). No capture/present — the ImGui frames are CPU-built. Implies
+    // --editor. The interactive-GUI counterpart of --fly-dry-run / --material-hotswap-dry-run.
+    bool ed1DryRun = false;
     // Issue #24 (Blueprint-class visual scripting, editor half): render the deterministic flow-graph
     // node editor over a fixed showcase flow::Graph (FlowGraphView -> BuildFlowEditorUI), write a BMP,
     // print a `flow-editor: {...}` line. Implies --editor (the ImGui overlay path).
@@ -3067,6 +3074,16 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--dot") == 0) {
             // Slice BI: with --material-introspect, emit a Graphviz DOT digraph instead of JSON.
             matIntrospectDot = true;
+        }
+        // Slice ED1 (interactive inspector editing): --ed1-dry-run. A SEPARATE `if` (the else-if
+        // ladder above is at MSVC's C1061 block-nesting limit). Headless synthetic-input proof that
+        // the docked editor's Inspector EDITS the live ECS through real ImGui widgets (select via a
+        // hierarchy click, Ctrl+click-type into the drag fields, commit with Enter), that the edit
+        // persists through DumpScene, and that two identical passes are byte-identical. Prints
+        // `ed1-dry-run: ...` proof lines; exit 0/1. Implies --editor (the ImGui overlay setup).
+        if (std::strcmp(argv[i], "--ed1-dry-run") == 0) {
+            editor = true;
+            ed1DryRun = true;
         }
         // Issue #5: the TIME-CHANNEL deliverable (--sky-animated-shot <out.bmp>). A SEPARATE `if` (not
         // chained onto the else-if ladder above) because that ladder is already at MSVC's block-nesting
@@ -109985,6 +110002,175 @@ int main(int argc, char** argv) {
                         widgetView.selected,
                         static_cast<unsigned long long>(viewDigest));
             teardownEditor();
+            return ok ? 0 : 1;
+        }
+
+        // --- Slice ED1: INTERACTIVE INSPECTOR EDITING dry-run — the headless proof that the docked
+        // editor's Inspector EDITS the live ECS through REAL ImGui widgets driven by REAL (synthetic)
+        // io events, mirroring the --fly-dry-run discipline for the GUI layer. No capture/present:
+        // the ImGui frames are CPU-built (NewFrame -> BuildEditorUI -> Render), so this runs headless.
+        //
+        // Input route (documented, LOCKED): drag widgets are mouse-DELTA driven and thus finicky to
+        // script exactly, so the deterministic route is ImGui's built-in Ctrl+click-to-type on a
+        // DragFloat — Ctrl+click turns the field into a text input with the old value selected, typed
+        // characters replace it, Enter commits — which fires the widget's value-change exactly ONCE
+        // with the exact parsed float. The widget rects are aimed via the EditorUIProbe BuildEditorUI
+        // fills (same screen space io.AddMousePosEvent uses), never hardcoded pixels.
+        //
+        // Sequence (each pass): click hierarchy row 1 (select the sphere) -> Ctrl+click-type 4.625
+        // into Position-X -> Ctrl+click-type 0.875 into Metallic. Both constants are exactly float-
+        // representable, so the ECS compare is EXACT (==), and neither string appears in the pristine
+        // default scene, so the DumpScene substring check is unambiguous.
+        //
+        // PROOFS (all must hold; exit 1 otherwise):
+        //   (a) EDIT REACHES THE ECS: TransformC.position.x == 4.625f and MaterialC.metallic ==
+        //       0.875f, exact float compares against the typed input (and differed beforehand).
+        //   (b) EDIT PERSISTS THROUGH SAVE: DumpScene JSON contains the typed values, and LoadScene
+        //       of that dump into a fresh registry carries them (the Ctrl+S path is DumpScene).
+        //   (c) DETERMINISTIC UI: a second full pass, on a fresh registry reloaded from the pre-edit
+        //       baseline dump, yields a byte-identical final scene dump.
+        if (ed1DryRun) {
+            const uint32_t dw = window.FramebufferWidth();
+            const uint32_t dh = window.FramebufferHeight();
+            ImGuiIO& io = ImGui::GetIO();
+
+            const int   kRow       = 1;                    // hierarchy row to select ("sphere #1")
+            const float kPosX      = 4.625f;               // typed Position-X (exact in float)
+            const char* kPosXText  = "4.625";
+            const float kMetallic  = 0.875f;               // typed Metallic (exact in float)
+            const char* kMetalText = "0.875";
+
+            // The pre-edit baseline (pass B reloads from this, so both passes start identically).
+            const std::string baseline = scene::DumpScene(registry, resources);
+
+            // One CPU-only ImGui frame: queued io events -> NewFrame -> the REAL editor -> Render.
+            auto uiFrame = [&](ecs::Registry& reg, editor::EditorState& st,
+                               editor::EditorUIProbe* probe) {
+                io.DisplaySize = ImVec2((float)dw, (float)dh);
+                ImGui::NewFrame();
+                editor::BuildEditorUI(reg, resources, st, dw, dh, probe);
+                ImGui::Render();
+            };
+            // A full left click at a rect's center (move / press / release across frames — Selectable
+            // and ButtonBehavior fire on release; one event per frame sidesteps event trickling).
+            auto clickAt = [&](ecs::Registry& reg, editor::EditorState& st,
+                               const editor::UiRect& r, bool ctrl) {
+                io.AddMousePosEvent(r.cx(), r.cy());
+                uiFrame(reg, st, nullptr);
+                if (ctrl) io.AddKeyEvent(ImGuiMod_Ctrl, true);
+                io.AddMouseButtonEvent(0, true);
+                uiFrame(reg, st, nullptr);
+                io.AddMouseButtonEvent(0, false);
+                uiFrame(reg, st, nullptr);
+                if (ctrl) { io.AddKeyEvent(ImGuiMod_Ctrl, false); uiFrame(reg, st, nullptr); }
+            };
+            // Ctrl+click a DragFloat, type `text` (replaces the selected old value), Enter-commit.
+            auto typeIntoField = [&](ecs::Registry& reg, editor::EditorState& st,
+                                     const editor::UiRect& r, const char* text) {
+                clickAt(reg, st, r, /*ctrl=*/true);
+                for (const char* c = text; *c; ++c) io.AddInputCharacter((unsigned int)(unsigned char)*c);
+                uiFrame(reg, st, nullptr);
+                uiFrame(reg, st, nullptr);  // flush any trickled remainder before the commit key
+                io.AddKeyEvent(ImGuiKey_Enter, true);
+                uiFrame(reg, st, nullptr);
+                io.AddKeyEvent(ImGuiKey_Enter, false);
+                uiFrame(reg, st, nullptr);
+            };
+            // Idle frames with the mouse parked away (settles ImGui state; defeats double-click
+            // pairing between scripted clicks and between the two passes).
+            auto idle = [&](ecs::Registry& reg, editor::EditorState& st, int frames) {
+                io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+                for (int f = 0; f < frames; ++f) uiFrame(reg, st, nullptr);
+            };
+
+            struct Ed1Pass {
+                bool rowsOk = false, selOk = false;
+                float posBefore = 0, posAfter = 0, metBefore = 0, metAfter = 0;
+                std::string dump;
+            };
+            auto runPass = [&](ecs::Registry& reg) -> Ed1Pass {
+                Ed1Pass r;
+                editor::EditorState st;         // fresh UI selection state per pass
+                editor::EditorUIProbe probe;
+                idle(reg, st, 2);
+                uiFrame(reg, st, &probe);       // frame with probe: capture the widget rects
+                r.rowsOk = (int)probe.hierarchyRows.size() > kRow &&
+                           probe.hierarchyRows[kRow].valid && probe.posX.valid &&
+                           probe.metallic.valid;
+                if (!r.rowsOk) return r;
+                {
+                    ecs::Entity ent = editor::EntityAtViewIndex(reg, kRow);
+                    r.posBefore = reg.get<scene::TransformC>(ent).t.position.x;
+                    r.metBefore = reg.get<scene::MaterialC>(ent).metallic;
+                }
+                // 1. Select via a REAL hierarchy click.
+                clickAt(reg, st, probe.hierarchyRows[kRow], /*ctrl=*/false);
+                r.selOk = (st.selectedEntity == kRow);
+                idle(reg, st, 4);
+                // Re-probe with the new selection (layout is fixed, but capture honestly).
+                uiFrame(reg, st, &probe);
+                // 2. Type the new Position-X into the REAL DragFloat (Ctrl+click-to-type route).
+                typeIntoField(reg, st, probe.posX, kPosXText);
+                idle(reg, st, 4);
+                // 3. Type the new Metallic.
+                typeIntoField(reg, st, probe.metallic, kMetalText);
+                idle(reg, st, 24);
+                {
+                    ecs::Entity ent = editor::EntityAtViewIndex(reg, kRow);
+                    r.posAfter = reg.get<scene::TransformC>(ent).t.position.x;
+                    r.metAfter = reg.get<scene::MaterialC>(ent).metallic;
+                }
+                r.dump = scene::DumpScene(reg, resources);
+                return r;
+            };
+
+            // Pass A on the live registry; pass B on a fresh registry reloaded from the baseline.
+            Ed1Pass a = runPass(registry);
+            ecs::Registry regB;
+            {
+                std::string tmpScene = std::string(std::tmpnam(nullptr)) + ".json";
+                { std::ofstream f(tmpScene, std::ios::binary); f << baseline; }
+                scene::LoadScene(regB, resources, tmpScene.c_str());
+                std::remove(tmpScene.c_str());
+            }
+            Ed1Pass b = runPass(regB);
+
+            // (a) The ECS mutated by exactly the typed values (and genuinely changed).
+            bool ecsOk = a.rowsOk && a.selOk && a.posAfter == kPosX && a.metAfter == kMetallic &&
+                         a.posBefore != kPosX && a.metBefore != kMetallic;
+            // (b) The edit persists through save: substring + a LoadScene round-trip carries it.
+            bool dumpHasValues = a.dump.find(kPosXText) != std::string::npos &&
+                                 a.dump.find(kMetalText) != std::string::npos;
+            bool reloadOk = false;
+            {
+                std::string tmpScene = std::string(std::tmpnam(nullptr)) + ".json";
+                { std::ofstream f(tmpScene, std::ios::binary); f << a.dump; }
+                ecs::Registry reloaded;
+                std::vector<ecs::Entity> rents =
+                    scene::LoadScene(reloaded, resources, tmpScene.c_str());
+                std::remove(tmpScene.c_str());
+                if ((int)rents.size() > kRow) {
+                    reloadOk = reloaded.get<scene::TransformC>(rents[kRow]).t.position.x == kPosX &&
+                               reloaded.get<scene::MaterialC>(rents[kRow]).metallic == kMetallic;
+                }
+            }
+            bool saveOk = dumpHasValues && reloadOk;
+            // (c) Two full dry-run passes are byte-identical.
+            bool deterministic = !a.dump.empty() && a.dump == b.dump;
+
+            std::printf("ed1-dry-run: click row %d -> selected=%s | posX %g -> %g (typed %s, exact "
+                        "%s) | metallic %g -> %g (typed %s, exact %s)\n",
+                        kRow, a.selOk ? "yes" : "NO", a.posBefore, a.posAfter, kPosXText,
+                        a.posAfter == kPosX ? "yes" : "NO", a.metBefore, a.metAfter, kMetalText,
+                        a.metAfter == kMetallic ? "yes" : "NO");
+            std::printf("ed1-dry-run: save persists edits: dump-contains=%s reload-match=%s\n",
+                        dumpHasValues ? "yes" : "NO", reloadOk ? "yes" : "NO");
+            std::printf("ed1-dry-run: two passes byte-identical=%s (dump %zu bytes)\n",
+                        deterministic ? "yes" : "NO", a.dump.size());
+            bool ok = ecsOk && saveOk && deterministic;
+            std::printf("ed1-dry-run: %s\n", ok ? "PASS" : "FAIL");
+            teardownEditor();
+            device->WaitIdle();
             return ok ? 0 : 1;
         }
 

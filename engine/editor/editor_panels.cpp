@@ -2,6 +2,7 @@
 
 #include "imgui.h"
 
+#include "editor/edit_ops.h"  // Slice ED1: the pure-CPU write path the inspector widgets drive.
 #include "editor/editor_panel_data.h"
 
 #include <cstdio>
@@ -42,10 +43,45 @@ bool BeginDocked(const char* title, ImVec2 pos, ImVec2 size) {
     return ImGui::Begin(title, nullptr, flags);
 }
 
+// Record the LAST-submitted item's screen rect into a probe slot (no-op with a null slot).
+void CaptureItemRect(UiRect* slot) {
+    if (!slot) return;
+    const ImVec2 mn = ImGui::GetItemRectMin();
+    const ImVec2 mx = ImGui::GetItemRectMax();
+    *slot = UiRect{mn.x, mn.y, mx.x, mx.y, true};
+}
+
+// Slice ED1 — one labelled 3-component drag row (the DragFloat3 look, but split into three explicit
+// DragFloats so the probe can record each component's exact rect for synthetic input). Returns true
+// if ANY component changed this frame (mouse drag or a Ctrl+click typed commit); `v` then holds the
+// full new vector. Width math mirrors DragFloat3 (CalcItemWidth split three ways, inner spacing
+// between components, the label on the same line).
+bool DragRow3(const char* label, float v[3], float speed, UiRect* r0, UiRect* r1, UiRect* r2) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float fullW = ImGui::CalcItemWidth();
+    const float compW = (fullW - 2.0f * style.ItemInnerSpacing.x) / 3.0f;
+    UiRect* slots[3] = {r0, r1, r2};
+    bool changed = false;
+    ImGui::PushID(label);
+    for (int c = 0; c < 3; ++c) {
+        if (c > 0) ImGui::SameLine(0.0f, style.ItemInnerSpacing.x);
+        ImGui::PushID(c);
+        ImGui::SetNextItemWidth(compW);
+        changed |= ImGui::DragFloat("", &v[c], speed);
+        CaptureItemRect(slots[c]);
+        ImGui::PopID();
+    }
+    ImGui::SameLine(0.0f, style.ItemInnerSpacing.x);
+    ImGui::TextUnformatted(label);
+    ImGui::PopID();
+    return changed;
+}
+
 }  // namespace
 
 void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resources,
-                   EditorState& state, uint32_t fbWidth, uint32_t fbHeight) {
+                   EditorState& state, uint32_t fbWidth, uint32_t fbHeight,
+                   EditorUIProbe* probe) {
     // --- Panel DATA (pure, ImGui-free, unit-tested): hierarchy rows + inspector + stats. ---
     const PanelData data = BuildPanelData(registry, resources, state);
     const DockLayout layout = DefaultDockLayout();
@@ -95,11 +131,13 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
     if (BeginDocked(layout.hierarchyTitle, ImVec2(0.0f, top), ImVec2(leftW, leftTopH))) {
         ImGui::Text("%d entities", count);
         ImGui::Separator();
+        if (probe) probe->hierarchyRows.assign(static_cast<size_t>(count), UiRect{});
         for (int i = 0; i < count; ++i) {
             const bool selected = (i == state.selectedEntity);
             if (ImGui::Selectable(data.hierarchy[i].label.c_str(), selected)) {
                 state.selectedEntity = i;
             }
+            if (probe) CaptureItemRect(&probe->hierarchyRows[static_cast<size_t>(i)]);
         }
     }
     ImGui::End();
@@ -115,26 +153,100 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
     }
     ImGui::End();
 
-    // --- Inspector (right column): the selected entity's Transform + Material + Mesh (read-only). ---
+    // --- Inspector (right column): the selected entity's Transform + Material + Mesh — Slice ED1:
+    // LIVE EDITABLE. Each widget shows the panel-data value (re-read from the ECS every frame) and,
+    // on a value change (drag or Ctrl+click typed commit), applies an ABSOLUTE SET of that field
+    // through the existing pure-CPU edit ops — the same deterministic write path the programmatic
+    // --editor-edit showcase uses, so widget edits persist through Ctrl+S / DumpScene. Applying per
+    // value-change keeps mouse drags live (the ECS updates, the panel re-reads it: no snap-back) and
+    // is a single set for a typed entry (the --ed1-dry-run route); the edit ops are absolute sets,
+    // so per-frame application is idempotent with respect to the final value. ---
     if (BeginDocked(layout.inspectorTitle, ImVec2(rightX, top), ImVec2(rightW, bodyH))) {
         if (data.inspector.valid) {
             const InspectorData& in = data.inspector;
             ImGui::Text("Selected: %s", in.label.c_str());
             ImGui::Separator();
             ImGui::TextUnformatted("Transform");
-            ImGui::Text("Position: %.2f, %.2f, %.2f", in.position.x, in.position.y, in.position.z);
-            ImGui::Text("Euler:    %.2f, %.2f, %.2f", in.eulerRadians.x, in.eulerRadians.y,
-                        in.eulerRadians.z);
-            ImGui::Text("Scale:    %.2f, %.2f, %.2f", in.scale.x, in.scale.y, in.scale.z);
+            {
+                float pos[3] = {in.position.x, in.position.y, in.position.z};
+                if (DragRow3("Position", pos, 0.01f, probe ? &probe->posX : nullptr,
+                             probe ? &probe->posY : nullptr, probe ? &probe->posZ : nullptr)) {
+                    TransformEdit e;
+                    e.setPosition = true;
+                    e.position = {pos[0], pos[1], pos[2]};
+                    ApplyTransformEdit(registry, in.index, e);
+                }
+                float eul[3] = {in.eulerRadians.x, in.eulerRadians.y, in.eulerRadians.z};
+                if (DragRow3("Euler", eul, 0.01f, probe ? &probe->eulerX : nullptr,
+                             probe ? &probe->eulerY : nullptr, probe ? &probe->eulerZ : nullptr)) {
+                    TransformEdit e;
+                    e.setEuler = true;
+                    e.euler = {eul[0], eul[1], eul[2]};
+                    ApplyTransformEdit(registry, in.index, e);
+                }
+                float scl[3] = {in.scale.x, in.scale.y, in.scale.z};
+                if (DragRow3("Scale", scl, 0.01f, probe ? &probe->scaleX : nullptr,
+                             probe ? &probe->scaleY : nullptr, probe ? &probe->scaleZ : nullptr)) {
+                    TransformEdit e;
+                    e.setScale = true;
+                    e.scale = {scl[0], scl[1], scl[2]};
+                    ApplyTransformEdit(registry, in.index, e);
+                }
+            }
             ImGui::Separator();
             ImGui::TextUnformatted("Mesh");
             ImGui::Text("%s", in.meshName.empty() ? "(none)" : in.meshName.c_str());
             ImGui::Separator();
             ImGui::TextUnformatted("Material");
-            ImGui::Text("Metallic:  %.2f", in.metallic);
-            ImGui::Text("Roughness: %.2f", in.roughness);
-            ImGui::Text("Base color: %s",
-                        in.baseColorName.empty() ? "(none)" : in.baseColorName.c_str());
+            {
+                const ImGuiStyle& style = ImGui::GetStyle();
+                float metallic = in.metallic;
+                ImGui::SetNextItemWidth(ImGui::CalcItemWidth());
+                if (ImGui::DragFloat("##Metallic", &metallic, 0.005f, 0.0f, 1.0f)) {
+                    MaterialEdit e;
+                    e.setMetallic = true;
+                    e.metallic = metallic;
+                    ApplyMaterialEdit(registry, in.index, e);
+                }
+                if (probe) CaptureItemRect(&probe->metallic);
+                ImGui::SameLine(0.0f, style.ItemInnerSpacing.x);
+                ImGui::TextUnformatted("Metallic");
+
+                float roughness = in.roughness;
+                ImGui::SetNextItemWidth(ImGui::CalcItemWidth());
+                if (ImGui::DragFloat("##Roughness", &roughness, 0.005f, 0.0f, 1.0f)) {
+                    MaterialEdit e;
+                    e.setRoughness = true;
+                    e.roughness = roughness;
+                    ApplyMaterialEdit(registry, in.index, e);
+                }
+                if (probe) CaptureItemRect(&probe->roughness);
+                ImGui::SameLine(0.0f, style.ItemInnerSpacing.x);
+                ImGui::TextUnformatted("Roughness");
+
+                // Base color is a NAMED TEXTURE in this engine (MaterialC.base is an opaque
+                // rhi::ITexture*, resolved by name from SceneResources — not an RGB factor), so the
+                // edit widget is a texture-name combo, not a color picker. std::map iteration gives a
+                // deterministic name order. Selecting a name applies the resolved pointer through
+                // ApplyMaterialEdit (edit_ops never dereferences it).
+                const char* preview = in.baseColorName.empty() ? "(none)" : in.baseColorName.c_str();
+                ImGui::SetNextItemWidth(ImGui::CalcItemWidth());
+                if (ImGui::BeginCombo("##BaseColor", preview)) {
+                    for (const auto& [name, tex] : resources.textures) {
+                        const bool selectedTex = (name == in.baseColorName);
+                        if (ImGui::Selectable(name.c_str(), selectedTex)) {
+                            MaterialEdit e;
+                            e.setBaseColor = true;
+                            e.baseColor = tex;
+                            ApplyMaterialEdit(registry, in.index, e);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (probe) CaptureItemRect(&probe->baseColorCombo);
+                ImGui::SameLine(0.0f, style.ItemInnerSpacing.x);
+                ImGui::TextUnformatted("Base color");
+            }
         } else {
             ImGui::TextDisabled("No entity selected.");
         }
