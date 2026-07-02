@@ -996,6 +996,220 @@ int main() {
         check(softState.retired == 0u, "FR7 control: no re-fracture -> nothing retired");
     }
 
+    // ================= FR8: CONVEX-SHARD RUBBLE — oriented boxes through the SHIPPED fric.h solver =======
+    // Closes the documented FR4 caveat (sphere-bound rubble): the SAME FR3 break spawns as ORIENTED BOXES
+    // (FragmentToBox: the AABB-box about the centroid — the documented approximation of the Voronoi cell)
+    // into the FC4 convex-SAT + Coulomb-friction world (fric::StepFrictionWorld called AS-IS). Pins:
+    //   (a) FragmentToBox shape math (hand cases);
+    //   (b) the sphere-path REGRESSION: FR4's StepFractureSteps digest UNCHANGED (FR1-FR7 untouched);
+    //   (c) THE UPGRADE PROOF: the FR4 scene settles as box rubble with >= 1 piece ROTATED (non-trivial
+    //       quaternion — impossible on the FR4 sphere path, which keeps orient identity EXACTLY), resting
+    //       interpenetration bounded, rest speed bounded; the settled-rubble digest PINNED (MSVC == clang);
+    //   (d) determinism: two runs byte-identical;
+    //   (e) lockstep: a peer re-derives the box rubble bit-for-bit + rollback corrects a real divergence.
+    {
+        namespace convex = hf::sim::convex;
+        namespace fric = hf::sim::fric;
+
+        // FNV-1a 64 over the body vector bytes (pure-integer state -> identical on every compiler).
+        auto bodyDigest = [](const std::vector<fpx::FxBody>& bodies) -> uint64_t {
+            uint64_t h = 1469598103934665603ull;
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(bodies.data());
+            const size_t n = bodies.size() * sizeof(fpx::FxBody);
+            for (size_t i = 0; i < n; ++i) { h ^= (uint64_t)p[i]; h *= 1099511628211ull; }
+            return h;
+        };
+
+        // ---- (a) FragmentToBox hand cases. ----
+        {
+            // The FR2 1-seed 5x5x5 fragment: centroid (2,2,2), AABB [0,4]^3 -> per-axis half = 2 cells +
+            // half a cell = 2.5 lattice units; worldCellSize kOne -> 2.5 * kOne.
+            fract::FractFragment fr{};
+            fr.cx = 2; fr.cy = 2; fr.cz = 2;
+            fr.minx = 0; fr.miny = 0; fr.minz = 0;
+            fr.maxx = 4; fr.maxy = 4; fr.maxz = 4;
+            const hf::sim::convex::FxBox box = fract::FragmentToBox(fr, fpx::kOne);
+            check(box.halfExtents.x == (fract::fx)(5 * (int)fpx::kOne / 2) &&
+                  box.halfExtents.y == box.halfExtents.x && box.halfExtents.z == box.halfExtents.x,
+                  "FR8 box: symmetric fragment -> half-extents 2.5 lattice cells");
+            // An ASYMMETRIC fragment (the FR2 hand case {x=0,1}, centroid 0): x half = max(0,1)+0.5 = 1.5
+            // cells; y/z half = 0.5 cells; worldCellSize kOne/2 halves everything.
+            fract::FractFragment fa{};
+            fa.cx = 0; fa.minx = 0; fa.maxx = 1;   // y/z all zero
+            const hf::sim::convex::FxBox ba = fract::FragmentToBox(fa, fpx::kOne / 2);
+            check(ba.halfExtents.x == (fract::fx)(3 * (int)fpx::kOne / 4),
+                  "FR8 box: asymmetric AABB covered about the centroid (1.5 cells * 0.5 world)");
+            check(ba.halfExtents.y == (fract::fx)((int)fpx::kOne / 4) && ba.halfExtents.z == ba.halfExtents.y,
+                  "FR8 box: one-sample-thick axis keeps half-a-cell thickness (no degenerate slab)");
+        }
+
+        // ---- The FR4 showcase scene VERBATIM (32x32x16 lattice, 16 seeds, hard break). ----
+        fract::FractField f; f.nx = 32; f.ny = 32; f.nz = 16;
+        const std::vector<fract::FractSeed> seeds = {
+            { 4,  5,  3}, {27,  6,  2}, { 6, 26,  4}, {25, 27,  3},
+            {16, 15,  8}, { 3, 14, 12}, {29, 18, 13}, {14,  3, 11},
+            {18, 29, 10}, { 9,  9,  6}, {22, 11,  9}, {11, 22,  7},
+            {24, 24, 12}, { 7, 18,  2}, {20,  7, 14}, {15, 28,  6},
+        };
+        const int M = (int)seeds.size();
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, M, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+        fract::BreakImpact imp{0u, (fract::fx)(1000 * (int)fpx::kOne)};
+        std::vector<uint8_t> sev;
+        fract::ApplyImpactBreak(bonds, frags, imp, 4, sev);
+        std::vector<uint32_t> clusters;
+        fract::CountFractPieces(frags, bonds, sev, &clusters);
+
+        const fract::fx gravY = (fract::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        fract::FractStepConfig cfg;
+        cfg.worldCellSize = fpx::kOne / 4;
+        cfg.gravity = fract::FxVec3{0, gravY, 0};
+        cfg.groundY = 0;
+        cfg.impactDir = fract::FxVec3{fpx::kOne / 2, -fpx::kOne, 0};
+        cfg.impactSpeed = (fract::fx)(4 * (int)fpx::kOne);
+        const fract::fx dt = fpx::kOne / 60;
+
+        // ---- (b) sphere-path REGRESSION: FR4's StepFractureSteps is untouched — digest PINNED. ----
+        {
+            fpx::FxWorld sw = fract::SpawnFractWorld(frags, bonds, sev, clusters, imp, cfg);
+            fract::StepFractureSteps(sw, dt, 8, 120);
+            const uint64_t sphereDigest = bodyDigest(sw.bodies);
+            std::printf("FR8 sphere-path digest: 0x%016llx\n", (unsigned long long)sphereDigest);
+            check(sphereDigest == 0x029245db75f0eb33ull,
+                  "FR8 regression: the FR4 sphere-path settled digest is UNCHANGED (pinned)");
+        }
+
+        // ---- (c) the BOX rubble: spawn + settle through the SHIPPED FC4 friction solver. ----
+        const fract::FxVec3 kFloorHalf{(fract::fx)(24 * (int)fpx::kOne), fpx::kOne,
+                                       (fract::fx)(24 * (int)fpx::kOne)};
+        const hf::sim::convex::ConvexWorld hull0 =
+            fract::SpawnFractHullWorld(frags, bonds, sev, clusters, imp, cfg, kFloorHalf);
+        check(hull0.bodies.size() == (size_t)M + 1u && hull0.boxes.size() == hull0.bodies.size(),
+              "FR8 spawn: one box body per fragment + the static floor appended LAST");
+        check(hull0.bodies.back().invMass == 0 && hull0.bodies.back().flags == 0u,
+              "FR8 spawn: the floor body is STATIC");
+        {
+            uint32_t dyn = 0, stat = 0;
+            for (size_t i = 0; i + 1 < hull0.bodies.size(); ++i)
+                if (hull0.bodies[i].flags & fpx::kFlagDynamic) ++dyn; else ++stat;
+            check(dyn > 0u && stat > 0u, "FR8 spawn: the break yields dynamic pieces AND a static anchor");
+            bool identityAll = true;
+            for (const fpx::FxBody& b : hull0.bodies)
+                if (b.orient.x != 0 || b.orient.y != 0 || b.orient.z != 0 || b.orient.w != fpx::kOne)
+                    identityAll = false;
+            check(identityAll, "FR8 spawn: every piece spawns with IDENTITY orientation (rotation is earned)");
+        }
+
+        // The FC4 friction-step knobs (the fric_test stack convention): grippy mu, angular damping OFF —
+        // the friction cone is what stops the pieces, not a damping crutch.
+        fric::FrictionStepConfig fcfg;
+        fcfg.gravity     = fract::FxVec3{0, gravY, 0};
+        fcfg.dt          = dt;
+        fcfg.solveIters  = 12;
+        fcfg.restitution = 0;
+        fcfg.slop        = fpx::kOne / 64;
+        fcfg.beta        = (fract::fx)((int64_t)4 * fpx::kOne / 10);    // 0.4
+        fcfg.linDamp     = (fract::fx)((int64_t)98 * fpx::kOne / 100);  // 0.98 (the FC4 stack setting)
+        fcfg.angDamp     = fpx::kOne;                                   // OFF — friction holds the rubble
+        fcfg.posIters    = 4;
+        fcfg.mu          = fpx::kOne;
+        // 480 ticks: the AABB-boxes overlap deeply at spawn (the documented over-approximation), so the
+        // de-penetration "burst" + the perched pieces toppling off the anchor need ~2x the FR4 settle time
+        // (measured: all dynamic speeds <= ~0.01 and max pairwise penetration ~= slop by tick 480).
+        const uint32_t kHullTicks = 480u;
+
+        hf::sim::convex::ConvexWorld hullA = hull0, hullB = hull0;
+        fract::StepFractureHullSteps(hullA, fcfg, kHullTicks);
+        fract::StepFractureHullSteps(hullB, fcfg, kHullTicks);
+
+        // ---- (d) determinism: two runs byte-identical + the settled digest PINNED. ----
+        check(hf::sim::convex::ConvexBodiesEqual(hullA.bodies, hullB.bodies),
+              "FR8 determinism: two StepFractureHullSteps runs BYTE-IDENTICAL");
+        const uint64_t hullDigest = bodyDigest(hullA.bodies);
+        std::printf("FR8 hull-rubble digest: 0x%016llx\n", (unsigned long long)hullDigest);
+        check(hullDigest == 0xa5a9b8f5158108d2ull,
+              "FR8 golden: the settled box-rubble digest is PINNED (MSVC == clang bit-exact)");
+
+        // ---- (c cont.) THE UPGRADE PROOF: settled + rotated + bounded interpenetration. ----
+        const fract::fx kRotEps = fpx::kOne / 32;   // |q.xyz| > ~0.031 == a > ~3.6 deg total rotation
+        const fract::FractHullRubbleState st = fract::MeasureFractHullRubble(hullA, kRotEps);
+        std::printf("FR8 rubble: dynamic=%u rotated=%u maxQuatDev=%d maxSpeed=%d maxPen=%d minY=%d\n",
+                    st.dynamic, st.rotated, (int)st.maxQuatDev, (int)st.maxSpeed,
+                    (int)st.maxPenetration, (int)st.minDynamicY);
+        check(st.dynamic > 0u, "FR8 rubble: dynamic box pieces exist");
+        check(st.rotated >= 1u,
+              "FR8 UPGRADE PROOF: >= 1 settled piece ROTATED (non-trivial quaternion — spheres cannot)");
+        check(st.maxQuatDev > kRotEps,
+              "FR8 UPGRADE PROOF: the max quaternion deviation is non-trivial (pinned > kOne/32)");
+        check(st.maxSpeed < fpx::kOne / 16,
+              "FR8 rest: the rubble comes to rest (max dynamic speed < 0.0625 unit/s after 480 ticks)");
+        check(st.maxPenetration < fpx::kOne / 16,
+              "FR8 overlap: resting interpenetration bounded (< 0.0625 world units ~= the slop band)");
+        {
+            // Every dynamic piece rests ABOVE the floor top (its center above groundY minus a slop band —
+            // the box solver's de-pen holds it out of the floor box).
+            bool aboveFloor = true;
+            for (size_t i = 0; i + 1 < hullA.bodies.size(); ++i) {
+                const fpx::FxBody& b = hullA.bodies[i];
+                if ((b.flags & fpx::kFlagDynamic) && b.pos.y < cfg.groundY) aboveFloor = false;
+            }
+            check(aboveFloor, "FR8 floor: every dynamic piece's center rests above the floor top");
+            // A rotated piece's exact quaternion is covered bit-for-bit by the pinned digest above; also
+            // pin that the WINNER (max-deviation piece) is a DYNAMIC piece with a normalized-ish quat.
+            fract::fx bestDev = 0; size_t bestIdx = (size_t)-1;
+            for (size_t i = 0; i + 1 < hullA.bodies.size(); ++i) {
+                const fpx::FxBody& b = hullA.bodies[i];
+                if (!(b.flags & fpx::kFlagDynamic)) continue;
+                fract::fx dev = b.orient.x < 0 ? -b.orient.x : b.orient.x;
+                fract::fx dy = b.orient.y < 0 ? -b.orient.y : b.orient.y;
+                fract::fx dz = b.orient.z < 0 ? -b.orient.z : b.orient.z;
+                if (dy > dev) dev = dy;
+                if (dz > dev) dev = dz;
+                if (dev > bestDev) { bestDev = dev; bestIdx = i; }
+            }
+            check(bestIdx != (size_t)-1 && bestDev > kRotEps,
+                  "FR8 rotation: the max-rotated piece is a dynamic fragment body");
+            if (bestIdx != (size_t)-1) {
+                const fpx::FxQuat& q = hullA.bodies[bestIdx].orient;
+                std::printf("FR8 rotation winner: piece %u quat {%d, %d, %d, %d}\n",
+                            (unsigned)bestIdx, (int)q.x, (int)q.y, (int)q.z, (int)q.w);
+            }
+        }
+
+        // ---- (e) LOCKSTEP + ROLLBACK: a peer re-derives the box rubble bit-for-bit from inputs alone. ----
+        {
+            namespace cv = hf::sim::convex;
+            // Kick the FIRST dynamic piece (a shove + a spin) at a few ticks — the input stream.
+            uint32_t kick = 0xFFFFFFFFu;
+            for (uint32_t i = 0; i + 1u < (uint32_t)hull0.bodies.size(); ++i)
+                if (hull0.bodies[i].flags & fpx::kFlagDynamic) { kick = i; break; }
+            check(kick != 0xFFFFFFFFu, "FR8 lockstep: a dynamic piece exists to kick");
+            const std::vector<cv::ConvexCommand> authStream = {
+                cv::ConvexCommand{2u, cv::kConvexCmdAddImpulse, kick,
+                                  fract::FxVec3{(fract::fx)(2000 * (int)fpx::kOne), 0, 0}},
+                cv::ConvexCommand{5u, cv::kConvexCmdSetAngVel, kick, fract::FxVec3{0, fpx::kOne, 0}},
+            };
+            const uint32_t kTicks = 60u, kRollbackAt = 20u;
+            bool identical = false;
+            const cv::ConvexWorld authority =
+                fract::RunFractureHullLockstep(hull0, fcfg, authStream, kTicks, &identical);
+            check(identical, "FR8 lockstep: authority == replica BIT-EXACT (inputs-only re-sim)");
+
+            std::vector<cv::ConvexCommand> mispredict = authStream;
+            mispredict.push_back(cv::ConvexCommand{kRollbackAt, cv::kConvexCmdAddImpulse, kick,
+                                                   fract::FxVec3{0, 0, (fract::fx)(4000 * (int)fpx::kOne)}});
+            bool corrected = false, diverged = false;
+            const cv::ConvexWorld rolled =
+                fract::RunFractureHullRollback(hull0, fcfg, authStream, mispredict, kTicks, kRollbackAt,
+                                               &corrected, &diverged);
+            check(corrected, "FR8 rollback: corrected == authority BIT-EXACT");
+            check(diverged, "FR8 rollback: the misprediction REALLY diverged before the rollback");
+            check(cv::ConvexBodiesEqual(rolled.bodies, authority.bodies),
+                  "FR8 rollback: the returned corrected world matches the authority");
+        }
+    }
+
     if (g_fail == 0) std::printf("fract_test: ALL PASS\n");
     else std::printf("fract_test: %d FAIL\n", g_fail);
     return g_fail == 0 ? 0 : 1;

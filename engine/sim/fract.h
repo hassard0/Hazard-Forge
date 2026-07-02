@@ -1257,3 +1257,232 @@ inline FractCascadeState MeasureFractCascade(const FractRecursiveWorld& rw, cons
 }
 
 }  // namespace hf::sim::fract
+
+// ====================================================================================================
+// Slice FR8 — CONVEX-SHARD RUBBLE (Track-R slice R4: closing the documented FR4 caveat "fragments solved
+// as bounding SPHERES (FPX3 is sphere-sphere) -> rounded rubble, convex manifolds deferred"). Additive
+// over FR1-FR7 (ALL code above is byte-unchanged; this section reopens the namespace BELOW the frozen
+// close — the append-only discipline). FR4 spawned each dislodged fragment as an fpx::FxBody bounding
+// SPHERE; FR8 spawns the SAME break (FR3 severed set + pieces, byte-identical reuse) as ORIENTED BOXES
+// and settles them through the engine's SHIPPED convex-SAT + Coulomb-friction solver
+// (fric::StepFrictionWorld, FLAGSHIP #20 FC4 — called AS-IS, fric.h/convex.h BYTE-UNTOUCHED): the rubble
+// falls, collides box-vs-box + box-vs-floor with real contact manifolds + inertia-tensor torque +
+// cone-clamped friction, and comes to rest ANGULAR — pieces ROTATE and rest flat/stacked instead of
+// rolling as spheres. The upgrade proof is a NON-TRIVIAL settled orientation (a rotated quaternion — a
+// sphere-world body under FR4's StepFracture keeps orient identity EXACTLY, so rotation is impossible
+// there and is exactly what the box path adds).
+//
+// THE HONEST SHAPE CAVEAT (state it wherever FR8 is described): the box is the AABB of the fragment's
+// member samples taken ABOUT THE CENTROID (per-axis half-extent = the max of centroid->min / centroid->max
+// plus half a lattice cell, so a one-sample-thick fragment still has thickness) — the AABB-BOX
+// APPROXIMATION of the Voronoi cell, NOT the exact convex cell hull. Adjacent fragments' boxes therefore
+// OVERLAP at spawn more than the true cells do (the solver's position de-penetration shatters them apart
+// — the visible "burst"); exact per-cell convex hulls (a gjk::FxHull per fragment through the warmhull
+// solver) stay FUTURE WORK. Boxes are consistent with the persist flagship's boxes-only scope and are the
+// fric.h solver's native shape.
+//
+// THE CPU/GPU CONVENTION (documented choice, the FC4/CF1/GF5 precedent): fric::StepFrictionWorld is int64
+// throughout (SAT/manifold/inertia/impulse products), so ITS GPU shader (fric_step.comp) is Vulkan-only
+// and the Metal fric showcases run the CPU step. FR8 adds NO new shader and drives the step PURE-CPU on
+// BOTH backends — the golden is cross-backend bit-identical BY CONSTRUCTION (the FR5/FR7 pure-CPU-slice
+// convention). NO new RHI.
+//
+// SEAM DISCIPLINE: header-only, ZERO backend symbols, NO float in the sim path. fric.h (and its convex.h)
+// are #included READ-ONLY below — the ONLY new dependency edge, placed AFTER the frozen FR1-FR7 body so
+// every frozen line above is byte-identical.
+
+#include "sim/fric.h"   // read-only: fric::StepFrictionWorld/N + FrictionStepConfig (FC4) and, via it,
+                        // sim/convex.h (FxBox/ConvexWorld/BoxSat/MeasureStack + the CX5 lockstep
+                        // command/snapshot machinery, ALL reused VERBATIM). Both BYTE-UNTOUCHED.
+
+namespace hf::sim::fract {
+
+// ----- (A) FragmentToBox: the FR2 fragment -> a convex::FxBox (the AABB-box about the centroid) -------
+// Per axis: half-extent = max(centroid - aabbMin, aabbMax - centroid) lattice cells (so the box centered
+// at the CENTROID covers the whole member AABB) PLUS half a cell (each lattice sample owns a unit cell,
+// and a one-sample-thick fragment must not degenerate to a zero-thickness slab), all scaled to world
+// units by ONE fxmul with worldCellSize. Pure integer. DOCUMENTED: this is the AABB-box approximation of
+// the Voronoi cell, NOT the exact cell hull (see the FR8 banner) — deliberately conservative (covers the
+// cell) at the cost of extra spawn overlap the solver de-penetrates.
+inline convex::FxBox FragmentToBox(const FractFragment& fr, fx worldCellSize) {
+    auto axisHalf = [&](int32_t mn, int32_t c, int32_t mx) -> fx {
+        const int32_t lo = c - mn;                   // centroid -> AABB min span (lattice cells, >= 0)
+        const int32_t hi = mx - c;                   // centroid -> AABB max span (lattice cells, >= 0)
+        const int32_t h  = lo > hi ? lo : hi;        // cover the WHOLE AABB about the centroid
+        // Promote to Q16.16 lattice units + half a cell, then ONE fxmul into world units.
+        const fx latticeHalf = (fx)(((int64_t)h << fpx::kFrac) + (int64_t)(fpx::kOne / 2));
+        return fpx::fxmul(latticeHalf, worldCellSize);
+    };
+    convex::FxBox box;
+    box.halfExtents = FxVec3{axisHalf(fr.minx, fr.cx, fr.maxx),
+                             axisHalf(fr.miny, fr.cy, fr.maxy),
+                             axisHalf(fr.minz, fr.cz, fr.maxz)};
+    return box;
+}
+
+// ----- (B) SpawnFractHullWorld: the FR4 spawn TWIN into the convex-box friction world -----------------
+// Byte-identical REUSE of the FR3 break inputs (severed set + piece clusters — the SAME arguments
+// SpawnFractWorld takes) with the SAME anchor rule (FractAnchorPiece: the LARGEST piece's fragments are
+// STATIC, all others DYNAMIC) and the SAME impact-velocity seeding. Differences vs FR4 (each documented):
+//   * one convex::FxBox per fragment (FragmentToBox) parallel to the body — the SAT collider;
+//   * body order = ASCENDING FRAGMENT INDEX (the FR4/FR2 compact order — the fixed deterministic order
+//     the all-pairs i<j solve sweeps);
+//   * the convex world has NO ground-plane field, so a STATIC FLOOR BOX is appended as the LAST body
+//     (index == fragmentCount): top face at cfg.groundY, centered laterally at the INTEGER MEAN of the
+//     fragment centroids (a fixed ascending sum -> deterministic), half-extents = floorHalfExtents
+//     (host-fixed; make it wide enough that the burst stays on it — a piece sliding past the floor edge
+//     falls forever, the documented static-basin-style containment caveat).
+// body.radius carries the FR4 bounding-sphere radius for provenance/debug only (the SAT never reads it).
+// Pure integer. Empty fragments -> empty world (no floor either — the degenerate no-op).
+inline convex::ConvexWorld SpawnFractHullWorld(const FractFragments& fragments, const FractBonds& bonds,
+                                               const std::vector<uint8_t>& severed,
+                                               const std::vector<uint32_t>& clusters,
+                                               const BreakImpact& impact, const FractStepConfig& cfg,
+                                               const FxVec3& floorHalfExtents) {
+    (void)bonds; (void)severed;   // the clusters already encode the break (the SpawnFractWorld contract).
+    convex::ConvexWorld world;
+    const uint32_t M = (uint32_t)fragments.fragments.size();
+    if (M == 0u) return world;
+
+    const uint32_t anchor = FractAnchorPiece(fragments, clusters);
+    const bool haveClusters = ((uint32_t)clusters.size() == M);
+
+    world.bodies.reserve((size_t)M + 1u);
+    world.boxes.reserve((size_t)M + 1u);
+    int64_t sumCx = 0, sumCz = 0;   // fixed ascending centroid sums (the floor's lateral center)
+    for (uint32_t f = 0; f < M; ++f) {
+        const FractFragment& fr = fragments.fragments[(size_t)f];
+        fpx::FxBody b;
+        // Lattice centroid -> Q16.16 world position (EXACTLY the FR4 SpawnFractWorld up-conversion).
+        b.pos = FxVec3{ fpx::fxmul((fx)((int64_t)fr.cx << fpx::kFrac), cfg.worldCellSize),
+                        fpx::fxmul((fx)((int64_t)fr.cy << fpx::kFrac), cfg.worldCellSize),
+                        fpx::fxmul((fx)((int64_t)fr.cz << fpx::kFrac), cfg.worldCellSize) };
+        b.vel = FxVec3{0, 0, 0};
+        b.radius = fpx::fxmul((fx)((int64_t)fr.boundRadius << fpx::kFrac), cfg.worldCellSize);
+        b.invMass = fr.invMass;
+        b.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};   // identity — every rotation in the settled state
+        b.angVel = FxVec3{0, 0, 0};                    // is EARNED from the SAT contacts (the proof)
+
+        const bool isAnchor = haveClusters && (clusters[(size_t)f] == anchor) && (anchor != 0xFFFFFFFFu);
+        if (isAnchor) { b.invMass = 0; b.flags = 0; }          // the held piece: static
+        else          { b.flags = fpx::kFlagDynamic; }         // dislodged: dynamic box rubble
+        world.bodies.push_back(b);
+        world.boxes.push_back(FragmentToBox(fr, cfg.worldCellSize));
+        sumCx += fr.cx; sumCz += fr.cz;
+    }
+
+    // Seed the impacted fragment's body with the impact velocity (only if dynamic — the FR4 rule).
+    if (impact.fragment < M) {
+        fpx::FxBody& hit = world.bodies[(size_t)impact.fragment];
+        if (hit.flags & fpx::kFlagDynamic) {
+            hit.vel = FxVec3{ fpx::fxmul(cfg.impactDir.x, cfg.impactSpeed),
+                              fpx::fxmul(cfg.impactDir.y, cfg.impactSpeed),
+                              fpx::fxmul(cfg.impactDir.z, cfg.impactSpeed) };
+        }
+    }
+
+    // The static FLOOR box, appended LAST (body index M — fragment index == body index is preserved).
+    // Top face at cfg.groundY -> center.y = groundY - halfExtents.y. Lateral center = the integer mean
+    // fragment centroid (deterministic fixed-order sum + truncating divide) up-converted like a centroid.
+    {
+        const int32_t mx = (int32_t)(sumCx / (int64_t)M);
+        const int32_t mz = (int32_t)(sumCz / (int64_t)M);
+        fpx::FxBody floor;
+        floor.pos = FxVec3{ fpx::fxmul((fx)((int64_t)mx << fpx::kFrac), cfg.worldCellSize),
+                            cfg.groundY - floorHalfExtents.y,
+                            fpx::fxmul((fx)((int64_t)mz << fpx::kFrac), cfg.worldCellSize) };
+        floor.vel = FxVec3{0, 0, 0};
+        floor.invMass = 0;
+        floor.flags = 0;   // static
+        floor.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};
+        floor.angVel = FxVec3{0, 0, 0};
+        world.bodies.push_back(floor);
+        world.boxes.push_back(convex::FxBox{floorHalfExtents});
+    }
+    return world;
+}
+
+// ----- (C) StepFractureHull: the FR4-step TWIN over the SHIPPED friction solver (fric.h AS-IS) --------
+// ONE deterministic tick = fric::StepFrictionWorld (FC4, reused VERBATIM with ZERO changes to fric.h):
+// predict-integrate (6-DOF) -> all-pairs SAT narrowphase + manifold + normal-AND-cone-clamped-tangent
+// Gauss-Seidel impulses (torque through the box inertia tensors — where the pieces EARN their rotation)
+// -> position de-penetration. Fixed body order = fragment index order (the spawn order); the solver's own
+// determinism discipline (every order PINNED in fric.h/convex.h) applies unchanged. Pure integer -> two
+// runs byte-identical, cross-backend identical (pure CPU on both — see the FR8 banner convention).
+inline void StepFractureHull(convex::ConvexWorld& world, const fric::FrictionStepConfig& cfg) {
+    fric::StepFrictionWorld(world, cfg);   // fric.h called AS-IS — zero modification
+}
+
+// StepFractureHullSteps(world, cfg, ticks): run `ticks` StepFractureHull ticks -> the box rubble settles.
+inline void StepFractureHullSteps(convex::ConvexWorld& world, const fric::FrictionStepConfig& cfg,
+                                  uint32_t ticks) {
+    fric::StepFrictionWorldN(world, cfg, ticks);   // the FC4 N-tick driver, reused VERBATIM
+}
+
+// ----- (D) Lockstep + rollback (the FR5 pattern with the step fn swapped — MAXIMAL REUSE) --------------
+// The FR8 world IS a convex::ConvexWorld and its tick IS fric::StepFrictionWorld, so the FC5 lockstep/
+// rollback harness (itself the CX5 command + snapshot machinery reused VERBATIM: convex::ConvexCommand /
+// ApplyConvexCommands / SnapshotConvex / RestoreConvex / ConvexBodiesEqual) applies UNCHANGED — these are
+// thin named delegates so the fracture flagship exposes its own FR5-shaped entry points. A peer fed the
+// initial spawn world + the command stream alone re-derives the exact settled BOX rubble bit-for-bit; a
+// mispredicted command is corrected by snapshot-restore + re-sim (fric::RunFricRollback's control flow).
+inline convex::ConvexWorld RunFractureHullLockstep(const convex::ConvexWorld& world0,
+                                                   const fric::FrictionStepConfig& cfg,
+                                                   const std::vector<convex::ConvexCommand>& commands,
+                                                   uint32_t ticks, bool* outIdentical = nullptr) {
+    return fric::RunFricLockstep(world0, cfg, commands, ticks, outIdentical);
+}
+
+inline convex::ConvexWorld RunFractureHullRollback(const convex::ConvexWorld& world0,
+                                                   const fric::FrictionStepConfig& cfg,
+                                                   const std::vector<convex::ConvexCommand>& authStream,
+                                                   const std::vector<convex::ConvexCommand>& mispredictStream,
+                                                   uint32_t ticks, uint32_t rollbackAt,
+                                                   bool* outCorrectedEqAuthority = nullptr,
+                                                   bool* outMispredictDiverged = nullptr) {
+    return fric::RunFricRollback(world0, cfg, authStream, mispredictStream, ticks, rollbackAt,
+                                 outCorrectedEqAuthority, outMispredictDiverged);
+}
+
+// ----- (E) MeasureFractHullRubble: the honest settled-rubble metrics (the upgrade proof numbers) -------
+// dynamic/maxSpeed/maxPenetration come from convex::MeasureStack (reused VERBATIM — max dynamic |vel| is
+// the REST test, max pairwise BoxSat penetration is the RESTING-INTERPENETRATION bound). The FR8-specific
+// numbers: maxQuatDev = the max over the DYNAMIC pieces of max(|orient.x|,|orient.y|,|orient.z|) (identity
+// has x=y=z=0, w=kOne — any nonzero vector part is a REAL rotation; FR4's sphere path provably keeps ALL
+// of these EXACTLY 0, see the FR4 banner) and rotated = #dynamic pieces whose deviation exceeds `rotEps`
+// (the caller-pinned non-triviality threshold). minDynamicY = the lowest dynamic center (the pile floor).
+// Pure integer, fixed order.
+struct FractHullRubbleState {
+    uint32_t dynamic        = 0;   // # dynamic box pieces
+    uint32_t rotated        = 0;   // # dynamic pieces with a non-trivial settled rotation (> rotEps)
+    fx       maxQuatDev     = 0;   // max over dynamic pieces of max(|qx|,|qy|,|qz|) — 0 == all identity
+    fx       maxSpeed       = 0;   // max FxLength(vel) over dynamic pieces (the rest test)
+    fx       maxPenetration = 0;   // max pairwise BoxSat penetration (the resting-overlap bound)
+    fx       minDynamicY    = 0;   // lowest dynamic center y (the pile floor)
+};
+inline FractHullRubbleState MeasureFractHullRubble(const convex::ConvexWorld& world, fx rotEps) {
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+    FractHullRubbleState st;
+    const convex::StackMeasure ms = convex::MeasureStack(world);   // reused VERBATIM
+    st.dynamic = ms.dynamicCount;
+    st.maxSpeed = ms.maxSpeed;
+    st.maxPenetration = ms.maxPenetration;
+    fx minY = (fx)0x7FFFFFFF;
+    bool any = false;
+    for (const fpx::FxBody& b : world.bodies) {
+        if (!convex::IsDynamic(b)) continue;
+        any = true;
+        fx dev = absfx(b.orient.x);
+        const fx dy = absfx(b.orient.y);
+        const fx dz = absfx(b.orient.z);
+        if (dy > dev) dev = dy;
+        if (dz > dev) dev = dz;
+        if (dev > st.maxQuatDev) st.maxQuatDev = dev;
+        if (dev > rotEps) ++st.rotated;
+        if (b.pos.y < minY) minY = b.pos.y;
+    }
+    st.minDynamicY = any ? minY : 0;
+    return st;
+}
+
+}  // namespace hf::sim::fract (FR8)
