@@ -132,8 +132,11 @@ stack:
   angular rubble that rests rotated; *honest gap:* shards are centroid-AABB boxes, not exact Voronoi cell hulls).
 - **Rigid bodies + contacts:** convex GJK/EPA, hull friction + joints (`--hf1-points` … `--hf6-hull`), warm-started
   stacking, CCD, ragdoll, vehicle; **spatial islands + sleeping hull piles** (`--ps7-hullsleep`, golden
-  `ps7_hullsleep` — O(n·k) island discovery byte-identical to all-pairs; *honest gap:* the warm hull solver is not
-  validated for hard drops, a tracked hardening candidate); **hinge/prismatic/motorized joints**
+  `ps7_hullsleep` — O(n·k) island discovery byte-identical to all-pairs); **high-energy impact hardening**
+  (`--wh7-harddrop`, golden `wh7_harddrop` — the WH7/R13 fix: 2.5-unit hard drops onto large floors settle
+  fully asleep; the former "not validated for hard drops" gap was two int32 narrowphase bugs, root-caused +
+  fixed; *honest gap:* the plain GJK dot products still saturate int32 at a CSO diameter of ~104 world units);
+  **hinge/prismatic/motorized joints**
   (`--jt7-machine`, golden `jt7_machine` — a lockstep-replayable motorized crank-slider; *honest gap:* the
   crank-slider is over-constrained with a pinned deterministic residual, and the bench is zero-g).
 - **Hair/strands:** `--hr1-hair-shot` (golden `hr1_hair`) — Q16.16 PBD rods with bending + strand↔strand collision,

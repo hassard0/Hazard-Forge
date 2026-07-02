@@ -538,17 +538,32 @@ inline convex::ContactManifold HullManifoldFromEpa(const FxHull& hullA, const Fx
     }
     if (candN == 0) return fallbackOnePoint();   // no clipped vertex penetrates -> the single-point floor
 
+    // WH7 (Track-R R13 BUG FIX — the PS7 "hard drops pump energy" root cause): refN is the RAW face cross
+    // (FaceNormalWorld is documented "NOT normalized ... only the SIGN of the outward test matters",
+    // manifold.h:162-164 — true for SupportFace/IncidentFace/the clip, which are sign-only). But the raw dot
+    // d = FxDot(refN, rel) above is |refN| x the TRUE perpendicular depth, and |refN| = 2 x the reference
+    // face's first-triangle AREA — so the STORED depth was inflated by the face size (x4 for the unit-half-1
+    // test boxes, x64 for a half-4 floor, x144 for half-6). The position de-pen consumes depths[0] directly
+    // (excess = depths[0] - slop), so a shallow graze on a large floor face was pushed apart by ~face-area x
+    // the true depth — the "phantom contact at 1.76-unit separation" (= 64 x a 0.0275 true depth on the PS7
+    // half-4 floor) and the hop/energy-pump on hard drops. THE FIX: rescale the STORED depths by |refN|
+    // (fxdiv, int64 — the true perpendicular distance, matching the box-SAT path whose unit axes never had
+    // this bug). The keep test above and the deepest/order reduce below stay on the RAW d — bit-identical
+    // candidate selection + ordering (the WH1 tagged-clip alignment contract is untouched).
+    const fx refNLen = fpx::FxLength(refN);
+    auto trueDepth = [&](fx dRaw) -> fx { return (refNLen > 0) ? fxdiv(dRaw, refNLen) : dRaw; };
+
     // Reduce to <=4: ALWAYS keep the DEEPEST (max depth, tie -> lowest clip-order index), then up to 3 MORE
-    // in clip order. Deterministic (== convex.h:539-552).
+    // in clip order. Deterministic (== convex.h:539-552). The RAW candDepth ranks; the stored depth is TRUE.
     int deepest = 0;
     for (int k = 1; k < candN; ++k) if (candDepth[k] > candDepth[deepest]) deepest = k;
     m.points[0] = candPts[deepest];
-    m.depths[0] = candDepth[deepest];
+    m.depths[0] = trueDepth(candDepth[deepest]);
     uint32_t cnt = 1;
     for (int k = 0; k < candN && cnt < 4; ++k) {
         if (k == deepest) continue;
         m.points[cnt] = candPts[k];
-        m.depths[cnt] = candDepth[k];
+        m.depths[cnt] = trueDepth(candDepth[k]);
         ++cnt;
     }
     m.count = cnt;

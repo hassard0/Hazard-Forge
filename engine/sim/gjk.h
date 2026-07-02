@@ -333,8 +333,22 @@ inline SubResult DoSimplex3(const FxVec3& a, const FxVec3& b, const FxVec3& c) {
     const fx d3 = FxDot(ab, bo);
     const fx d4 = FxDot(ac, bo);
     if (d3 >= 0 && d4 <= d3) { r.size = 1; r.keep[0] = 1; r.w[0] = kOne; r.dir = bo; return r; }
+    // WH7 (Track-R R13 BUG FIX — the "gjk iteration-cap near-field band" root cause): the Voronoi-region
+    // determinants va/vb/vc are PRODUCTS of the d1..d6 dots. On large hulls (a floor half-extent > ~4) the
+    // dots reach hundreds of world units, so the old int32 fxmul products — and above all the face-region SUM
+    // denom = va+vb+vc — WRAPPED int32 (e.g. the observed 38399*kOne ~ 2.52e9 > INT32_MAX): garbage barycentric
+    // weights put the "closest" point tens of units OUTSIDE the CSO, the loop cycled to kGjkMaxIter, and the
+    // tick-by-tick outcome flipped between PHANTOM overlap (a falling hull braked + torqued in mid-air — the
+    // PS7 "phantom contact at 1.76-unit separation") and MISSED true overlap. THE FIX: carry the determinants,
+    // their sum, and the barycentric ratio in int64 (det64 = ((int64)p*q>>16) - ((int64)r*s>>16); the ratio
+    // (v<<16)/denom in int64). BIT-IDENTICAL to the old math wherever no overflow occurred (same shifts, same
+    // truncation); only the previously-wrapping band changes (the bug). The plain d1..d6 dots stay int32-safe
+    // up to a CSO diameter of ~104 world units (FxDot's own ceiling) — the documented remaining band.
+    auto det64 = [](fx p, fx q, fx s, fx t) -> int64_t {
+        return (((int64_t)p * (int64_t)q) >> 16) - (((int64_t)s * (int64_t)t) >> 16);
+    };
     // Edge region AB: closest on AB.
-    const fx vc = fxmul(d1, d4) - fxmul(d3, d2);
+    const int64_t vc = det64(d1, d4, d3, d2);
     if (vc <= 0 && d1 >= 0 && d3 <= 0) {
         const fx denom = d1 - d3;
         const fx t = (denom > convex::kEdgeEps || denom < -convex::kEdgeEps) ? fxdiv(d1, denom) : 0;
@@ -347,8 +361,8 @@ inline SubResult DoSimplex3(const FxVec3& a, const FxVec3& b, const FxVec3& c) {
     const fx d5 = FxDot(ab, co);
     const fx d6 = FxDot(ac, co);
     if (d6 >= 0 && d5 <= d6) { r.size = 1; r.keep[0] = 2; r.w[0] = kOne; r.dir = co; return r; }
-    // Edge region AC: closest on AC.
-    const fx vb = fxmul(d5, d2) - fxmul(d1, d6);
+    // Edge region AC: closest on AC. (int64 det — the WH7 overflow fix.)
+    const int64_t vb = det64(d5, d2, d1, d6);
     if (vb <= 0 && d2 >= 0 && d6 <= 0) {
         const fx denom = d2 - d6;
         const fx t = (denom > convex::kEdgeEps || denom < -convex::kEdgeEps) ? fxdiv(d2, denom) : 0;
@@ -356,8 +370,8 @@ inline SubResult DoSimplex3(const FxVec3& a, const FxVec3& b, const FxVec3& c) {
         r.size = 2; r.keep[0] = 0; r.keep[1] = 2; r.w[0] = kOne - t; r.w[1] = t; r.dir = FxNeg(closest);
         return r;
     }
-    // Edge region BC.
-    const fx va = fxmul(d3, d6) - fxmul(d5, d4);
+    // Edge region BC. (int64 det — the WH7 overflow fix.)
+    const int64_t va = det64(d3, d6, d5, d4);
     if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) {
         const fx denom = (d4 - d3) + (d5 - d6);
         const fx t = (denom > convex::kEdgeEps || denom < -convex::kEdgeEps) ? fxdiv(d4 - d3, denom) : 0;
@@ -368,11 +382,12 @@ inline SubResult DoSimplex3(const FxVec3& a, const FxVec3& b, const FxVec3& c) {
     }
     // Face region: closest = a + u*AB + v*AC via barycentrics (va,vb,vc). The face normal direction toward
     // the origin determines the search dir; the closest point's weights are the face barycentrics.
-    const fx denom = va + vb + vc;
+    // (int64 sum + int64 ratio — the WH7 overflow fix: THIS sum is the observed int32 wrap site.)
+    const int64_t denom = va + vb + vc;
     fx u, v;   // weights on b (=v) and c (=w via 1-u-v); the Ericson (u=va,v=vb,w=vc)/denom
-    if (denom > convex::kEdgeEps || denom < -convex::kEdgeEps) {
-        v = fxdiv(vb, denom);
-        const fx w = fxdiv(vc, denom);
+    if (denom > (int64_t)convex::kEdgeEps || denom < -(int64_t)convex::kEdgeEps) {
+        v = (fx)((vb << 16) / denom);
+        const fx w = (fx)((vc << 16) / denom);
         u = kOne - v - w;
         r.w[0] = u; r.w[1] = v; r.w[2] = w;
     } else {
@@ -1028,12 +1043,18 @@ inline EpaResult Epa(const FxHull& hullA, const FxBody& bodyA,
     const fx d11 = FxDot(v1, v1);
     const fx d20 = FxDot(v2, v0);
     const fx d21 = FxDot(v2, v1);
-    const fx denom = fxmul(d00, d11) - fxmul(d01, d01);
+    // WH7 (Track-R R13 BUG FIX, the DoSimplex3 twin): the Cramer determinant/numerators are PRODUCTS of the
+    // d00..d21 dots — on large hulls (CSO face edges of tens of units) fxmul(d00,d11) wrapped int32 (e.g.
+    // ~345000*kOne on a half-6 floor's CSO), yielding garbage barycentrics -> garbage witness CONTACT POINTS
+    // (a bogus lever arm torques the impulse solve). Carry the products, the determinant, and the ratios in
+    // int64. BIT-IDENTICAL wherever the old math did not overflow (same shifts/truncation).
+    auto mul64 = [](fx p, fx q) -> int64_t { return ((int64_t)p * (int64_t)q) >> 16; };
+    const int64_t denom = mul64(d00, d11) - mul64(d01, d01);
     fx bu, bv, bw;
-    if (denom > convex::kEdgeEps || denom < -convex::kEdgeEps) {
-        bv = fxdiv(fxmul(d11, d20) - fxmul(d01, d21), denom);   // weight on pB
-        bw = fxdiv(fxmul(d00, d21) - fxmul(d01, d20), denom);   // weight on pC
-        bu = kOne - bv - bw;                                     // weight on pA
+    if (denom > (int64_t)convex::kEdgeEps || denom < -(int64_t)convex::kEdgeEps) {
+        bv = (fx)(((mul64(d11, d20) - mul64(d01, d21)) << 16) / denom);   // weight on pB
+        bw = (fx)(((mul64(d00, d21) - mul64(d01, d20)) << 16) / denom);   // weight on pC
+        bu = kOne - bv - bw;                                              // weight on pA
     } else {
         bu = kOne; bv = 0; bw = 0;   // degenerate triangle -> full weight on pA (deterministic)
     }

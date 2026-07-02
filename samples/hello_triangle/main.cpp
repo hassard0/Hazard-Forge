@@ -682,6 +682,7 @@ int main(int argc, char** argv) {
     const char* persistLockstepShotPath = nullptr; // --persist-lockstep-shot <out.bmp> (Slice PS5, THE NETCODE HEADLINE: Deterministic Persistent Contacts LOCKSTEP + ROLLBACK, the 5th slice of FLAGSHIP #21 — PURE CPU, NO GPU shader, NO new RHI; both backends run the IDENTICAL persist.h::RunPersistLockstep/RunPersistRollback over the PS4 warm+sleep tower scene + a fixed command stream (early perturbations -> the tower settles + SLEEPS -> a wake-impulse wakes + topples it). THE KEY DIFFERENCE from CX5/FC5: the replayable state INCLUDES the persistent impulse CACHE (PS2) + the per-body SLEEP STATE (PS4), so the snapshot captures the TRIPLE (bodies + cache + sleep); PersistStatesEqual compares all three. authority==replica BIT-IDENTICAL inputs-only (bodies+cache+sleep) + rollback corrects a real misprediction to authority BIT-EXACT; converged authority world drawn as the PS4-style 2D side-view, bit-identical cross-backend BY CONSTRUCTION. Reuses the frozen CX5 convex:: command helpers verbatim, swapping StepWarmSleepWorld for StepConvexWorld + extending the snapshot.)
     const char* persistRenderShotPath = nullptr; // --persist-render-shot <out.bmp> (Slice PS6, THE MONEY-SHOT COMPLETING FLAGSHIP #21: Deterministic Persistent Contacts LIT 3D INSTANCED RENDER CAPSTONE — the bit-exact PS4 warm+sleep tower (static floor + 3 dynamic slabs) + the PS5 command stream (early nudges -> the tower settles + SLEEPS -> a wake-impulse at tick 160 wakes the island + topples it), run through persist::RunPersistLockstep to the converged AUTHORITY world, then turned into a split FLOAT instance set via persist::PersistToRenderInstances (a one-line delegate to the frozen convex::ConvexToRenderInstances — each body -> an oriented CUBE: fpx::FxBodyTransform pose x the box's 2*halfExtents scale, the ONE float crossing, render-only), drawn as MATTE warm-amber dynamic boxes on a cool-grey floor through the EXISTING cube-mesh + lit_instanced.vert + lit.frag + shadow_instanced.vert (REUSED VERBATIM from --fric-render-shot; NO new shader/RHI); provenance (two calls byte-equal) + toppled + shaded; FLOAT render-capstone bar, Metal-baked golden persist_render.png)
     const char* ps7HullSleepShotPath = nullptr; // --ps7-hullsleep-shot <out.bmp> (Slice PS7, Track-R R7: SPATIAL ISLAND PARTITIONING + GENERAL-HULL CONTACT PERSISTENCE — the mixed tetra/octa/box hull pile (the GJ6 shapes) on a floor hull runs persist::RunPersistHullLockstep (the WH5 command+snapshot mold over persist::StepWarmSleepHullWorldSpatial — broadphase candidates [frozen BP4 grid] -> narrowphase-confirm -> UNION-FIND islands O(n*k), replacing the all-pairs O(n^2) island discovery; the hull warm-start/sleep machinery is the frozen flagship-#26 warmhull.h REUSED VERBATIM): the pile settles -> goes FULLY ASLEEP -> a wake-impulse at tick 60 wakes ONLY the struck island (partial-world wake) -> re-settles -> ASLEEP at the final tick. PURE CPU (NO GPU dispatch, NO new shader, NO new RHI) — both backends run the IDENTICAL header-only integer harness -> the golden is bit-identical BY CONSTRUCTION. Proofs: lockstep identical + two-run determinism + rollback corrected + mispredict diverged + spatial islands == all-pairs islands + all-asleep. PURE-INTEGER 2D side-view; SLEEPING hulls tinted cool slate, awake warm amber (the wh4 convention); stat line = hulls/steps/digest/asleepCount/islandCount/candidatePairs.)
+    const char* wh7HardDropShotPath = nullptr; // --wh7-harddrop-shot <out.bmp> (Slice WH7, Track-R R13: WARM-HULL SOLVER HARDENING FOR HIGH-ENERGY IMPACTS — the previously-IMPOSSIBLE scene: a mixed tetra/octa/box hull trio HARD-DROPPED 2.5 units onto a HALF-6 floor hull (BOTH PS7-documented fatal triggers: "floor half-extent >4 or a 2.5-unit drop makes hulls hop"), warm+sleep-settled to FULLY ASLEEP at exactly-zero residual with angDamp 0.9 (NOT the 0.3 workaround). WH7 root-caused the PS7 "gjk iteration-cap near-field band" energy pump to TWO int32 bugs, both fixed surgically + mirrored VERBATIM into every GPU shader copy: (A) manifold.h HullManifoldFromEpa stored |refN|-INFLATED contact depths (refN = the RAW face cross, magnitude 2x the ref face's first-triangle area — x144 on a half-6 floor; the de-pen consumed them directly -> the observed one-tick y 0.5 -> 9.97 teleport; the "phantom contact at 1.76-unit separation" = a 64x-inflated 0.0275 true depth); FIX: rescale the STORED depths by |refN| (int64), keep/order on the RAW dot (bit-identical selection, the WH1 tag alignment untouched). (B) gjk.h DoSimplex3's Voronoi determinants + their face-region SUM, and Epa's Cramer barycentric products, WRAPPED int32 on large hulls (observed sum ~2.52e9 > INT32_MAX): garbage weights put GJK's "closest" tens of units outside the CSO, the loop cycled to kGjkMaxIter (the misdiagnosed band) and flipped between PHANTOM overlap at true separations up to ~0.12+ (a falling hull braked+torqued MID-AIR) and MISSED true overlaps; FIX: int64 determinants/sums/ratios — bit-identical wherever the old math did not wrap. PURE CPU showcase (NO GPU dispatch, NO new shader, NO new RHI — the PS7/JT7 Track-R convention): both backends run the IDENTICAL header-only warmhull::StepWarmSleepHullWorld harness -> the pure-integer 2D side-view golden is bit-identical BY CONSTRUCTION. Proofs: NO phantom (max contact separation EXACTLY 0 over every emitted contact), NO pump (no hull rises more than slop above its contact-entry height — pre-fix: multi-unit hops), fully ASLEEP at the pinned tick 134 with awake-speed EXACTLY 0, two-run determinism. Stat line = hulls/steps/digest/maxSep/restSpeed.)
     const char* jt7MachineShotPath = nullptr; // --jt7-machine-shot <out.bmp> (Slice JT7, Track-R R12: HINGE + PRISMATIC + MOTORIZED JOINTS — closing the flagship-#15 "ball+cone limits only" caveat. PURE CPU (NO GPU dispatch, NO new shader, NO new RHI — the GR5/CL7/PS7/NAV7 Track-R precedent): both backends run the IDENTICAL header-only integer harness (joint.h JT7: FxHingeJoint = the JT1 ball pivot + a shortest-arc quaternion AXIS-ALIGNMENT [cross/dot only, zero transcendentals]; FxPrismaticJoint = the perpendicular-offset line projection + slide-range clamp + the JT2-nlerp orientation lock; FxJointMotor = a velocity-target impulse with a per-tick ACCUMULATED-IMPULSE clamp [maxImpulse=0 == unmotorized bit-identical]) over THE MACHINE: a motorized hinge WHEEL cranks a connecting ROD driving a PISTON on a prismatic rail (a crank-slider on a zero-g bench — the family is positional PBD with no velocity reconciliation, so the bench is zero-g by design), spun up by kCmdSetMotorTarget commands (+2 rad/s at tick 0, REVERSED to -2 at tick 120 — the actuation IS the input stream) 200 ticks. Proofs: lockstep authority==replica BIT-IDENTICAL (bodies + motor setpoints), two-run determinism, rollback corrects a mispredicted setpoint EXACTLY, the piston strokes the full crank diameter, the hinge axis + prismatic line errors pinned at 0 LSB, the pinned FNV digest. Pure-integer 2D side-view golden; stat line = bodies/joints/motors/steps/digest/axisErr/slideErr.)
     const char* seqRenderShotPath = nullptr; // --seq-render-shot <out.bmp> (Slice SEQ-S6, THE MONEY-SHOT COMPLETING FLAGSHIP #25: Deterministic Cinematic Sequencer LIT 3D RENDER CAPSTONE — a hero object sampled at N successive times along a FIXED cutscene TransformTrack (seq::MakeCutsceneTrail, bit-exact seq::SampleTransform — the S4 rotation keys + scale pulse enriched with a wider translation sweep), turned into a ghosted MOTION TRAIL of FLOAT instances via seq::SeqToRenderInstances (one math::Mat4 per sample via SeqTransformToMat4 = translate*rotate*scale through FxToFloat — the ONE float crossing, render-only), drawn as MATTE warm cubes on a cool-grey floor through the EXISTING cube-mesh + lit_instanced.vert + lit.frag + shadow_instanced.vert (REUSED VERBATIM from --persist-render-shot/--fract-render-shot; NO new shader/RHI); four proofs (provenance/count, two-run BYTE-IDENTICAL, instances==rebuild, empty no-op); FLOAT render-capstone bar, Metal-baked golden seq_render.png)
     const char* fricLockstepShotPath = nullptr;  // --fric-lockstep-shot <out.bmp> (Slice FC5, THE NETCODE HEADLINE: Deterministic Contact Friction LOCKSTEP + ROLLBACK, the 5th slice of FLAGSHIP #20 — PURE CPU, NO GPU shader, NO new RHI; both backends run the IDENTICAL fric.h::RunFricLockstep/RunFricRollback over the FC4 friction-stack scene + a fixed command stream (impulse/angVel perturbations knock the friction-held tower, it re-settles under Coulomb friction); authority==replica BIT-IDENTICAL inputs-only + rollback corrects a real misprediction to authority BIT-EXACT; converged authority world drawn as the FC4-style 2D side-view, bit-identical cross-backend BY CONSTRUCTION. Reuses the frozen CX5 convex:: command/snapshot helpers verbatim, swapping StepFrictionWorld for StepConvexWorld)
@@ -4123,6 +4124,14 @@ int main(int argc, char** argv) {
     // new shader/RHI; sleeping hulls tinted cool slate). Its OWN loop (the standalone-loop pattern).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--ps7-hullsleep-shot") == 0) { ps7HullSleepShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice WH7: --wh7-harddrop-shot <out.bmp> (WARM-HULL SOLVER HARDENING FOR HIGH-ENERGY IMPACTS, Track-R
+    // R13 — the mixed hull trio HARD-DROPPED 2.5 units onto a HALF-6 floor settles FULLY ASLEEP; the two
+    // int32 narrowphase bugs behind the PS7 "iteration-cap near-field band" energy pump are fixed; PURE CPU,
+    // NO new shader/RHI). Its OWN loop (the standalone-loop pattern).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--wh7-harddrop-shot") == 0) { wh7HardDropShotPath = argv[i + 1]; break; }
     }
 
     // Slice NAV7: --nav7-ml-shot <out.bmp> (MULTI-LAYER NAVMESH, Track-R R8 — the flagship-#7
@@ -23095,7 +23104,9 @@ int main(int argc, char** argv) {
             cfg.solveIters  = 24;
             cfg.restitution = 0;
             cfg.slop        = kOne / 64;
-            cfg.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
+            // WH7 succession (== the mf4-stack succession): beta 0.2 -> 0.8 — the 0.2 was an EFFECTIVE 0.8
+            // under the pre-WH7 4x-inflated depths; the true-depth face value restores the settle band.
+            cfg.beta        = (fx)((int64_t)8 * kOne / 10);    // 0.8 — the true-depth de-pen strength
             cfg.linDamp     = (fx)((int64_t)95 * kOne / 100);  // 0.95
             cfg.angDamp     = kOne;                            // OFF (the MF4 headline — the settle is real)
             cfg.posIters    = 2;
@@ -52774,7 +52785,13 @@ int main(int argc, char** argv) {
             kCfg.solveIters  = 24;
             kCfg.restitution = 0;
             kCfg.slop        = kOne / 64;
-            kCfg.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2 — gentle de-pen (the multi-point depths)
+            // WH7 succession: beta 0.2 -> 0.8. The 0.2 was tuned against the manifold-depth bug (depths
+            // arrived 4x-inflated on these unit-half-1 boxes, so 0.2 was an EFFECTIVE 0.8 on the true
+            // depth). With the WH7 fix the face-value 0.8 (the ConvexStepConfig default) restores the
+            // intended de-pen strength; at a literal 0.2 the hardened settle overruns the 0.05 band
+            // (0.0859). The headline holds at 0.8: hardened 0.0275 < band, frozen 0.0901 >= band
+            // (== the manifold_test MF4 succession).
+            kCfg.beta        = (fx)((int64_t)8 * kOne / 10);    // 0.8 — the true-depth de-pen strength
             kCfg.linDamp     = (fx)((int64_t)95 * kOne / 100);  // 0.95
             kCfg.angDamp     = kOne;                            // OFF — the teeter must be real for the headline
             kCfg.posIters    = 2;
@@ -53122,7 +53139,13 @@ int main(int argc, char** argv) {
             convex::ConvexStepConfig kCfg;
             kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
             kCfg.dt          = kOne / 60;
-            kCfg.solveIters  = 2;                               // LOW — the convergence test (warm needs fewer iters)
+            // WH7 succession: solveIters 2 -> 1. Pre-WH7 the cold reference was destabilized by the
+            // manifold-depth bug (a 4x-overdriven de-pen on these unit-half-1 boxes churned the cold step's
+            // residual), so iters=2 showed warm < cold. With TRUE depths (the WH7 fix) the cold hardened step
+            // also settles this easy scene at iters=2; at the HARDER iters=1 budget the accumulated
+            // warm-start's advantage is real (warm ~0.0141 < band vs cold ~0.0790 >= band) — the honest
+            // re-anchor of the same claim (== the warmhull_test WH3 succession).
+            kCfg.solveIters  = 1;                               // LOW — the convergence test (warm needs fewer iters)
             kCfg.restitution = 0;
             kCfg.slop        = kOne / 64;
             kCfg.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
@@ -55018,7 +55041,7 @@ int main(int argc, char** argv) {
             kCfg.wakeThreshold    = (fx)(2 * (int)kOne);
             kCfg.sleepTicks       = 30;
             const fx kCell = fi(6);              // >= the tumbling unit-hull inflated-AABB diameter (BP2 bound)
-            const uint32_t kTicks = 260u;        // settle (asleep by 38) -> wake at 60 -> re-settle (asleep ~202)
+            const uint32_t kTicks = 260u;        // settle (asleep by 30 post-WH7) -> wake at 60 -> re-settle (asleep ~112)
             const uint32_t kWakeTick = 60u;
             const uint32_t kRollbackAt = 60u;
 
@@ -55208,6 +55231,258 @@ int main(int argc, char** argv) {
                                 (unsigned long long)digest, sm.asleepCount, spatialIslands.islandCount,
                                 candidatePairs);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ps7HullSleepShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- WARM-HULL SOLVER HARDENING FOR HIGH-ENERGY IMPACTS (--wh7-harddrop-shot <out.bmp>, Slice WH7,
+        // Track-R R13 — the PS7-discovered hardening). PURE CPU — NO GPU dispatch, NO new shader, NO new RHI;
+        // both backends run the IDENTICAL header-only integer harness (warmhull::StepWarmSleepHullWorld over
+        // the hard-drop scene) so the golden is bit-identical cross-backend BY CONSTRUCTION. THE SCENE: the
+        // PS7 mixed tetra/octa/box hull trio HARD-DROPPED 2.5 units onto a HALF-6 floor hull — BOTH of the
+        // PS7-documented fatal triggers at once ("floor half-extent >4 or a 2.5-unit drop makes hulls hop"),
+        // with angDamp 0.9 (NOT the 0.3 workaround). Pre-WH7 this scene pumped energy through two int32
+        // narrowphase bugs (an |refN|-inflated manifold depth feeding the de-pen + int32-wrapping GJK/EPA
+        // barycentric determinants -> phantom mid-air contacts) — hulls hopped/teleported. Post-fix it lands,
+        // settles, and goes FULLY ASLEEP at exactly-zero residual. Proofs: NO phantom (max contact separation
+        // EXACTLY 0 across every emitted contact), NO pump (no hull rises more than slop above its
+        // contact-entry height), fully asleep at the pinned tick, two-run determinism.
+        if (wh7HardDropShotPath) {
+            using math::Vec3;
+            namespace convex   = hf::sim::convex;
+            namespace gjk      = hf::sim::gjk;
+            namespace fpx      = hf::sim::fpx;
+            namespace manifold = hf::sim::manifold;
+            namespace persist  = hf::sim::persist;
+            namespace warmhull = hf::sim::warmhull;
+            using convex::fx;
+            const fx kOne = convex::kOne;
+            auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+
+            // The warm+sleep config: the WH4 recipe with angDamp 0.9 (the 0.3 workaround REMOVED).
+            const fx kGravY = (fx)(-9.8 * (double)kOne - 0.5);
+            warmhull::HullSleepConfig kCfg;
+            kCfg.warm.gravity     = convex::FxVec3{0, kGravY, 0};
+            kCfg.warm.dt          = kOne / 60;
+            kCfg.warm.solveIters  = 8;
+            kCfg.warm.restitution = 0;
+            kCfg.warm.slop        = kOne / 64;
+            kCfg.warm.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
+            kCfg.warm.linDamp     = (fx)((int64_t)95 * kOne / 100);  // 0.95
+            kCfg.warm.angDamp     = (fx)((int64_t)90 * kOne / 100);  // 0.90 — NOT the removed 0.3 workaround
+            kCfg.warm.posIters    = 4;
+            kCfg.sleepThreshold   = kOne;
+            kCfg.wakeThreshold    = (fx)(2 * (int)kOne);
+            kCfg.sleepTicks       = 30;
+            const uint32_t kTicks = 400u;
+            const uint32_t kFirstAsleepPinned = 134u;   // the pinned fully-asleep tick (MSVC == clang)
+
+            auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+                fpx::FxBody b;
+                b.pos = {x, y, z};
+                b.orient = fpx::FxQuat{0, 0, 0, kOne};
+                b.invMass = dyn ? kOne : 0;
+                b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+                b.vel = {0, 0, 0};
+                b.angVel = {0, 0, 0};
+                return b;
+            };
+            // THE SCENE: the PS7 hull trio, every drop height +2.5 units (kDrop), on a HALF-6 floor.
+            const fpx::FxQuat kTiltZp05{0, 0, (fx)1638, (fx)65515};   // tiltZ(+0.05 rad), host-snapped
+            const fx kDrop = (fx)((int64_t)5 * kOne / 2);             // +2.5 units — the hard drop
+            auto buildScene = [&]() {
+                gjk::HullWorld w;
+                w.bodies.push_back(makeBody(0, 0, 0, false));
+                w.hulls.push_back(gjk::MakeBox(fi(6), kOne, fi(6)));                     // 0 HALF-6 floor
+                { fpx::FxBody b = makeBody((fx)-144179, (fx)134348 + kDrop, 0, true);    // (-2.2, 4.55)
+                  w.bodies.push_back(b); w.hulls.push_back(gjk::MakeTetra(kOne)); }      // 1 tetra
+                { fpx::FxBody b = makeBody(0, (fx)134348 + kDrop, 0, true);              // (0, 4.55)
+                  b.orient = kTiltZp05;
+                  w.bodies.push_back(b); w.hulls.push_back(gjk::MakeOcta(kOne)); }       // 2 octa
+                { fpx::FxBody b = makeBody((fx)144179, (fx)132382 + kDrop, 0, true);     // (2.2, 4.52)
+                  w.bodies.push_back(b); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne)); }  // 3 box
+                return w;
+            };
+            const gjk::HullWorld kInit = buildScene();
+            const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+
+            // === The harness (PURE CPU): step + instrument the no-phantom / no-pump evidence. ===
+            struct Wh7Run {
+                gjk::HullWorld world;
+                warmhull::HullCache cache;
+                std::vector<warmhull::HullSleepState> sleep;
+                uint32_t firstAsleep = 0;
+                fx maxSep = 0;       // max TRUE separation across every emitted contact (0 == no phantom)
+                fx maxRise = 0;      // max rise of any hull above its contact-entry height (<= slop == no pump)
+                fx maxDepth = 0;     // max manifold depth (the ~v*dt impact band)
+            };
+            auto runOnce = [&]() {
+                Wh7Run r;
+                r.world = buildScene();
+                fx entryY[8];
+                bool contacted[8];
+                for (uint32_t i = 0; i < 8; ++i) { entryY[i] = 0; contacted[i] = false; }
+                for (uint32_t t = 0; t < kTicks; ++t) {
+                    warmhull::StepWarmSleepHullWorld(r.world, r.cache, r.sleep, kCfg);
+                    for (size_t i = 0; i < r.world.bodies.size(); ++i) {
+                        for (size_t j = i + 1; j < r.world.bodies.size(); ++j) {
+                            if (r.world.bodies[i].invMass == 0 && r.world.bodies[j].invMass == 0) continue;
+                            const convex::ContactManifold m = manifold::HullContactMulti(
+                                r.world.bodies[i], r.world.hulls[i], r.world.bodies[j], r.world.hulls[j]);
+                            if (m.count == 0) continue;
+                            // The NO-PHANTOM evidence: a contact may only exist at TRUE overlap.
+                            const gjk::GjkResult g = gjk::Gjk(r.world.hulls[i], r.world.bodies[i],
+                                                              r.world.hulls[j], r.world.bodies[j]);
+                            const fx sep = g.overlap ? 0 : fpx::FxLength(g.separation);
+                            if (sep > r.maxSep) r.maxSep = sep;
+                            for (uint32_t k = 0; k < m.count; ++k)
+                                if (m.depths[k] > r.maxDepth) r.maxDepth = m.depths[k];
+                            const size_t two[2] = {i, j};
+                            for (int bi = 0; bi < 2; ++bi) {
+                                const size_t idx = two[bi];
+                                if (r.world.bodies[idx].invMass == 0 || idx >= 8) continue;
+                                if (!contacted[idx]) { contacted[idx] = true; entryY[idx] = r.world.bodies[idx].pos.y; }
+                            }
+                        }
+                    }
+                    // The NO-PUMP evidence: once a hull has touched, it never rises more than slop above its
+                    // contact-entry height (pre-fix: multi-unit hops / a one-tick y 0.5 -> 9.97 teleport).
+                    for (size_t i = 0; i < r.world.bodies.size() && i < 8; ++i) {
+                        if (!contacted[i]) continue;
+                        const fx rise = r.world.bodies[i].pos.y - entryY[i];
+                        if (rise > r.maxRise) r.maxRise = rise;
+                    }
+                    const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(r.world, r.sleep);
+                    if (r.firstAsleep == 0 && sm.asleepCount == sm.dynamicCount) r.firstAsleep = t + 1;
+                }
+                return r;
+            };
+            const Wh7Run run1 = runOnce();
+
+            // PROOF (1) NO PHANTOM: every emitted contact was at TRUE overlap (max separation EXACTLY 0).
+            if (run1.maxSep != 0) {
+                std::fprintf(stderr, "FATAL: wh7-harddrop phantom contact (maxSep=%d != 0)\n", (int)run1.maxSep);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("wh7-harddrop: NO phantom contact (max contact separation EXACTLY 0 over %u ticks)\n",
+                        kTicks);
+
+            // PROOF (2) NO PUMP: no hull rose more than slop above its contact-entry height.
+            if (run1.maxRise > kCfg.warm.slop) {
+                std::fprintf(stderr, "FATAL: wh7-harddrop energy pump (maxRise=%d > slop=%d)\n",
+                             (int)run1.maxRise, (int)kCfg.warm.slop);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("wh7-harddrop: NO energy pump (maxRise:%d <= slop:%d; pre-fix: multi-unit hops)\n",
+                        (int)run1.maxRise, (int)kCfg.warm.slop);
+
+            // PROOF (3) THE SETTLE: fully asleep at the pinned tick, awake-speed EXACTLY 0.
+            const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(run1.world, run1.sleep);
+            if (sm.asleepCount != sm.dynamicCount || sm.maxSpeed != 0 ||
+                run1.firstAsleep != kFirstAsleepPinned) {
+                std::fprintf(stderr, "FATAL: wh7-harddrop did not settle asleep (asleep=%u/%u speed=%d "
+                             "firstAsleep=%u pinned=%u)\n", sm.asleepCount, sm.dynamicCount,
+                             (int)sm.maxSpeed, run1.firstAsleep, kFirstAsleepPinned);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("wh7-harddrop: {hulls:%u, asleep:%u/%u, firstAsleep:%u, restSpeed:%d} — the 2.5-unit "
+                        "hard drop onto the half-6 floor SETTLES (both pre-fix fatal triggers)\n",
+                        kBodyCount, sm.asleepCount, sm.dynamicCount, run1.firstAsleep, (int)sm.maxSpeed);
+
+            // PROOF (4) DETERMINISM: two full instrumented runs byte-identical over the (bodies, cache,
+            // sleep) TRIPLE.
+            const Wh7Run run2 = runOnce();
+            if (!warmhull::WarmHullStatesEqual(run1.world.bodies, run1.cache, run1.sleep,
+                                               run2.world.bodies, run2.cache, run2.sleep)) {
+                std::fprintf(stderr, "FATAL: wh7-harddrop two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("wh7-harddrop determinism: two runs BYTE-IDENTICAL\n");
+
+            // --- Golden: the PS7-style PURE-INTEGER 2D side-view (XY) of the settled asleep trio; sleeping
+            // hulls tinted cool slate, an (impossible here) awake hull warm amber (the wh4 convention). ---
+            const gjk::HullWorld& cw = run1.world;
+            const int kPxPerUnit = 48, kMargin = 24;
+            const int kWorldHalfX = 7, kWorldHalfY = 5;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+                bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+            }
+            auto putPx = [&](int ix, int iy, const Vec3& col) {
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            };
+            auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+                int dx = x1 - x0, dy = y1 - y0;
+                int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+                int nn = adx > ady ? adx : ady;
+                if (nn == 0) { putPx(x0, y0, col); return; }
+                for (int s = 0; s <= nn; ++s) {
+                    int ix = x0 + (int)((int64_t)dx * s / nn);
+                    int iy = y0 + (int)((int64_t)dy * s / nn);
+                    putPx(ix, iy, col);
+                }
+            };
+            auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+                const int gx = (int)(wx >> convex::kFrac);
+                const int gy = (int)(wy >> convex::kFrac);
+                ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+                iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);   // flip y (up)
+            };
+            auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+                std::vector<std::pair<int,int>> pts;
+                for (uint32_t v = 0; v < h.count; ++v) {
+                    const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+                    int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+                    pts.push_back({ix, iy});
+                }
+                if (pts.size() < 2) return;
+                std::sort(pts.begin(), pts.end());
+                pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+                const size_t m = pts.size();
+                if (m < 2) return;
+                auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                                const std::pair<int,int>& B) {
+                    return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                           (int64_t)(A.second - O.second) * (B.first - O.first);
+                };
+                std::vector<std::pair<int,int>> hull(2 * m);
+                size_t k = 0;
+                for (size_t i = 0; i < m; ++i) {
+                    while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+                    hull[k++] = pts[i];
+                }
+                size_t lower = k + 1;
+                for (size_t i = m - 1; i-- > 0; ) {
+                    while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+                    hull[k++] = pts[i];
+                }
+                hull.resize(k > 0 ? k - 1 : 0);
+                const size_t hn = hull.size();
+                if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+                for (size_t i = 0; i < hn; ++i)
+                    drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+            };
+            drawHullXY(cw.bodies[0], kInit.hulls[0], Vec3{0.30f, 0.40f, 0.55f});   // static floor (cool grey)
+            for (uint32_t i = 1; i < kBodyCount; ++i) {
+                const Vec3 col = (i < run1.sleep.size() && run1.sleep[i].asleep)
+                                     ? Vec3{0.40f, 0.62f, 0.82f} : Vec3{0.88f, 0.62f, 0.28f};
+                drawHullXY(cw.bodies[i], kInit.hulls[i], col);
+            }
+
+            const uint64_t digest = persist::DigestBodyWorld(cw.bodies);
+            bool ok = WriteBMP(wh7HardDropShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — wh7 hard-drop hulls settle "
+                                "{hulls:%u, steps:%u, digest:0x%016llx, maxSep:%d, restSpeed:%d}\n",
+                                wh7HardDropShotPath, imgW, imgH, kBodyCount, kTicks,
+                                (unsigned long long)digest, (int)run1.maxSep, (int)sm.maxSpeed);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", wh7HardDropShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

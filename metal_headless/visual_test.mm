@@ -43206,7 +43206,10 @@ static int RunMf4StackShowcase(const char* outPath) {
     kCfg.solveIters  = 24;
     kCfg.restitution = 0;
     kCfg.slop        = kOne / 64;
-    kCfg.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
+    // WH7 succession (== the Vulkan --mf4-stack-shot + manifold_test MF4): beta 0.2 -> 0.8. The 0.2 was
+    // tuned against the manifold-depth bug (4x-inflated depths on unit-half-1 boxes == an effective 0.8);
+    // with true depths the face-value 0.8 restores the intended de-pen strength.
+    kCfg.beta        = (fx)((int64_t)8 * kOne / 10);    // 0.8 — the true-depth de-pen strength
     kCfg.linDamp     = (fx)((int64_t)95 * kOne / 100);  // 0.95
     kCfg.angDamp     = kOne;                            // OFF
     kCfg.posIters    = 2;
@@ -43385,7 +43388,10 @@ static int RunWh3WarmShowcase(const char* outPath) {
     convex::ConvexStepConfig kCfg;
     kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
     kCfg.dt          = kOne / 60;
-    kCfg.solveIters  = 2;
+    // WH7 succession (== the Vulkan --wh3-warm-shot + warmhull_test WH3): solveIters 2 -> 1. With the
+    // WH7 true-depth fix the cold hardened step also settles this scene at iters=2; the accumulated
+    // warm-start's advantage is real at the harder iters=1 budget (warm ~0.0141 < band vs cold ~0.0790).
+    kCfg.solveIters  = 1;
     kCfg.restitution = 0;
     kCfg.slop        = kOne / 64;
     kCfg.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
@@ -44399,6 +44405,236 @@ static int RunPs7HullSleepShowcase(const char* outPath) {
                 "{hulls:%u, steps:%u, digest:0x%016llx, asleepCount:%u, islandCount:%u, candidatePairs:%u}\n",
                 outPath, imgW, imgH, kBodyCount, kTicks, (unsigned long long)digest,
                 sm.asleepCount, spatialIslands.islandCount, candidatePairs);
+    return 0;
+}
+
+// ===== Slice WH7 — WARM-HULL SOLVER HARDENING FOR HIGH-ENERGY IMPACTS showcase (--wh7-harddrop) (Track-R R13,
+// the PS7-discovered hardening). PURE CPU — NO GPU compute, NO new shader, NO new RHI; the warmhull.h
+// warm+sleep harness is header-only integer math, so Metal runs the IDENTICAL hard-drop scene + pure-integer
+// 2D side-view the Vulkan --wh7-harddrop-shot runs on Windows -> the golden is bit-identical cross-backend BY
+// CONSTRUCTION. THE SCENE: the PS7 mixed tetra/octa/box hull trio HARD-DROPPED 2.5 units onto a HALF-6 floor
+// hull — BOTH PS7-documented fatal triggers at once ("floor half-extent >4 or a 2.5-unit drop makes hulls
+// hop"), angDamp 0.9 (NOT the 0.3 workaround). WH7 fixed the two int32 narrowphase bugs behind the pump (the
+// |refN|-inflated manifold depths feeding the de-pen + the int32-wrapping GJK/EPA barycentric determinants ->
+// phantom mid-air contacts); post-fix the trio lands, settles, and goes FULLY ASLEEP at exactly-zero residual.
+// Proof lines match the Vulkan side EXACTLY. New golden tests/golden/metal/wh7_harddrop.png (Mac-baked by the
+// controller).
+static int RunWh7HardDropShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace manifold = hf::sim::manifold;
+    namespace persist  = hf::sim::persist;
+    namespace warmhull = hf::sim::warmhull;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+
+    // The warm+sleep config (== the Vulkan --wh7-harddrop-shot): the WH4 recipe, angDamp 0.9.
+    const fx kGravY = (fx)(-9.8 * (double)kOne - 0.5);
+    warmhull::HullSleepConfig kCfg;
+    kCfg.warm.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.warm.dt          = kOne / 60;
+    kCfg.warm.solveIters  = 8;
+    kCfg.warm.restitution = 0;
+    kCfg.warm.slop        = kOne / 64;
+    kCfg.warm.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
+    kCfg.warm.linDamp     = (fx)((int64_t)95 * kOne / 100);  // 0.95
+    kCfg.warm.angDamp     = (fx)((int64_t)90 * kOne / 100);  // 0.90 — NOT the removed 0.3 workaround
+    kCfg.warm.posIters    = 4;
+    kCfg.sleepThreshold   = kOne;
+    kCfg.wakeThreshold    = (fx)(2 * (int)kOne);
+    kCfg.sleepTicks       = 30;
+    const uint32_t kTicks = 400u;
+    const uint32_t kFirstAsleepPinned = 134u;   // the pinned fully-asleep tick (MSVC == clang)
+
+    auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = fpx::FxQuat{0, 0, 0, kOne};
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    // THE SCENE (== the Vulkan side, EXACT Q16.16 integer constants — no libm).
+    const fpx::FxQuat kTiltZp05{0, 0, (fx)1638, (fx)65515};   // tiltZ(+0.05 rad), host-snapped
+    const fx kDrop = (fx)((int64_t)5 * kOne / 2);             // +2.5 units — the hard drop
+    auto buildScene = [&]() {
+        gjk::HullWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, false));
+        w.hulls.push_back(gjk::MakeBox(fi(6), kOne, fi(6)));                     // 0 HALF-6 floor
+        { fpx::FxBody b = makeBody((fx)-144179, (fx)134348 + kDrop, 0, true);    // (-2.2, 4.55)
+          w.bodies.push_back(b); w.hulls.push_back(gjk::MakeTetra(kOne)); }      // 1 tetra
+        { fpx::FxBody b = makeBody(0, (fx)134348 + kDrop, 0, true);              // (0, 4.55)
+          b.orient = kTiltZp05;
+          w.bodies.push_back(b); w.hulls.push_back(gjk::MakeOcta(kOne)); }       // 2 octa
+        { fpx::FxBody b = makeBody((fx)144179, (fx)132382 + kDrop, 0, true);     // (2.2, 4.52)
+          w.bodies.push_back(b); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne)); }  // 3 box
+        return w;
+    };
+    const gjk::HullWorld kInit = buildScene();
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+
+    // === The harness (PURE CPU): step + instrument the no-phantom / no-pump evidence (== Vulkan). ===
+    struct Wh7Run {
+        gjk::HullWorld world;
+        warmhull::HullCache cache;
+        std::vector<warmhull::HullSleepState> sleep;
+        uint32_t firstAsleep = 0;
+        fx maxSep = 0;       // max TRUE separation across every emitted contact (0 == no phantom)
+        fx maxRise = 0;      // max rise of any hull above its contact-entry height (<= slop == no pump)
+        fx maxDepth = 0;     // max manifold depth (the ~v*dt impact band)
+    };
+    auto runOnce = [&]() {
+        Wh7Run r;
+        r.world = buildScene();
+        fx entryY[8];
+        bool contacted[8];
+        for (uint32_t i = 0; i < 8; ++i) { entryY[i] = 0; contacted[i] = false; }
+        for (uint32_t t = 0; t < kTicks; ++t) {
+            warmhull::StepWarmSleepHullWorld(r.world, r.cache, r.sleep, kCfg);
+            for (size_t i = 0; i < r.world.bodies.size(); ++i) {
+                for (size_t j = i + 1; j < r.world.bodies.size(); ++j) {
+                    if (r.world.bodies[i].invMass == 0 && r.world.bodies[j].invMass == 0) continue;
+                    const convex::ContactManifold m = manifold::HullContactMulti(
+                        r.world.bodies[i], r.world.hulls[i], r.world.bodies[j], r.world.hulls[j]);
+                    if (m.count == 0) continue;
+                    const gjk::GjkResult g = gjk::Gjk(r.world.hulls[i], r.world.bodies[i],
+                                                      r.world.hulls[j], r.world.bodies[j]);
+                    const fx sep = g.overlap ? 0 : fpx::FxLength(g.separation);
+                    if (sep > r.maxSep) r.maxSep = sep;
+                    for (uint32_t k = 0; k < m.count; ++k)
+                        if (m.depths[k] > r.maxDepth) r.maxDepth = m.depths[k];
+                    const size_t two[2] = {i, j};
+                    for (int bi = 0; bi < 2; ++bi) {
+                        const size_t idx = two[bi];
+                        if (r.world.bodies[idx].invMass == 0 || idx >= 8) continue;
+                        if (!contacted[idx]) { contacted[idx] = true; entryY[idx] = r.world.bodies[idx].pos.y; }
+                    }
+                }
+            }
+            for (size_t i = 0; i < r.world.bodies.size() && i < 8; ++i) {
+                if (!contacted[i]) continue;
+                const fx rise = r.world.bodies[i].pos.y - entryY[i];
+                if (rise > r.maxRise) r.maxRise = rise;
+            }
+            const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(r.world, r.sleep);
+            if (r.firstAsleep == 0 && sm.asleepCount == sm.dynamicCount) r.firstAsleep = t + 1;
+        }
+        return r;
+    };
+    const Wh7Run run1 = runOnce();
+
+    // PROOF (1) NO PHANTOM.
+    if (run1.maxSep != 0) return fail("wh7-harddrop: phantom contact (maxSep != 0)");
+    std::printf("wh7-harddrop: NO phantom contact (max contact separation EXACTLY 0 over %u ticks)\n", kTicks);
+
+    // PROOF (2) NO PUMP.
+    if (run1.maxRise > kCfg.warm.slop) return fail("wh7-harddrop: energy pump (maxRise > slop)");
+    std::printf("wh7-harddrop: NO energy pump (maxRise:%d <= slop:%d; pre-fix: multi-unit hops)\n",
+                (int)run1.maxRise, (int)kCfg.warm.slop);
+
+    // PROOF (3) THE SETTLE.
+    const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(run1.world, run1.sleep);
+    if (sm.asleepCount != sm.dynamicCount || sm.maxSpeed != 0 || run1.firstAsleep != kFirstAsleepPinned)
+        return fail("wh7-harddrop: did not settle fully asleep at the pinned tick");
+    std::printf("wh7-harddrop: {hulls:%u, asleep:%u/%u, firstAsleep:%u, restSpeed:%d} — the 2.5-unit hard "
+                "drop onto the half-6 floor SETTLES (both pre-fix fatal triggers)\n",
+                kBodyCount, sm.asleepCount, sm.dynamicCount, run1.firstAsleep, (int)sm.maxSpeed);
+
+    // PROOF (4) DETERMINISM.
+    const Wh7Run run2 = runOnce();
+    if (!warmhull::WarmHullStatesEqual(run1.world.bodies, run1.cache, run1.sleep,
+                                       run2.world.bodies, run2.cache, run2.sleep))
+        return fail("wh7-harddrop: two runs differ (nondeterministic)");
+    std::printf("wh7-harddrop determinism: two runs BYTE-IDENTICAL\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view as the Vulkan --wh7-harddrop-shot (identical by
+    // construction); sleeping hulls tinted cool slate, awake warm amber (the wh4 convention). ---
+    const gjk::HullWorld& cw = run1.world;
+    const int kPxPerUnit = 48, kMargin = 24;
+    const int kWorldHalfX = 7, kWorldHalfY = 5;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    drawHullXY(cw.bodies[0], kInit.hulls[0], Vec3{0.30f, 0.40f, 0.55f});   // static floor (cool grey)
+    for (uint32_t i = 1; i < kBodyCount; ++i) {
+        const Vec3 col = (i < run1.sleep.size() && run1.sleep[i].asleep)
+                             ? Vec3{0.40f, 0.62f, 0.82f} : Vec3{0.88f, 0.62f, 0.28f};
+        drawHullXY(cw.bodies[i], kInit.hulls[i], col);
+    }
+
+    const uint64_t digest = persist::DigestBodyWorld(cw.bodies);
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — wh7 hard-drop hulls settle "
+                "{hulls:%u, steps:%u, digest:0x%016llx, maxSep:%d, restSpeed:%d}\n",
+                outPath, imgW, imgH, kBodyCount, kTicks, (unsigned long long)digest,
+                (int)run1.maxSep, (int)sm.maxSpeed);
     return 0;
 }
 
@@ -62194,7 +62430,9 @@ static int RunMf6RenderShowcase(const char* outPath) {
     cfg.solveIters  = 24;
     cfg.restitution = 0;
     cfg.slop        = kOne / 64;
-    cfg.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
+    // WH7 succession (== the Vulkan --mf6-render-shot): beta 0.2 -> 0.8 — the 0.2 was an EFFECTIVE 0.8
+    // under the pre-WH7 4x-inflated depths; the true-depth face value restores the settle band.
+    cfg.beta        = (fx)((int64_t)8 * kOne / 10);    // 0.8 — the true-depth de-pen strength
     cfg.linDamp     = (fx)((int64_t)95 * kOne / 100);  // 0.95
     cfg.angDamp     = kOne;                            // OFF (the MF4 headline — the settle is real)
     cfg.posIters    = 2;
@@ -79262,6 +79500,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ps7-hullsleep") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ps7_hullsleep.png";
             try { return RunPs7HullSleepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --wh7-harddrop <out.png> (alias --wh7-harddrop-shot): render the WARM-HULL SOLVER HARDENING FOR
+        // HIGH-ENERGY IMPACTS showcase (Slice WH7, Track-R R13 — the PS7-discovered hardening). PURE CPU —
+        // the warmhull.h warm+sleep harness is header-only integer math, so Metal runs the IDENTICAL
+        // hard-drop scene (the mixed hull trio hard-dropped 2.5 units onto a HALF-6 floor, both pre-WH7
+        // fatal triggers, angDamp 0.9) + pure-integer side-view the Vulkan --wh7-harddrop-shot runs on
+        // Windows -> bit-identical cross-backend BY CONSTRUCTION. NO GPU compute, NO new shader, NO new RHI.
+        // New golden tests/golden/metal/wh7_harddrop.png.
+        if (argc > 1 && (std::strcmp(argv[1], "--wh7-harddrop") == 0 ||
+                         std::strcmp(argv[1], "--wh7-harddrop-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_wh7_harddrop.png";
+            try { return RunWh7HardDropShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --jt7-machine <out.png> (alias --jt7-machine-shot): render the HINGE + PRISMATIC + MOTORIZED

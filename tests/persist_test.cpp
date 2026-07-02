@@ -1145,7 +1145,10 @@ int main() {
             const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(ws, ss);
             check(sm.asleepCount == 4u && sm.maxSpeed == 0,
                   "PS7 hull step (WH4 tower): the tower is FULLY ASLEEP through the spatial path");
-            check(persist::DigestBodyWorld(ws.bodies) == 0x4bda223ac42f8adfull,
+            // WH7 succession: 0x4bda223ac42f8adf pinned the settled world under the manifold-depth bug
+            // (HullManifoldFromEpa stored |refN|-inflated depths -> a 4x-overdriven de-pen on these unit-half-1
+            // boxes; fixed in WH7). The new digest is the settle under TRUE perpendicular depths.
+            check(persist::DigestBodyWorld(ws.bodies) == 0x07d55326b28a51f1ull,
                   "PS7 hull step (WH4 tower): the pinned asleep body digest");
             uint32_t cand = 0;
             const persist::IslandPartition ap = persist::BuildHullIslandsAllPairs(ws);
@@ -1159,10 +1162,11 @@ int main() {
         }
 
         // --- (3b-3f) THE MIXED-HULL PILE (tetra/octa/box on a floor hull — the GJ6 shapes) ---
-        // The PS7 hull-sleep scene: gentle near-rest drops (the WH4 recipe — the frozen accumulated warm
-        // solver is NOT validated for hard drops; a large fall pumps energy through GJK near-field phantom
-        // contacts, the documented gjk.h iteration-cap band) + angDamp 0.3 (the GJ4 stability knob — the 0.9
-        // retain leaves tetra/octa rocking above the sleep threshold forever).
+        // The PS7 hull-sleep scene: gentle near-rest drops + angDamp 0.3. HISTORY (WH7): these were shipped as
+        // WORKAROUNDS for what PS7 misdiagnosed as a "gjk iteration-cap near-field" phantom; the real root
+        // cause was HullManifoldFromEpa storing |refN|-inflated depths (64x on this half-4 floor face), fixed
+        // in WH7 — hard drops now settle (see warmhull_test WH7, which pins THIS pile with the workarounds
+        // REMOVED). The gentle-drop configuration is kept here as the canonical PS7 pinned scene.
         warmhull::HullSleepConfig pcfg;
         pcfg.warm.gravity = convex::FxVec3{0, kGravY, 0};
         pcfg.warm.dt = kOne / 60; pcfg.warm.solveIters = 8; pcfg.warm.restitution = 0;
@@ -1195,13 +1199,17 @@ int main() {
             const warmhull::HullSleepMeasure m = warmhull::MeasureHullSleep(pw, psl);
             if (firstAllAsleep == 0 && m.asleepCount == m.dynamicCount) firstAllAsleep = t + 1;
         }
-        check(firstAllAsleep == 38u,
-              "PS7 hull sleep: the mixed tetra/octa/box pile goes FULLY ASLEEP at the pinned step 38");
+        // WH7 succession: 38 -> 30 (the true-depth de-pen no longer over-pushes the settling hulls, so the
+        // pile quiets 8 ticks sooner; same fully-asleep outcome).
+        check(firstAllAsleep == 30u,
+              "PS7 hull sleep: the mixed tetra/octa/box pile goes FULLY ASLEEP at the pinned step 30");
         {
             const warmhull::HullSleepMeasure m = warmhull::MeasureHullSleep(pw, psl);
             check(m.asleepCount == 3u && m.maxSpeed == 0,
                   "PS7 hull sleep: all 3 dynamic hulls asleep at 400 ticks, zero residual");
-            check(persist::DigestBodyWorld(pw.bodies) == 0x95549e6550d6aa85ull,
+            // WH7 succession: 0x95549e6550d6aa85 pinned the buggy-depth settle (64x-inflated de-pen on the
+            // half-4 floor face); the new digest is the true-depth settle.
+            check(persist::DigestBodyWorld(pw.bodies) == 0x170ad93a8259d9beull,
                   "PS7 hull sleep: the pinned settled-asleep pile digest (MSVC == clang)");
             std::printf("ps7 hull pile: firstAllAsleep=%u asleep=%u/%u\n",
                         firstAllAsleep, m.asleepCount, m.dynamicCount);
@@ -1239,9 +1247,12 @@ int main() {
                 const warmhull::HullSleepMeasure mm = warmhull::MeasureHullSleep(pw, psl);
                 if (mm.asleepCount == mm.dynamicCount) { reAsleep = t + 1; break; }
             }
-            check(reAsleep == 141u,
-                  "PS7 hull wake: the struck box re-settles -> the pile is FULLY ASLEEP again at the pinned step 141");
-            check(persist::DigestBodyWorld(pw.bodies) == 0x98d8e3e056a9433eull,
+            // WH7 succession: 141 -> 51 and a new digest. Pre-fix the struck box's landing re-triggered the
+            // inflated de-pen (each graze on the half-4 floor pushed 64x the true depth -> repeated hops
+            // stretched the re-settle to 141 ticks); with true depths it slides, stops, and re-sleeps at 51.
+            check(reAsleep == 51u,
+                  "PS7 hull wake: the struck box re-settles -> the pile is FULLY ASLEEP again at the pinned step 51");
+            check(persist::DigestBodyWorld(pw.bodies) == 0xb09bd6e5a5b75f2eull,
                   "PS7 hull wake: the pinned re-settled pile digest");
         }
         // (3e) HULL WARM-START METRICS (the honest pin): on THIS pile at low iters the persistent cache shows
@@ -1262,14 +1273,19 @@ int main() {
                 persist::StepWarmSleepHullWorldSpatial(cw, fresh, csl, wcfg, kHullCell);
             }
             const gjk::HullStackMeasure cm = gjk::MeasureHullStack(cw);
-            check(wm.maxSpeed == 127317 && wm.maxPenetration == 0,
-                  "PS7 warm-start metrics: pinned WARM pile metrics {maxSpeed 127317, maxPen 0}");
-            check(cm.maxSpeed == 127317 && cm.maxPenetration == 0,
-                  "PS7 warm-start metrics: pinned COLD pile metrics {maxSpeed 127317, maxPen 0}");
-            check(wm.maxSpeed == cm.maxSpeed && wm.maxPenetration == cm.maxPenetration,
-                  "PS7 warm-start metrics: warm == cold on this scene (NO measurable benefit — reported honestly)");
-            std::printf("ps7 warm-vs-cold (pile, iters=2, K=%u): warm{maxSpeed=%d,maxPen=%d} == "
-                        "cold{maxSpeed=%d,maxPen=%d} (no benefit on this scene; WH3's tower carries the benefit proof)\n",
+            // WH7 succession (an honest UPGRADE): the old pin recorded warm == cold == {127317, 0} — NO
+            // measurable warm-start benefit on this pile. That equality was an artifact of the manifold-depth
+            // bug: the 64x-inflated de-pen dominated both runs identically, drowning the solver difference.
+            // With TRUE depths the persistent cache shows a REAL benefit at low iters: the warm pile's residual
+            // maxSpeed is ~400x lower than the cold (force-cleared-cache) pile's. Both pinned exactly.
+            check(wm.maxSpeed == 19 && wm.maxPenetration == 1153,
+                  "PS7 warm-start metrics: pinned WARM pile metrics {maxSpeed 19, maxPen 1153}");
+            check(cm.maxSpeed == 8264 && cm.maxPenetration == 1177,
+                  "PS7 warm-start metrics: pinned COLD pile metrics {maxSpeed 8264, maxPen 1177}");
+            check(wm.maxSpeed < cm.maxSpeed,
+                  "PS7 warm-start metrics: warm residual < cold on this scene (a REAL warm-start benefit)");
+            std::printf("ps7 warm-vs-cold (pile, iters=2, K=%u): warm{maxSpeed=%d,maxPen=%d} < "
+                        "cold{maxSpeed=%d,maxPen=%d} (the warm-start benefit, unmasked by the WH7 depth fix)\n",
                         K, (int)wm.maxSpeed, (int)wm.maxPenetration, (int)cm.maxSpeed, (int)cm.maxPenetration);
         }
         // (3f) LOCKSTEP + ROLLBACK over the spatial hull-persist world (the WH5 command+snapshot mold):
@@ -1304,7 +1320,9 @@ int main() {
             const warmhull::HullSleepMeasure m = warmhull::MeasureHullSleep(a1.world, a1.sleep);
             check(m.asleepCount == 3u && m.maxSpeed == 0,
                   "PS7 lockstep: the converged world is FULLY ASLEEP (settle -> wake -> re-settle replayed)");
-            check(persist::DigestBodyWorld(a1.world.bodies) == 0x3a49757d1f7d6750ull,
+            // WH7 succession: 0x3a49757d1f7d6750 (the roadmap-quoted PS7 digest) pinned the buggy-depth
+            // trajectory; the new digest is the true-depth settle->wake->re-settle replay.
+            check(persist::DigestBodyWorld(a1.world.bodies) == 0xfa9b771dbec0f1d2ull,
                   "PS7 lockstep: the pinned converged authority digest");
             uint32_t cand = 0;
             const persist::IslandPartition sp = persist::BuildHullIslandsSpatial(a1.world, kHullCell, &cand);

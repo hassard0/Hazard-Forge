@@ -416,6 +416,11 @@ int main() {
         check(roundtrip, "MF4 FxMat3SymInverse: M*Minv ~ identity (round-trip within tol)");
 
         // The hardened-step config (== the showcases). angDamp OFF so the teeter is real.
+        // WH7 succession: beta 0.2 -> 0.8 in THIS settle-headline block. The 0.2 was tuned against the
+        // manifold-depth bug (depths arrived 4x-inflated on these unit-half-1 boxes, so 0.2 was an EFFECTIVE
+        // 0.8 on the true depth). With the WH7 fix the face-value 0.8 (the ConvexStepConfig default) restores
+        // the intended de-pen strength; at a literal 0.2 the hardened settle overruns the 0.05 band (0.0859).
+        // The headline still holds at 0.8: hardened 0.0275 < band, frozen 0.0901 >= band.
         const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
         convex::ConvexStepConfig cfg;
         cfg.gravity     = convex::FxVec3{0, kGravY, 0};
@@ -423,7 +428,7 @@ int main() {
         cfg.solveIters  = 24;
         cfg.restitution = 0;
         cfg.slop        = kOne / 64;
-        cfg.beta        = (fx)((int64_t)2 * kOne / 10);
+        cfg.beta        = (fx)((int64_t)8 * kOne / 10);
         cfg.linDamp     = (fx)((int64_t)95 * kOne / 100);
         cfg.angDamp     = kOne;
         cfg.posIters    = 2;

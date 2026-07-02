@@ -505,7 +505,10 @@ Sub DoSimplex3(int3 a, int3 b, int3 c) {
     int d3 = FxDot(ab, bo);
     int d4 = FxDot(ac, bo);
     if (d3 >= 0 && d4 <= d3) { r.size=1; r.keep[0]=1; r.w[0]=HF_FPX_ONE; r.dir=bo; return r; }
-    int vc = fxmul(d1, d4) - fxmul(d3, d2);
+    // WH7 (R13 bug fix, == gjk.h DoSimplex3): the Voronoi determinants + their face-region SUM overflow
+    // int32 on large hulls (the "iteration-cap near-field band" phantom) — carry them in int64. Bit-identical
+    // wherever the old int32 math did not wrap.
+    int64_t vc = (((int64_t)d1 * (int64_t)d4) >> HF_FPX_FRAC) - (((int64_t)d3 * (int64_t)d2) >> HF_FPX_FRAC);
     if (vc <= 0 && d1 >= 0 && d3 <= 0) {
         int denom = d1 - d3;
         int t = (denom > HF_GJK_EDGE_EPS || denom < -HF_GJK_EDGE_EPS) ? fxdiv(d1, denom) : 0;
@@ -516,14 +519,14 @@ Sub DoSimplex3(int3 a, int3 b, int3 c) {
     int d5 = FxDot(ab, co);
     int d6 = FxDot(ac, co);
     if (d6 >= 0 && d5 <= d6) { r.size=1; r.keep[0]=2; r.w[0]=HF_FPX_ONE; r.dir=co; return r; }
-    int vb = fxmul(d5, d2) - fxmul(d1, d6);
+    int64_t vb = (((int64_t)d5 * (int64_t)d2) >> HF_FPX_FRAC) - (((int64_t)d1 * (int64_t)d6) >> HF_FPX_FRAC);
     if (vb <= 0 && d2 >= 0 && d6 <= 0) {
         int denom = d2 - d6;
         int t = (denom > HF_GJK_EDGE_EPS || denom < -HF_GJK_EDGE_EPS) ? fxdiv(d2, denom) : 0;
         int3 closest = int3(a.x + fxmul(ac.x,t), a.y + fxmul(ac.y,t), a.z + fxmul(ac.z,t));
         r.size=2; r.keep[0]=0; r.keep[1]=2; r.w[0]=HF_FPX_ONE - t; r.w[1]=t; r.dir=FxNeg(closest); return r;
     }
-    int va = fxmul(d3, d6) - fxmul(d5, d4);
+    int64_t va = (((int64_t)d3 * (int64_t)d6) >> HF_FPX_FRAC) - (((int64_t)d5 * (int64_t)d4) >> HF_FPX_FRAC);
     if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) {
         int denom = (d4 - d3) + (d5 - d6);
         int t = (denom > HF_GJK_EDGE_EPS || denom < -HF_GJK_EDGE_EPS) ? fxdiv(d4 - d3, denom) : 0;
@@ -531,11 +534,11 @@ Sub DoSimplex3(int3 a, int3 b, int3 c) {
         int3 closest = int3(b.x + fxmul(bc.x,t), b.y + fxmul(bc.y,t), b.z + fxmul(bc.z,t));
         r.size=2; r.keep[0]=1; r.keep[1]=2; r.w[0]=HF_FPX_ONE - t; r.w[1]=t; r.dir=FxNeg(closest); return r;
     }
-    int denom = va + vb + vc;
+    int64_t denom = va + vb + vc;
     int u, v, w;
-    if (denom > HF_GJK_EDGE_EPS || denom < -HF_GJK_EDGE_EPS) {
-        v = fxdiv(vb, denom);
-        w = fxdiv(vc, denom);
+    if (denom > (int64_t)HF_GJK_EDGE_EPS || denom < -(int64_t)HF_GJK_EDGE_EPS) {
+        v = (int)((vb << HF_FPX_FRAC) / denom);
+        w = (int)((vc << HF_FPX_FRAC) / denom);
         u = HF_FPX_ONE - v - w;
         r.w[0]=u; r.w[1]=v; r.w[2]=w;
     } else {
@@ -894,11 +897,16 @@ EpaOut RunEpa(FxHull hA, int4 oA, int3 pA, FxHull hB, int4 oB, int3 pB, GjkOut g
     int d11 = FxDot(v1, v1);
     int d20 = FxDot(v2, v0);
     int d21 = FxDot(v2, v1);
-    int denom = fxmul(d00, d11) - fxmul(d01, d01);
+    // WH7 (R13 bug fix, == gjk.h Epa): the Cramer products of the d00..d21 dots overflow int32 on large
+    // hulls (garbage witness contact points) — carry the determinant/numerators/ratios in int64. Bit-identical
+    // wherever the old int32 math did not wrap.
+    int64_t denom = (((int64_t)d00 * (int64_t)d11) >> HF_FPX_FRAC) - (((int64_t)d01 * (int64_t)d01) >> HF_FPX_FRAC);
     int bu, bv, bw;
-    if (denom > HF_GJK_EDGE_EPS || denom < -HF_GJK_EDGE_EPS) {
-        bv = fxdiv(fxmul(d11, d20) - fxmul(d01, d21), denom);
-        bw = fxdiv(fxmul(d00, d21) - fxmul(d01, d20), denom);
+    if (denom > (int64_t)HF_GJK_EDGE_EPS || denom < -(int64_t)HF_GJK_EDGE_EPS) {
+        int64_t nbv = (((int64_t)d11 * (int64_t)d20) >> HF_FPX_FRAC) - (((int64_t)d01 * (int64_t)d21) >> HF_FPX_FRAC);
+        int64_t nbw = (((int64_t)d00 * (int64_t)d21) >> HF_FPX_FRAC) - (((int64_t)d01 * (int64_t)d20) >> HF_FPX_FRAC);
+        bv = (int)((nbv << HF_FPX_FRAC) / denom);
+        bw = (int)((nbw << HF_FPX_FRAC) / denom);
         bu = HF_FPX_ONE - bv - bw;
     } else { bu = HF_FPX_ONE; bv = 0; bw = 0; }
     int3 cA = FxAdd(FxAdd(FxScale(gVertsA[cfa], bu), FxScale(gVertsA[cfb], bv)), FxScale(gVertsA[cfc], bw));
@@ -1104,11 +1112,18 @@ Manifold HullContactMulti(FxHull hA, int4 oA, int3 pA, FxHull hB, int4 oB, int3 
     for (int k = 1; k < candN; ++k) if (candDepth[k] > candDepth[deepest]) deepest = k;
     int3 outPts[4];
     int  outDep[4];
-    outPts[0] = candPts[deepest]; outDep[0] = candDepth[deepest];
+    // WH7 (R13 bug fix): refN is the RAW face cross, so the raw dot d above is |refN| x the TRUE perpendicular
+    // depth; rescale the STORED depths by |refN| (== manifold.h HullManifoldFromEpa trueDepth). The keep test
+    // + the deepest/order reduce stay on the RAW d — bit-identical candidate selection + ordering.
+    int refNLen = FxLength(refN);
+    outPts[0] = candPts[deepest];
+    outDep[0] = (refNLen > 0) ? fxdiv(candDepth[deepest], refNLen) : candDepth[deepest];
     int cnt = 1;
     for (int k = 0; k < candN && cnt < 4; ++k) {
         if (k == deepest) continue;
-        outPts[cnt] = candPts[k]; outDep[cnt] = candDepth[k]; ++cnt;
+        outPts[cnt] = candPts[k];
+        outDep[cnt] = (refNLen > 0) ? fxdiv(candDepth[k], refNLen) : candDepth[k];
+        ++cnt;
     }
     m.count = (uint)cnt;
     for (int z = 0; z < cnt; ++z) { m.pts[z] = outPts[z]; m.depths[z] = outDep[z]; }
@@ -1285,9 +1300,13 @@ KeyedManifold BuildKeyedManifold(uint bodyAIdx, FxHull hA, int4 oA, int3 pA,
         int deepest = 0;
         for (int k = 1; k < candN; ++k) if (candDepth[k] > candDepth[deepest]) deepest = k;
         int3 outPts[4]; int outDep[4]; uint orderTag[4];
-        outPts[0] = candPts[deepest]; outDep[0] = candDepth[deepest]; orderTag[0] = candTag[deepest];
+        // WH7 (R13 bug fix): stored depths rescaled by |refN| to the TRUE perpendicular depth (== the CPU
+        // m.depths after the manifold.h fix); keep/order stayed on the RAW d (bit-identical selection).
+        int refNLenT = FxLength(refN);
+        outPts[0] = candPts[deepest]; orderTag[0] = candTag[deepest];
+        outDep[0] = (refNLenT > 0) ? fxdiv(candDepth[deepest], refNLenT) : candDepth[deepest];
         int cnt = 1;
-        for (int k = 0; k < candN && cnt < 4; ++k) { if (k == deepest) continue; outPts[cnt] = candPts[k]; outDep[cnt] = candDepth[k]; orderTag[cnt] = candTag[k]; ++cnt; }
+        for (int k = 0; k < candN && cnt < 4; ++k) { if (k == deepest) continue; outPts[cnt] = candPts[k]; outDep[cnt] = (refNLenT > 0) ? fxdiv(candDepth[k], refNLenT) : candDepth[k]; orderTag[cnt] = candTag[k]; ++cnt; }
         km.m.count = (uint)cnt; km.m.normal = nrm;
         for (int z = 0; z < cnt; ++z) { km.m.pts[z] = outPts[z]; km.m.depths[z] = outDep[z]; pointTag[z] = orderTag[z]; }
     }

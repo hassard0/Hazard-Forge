@@ -18,6 +18,8 @@
 // Pure C++ (hf_core), ASan-eligible like the other sim tests.
 #include "sim/warmhull.h"
 
+#include "sim/persist.h"   // WH7: persist::DigestBodyWorld (the world-state pin; already a transitive dep)
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -31,6 +33,7 @@ namespace manifold = hf::sim::manifold;
 namespace convex   = hf::sim::convex;
 namespace gjk      = hf::sim::gjk;
 namespace fpx      = hf::sim::fpx;
+namespace persist  = hf::sim::persist;   // WH7: DigestBodyWorld
 using gjk::fx;
 using gjk::kOne;
 using gjk::FxVec3;
@@ -464,7 +467,13 @@ int main() {
         const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
         convex::ConvexStepConfig cfg;
         cfg.gravity = convex::FxVec3{0, kGravY, 0};
-        cfg.dt = kOne / 60; cfg.solveIters = 2; cfg.restitution = 0; cfg.slop = kOne / 64;
+        // WH7 succession: solveIters 2 -> 1. Pre-WH7 the cold reference was destabilized by the manifold-depth
+        // bug (a 4x-overdriven de-pen on these unit-half-1 boxes churned the cold step's residual), so iters=2
+        // showed warm < cold. With TRUE depths (the WH7 fix) the cold hardened step also settles this easy
+        // scene at iters=2 (the inequality inverts: warm 0.0244 vs cold 0.0044 — the de-pen was carrying it).
+        // At the HARDER iters=1 budget the accumulated warm-start's advantage is real and pinned below:
+        // warm ~0.0141 (< band) vs cold ~0.0790 (>= band) — the honest re-anchor of the same claim.
+        cfg.dt = kOne / 60; cfg.solveIters = 1; cfg.restitution = 0; cfg.slop = kOne / 64;
         cfg.beta = (fx)((int64_t)2 * kOne / 10); cfg.linDamp = (fx)((int64_t)95 * kOne / 100);
         cfg.angDamp = kOne; cfg.posIters = 2;   // angDamp OFF — the headline
         const uint32_t K = 300, WIN = 20;
@@ -860,6 +869,220 @@ int main() {
 
         std::printf("wh6-render: {hulls:%u, tris:%u} provenance byte-equal + sim byte-unmutated (CPU)\n",
                     (uint32_t)world.bodies.size(), meshA.triangles);
+    }
+
+    // ================= Slice WH7 — WARM-HULL SOLVER HARDENING FOR HIGH-ENERGY IMPACTS (Track-R R13) =========
+    // The PS7 ship notes said: "a large fall pumps energy through the documented gjk iteration-cap near-field
+    // band (floor half-extent >4 or a 2.5-unit drop makes hulls hop — a phantom contact at 1.76-unit separation
+    // was observed); scenes use near-rest drops + angDamp 0.3 as workarounds." WH7 root-caused it to TWO int32
+    // bugs, both fixed:
+    //   (A) manifold.h HullManifoldFromEpa stored |refN|-INFLATED depths (refN is the RAW face cross, magnitude
+    //       = 2x the reference face's first-triangle area: x4 on the unit-half-1 test boxes — which MASKED the
+    //       bug and mis-tuned beta — x64 on a half-4 floor, x144 on half-6). The position de-pen consumes
+    //       depths[0] directly, so a shallow graze on a big floor was pushed apart by ~face-area x the true
+    //       depth: pre-fix, THIS scene's box TELEPORTED from y~0.5 to y~9.97 in one tick (the hop / the
+    //       energy pump), and the "phantom contact at 1.76-unit separation" was a 64x-inflated 0.0275 depth.
+    //   (B) gjk.h DoSimplex3's Voronoi determinants + their face-region SUM (va+vb+vc), and Epa's Cramer
+    //       barycentric products, WRAPPED int32 on large hulls (the observed sum 38399*kOne ~ 2.52e9 >
+    //       INT32_MAX): garbage barycentric weights put GJK's "closest" point tens of units outside the CSO,
+    //       the loop cycled to kGjkMaxIter (the misdiagnosed "iteration-cap band"), and the outcome flipped
+    //       between PHANTOM overlap at true separations up to ~0.12+ (pre-fix, THIS scene reported overlap=1
+    //       + a count-1 contact at a +0.1199 TRUE gap, braking + torquing the box in mid-air) and MISSED true
+    //       overlaps. Fixed by carrying the determinants/sums/ratios in int64 (bit-identical wherever the old
+    //       math did not wrap). Remaining documented band: the plain d1..d6 dots themselves saturate int32 at
+    //       a CSO diameter of ~104 world units (FxDot's ceiling).
+    // What this pins (the proof hard drops now SETTLE):
+    //   (1) THE REPRO: a tilted unit box hard-dropped 2.5 units onto a HALF-6 floor (both previously-fatal
+    //       triggers), warm+sleep, angDamp fully OFF (kOne — stronger than the removed 0.3 workaround): first
+    //       contact at the pinned tick, the body NEVER rises above its contact-entry height (maxYAfter ==
+    //       firstContactY EXACTLY — zero pumping, restitution 0), max manifold depth == the impact-penetration
+    //       band (~v*dt), fully ASLEEP at the pinned tick with maxSpeed EXACTLY 0, pinned digest (MSVC==clang).
+    //   (2) NO PHANTOMS: at true separations +0.05/+0.12/+0.25/+1.0/+1.76 (incl. the two observed phantom
+    //       separations) over floor halves 2/4/6, Gjk reports NO overlap and HullContactMulti emits NO contact;
+    //       a REAL 0.02-deep contact IS found and its manifold depth EQUALS the EPA depth exactly (the
+    //       depth-inflation kill: pre-fix the manifold depth scaled x16/x64/x144 with the floor half).
+    //   (3) THE PS7 SCENES UNRESTRICTED: the exact PS7 mixed tetra/octa/box pile with the workarounds REMOVED
+    //       (every hull hard-dropped +2.5 units, angDamp 0.9 instead of 0.3) settles FULLY ASLEEP at the
+    //       pinned tick, pinned digest. (persist_test keeps the canonical gentle-drop PS7 pins.)
+    //   (4) NETCODE: lockstep + rollback replay the high-energy impact bit-exact (the WH5 harness over the
+    //       hard-drop scene, incl. a post-sleep wake command).
+    {
+        auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const fpx::FxQuat kTiltZp05{0, 0, (fx)1638, (fx)65515};   // tiltZ(+0.05 rad), host-snapped exact ints
+        auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+            FxBody b; b.pos = {x, y, z}; b.orient = {0, 0, 0, kOne};
+            b.invMass = dyn ? kOne : 0; b.flags = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0}; b.angVel = {0, 0, 0}; return b;
+        };
+
+        // ---- (2) THE NO-PHANTOM BATTERY (static narrowphase truth table over floor halves 2/4/6). ----
+        {
+            uint32_t phantoms = 0, misses = 0, depthMismatch = 0;
+            // True separations to probe: +0.05, +0.12 (the observed mid-air brake gap), +0.25, +1.0, +1.76
+            // (the PS7-observed phantom separation). ALL must report NO contact.
+            const fx kGaps[5] = {(fx)3277, (fx)7864, (fx)16384, (fx)65536, (fx)115343};
+            for (int half = 2; half <= 6; half += 2) {
+                const FxHull floorH = gjk::MakeBox(fi(half), kOne, fi(half));
+                const FxBody floorB = makeBody(0, 0, 0, false);
+                const FxHull boxH = gjk::MakeBox(kOne, kOne, kOne);
+                // The tilted box's exact lowest extent below its center (integer support scan — no float).
+                FxBody probe = makeBody(0, fi(3), 0, true); probe.orient = kTiltZp05;
+                fx minY = fi(100);
+                for (uint32_t v = 0; v < boxH.count; ++v) {
+                    const FxVec3 wv = convex::FxAdd(fpx::FxRotate(probe.orient, boxH.verts[v]), probe.pos);
+                    if (wv.y < minY) minY = wv.y;
+                }
+                const fx ext = probe.pos.y - minY;   // lowest extent below center (~1.0487)
+                for (int g = 0; g < 5; ++g) {
+                    FxBody b = makeBody(0, kOne + ext + kGaps[g], 0, true); b.orient = kTiltZp05;
+                    const gjk::GjkResult gr = gjk::Gjk(floorH, floorB, boxH, b);
+                    const convex::ContactManifold m = manifold::HullContactMulti(floorB, floorH, b, boxH);
+                    if (gr.overlap || m.count != 0) ++phantoms;
+                }
+                // A REAL shallow 0.02-deep contact IS found, and its manifold depth == the EPA depth EXACTLY
+                // (pre-fix the manifold depth here was x16/x64/x144 the EPA depth — the inflation kill).
+                {
+                    const fx pen = (fx)1311;   // 0.02
+                    FxBody b = makeBody(0, kOne + ext - pen, 0, true); b.orient = kTiltZp05;
+                    const gjk::GjkResult gr = gjk::Gjk(floorH, floorB, boxH, b);
+                    const convex::ContactManifold m = manifold::HullContactMulti(floorB, floorH, b, boxH);
+                    if (!gr.overlap || m.count == 0) ++misses;
+                    else {
+                        const gjk::EpaResult e = gjk::Epa(floorH, floorB, boxH, b, gr.simplex);
+                        fx dmax = 0;
+                        for (uint32_t k = 0; k < m.count; ++k) if (m.depths[k] > dmax) dmax = m.depths[k];
+                        if (dmax != e.depth) ++depthMismatch;
+                    }
+                }
+            }
+            check(phantoms == 0, "WH7: NO phantom contact at any probed true separation (+0.05..+1.76, halves 2/4/6)");
+            check(misses == 0, "WH7: the real 0.02-deep contact IS detected on every floor size");
+            check(depthMismatch == 0, "WH7: manifold depth == EPA depth EXACTLY (no |refN| inflation, all floor sizes)");
+        }
+
+        // ---- (1) THE REPRO: the 2.5-unit hard drop onto the half-6 floor, angDamp OFF. ----
+        // The warm+sleep config == the WH4 recipe with angDamp = kOne (NO workaround).
+        warmhull::HullSleepConfig scfg;
+        scfg.warm.gravity = convex::FxVec3{0, kGravY, 0};
+        scfg.warm.dt = kOne / 60; scfg.warm.solveIters = 8; scfg.warm.restitution = 0;
+        scfg.warm.slop = kOne / 64;
+        scfg.warm.beta = (fx)((int64_t)2 * kOne / 10);      // 0.2
+        scfg.warm.linDamp = (fx)((int64_t)95 * kOne / 100); // 0.95
+        scfg.warm.angDamp = kOne;                           // OFF — the removed workaround
+        scfg.warm.posIters = 4;
+        scfg.sleepThreshold = kOne; scfg.wakeThreshold = (fx)(2 * (int)kOne); scfg.sleepTicks = 30;
+
+        auto buildHardDrop = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false));
+            w.hulls.push_back(gjk::MakeBox(fi(6), kOne, fi(6)));   // the half-6 floor (a fatal trigger pre-fix)
+            { FxBody b = makeBody(0, (fx)(fi(2) + (fx)((int64_t)5 * kOne / 2)), 0, true);  // rest+2.5 = y 4.5
+              b.orient = kTiltZp05;
+              w.bodies.push_back(b); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne)); }
+            return w;
+        };
+        const gjk::HullWorld w0 = buildHardDrop();
+        {
+            gjk::HullWorld w = w0;
+            warmhull::HullCache c; std::vector<warmhull::HullSleepState> s;
+            uint32_t firstContact = 0, firstAsleep = 0;
+            fx firstContactY = 0, maxYAfter = -fi(100), maxDepth = 0;
+            bool negDepth = false;
+            for (uint32_t t = 0; t < 600; ++t) {
+                warmhull::StepWarmSleepHullWorld(w, c, s, scfg);
+                const convex::ContactManifold m = manifold::HullContactMulti(w.bodies[0], w.hulls[0],
+                                                                             w.bodies[1], w.hulls[1]);
+                if (m.count > 0) {
+                    if (firstContact == 0) { firstContact = t + 1; firstContactY = w.bodies[1].pos.y; }
+                    for (uint32_t k = 0; k < m.count; ++k) {
+                        if (m.depths[k] > maxDepth) maxDepth = m.depths[k];
+                        if (m.depths[k] < 0) negDepth = true;
+                    }
+                }
+                if (firstContact != 0 && w.bodies[1].pos.y > maxYAfter) maxYAfter = w.bodies[1].pos.y;
+                const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(w, s);
+                if (firstAsleep == 0 && sm.asleepCount == sm.dynamicCount) firstAsleep = t + 1;
+            }
+            const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(w, s);
+            check(firstContact == 64u, "WH7 repro: first REAL contact at the pinned tick 64 (never mid-air)");
+            check(maxYAfter == firstContactY,
+                  "WH7 repro: the box NEVER rises above its contact-entry height (zero energy pumping, e=0)");
+            check(!negDepth && maxDepth == (fx)1769,
+                  "WH7 repro: max manifold depth == pinned 1769 (~0.027, the v*dt impact band; pre-fix ~9.4)");
+            check(firstAsleep == 96u, "WH7 repro: the hard drop goes FULLY ASLEEP at the pinned tick 96");
+            check(sm.asleepCount == 1u && sm.maxSpeed == 0,
+                  "WH7 repro: asleep at EXACTLY zero residual (the freeze) — settled, not hopping");
+            check(persist::DigestBodyWorld(w.bodies) == 0x9e836e7d971987bbull,
+                  "WH7 repro: the pinned settled hard-drop digest (MSVC == clang)");
+            std::printf("wh7-harddrop: {firstContact:%u, maxDepth:%d, firstAsleep:%u, digest:0x%016llx}\n",
+                        firstContact, (int)maxDepth, firstAsleep,
+                        (unsigned long long)persist::DigestBodyWorld(w.bodies));
+        }
+
+        // ---- (4) NETCODE: lockstep + rollback replay the high-energy impact bit-exact. ----
+        {
+            std::vector<convex::ConvexCommand> auth;
+            auth.push_back(convex::ConvexCommand{150u, convex::kConvexCmdAddImpulse, 1u,
+                                                 convex::FxVec3{fi(3), 0, 0}});   // wake the sleeper
+            std::vector<convex::ConvexCommand> mis = auth;
+            mis.push_back(convex::ConvexCommand{60u, convex::kConvexCmdAddImpulse, 1u,
+                                                convex::FxVec3{0, fi(5), 0}});    // the wrong mid-fall shove
+            bool identical = false;
+            const warmhull::WarmHullState a1 = warmhull::RunWarmHullLockstep(w0, scfg, auth, 300u, &identical);
+            check(identical, "WH7 lockstep: authority == replica BIT-IDENTICAL over the hard-drop impact");
+            bool corrected = false, diverged = false;
+            warmhull::RunWarmHullRollback(w0, scfg, auth, mis, 300u, 60u, &corrected, &diverged);
+            check(corrected && diverged,
+                  "WH7 rollback: the mispredicted mid-fall shove genuinely diverged AND was corrected bit-exact");
+            check(persist::DigestBodyWorld(a1.world.bodies) == 0x37c81f0fef92a68bull,
+                  "WH7 lockstep: the pinned converged hard-drop authority digest");
+        }
+
+        // ---- (3) THE PS7 PILE UNRESTRICTED: hard drops (+2.5) + angDamp 0.9 (workarounds REMOVED). ----
+        {
+            warmhull::HullSleepConfig pcfg = scfg;
+            pcfg.warm.angDamp = (fx)((int64_t)90 * kOne / 100);   // 0.90 — NOT the 0.30 workaround
+            const fx kDrop = (fx)((int64_t)5 * kOne / 2);          // +2.5 units — NOT near-rest
+            gjk::HullWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false));
+            w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));                       // the PS7 half-4 floor
+            { FxBody b = makeBody((fx)-144179, (fx)134348 + kDrop, 0, true);           // tetra, hard-dropped
+              w.bodies.push_back(b); w.hulls.push_back(gjk::MakeTetra(kOne)); }
+            { FxBody b = makeBody(0, (fx)134348 + kDrop, 0, true);                     // octa, hard-dropped
+              b.orient = kTiltZp05;
+              w.bodies.push_back(b); w.hulls.push_back(gjk::MakeOcta(kOne)); }
+            { FxBody b = makeBody((fx)144179, (fx)132382 + kDrop, 0, true);            // box, hard-dropped
+              w.bodies.push_back(b); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne)); }
+
+            warmhull::HullCache c; std::vector<warmhull::HullSleepState> s;
+            uint32_t firstAsleep = 0;
+            fx maxDepth = 0;
+            for (uint32_t t = 0; t < 900; ++t) {
+                warmhull::StepWarmSleepHullWorld(w, c, s, pcfg);
+                for (size_t i = 0; i < w.bodies.size(); ++i)
+                    for (size_t j = i + 1; j < w.bodies.size(); ++j) {
+                        if (w.bodies[i].invMass == 0 && w.bodies[j].invMass == 0) continue;
+                        const convex::ContactManifold m = manifold::HullContactMulti(w.bodies[i], w.hulls[i],
+                                                                                     w.bodies[j], w.hulls[j]);
+                        for (uint32_t k = 0; k < m.count; ++k) if (m.depths[k] > maxDepth) maxDepth = m.depths[k];
+                    }
+                const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(w, s);
+                if (firstAsleep == 0 && sm.asleepCount == sm.dynamicCount) firstAsleep = t + 1;
+            }
+            const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(w, s);
+            check(firstAsleep == 134u,
+                  "WH7 unrestricted PS7 pile: hard drops + angDamp 0.9 go FULLY ASLEEP at the pinned tick 134");
+            check(sm.asleepCount == 3u && sm.maxSpeed == 0,
+                  "WH7 unrestricted PS7 pile: all 3 hulls asleep at EXACTLY zero residual");
+            check(maxDepth == (fx)1768,
+                  "WH7 unrestricted PS7 pile: max manifold depth == pinned 1768 (~0.027 — no inflated contacts)");
+            check(persist::DigestBodyWorld(w.bodies) == 0xd5c2fc528327cc3full,
+                  "WH7 unrestricted PS7 pile: the pinned settled digest (MSVC == clang)");
+            std::printf("wh7-pile-unrestricted: {firstAsleep:%u, maxDepth:%d, digest:0x%016llx}\n",
+                        firstAsleep, (int)maxDepth,
+                        (unsigned long long)persist::DigestBodyWorld(w.bodies));
+        }
     }
 
     if (g_fail == 0) std::printf("warmhull_test: ALL PASS\n");

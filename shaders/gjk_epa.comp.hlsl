@@ -466,11 +466,16 @@ void main(uint3 gid : SV_DispatchThreadID) {
     int d11 = FxDot(v1, v1);
     int d20 = FxDot(v2, v0);
     int d21 = FxDot(v2, v1);
-    int denom = fxmul(d00, d11) - fxmul(d01, d01);
+    // WH7 (R13 bug fix, == gjk.h Epa): the Cramer products of the d00..d21 dots overflow int32 on large
+    // hulls (garbage witness contact points) — carry the determinant/numerators/ratios in int64. Bit-identical
+    // wherever the old int32 math did not wrap.
+    int64_t denom = (((int64_t)d00 * (int64_t)d11) >> HF_FPX_FRAC) - (((int64_t)d01 * (int64_t)d01) >> HF_FPX_FRAC);
     int bu, bv, bw;
-    if (denom > HF_GJK_EDGE_EPS || denom < -HF_GJK_EDGE_EPS) {
-        bv = fxdiv(fxmul(d11, d20) - fxmul(d01, d21), denom);
-        bw = fxdiv(fxmul(d00, d21) - fxmul(d01, d20), denom);
+    if (denom > (int64_t)HF_GJK_EDGE_EPS || denom < -(int64_t)HF_GJK_EDGE_EPS) {
+        int64_t nbv = (((int64_t)d11 * (int64_t)d20) >> HF_FPX_FRAC) - (((int64_t)d01 * (int64_t)d21) >> HF_FPX_FRAC);
+        int64_t nbw = (((int64_t)d00 * (int64_t)d21) >> HF_FPX_FRAC) - (((int64_t)d01 * (int64_t)d20) >> HF_FPX_FRAC);
+        bv = (int)((nbv << HF_FPX_FRAC) / denom);
+        bw = (int)((nbw << HF_FPX_FRAC) / denom);
         bu = HF_GJK_ONE - bv - bw;
     } else { bu = HF_GJK_ONE; bv = 0; bw = 0; }
 
