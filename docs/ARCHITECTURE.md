@@ -527,6 +527,8 @@ Slices PT1–PT6 add a **Niagara-class GPU particle system in Q16.16 fixed-point
 - **Lockstep + rollback (Slice PT5, pure CPU).** The family's netcode headline applied to particles: `ParticleCommand{burst/gust/move-emitter}`, `SnapshotParticles` capturing the **whole pool** (particles + free-list + spawn-cursor + tick — because spawn/death IS the sim), `RunParticleLockstep`/`RunParticleRollback`. **Proof:** replica == authority bit-exact inputs-only; rollback corrected a mispredict to the authority; a **snapshot-completeness control** proves omitting the free-list/cursor diverges (the crux). Golden `pt5_lockstep` (the converged command-perturbed state, strict zero-diff cross-backend). **The beyond-mainstream result: a deterministic, rollback-able, bit-identical-cross-platform *particle system* — Niagara cannot replay a fountain bit-for-bit.**
 - **Lit 3D render (Slice PT6, render-only — `ParticleToRenderInstances`).** The capstone money-shot: the bit-exact pool rendered as lit 3D instanced spheres (a particle per `pos/kOne`, scaled by the particle radius — the single host float crossing), through the **existing instanced-lit-sphere pipeline reused verbatim** from `--grain-render-shot` — no new shader, no new RHI. The arc's one **float** slice (visresolve-bar): Metal-baked golden, the bar is Metal-determinism (two-run DIFF 0.0000) + provenance (the instances derive from the bit-exact PT1–PT5 pool) + visual parity, the cross-vendor delta the documented float baseline (~44/channel). The showcase is a deterministic spark fountain (emit + vortex + gravity + ground/sphere collision). **Proof:** `{particles, instances, shaded}` provenance, two-render determinism, a coherent lit fountain, an empty no-op. Golden `pt6_render`. **Completes flagship #19 — deterministic GPU particles.**
 
+- **Particle authoring via the flow VM (Slice PA1, superiority-run S11 — pure CPU, `engine/sim/particle_author.h`, namespace `hf::sim::pauthor`).** Closes the flagship's "#19 note" gap — the deterministic particle sim existed but was configured only from hand-written C++ structs. PA1 wires the **flow VM** (`flow.h` `StepGraph`) as the particle *authoring* system: a flow graph's per-tick output registers overwrite bound emitter/force-field parameters, so particle effects are authored as **graphs** via the editor edit-ops, not code — Niagara-class emitter graphs, deterministic. `StepAuthoredEffect` = `StepGraph` → resolve each `ParamBinding{node → param}` **in array order** (later wins) → `StepParticles` **verbatim**; the drivable set is spawn count, emitter origin XYZ, lifetime, speed, per-field strength + center XYZ, gravity Y, and drag. The unit contract is exact and pinned: a register IS the Q16.16 value (a pure int32 reinterpret — no scaling, no rounding, no float), and `kParamSpawnPerTick` IS the raw integer count (`Emit`'s documented dual convention). ZERO bindings == `StepParticles(baseCfg)` **bit-identical** (the pinned identity control). The showcase fixture — the **pulsing fountain** — is built **exclusively** through `editor::AddFlowNode`/`ConnectFlow` (24 nodes, 3 bindings; its `SerializeGraph` digest is pinned `0xca55eabb27042ba8` — the *authored-not-hardcoded* proof): a self-resetting cycle counter pulses the spawn count 1→12 every 6 ticks, a period-16 triangle wave sweeps the emitter X across exactly [−1, +1], and a counter ramps the vortex strength per tick. **Lockstep + rollback (the PT5 mold over the COMPOSED state):** the snapshot is the pool AND the flow `GraphState` — the snapshot-completeness control proves omitting the graph state **diverges** (graph state IS sim state); commands write flow *input* channels (the player boosts the spawn *through* the authored graph); the replica re-derives both halves bit-for-bit and rollback corrects a real misprediction (lockstep digest `0x2f2c7ba5d6ee3fcc`, composed-state digest `0x745c02a3574c687f`, identical MSVC/clang). Showcases `--pa1-fountain-shot` / `--pa1-fountain` (pure CPU on both backends → the integer strict-zero golden is byte-identical by construction), golden `pa1_fountain`. No new shader, no new RHI; `particles.h`/`flow.h`/`flow_edit_ops.h` byte-untouched (the one deliberate layering addition: `sim/` includes `editor/flow_edit_ops.h`, because PA1 IS the authoring bridge). UE5's Niagara graphs are float/non-deterministic — two machines running the same Niagara system routinely diverge; here the authored effect's entire evolution is a **pure integer function of (graph, bindings, input stream)**.
+
 ### Deterministic two-way rigid↔fluid coupling (`engine/sim/couple.h`, namespace `hf::sim::couple`)
 
 Slices CP1–CP6 add the **5th act of the deterministic-sim arc** — not another isolated body, but making the *existing* bodies **interact**. The four sim members (rigid `fpx`, cloth, fluid, grain) each lived in their own world and only touched *static* kinematic colliders; no two simulated bodies ever exchanged momentum. This flagship couples a **dynamic `fpx::FxBody` to the bit-exact PBF fluid** — buoyancy + drag + displacement, all in one Q16.16 world, lockstep/rollback-replayable. The headline: a barrel **bobbing** in water (emergent from the coupled solve, no script) that two netcode peers re-simulate bit-for-bit from inputs alone — a genuine first (mainstream float fluid-rigid coupling is one-way-ish and non-deterministic). It reuses the fluid solver (FL1–FL6), the rigid solver (`fpx.h`), the FL2 grid-hash, the GR3 collide, the FPX5/FL5 lockstep, and the instanced-lit render — adding only the *exchange* terms; `engine/sim/fpx.h`/`fluid.h`/`cloth.h`/`grain.h` (reused read-only) and `engine/physics/` are untouched, **no new RHI** across the flagship — the ELEVENTH flagship, complete (6/6).
@@ -670,6 +672,26 @@ Slices GJ1–GJ6 lift the single hardest limitation of the whole contact stack: 
 - **The general-hull world step (Slice GJ4, `shaders/hull_step.comp.hlsl` — the new physics).** The payoff: `StepHullWorld` reproduces the convex 5-pass per-tick shell (predict-integrate → all-pairs narrowphase → world Gauss-Seidel impulse → position de-penetration → orientation) with the **only** change being the box SAT swapped for the GJK/EPA `HullContact` (which returns a `convex::ContactManifold`), plus a hull inverse-inertia (a diagonal tensor, exact for the symmetric canonical hulls). Arbitrary convex polyhedra integrate, collide, and **settle** — a tetrahedron resting on its triangular face, a wedge interlocked against a box, physics the box-only solver literally cannot represent. int64 → Vulkan drives the world step; Metal CPU `StepHullWorldN` byte-identical. **Proof:** GPU final world == CPU byte-for-byte over 240 ticks; the dynamic hulls came to rest (max speed below band) and are held (max penetration within slop). Golden `gjk_settle`. **A note on robustness:** the single-thread world-step dispatch runs the whole 240-tick simulation in one GPU submission (~5s), which marginally exceeds the Windows GPU watchdog (TDR) and intermittently lost the device; the fix splits it into bounded sub-dispatches over the same buffer with a barrier between — bit-identical to one big dispatch, only the dispatch boundary moves. **Caveats:** convex polyhedra only; single-point manifold (a face-resting hull may rock within an angular-damping band); diagonal inertia (off-diagonal dropped — exact for the symmetric test hulls).
 - **Lockstep + rollback (Slice GJ5, pure CPU — `RunHullLockstep`/`RunHullRollback`).** The hull world *is* pure data (the `hulls` are immutable geometry, like boxes), so GJ5 reuses the command + snapshot machinery **verbatim** and swaps only the per-tick step to `StepHullWorld`. Two peers fed the input command stream alone converge byte-identical; a mispredicted impulse rolls back from a snapshot and re-sims bit-for-bit. No GPU/shader/RHI — both backends run the identical harness, the golden bit-identical by construction. **Proof:** authority == replica bit-identical; rollback corrected == authority; a real divergence before rollback; two-run determinism. Golden `gjk_lockstep`. **Deterministic, rollback-replayable, bit-identical-cross-platform contacts for *arbitrary convex polyhedra*, re-derived from inputs alone — which mainstream float physics cannot provide.**
 - **Lit 3D instanced render (Slice GJ6, render-only — the money-shot).** The capstone: `HullToRenderInstances` triangulates each hull's faces and transforms them by the bit-exact body pose into a float world-space mesh, drawn through the **existing instanced-lit pipeline reused verbatim** as a lit, shadowed 3D scene — the polyhedra rendered as **true polyhedra**, not box proxies. The distinctive shot is a **matte pile of mixed convex shapes** — a rust tetrahedron, an amber octahedron, and a box at rest on a floor under directional light. **Matte** material to avoid the sky-IBL iridescence. The float visresolve-bar: Metal two-run DIFF 0.0000 + provenance (two render calls byte-equal) + an in-band cross-vendor mean (~37/channel — the single float crossing; the integer-determinism headline is GJ1–GJ5's). **Proof:** `{hulls, tris}` provenance, `{dynamic, restedPile}`, two-render determinism, a non-trivial shaded pixel count. Golden `gjk_render`. **Completes flagship #22 — the twenty-second flagship.**
+
+**The WH7 int64 hardening (superiority-run R13 — a root-caused bug fix, not a redesign).** `DoSimplex3`'s Voronoi
+determinants (`va`/`vb`/`vc`, products of the `d1..d6` support dots) and above all their face-region SUM
+(`denom = va+vb+vc`), plus `Epa`'s Cramer barycentric products, **wrapped int32 on large hulls** — the measured
+repro wrapped at `denom = 38399·kOne` (~2.52e9 > INT32_MAX), producing garbage barycentric weights that put GJK's
+"closest" point 24 units *outside* the CSO, cycling the loop to `kGjkMaxIter` (the misdiagnosed PS7
+"iteration-cap near-field band") and flipping tick-to-tick between **phantom overlap** at true separations up to
+~0.12+ (a falling tilted box was braked from vy −2.97 to −1.70 and torqued *in mid-air* at a +0.1199 true gap) and
+**missed true overlaps** (overlap = 0 at a −0.0019 true penetration). The fix is surgical: the determinants, the
+sum, and the barycentric ratios are carried in **int64**
+(`det64 = ((int64)p·q≫16) − ((int64)s·t≫16)`; `ratio = (v≪16)/denom`) — **bit-identical to the old math wherever
+no wrap occurred** (same shifts, same truncation); only the wrapping band changes. The same treatment lands in the
+EPA barycentric tail, and both fixes are mirrored **verbatim** into every GPU shader copy (12 files:
+`hull_manifold`, `hull_step`, `hull_step_hardened`, `hullfric_step`, `hulljoint_step`, `warmhull_warm`,
+`warmhull_sleep`, `broad_hull_step`, `ccd_step`, `ccd_toi`, `gjk_distance`, `gjk_epa`) — the GPU == CPU memcmps
+all re-verified green live. The no-phantom proof: at true separations +0.05/+0.12/+0.25/+1.0/+1.76 over floor
+half-extents 2/4/6 (including both observed phantom separations) `Gjk` reports NO overlap and the multi-point
+narrowphase emits NO contact, while a real 0.02-deep contact IS found at every floor size. **The remaining
+documented band:** the plain `d1..d6` GJK dots themselves saturate int32 at a CSO diameter of ~104 world units
+(`FxDot`'s own ceiling) — noted in the code and in `CAPABILITIES.md`.
 
 ### Deterministic integer broadphase (`engine/sim/broad.h`, namespace `hf::sim::broad`)
 
@@ -859,6 +881,25 @@ linear position-correction solver as residual jitter accumulates; a robustly sta
 (warm-started contacts / a stiffer stacking solve). Determinism, however, holds for *any* scene — the lockstep
 proof (MF5) reproduces a multi-body world bit-for-bit regardless of whether it has settled.
 
+**The WH7 depth-scaling fix (superiority-run R13 — a root-caused bug fix in `HullManifoldFromEpa`).** The
+candidate-keep step stored each contact point's depth as `d = FxDot(refN, refC − vertex)` with `refN` =
+`FaceNormalWorld`'s **raw face cross** — documented "NOT normalized … only the SIGN matters," which is true for
+`SupportFace`/`IncidentFace`/the clip (all sign-only) but **false for the depth**: `|refN|` = 2× the reference
+face's first-triangle area, so the stored depth was `|refN|`× the TRUE perpendicular depth — ×1.0 *exactly* for
+half-0.5 boxes, **×4** for the unit-half-1 test boxes (which masked the bug and mis-tuned the MF4 position-correction
+`beta` to 0.2 == an effective 0.8), **×64** on the PS7 half-4 floor, **×144** on a half-6 floor. The position
+de-penetration consumes `depths[0]` directly (`excess = depths[0] − slop`), so a shallow graze on a large floor
+face was pushed apart by ~face-area × the true depth: the measured repro **teleported** a box from y ≈ 0.5 to
+y ≈ 9.97 in ONE tick, and the PS7 "phantom contact at 1.76-unit separation" was a 64×-inflated 0.0275 true depth.
+(The box SAT path never had this bug — its axes are unit — exactly why boxes never pumped.) The fix stores the
+depths **rescaled by `|refN|`** (int64 `FxLength` + `fxdiv`) — the true perpendicular distance — while the keep
+test and the deepest/order reduce stay on the RAW dot, so candidate selection and ordering are **bit-identical**
+and the WH1 tagged-clip alignment contract is untouched; the fix is mirrored verbatim into the GPU shader copies
+(the 12-file WH7 list in the GJK section). Post-fix, the manifold depth **equals the EPA depth exactly** at every
+floor size (pre-fix: ×16/×64/×144 quadratic scaling, pinned). One honest pin succession follows: MF4's `beta`
+0.2 → 0.8 (the face value of what 0.2 effectively was under the ×4 inflation) — the MF4 headline is intact at 0.8
+(hardened residual 0.0275 < the 0.05 band, frozen 0.0901 ≥ band).
+
 ### Warm-started hull contacts + robust stacking (`engine/sim/warmhull.h`, namespace `hf::sim::warmhull`)
 
 Slices WH1–WH6 close the open problem the previous flagship documented: a *tall* hull stack destabilizes because
@@ -919,11 +960,51 @@ complete (6/6).
   by the render; the float visresolve-bar (Metal two-run DIFF 0.0000 + an in-band cross-vendor mean ~28/channel).
   Golden `wh6_render`. **Completes flagship #26 — the twenty-sixth flagship.**
 
+- **High-energy-impact hardening (Slice WH7, superiority-run R13 — the root-cause fix, golden `wh7_harddrop`).**
+  PS7 shipped with a verbatim workaround note: *"a large fall pumps energy through the documented gjk
+  iteration-cap near-field band (floor half-extent >4 or a 2.5-unit drop makes hulls hop — a phantom contact at
+  1.76-unit separation was observed); scenes use near-rest drops + angDamp 0.3 as workarounds."* WH7 root-caused
+  that band as a **misdiagnosis** — TWO independent int32 bugs, both reproduced deterministically: (A) the
+  `|refN|`-inflated manifold depth feeding the de-penetration (the fix documented in the narrowphase-hardening
+  section above) and (B) the int32-wrapping GJK/EPA barycentric determinants (the fix documented in the GJK
+  section). Both fixes are surgical int64 — **bit-identical wherever the old math did not wrap** — and mirrored
+  verbatim into all 12 GPU shader files, the GPU == CPU memcmps re-verified green live; no float, no damping.
+  **Proof (`tests/warmhull_test.cpp` WH7, every pin identical MSVC == clang):** the repro — a tilted unit box
+  hard-dropped 2.5 units onto a **half-6** floor (both previously-fatal triggers), warm+sleep, angular damping
+  fully OFF — makes first REAL contact at the pinned tick 64 (never mid-air), **never rises above its
+  contact-entry height** (`maxYAfter == firstContactY` exactly — zero energy pumping), max manifold depth pinned
+  1769 (~0.027, the v·dt impact band; ~9.4 pre-fix), and goes **fully asleep at the pinned tick 96 at
+  exactly-zero residual** (digest `0x9e836e7d971987bb`). NO phantoms: at true separations +0.05 … +1.76 over
+  floor halves 2/4/6, no overlap is reported and no contact emitted, while a real 0.02-deep contact IS found with
+  its manifold depth equal to the EPA depth exactly. **The PS7 scenes unrestricted (the R13 deliverable):** the
+  exact PS7 pile with the workarounds REMOVED (all hulls hard-dropped +2.5 units, angDamp 0.9 not 0.3) settles
+  fully asleep at the pinned tick 134, max depth 1768, digest `0xd5c2fc528327cc3f`; `RunWarmHullLockstep` /
+  `RunWarmHullRollback` replay the high-energy impact bit-exact (digest `0x37c81f0fef92a68b`). Showcases
+  `--wh7-harddrop-shot` / `--wh7-harddrop` (pure CPU on both backends → the integer golden is bit-identical by
+  construction; the showcase pins digest `0x48799876a175d774` with max contact separation exactly 0 and rest
+  speed exactly 0).
+- **The corrected warm-start claim (honest pin successions, every one justified).** The PS7-era warm-vs-cold
+  **equality** pin (warm == cold == {127317, 0}) — read at the time as the warm start showing *no measurable
+  benefit* on the pile — was an **artifact**: the inflated de-penetration dominated both runs identically. With
+  true depths the accumulated warm start shows a **real ~400× residual win** — warm {maxSpeed 19, maxPen 1153} vs
+  cold {8264, 1177}, both pinned exactly in `tests/persist_test.cpp` — an honest *upgrade* of the claim, not a
+  regression. WH3 was re-anchored the same way: `solveIters` 2 → 1, because pre-fix the *cold* reference was
+  destabilized by the inflated de-pen (at iters=2 post-fix the cold step also settles this easy scene and the
+  inequality inverts: warm 0.0244 vs cold 0.0044); at the **harder** iters=1 budget the warm start's advantage is
+  real and pinned — warm 921 (~0.014, < band) vs cold 5175 (~0.079, ≥ band) — the same claim re-anchored
+  honestly. The WH4 tower delta (warm+sleep holds where the frozen step topples) passes **unchanged** — the
+  flagship headline never depended on the bug. The PS7 canonical pins succeeded (fully-asleep step 38 → 30,
+  re-settle 141 → 51 — the struck box no longer hops on landing; lockstep digest `0x3a49757d1f7d6750` →
+  `0xfa9b771dbec0f1d2`; the island-partition digests UNCHANGED); all other pins pass unchanged — gjk, hullfric,
+  hulljoint, broad, ccd, and the convex/fric/persist box paths.
+
 Honest scope: the stability claim is a measured, reproducible *delta* over the previous flagship plus provable rest
 to a **demonstrated height (four hulls)** — robust at three, while five or more need a longer settle before sleep —
 not unconditional unbounded stability; the within-band settle that precedes sleep can leave a slight residual lean
 (a leaning-but-stable tower, not a perfectly vertical one). The differentiator is independent of the exact height:
-a resting, lockstep-replayable convex-polyhedron stack that is byte-identical across CPU, Vulkan, and Metal.
+a resting, lockstep-replayable convex-polyhedron stack that is byte-identical across CPU, Vulkan, and Metal. With
+WH7, high-energy impacts (hard drops onto large floor hulls) are validated and pinned; the remaining documented
+narrowphase band is the plain GJK dots' int32 saturation at a CSO diameter of ~104 world units.
 
 ### Deterministic gameplay / netcode product layer (`engine/game/verdict.h`, namespace `hf::game::verdict`)
 
@@ -1057,7 +1138,8 @@ tier, strict zero-pixel). The TWENTY-EIGHTH flagship, feature-complete (6/6).
 Honest scope: this is the moat-preserving *Tier-A* (deterministic, procedural/analytic-geometry, strict-integer)
 plus a software-reference *Tier-C* golden — exactly the pieces a bit-exact reflections / GI path needs. Deliberately
 out of scope here: float HW-triangle ray tracing (the *Tier-B* fidelity path, a later concern), multi-bounce /
-path-traced global illumination (the next flagship), glossy/rough reflections, refraction, soft shadows, and AO. The
+path-traced global illumination (the next flagship), glossy/rough reflections, refraction, and AO — stochastic
+**soft shadows** have since shipped (superiority-run RTD1, the passage below). The
 analytic-primitive scenes (spheres + AABBs) are the bit-exact geometry tier. **Metal HW RT through the engine RHI now
 ships (issues #42/#35, CLOSED):** `engine/rhi_metal/metal_accel.{h,mm}` implements the `IAccelStructure` seam
 (`CreateBlas`/`CreateTlas`/`BindAccelStructure`/`SupportsHardwareRayQuery`→true on Apple-silicon), and the native MSL
@@ -1084,6 +1166,44 @@ fragment-stage RT (`accelStructureBinding` on graphics pipelines, `--rt-reflect-
 RT7's kernels are compute inline-ray-query, not a Metal graphics-stage path. The marketing line the architecture
 earns: *the only engine with hardware ray tracing on BOTH Vulkan and Metal
 AND a deterministic, cross-platform-identical integer reference that both are proven byte-equal to.*
+
+**Deterministic stochastic RT soft shadows + SVGF-lite temporal denoiser (Slice RTD1, superiority-run S9 —
+`engine/render/rtd.h`, namespace `hf::render::rtd`).** The RT arc above is exact/binary (hard shadows, mirror
+reflections); RTD1 adds the missing pair the roadmap flagged as the documented RT gap — *stochastic* RT and its
+denoiser — with a claim DLSS-RR/OptiX cannot make: a stochastic ray-traced image that is **byte-reproducible**,
+with the integer half **HW == CPU byte-equal**. (a) *Stochastic RT — area-light soft shadows:* per pixel per frame
+k, ONE shadow ray toward a **deterministic** point on a disc area light. The sample point is the j-th entry of a
+fixed 64-entry golden-angle **Vogel spiral** over the unit disc, baked as Q16.16 **host literals**
+(`kRtdDiscSamples`, the fpx host-baked-LUT precedent — no runtime sqrt/cos/sin), indexed
+`j = (PcgHash(pixel) + k·39) & 63` — `pcg::PcgHash` reused verbatim; the frame stride 39 = round(64/φ) is coprime
+with 64, so any prefix of frames covers the spiral near-uniformly and 64 frames visit ALL 64 points exactly once —
+the 64-sample **ground truth** is the full-table mean, independent of the pixel hash (unit-tested). NO RNG, NO
+clock. Occlusion is **ranged** (`TraceAnyHitRanged`): the light point sits at t == kOne, so occluded iff
+`kRtShadowMinT < t < kOne` — an occluder *beyond* the light does not occlude, the far bound RT3's unbounded
+directional test lacks. One sample is a binary visibility → a noisy penumbra. (b) *SVGF-lite denoiser:* fixed-N
+temporal accumulation (N = 8, the `taa::kAccumFrames` convention; static camera → no reprojection, the
+`ssgi_temporal` precedent — motion reprojection composes with the shipped TSR US3 disocclusion machinery,
+documented future work, not claimed) followed by the `ssgi.h` bilateral spatial pass —
+`ssgi::BilateralDenoiseScalar` **called verbatim**, edge-guarded by the RT hits' own t/normal (the RT scene has no
+raster G-buffer; the ray tracer's hits ARE the G-buffer; misses get a 1e8 depth sentinel + zero normal →
+pass-through). The pinned RTD1 tuning (`RtdDenoiseParams`) tightens spatialSigma 2.0 → 1.0: the ssgi default
+**over-blurs the penumbra ramp** (band MAE vs the 64-sample truth 0.0860 > the raw 8-sample's 0.0748 — the classic
+SVGF failure, found by a pinned parameter sweep on the 320×240 showcase scene); sigma 1.0 yields maeD 0.0631 AND
+varD 0.0575, strictly better than the raw 8-sample on BOTH metrics; the weight math is unchanged. **The honest
+proof split:** the INTEGER byte-equal class is the visibility counts + the accumulated image (integer Lambert
+scaled by the exact `(vis<<16)/N` fraction) — `shaders/rt_softshadow.comp.hlsl` (int64 + `RayQuery`,
+Vulkan-SPIR-V-only) copies the math verbatim and the Vulkan showcase memcmps BOTH buffers **HW == CPU strict**,
+proven live on RT hardware (integer digests `0xf38663819426b236` / `0xc93c6d134aa489aa`, cross-platform exact);
+the FLOAT visresolve-class exception is the bilateral (exp/pow) + the denoised shade — two full pipeline runs
+byte-identical *including the float buffers*, but not cross-vendor byte-comparable (the FPX6/MC5 split). Metal
+runs the CPU `rtd::` reference per the rt1/rt2/rt3 convention (the int64 `RayQuery` kernel cannot lower to MSL).
+Showcases `--rtd1-softshadow-shot` (Vulkan) / `--rtd1-softshadow` (Metal), golden `rtd1_softshadow` (float class);
+`tests/rtd_test.cpp` pins the disc-table digest `0x369d1d1fca87ea88` + the 96×72 integer digests
+`0x6cbed647eed45d4d` / `0x885b85ec5cbd4f3d`, identical MSVC + clang. **Honest caveat (reported, not hidden):** the
+denoiser's strict gates hold at every resolution against the *raw 1-sample* (varD < var1, maeD < mae1, plus float
+two-run identity); the beats-the-8-sample inequality holds at the 320×240 showcase but NOT at the 96×72 test
+resolution, where the ~4 px penumbra still over-blurs (maeD 0.0935 > mae8 0.0646). `rtrace.h` / `ssgi.h` / `pcg.h`
+and all existing shaders are byte-untouched; no new RHI.
 
 ### Deterministic Lumen-class global illumination (`engine/render/gi.h`, namespace `hf::render::gi`)
 
@@ -1352,6 +1472,21 @@ The resident set is a **pure function** of (camera position, radii, budget, prio
 An `AnimState` is a named clip (an index into a caller-provided `std::vector<Animation>`) with a per-state playback `speed` and a `loop` flag; a `Transition` is a parameter-threshold-gated edge (`paramIndex cmp threshold`, `Cmp::Greater|Less`) with a cross-fade `duration`, where `from == -1` means an **any-state** edge. `Update(dt)` advances a deterministic cursor: when not transitioning it accrues `stateTime += dt·speed(current)` then evaluates the current state's outgoing edges (plus every any-state edge) **in the fixed order they were added — first satisfied wins** — and on a firing edge records the target, seeds `transitionTime = 0`, and starts both states' local times advancing; while transitioning both local times advance, `transitionTime += dt`, and at `transitionTime ≥ duration` the transition **completes** (current = target). `Evaluate()` turns the cursor into a palette: not transitioning → `SampleAnimation(current)`; transitioning → **`BlendAnimations(from, to, weight = transitionTime/duration)`**, reusing the established blend convention.
 
 The FSM output (current state, transition progress, blend weight, final palette) is a **pure function of (state graph, scripted parameter timeline, fixed-dt sequence)** — no input / RNG / wall-clock — so it is bit-stable run-to-run and across backends. Unit-tested (`anim_fsm_test`) and golden-captured (`--anim-fsm-shot` / `--anim-fsm`, the `anim_fsm` golden), scripted to a fixed mid walk→run cross-fade: `state:walk->run, blend:0.53, speed:0.925, step:37`.
+
+### Deterministic motion matching (`engine/anim/motion_match.h`, namespace `hf::anim::mm`) — flagship #33
+
+Slice MM1 (superiority-run S4) adds **motion matching** — the data-driven locomotion technique UE5 markets, made **bit-exact and lockstep/rollback-replayable**: a Q16.16 pose **feature database** extracted from animation clips plus an **integer nearest-neighbor search** that picks the best next frame given the character's trajectory intent. UE5's motion matching is float/non-replayable; ours is a **pure integer function of (database, input stream)**, so a peer re-derives the *entire animation-selection sequence* bit-for-bit. It is the anim family's first integer header; `animation.h`/`skeleton.h`/`state_machine.h`/`ik.h` are `#include`d **read-only** (byte-untouched) — the existing float clip stack is the pose *source*.
+
+- **The one float→integer boundary (documented, the FPX host-snap discipline).** `BuildMotionDatabase` samples each clip's float pose (`SampleLocalPose` + the hierarchy walk, *without* inverse-bind — true joint world positions) on a fixed 32 fps tick grid and quantizes ONCE (`QuantizeFx = llround(v·65536)`); every derived feature (velocities, trajectory offsets) is integer from there, and the runtime — query build, cost, argmin, controller, lockstep — is integer end-to-end.
+- **The feature vector (20-dim Q16.16, the standard MM set):** root velocity (x, z) + future trajectory offsets at +10/+20/+30 frames (x, z, root-relative) + L/R foot positions (3D, root-relative) + foot velocities (3D). Fixed weights rootVel 2.0 / trajectory 1.0 / footPos 1.0 / footVel 0.25 — all inside the pinned digest.
+- **The query (`MatchPose`):** an integer weighted-L1 cost (int64 accumulate) over ALL database frames — v1 is a documented **brute-force linear scan**, and any future acceleration structure must reproduce this scan's argmin bit-for-bit to be admissible. The argmin uses the strict **(cost, index) total order** — equal cost keeps the LOWER index (a constructed tie is pinned, and so is the organic walk-loop duplicate row).
+- **The controller (`StepMotionMatch`):** advance the clip cursor every tick → `MatchPose` every N = 10 ticks → adopt the winner. The current frame self-matches at cost 0, so continuation is free; selections can ONLY change on search ticks (pinned — a tick-63 input change waits for search tick 70). The v1 transition is a **hard switch** (visible popping is the honest v1 behavior; a render-side cross-fade via the existing `anim::BlendAnimations` is the layerable smoothing that never touches the integer selection state).
+- **Lockstep + rollback (the CL5/FPX5 mold):** commands are desired-velocity changes (the player stick); `MMState` is a 7-int32-word POD {clip, cursor, tick, **held input**, diagnostics} — the snapshot is a struct copy; `RunMMLockstep` re-derives the replica == authority bit-exact from inputs alone, `RunMMRollback` corrects a real stop-misprediction, and the completeness controls prove omitting the CURSOR or the HELD INPUT diverges.
+- **Fixture assets in the header (the PA1 precedent — test and both showcases share identical bits):** a 3-joint rig (root + two feet) + a 2 s IDLE loop + a 2 s WALK loop (root +z at exactly 1.5 u/s, antiphase foot swing). All keys are exact binary fractions, so the float sampling is EXACT (verified immune to clang FMA contraction — pins identical with `-ffp-contract=off` AND on) and the database digest is cross-compiler identical.
+- **Proof (`tests/motion_match_test.cpp`, every pin identical MSVC and clang):** `DigestMotionDatabase` `0xeeb343f0795a497d` (70 frames = 2×35 — the 30-tick lookahead margin truncated); analytic features exact (walk root velocity == (0, 98304)); exact-match query cost 0; both tie-breaks; the behavior — idle holds under zero velocity, WALK adopted EXACTLY at search tick 60, IDLE back EXACTLY at 150, switches == 2, searches == 24, trace digest `0xb37aa47b7bc7d69b`, state digest `0xb58696a56b71ec9a`; lockstep/rollback + both snapshot-completeness controls.
+- **Showcase** `--mm1-locomotion-shot` (both backends, pure CPU, identical code → the golden byte-identical **by construction**; integer strict-zero viz: the top-down root path, idle amber / walk cyan, plus a per-tick selection timeline strip with white search notches and gold switch ticks). Golden `mm1_locomotion`.
+
+**Honest v1 limits (verbatim from the header):** brute-force search cost; hard-switch popping; features are root-POSITION-relative, not facing-relative (canonical-facing clips assumed); clip tails inside the 30-tick lookahead are truncated from the database; a small fixture database. No new shader, no new RHI.
 
 ---
 
@@ -2099,6 +2234,75 @@ Beyond the deterministic logic modules (`picking`, `gizmo`, `introspect`), the e
 ### Live edit-ops → scene_io round-trip (`engine/editor/edit_ops.*`)
 
 Slice BX closes the editor's **author → save → reload** loop. An `EditOp` (e.g. translate, set-material) **mutates the live ECS `Registry` in place**, then the edited scene is **serialized through the existing `scene_io` writer** and **reloaded** into a fresh registry, and the reloaded state is asserted **bit-identical** to the in-memory edited state — proving an edit *survives a save/load round-trip exactly* (no silent loss or reordering across serialization). It follows the same backend-free seam discipline as `editor_panel_data`/`introspect`: it touches **only** the ECS `Registry`, the opaque `scene_io` text format, and `math`, carrying **zero** `vk*`/`MTL*`/`rhi`/ImGui symbols, so it lives in `hf_core` and is unit-tested **headlessly** (`edit_ops_test`) by asserting the registry/round-trip equality, not pixels. The deterministic edit script makes the result two-run byte-identical. Golden-captured (`--editor-edit-shot` / `--editor-edit`, the `editor_edit` golden); the showcase applies a fixed edit script and reports `editor-edit: {edits:2, entity:8, saved:true, reloadMatch:true}`.
+
+### Interactive editing — inspector edits, authoring panels, undo/redo (superiority-run R11: ED1/ED2/ED5 — `engine/editor/editor_panels.*`, `flow_editor_panels.*`, `seq_editor_panels.*`, `widget_editor_panels.*`, `engine/editor/edit_history.h`)
+
+The editor's panels were views and its edit ops were only callable from C++; slices ED1/ED2/ED5 make the GUI itself
+**edit** — and prove the *interactivity itself* headlessly, which is the practice worth naming: the
+**synthetic-input golden gate**. Each slice ships a `--edN-dry-run` that drives the REAL panel-building code with
+REAL synthetic ImGui io events (`AddMousePosEvent`/`AddMouseButtonEvent`/`AddKeyEvent`/`AddInputCharacter`) in
+CPU-only frames — no capture, no present — with the input **aimed at probe-recorded widget rects**
+(`EditorUIProbe`/`FlowEditorUIProbe`/`SeqEditorUIProbe`/`WidgetEditorUIProbe` record every editable field's real
+screen rect, so nothing is hardcoded pixels), asserts the data-model outcome bit-exactly, and requires **two full
+passes byte-identical** — then `scripts/verify.ps1` gates each dry-run exactly like an image golden (ED1 exit 24,
+ED2 exit 30, ED5 exit 41). Drag widgets are mouse-delta finicky, so the deterministic route is ImGui's built-in
+Ctrl+click-to-type on a DragFloat: the typed string commits exactly ONE value-change with the exact parsed float.
+This supersedes the R11 "panels read-only, inspector text-only" state.
+
+- **Interactive inspector editing (Slice ED1, `--ed1-dry-run`).** The Inspector's Transform rows become
+  per-component DragFloats and Material metallic/roughness DragFloats, applying through the **existing pure edit
+  ops** (`ApplyTransformEdit`/`ApplyMaterialEdit` — `edit_ops.h`/`ecs.h`/`scene_io.h` byte-untouched); base color
+  is a **texture-name combo** (`MaterialC`'s base is an opaque `rhi::ITexture*` resolved by name from
+  `SceneResources` — not an RGB factor, so a color picker would misrepresent the data model; the resolved pointer
+  is applied, never dereferenced). Edit semantics are locked: apply-on-value-change per frame as an **absolute
+  set** (a drag streams sets with live feedback — the panel re-reads the ECS each frame, so widget and scene stay
+  in lockstep; a Ctrl+click typed entry commits exactly one set). The dry-run clicks a hierarchy row, types 4.625
+  into Position-X and 0.875 into Metallic (both exactly float-representable), and proves: the ECS mutated by
+  EXACTLY the typed values; the edit persists through `DumpScene` AND a `LoadScene` round-trip; and a second full
+  pass on a fresh registry yields a **byte-identical final scene dump**. The Inspector's widget chrome changed
+  the `--editor`/`--editor-edit` pixels, so the `editor` + `editor_edit` goldens were rebaked.
+- **Interactive authoring panels (Slice ED2, `--ed2-dry-run`).** The flow/sequencer/widget editors now AUTHOR
+  from clicks, hit-testing the SAME drawn geometry the shot goldens render: palette Selectables →
+  `AddFlowNode`; a node-box click selects, a click within ±8 px of another node's real input-slot anchor wires
+  via `ConnectFlow`; Delete-key → `DeleteFlowNode`. A seq track-lane click ADDS a key at the **pinned
+  `SeqMapXToTime` inverse** of `MapTimeToX` (the rounding convention is locked and the dry-run twin recomputes
+  it), with the value sampled ON the current curve; diamonds select, arrow keys `MoveKeyframe`, Delete deletes.
+  Widget hierarchy rows select; an edit-mode-only `[+]` adds a child, a root-guarded button deletes, and the
+  inspector's Style rows become ED1-style Ctrl+click-typeable DragInts → `SetWidgetStyleProp`. Every affordance
+  is **edit-mode-only chrome**, so the static shot goldens stayed pixel-identical (the pinned flow view digest
+  `0xaaf9beb70640a9b7` unchanged; `--flow-editor-shot`/`--seq-editor-shot`/`--widget-editor-shot` byte-identical
+  vs a pre-ED2 baseline build — no golden rebakes); the panel signatures grew *defaulted* params so all existing
+  5-arg callers compile and render unchanged. The dry-run runs three phases over fresh fixtures, and after EVERY
+  action the data model is **bit-compared memberwise against a hand-called twin of the exact edit-op call** and
+  the view digest must equal the twin's; the flow baseline digest RESTORES after the delete, and two full passes
+  produce a byte-identical transcript.
+- **Deterministic undo/redo + the replayable edit session (Slice ED5, `edit_history.h`, `--ed5-dry-run`).** Every
+  editor edit is recorded as a **flat-POD reversible command** `{kind, target, BEFORE payload, AFTER payload}` —
+  no `std::function`, no heap indirection, serializable by construction. Undo applies BEFORE **through the same
+  pure ops**, Redo re-applies AFTER, so restoration is exactly as deterministic as the ops themselves — **undo N
+  + redo N restores BIT-IDENTICAL state** (`DumpScene` byte-compares). `SerializeHistory`/`DeserializeHistory`
+  (hand-LE bytes, per-kind field lists — zero compiler-layout dependence) + `DigestHistory` turn the live session
+  into a portable artifact, and `ReplayHistory` reproduces the edited scene **byte-for-byte on a fresh registry**.
+  The one pointer in the payload — material baseColor, an opaque pointer per the scene_io contract — is optionally
+  resolved to its registered **name** via `SceneResources` (the DumpScene reverse-mapping), making the artifact
+  **pointer-free and byte-identical across processes**; deserializing re-binds names to the target process's
+  pointers (unknown name / missing table = strict reject). ED5 enrolls the scene Transform/Material ops fully
+  plus the FLOW family (add/connect/disconnect/delete — delete captures the victim node + severed inbound refs
+  inline, `kFlowMaxCutRefs = 12`, overflow = a documented deterministic history invalidation, never a corrupt
+  stack); `BuildEditorUI`/`BuildFlowEditorUI` gain an optional `EditHistory*` (null = byte-identical pre-ED5
+  behavior — all four static shots verified byte-identical against a pre-ED5 build), `--fly` records each
+  completed gizmo drag as ONE command (`RecordTransformState`: before at grab, after at release) with live
+  Ctrl+Z/Ctrl+Y. The dry-run injects Ctrl+Z ×2 through the REAL key handling (posX/metallic revert bitwise; the
+  dump byte-identical to the pre-edit baseline), Ctrl+Y ×2 (matches the post-edit dump), round-trips the NAMED
+  artifact digest-identically, and replays it byte-for-byte onto a fresh baseline scene. The fixed hand-authored
+  history digests to the pinned cross-compiler constant `0x3cb790d71e9f35d2` (MSVC == clang,
+  `tests/edit_history_test.cpp`); named artifacts are byte-identical across two different-pointer worlds. UE5's
+  `FTransaction` is neither serializable nor replay-stable; this one is both.
+
+**Documented scope (honest):** the seq/widget op families are enrollment work for the history stack (the
+envelope + recipe are in the header); scene entity create/delete is not enrolled (view-index addressing); the
+flow-delete cut cap is 12 with clear-on-overflow; ED3 (docking), the ED4 remainder (multi-select + snapping), and
+ED6 (asset browser) remain open on the R11 row.
 
 ---
 

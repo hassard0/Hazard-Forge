@@ -9,7 +9,7 @@
 > `samples/hello_triangle`) and a Metal flag (`--<name>`, on `metal_headless/visual_test`). Every flag in this doc has
 > a committed reference render under `tests/golden/metal/` (byte-compared cross-platform at DIFF 0.0000 in
 > `scripts/verify.ps1`). Run `hello_triangle --help` or read `scripts/verify.ps1`'s `$Goldens` table for the complete,
-> always-current list (265 showcases). The determinism that underlies all of this — bit-identical Vulkan/Windows ==
+> always-current list (279 showcases). The determinism that underlies all of this — bit-identical Vulkan/Windows ==
 > Metal/macOS, lockstep/rollback-replayable — is the moat described in `docs/ARCHITECTURE.md`.
 
 ## Rendering & lighting
@@ -95,8 +95,19 @@ reference on BOTH vendors** — Metal HW == Vulkan HW == CPU, byte-for-byte — 
 offers. **Honest scope (issues #42/#35):** the v1 "degenerate single-instance TLAS" caveat is CLOSED by RT7 (above —
 a 1-instance TLAS keeps the original path byte-for-byte, so the rt2/rt3/rt4/rt6 goldens are unchanged);
 fragment-stage RT (the graphics-pipeline `accelStructureBinding` / `--rt-reflect-graphics`) is wired on Vulkan but
-not yet on Metal. See ARCHITECTURE "Hardware ray tracing, deterministically reconciled". *Genuine remaining work:* a
-temporal RT **denoiser** for noisy 1-spp paths (a screen-space denoiser exists for SSGI: `--ssgi-denoise`).
+not yet on Metal. See ARCHITECTURE "Hardware ray tracing, deterministically reconciled".
+
+✅ **Deterministic stochastic RT soft shadows + an SVGF-lite temporal denoiser now also ship** (superiority-run S9:
+`--rtd1-softshadow-shot` / `--rtd1-softshadow`, golden `rtd1_softshadow`, `engine/render/rtd.h`): area-light soft
+shadows via one jittered shadow ray per pixel per frame off a fixed 64-entry host-baked golden-angle Vogel spiral
+(no RNG/clock; ranged any-hit occlusion — an occluder beyond the light does not occlude), denoised by fixed-N=8
+temporal accumulation + the `--ssgi-denoise` bilateral called verbatim, edge-guarded by the RT hits' own t/normal.
+The integer half (visibility counts + accumulated image) is **HW == CPU byte-equal** (digests
+`0xf38663819426b236`/`0xc93c6d134aa489aa`, cross-platform exact); the bilateral + denoised shade is the float
+visresolve class (two full runs byte-identical, float buffers included). *Honest notes:* the pinned
+`RtdDenoiseParams` tightens spatialSigma 2.0→1.0 because the ssgi default over-blurs the penumbra ramp; at the
+96×72 test resolution the ~4 px penumbra still over-blurs vs the raw 8-sample (reported, not hidden — the strict
+gates are vs the raw 1-sample); static camera, no motion reprojection yet (composes with TSR US3).
 
 ## Virtualized geometry (Nanite-style) — issue #9
 
@@ -135,7 +146,9 @@ stack:
   `ps7_hullsleep` — O(n·k) island discovery byte-identical to all-pairs); **high-energy impact hardening**
   (`--wh7-harddrop`, golden `wh7_harddrop` — the WH7/R13 fix: 2.5-unit hard drops onto large floors settle
   fully asleep; the former "not validated for hard drops" gap was two int32 narrowphase bugs, root-caused +
-  fixed; *honest gap:* the plain GJK dot products still saturate int32 at a CSO diameter of ~104 world units);
+  fixed, and the fix revealed the warm-start's real ~400× residual win the depth bug had masked — the old
+  warm-vs-cold "no benefit" equality pin was an artifact; *honest gap:* the plain GJK dot products still
+  saturate int32 at a CSO diameter of ~104 world units);
   **hinge/prismatic/motorized joints**
   (`--jt7-machine`, golden `jt7_machine` — a lockstep-replayable motorized crank-slider; *honest gap:* the
   crank-slider is over-constrained with a pinned deterministic residual, and the bench is zero-g).
@@ -187,19 +200,30 @@ free-list emitter (no atomics, no `rand` — spawn is a pure function of the com
 (point/vortex/wind), **particle-vs-world collision** (ground + spheres + restitution bounce), the composed
 `StepParticles` tick, **lockstep/rollback replay**, and a **lit 3D capstone** (the spark-fountain money-shot). The
 entire sim is Q16.16, **bit-identical CPU/Vulkan/Metal AND lockstep/rollback-replayable** — which float Niagara
-cannot do (two machines re-derive the exact same fountain, every spark, from inputs alone). Honest v1 scope: a pure
-emitter (no particle-particle/SPH — the grid-hash is reuse-ready for a future slice), sphere-instanced particles (not
-sprites/ribbons), no mesh/skinned emission. The older CPU billboard emitter (`--vfx`) also remains. See ARCHITECTURE
-"Deterministic GPU particle system".
+cannot do (two machines re-derive the exact same fountain, every spark, from inputs alone). **Particle AUTHORING now
+also ships** (superiority-run S11: `--pa1-fountain-shot` / `--pa1-fountain`, golden `pa1_fountain`,
+`engine/sim/particle_author.h`): the deterministic flow VM drives the emitter/force-field parameters — Niagara-class
+emitter graphs, authored via the editor edit-ops, not C++ structs. The showcase pulsing fountain is built exclusively
+through `AddFlowNode`/`ConnectFlow` (24 nodes, 3 bindings; the pinned `SerializeGraph` digest `0xca55eabb27042ba8` is
+the authored-not-hardcoded proof), and the lockstep snapshot includes the flow `GraphState` (omitting it provably
+diverges — graph state IS sim state). Honest v1 scope: a pure emitter (no particle-particle/SPH — the grid-hash is
+reuse-ready for a future slice), sphere-instanced particles (not sprites/ribbons), no mesh/skinned emission. The older
+CPU billboard emitter (`--vfx`) also remains. See ARCHITECTURE "Deterministic GPU particle system".
 
 ## Animation — issue #17
 
 ✅ **Skinned glTF animation ships, and `--skinning` is the public animated sample** (the GPU-skinned **Fox.glb**,
 which is an animated model — the Fox is posed by sampling its animation, then GPU-skinned and rendered). The full set:
 **skinning** (`--skinning`), an animation **state-machine** cross-fade (`--anim-fsm`), animation **blending**
-(`--anim-blend`), and a **deterministic IK control-rig** (`--ik1-angle` … `--ik6-render`: two-bone + FABRIK + look-at +
-skeleton bridge + lockstep + a lit skinned capstone, bit-identical + rollback-replayable). See ARCHITECTURE
-"Deterministic IK control-rig".
+(`--anim-blend`), a **deterministic IK control-rig** (`--ik1-angle` … `--ik6-render`: two-bone + FABRIK + look-at +
+skeleton bridge + lockstep + a lit skinned capstone, bit-identical + rollback-replayable), and now **deterministic
+MOTION MATCHING** (superiority-run S4 / flagship #33: `--mm1-locomotion-shot`, golden `mm1_locomotion`,
+`engine/anim/motion_match.h`) — a Q16.16 20-dim pose/trajectory feature database + an int64 weighted-L1
+nearest-neighbor search with the strict (cost, index) tie-break, lockstep/rollback-replayable from input commands
+alone (trace digest `0xb37aa47b7bc7d69b`); UE5's motion matching is float/non-replayable. *Honest v1:* brute-force
+search, hard-switch transitions (a render-side cross-fade layers on top), root-position-relative (not
+facing-relative) features, small fixture database. See ARCHITECTURE "Deterministic IK control-rig" and
+"Deterministic motion matching".
 
 **The loader *does* surface skeleton + animation** (the issue's premise that it only handles static meshes is out of
 date): `asset::LoadSkinnedGltfModel(device, path)` returns a `SkinnedModel` with `.skeleton` + `.animations`
@@ -218,6 +242,24 @@ Drive `timeSeconds` from your frame clock to play it; use `anim::StateMachine::E
 `metal_headless/visual_test.mm` are the copy-paste references. **Genuine gap:** **morph targets** (blend-shapes — for
 facial animation / vehicle wheel-deform) are not yet extracted by the glTF loader; tracked as a follow-up. (Rotating
 *wheels* are a skeletal/transform animation, which the path above already supports.)
+
+## Editor — interactive, headlessly verified
+
+✅ **The docked editor now EDITS, not just displays** (superiority-run R11: ED1/ED2/ED5 — the former "panels
+read-only, inspector text-only" state is closed). Every piece of interactivity is proven headlessly by a
+**synthetic-input dry-run gate** in `scripts/verify.ps1` (real ImGui io events aimed at probe-recorded widget
+rects; two full passes must be byte-identical):
+
+| Capability | Ships? | See it (flag) | Notes |
+|---|---|---|---|
+| **Interactive Inspector editing** (Transform/Material DragFloats + a texture-name combo, through the existing pure edit ops) | ✅ | `--ed1-dry-run` (+ the live `--fly` editor; goldens `editor`/`editor_edit` rebaked) | Typed values land bit-exact, persist through save/reload, second pass byte-identical |
+| **Interactive authoring panels** — flow (palette-add / slot-wire / delete), sequencer (lane-click add-key on-curve, arrow-key move), widget (add-child / delete / Ctrl+click-typed style edits) | ✅ | `--ed2-dry-run` (static shots `--flow-editor-shot`/`--seq-editor-shot`/`--widget-editor-shot` byte-unchanged) | Every action bit-compared against a hand-called edit-op twin; all edit chrome is edit-mode-only, so the static goldens stayed pixel-identical |
+| **Deterministic undo/redo + a replayable edit-session artifact** (`engine/editor/edit_history.h`) | ✅ | `--ed5-dry-run` (+ Ctrl+Z/Ctrl+Y in `--fly`) | Flat-POD reversible commands; undo N + redo N restores BIT-IDENTICAL state; the serialized session is pointer-free (name-resolved textures) and `ReplayHistory` reproduces the edited scene byte-for-byte on a fresh registry — UE5's `FTransaction` is neither serializable nor replay-stable. Pinned cross-compiler digest `0x3cb790d71e9f35d2` |
+
+*Honest gaps (open on the R11 row):* ED3 docking/layout, the ED4 remainder (multi-select + snapping), ED6
+asset/content browser; the undo stack enrolls the scene Transform/Material + flow op families (seq/widget
+enrollment is documented follow-up work; scene entity create/delete is not enrolled). See ARCHITECTURE
+"Interactive editing — inspector edits, authoring panels, undo/redo".
 
 ## Agent / developer experience
 
@@ -248,7 +290,11 @@ Rayleigh+Mie sky** (`--at1-sky`), ✅ **auto-LOD (integer QEM)** (`--lod-gen-sho
 ✅ **XSPH viscosity** (`--fl7-visc`), ✅ **convex-shard rubble** (`--fr8-hull-shot`), ✅ **Archimedes buoyancy +
 sealed containment** (`--cp7-float-shot`), ✅ **polydisperse grains** (`--gr7-poly`), ✅ **spatial islands + hull
 sleep** (`--ps7-hullsleep`), ✅ **multi-layer navmesh** (`--nav7-ml`), ✅ **multi-instance TLAS on Metal**
-(`--rt7-instanced`), ✅ **hinge/prismatic/motorized joints** (`--jt7-machine`).
+(`--rt7-instanced`), ✅ **hinge/prismatic/motorized joints** (`--jt7-machine`), ✅ **stochastic RT soft shadows +
+SVGF-lite denoiser** (`--rtd1-softshadow`), ✅ **particle authoring via the flow VM** (`--pa1-fountain`),
+✅ **deterministic motion matching** (`--mm1-locomotion-shot`), ✅ **warm-hull high-energy-impact hardening**
+(`--wh7-harddrop`), ✅ **interactive editor: inspector editing / authoring panels / undo+redo with a replayable
+edit session** (`--ed1-dry-run` / `--ed2-dry-run` / `--ed5-dry-run`).
 
 **Earlier ships moved out:** ✅ **deterministic GPU particles** (#19, `--pt1-emit`…`--pt6-render`),
 ✅ **Substrate-lite layered materials** (#11, `--sb1-clearcoat`…`--sb6-substrate` — clearcoat/sheen/iridescence/aniso/
