@@ -407,6 +407,7 @@ $Goldens = @(
     @{ Name = 'cl8_ride';        Flag = '--cl8-ride-shot' }      # CL8 cloth dynamic colliders + Coulomb friction (R3 remainder; the cloth rides the moving body, digest 0xbc5de9aa3b86f976)
     @{ Name = 'nav8_funnel';     Flag = '--nav8-funnel-shot' }   # NAV8 hole-carving + convex-poly merge + portals + integer funnel (R8 remainder; taut path around the carved pillar, digest 0x86a81e1c22025a98)
     @{ Name = 'sc1_hero';        Flag = '--sc1-hero-shot' }      # SC1 THE REAL-SPONZA HERO BAKE (gap-roadmap Tier 2; 103 meshes / 25 materials / 69 URI textures / 262k tris / 208 draws; REQUIRES assets/reference/_downloaded/Sponza — run fetch_reference_assets --sponza on the Mac first)
+    @{ Name = 'sc3_stack';       Flag = '--sc3-stack-shot' }     # SC3 Sponza through the virtual-geometry stack (2097 clusters, cull-sound, digest 0x7a025cd461ba6902; REQUIRES the fetched Sponza)
 )
 
 $winResult = 'SKIP'
