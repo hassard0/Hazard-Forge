@@ -1082,6 +1082,24 @@ hf_add_pure_test(rt_query_test)
 # is APPEND-ONLY/byte-frozen, #included read-only). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(rt_shadow_test)
 
+# Slice RTD1 (Track-S S9): DETERMINISTIC STOCHASTIC RT SOFT SHADOWS + SVGF-LITE DENOISER — the CPU-side
+# invariants the HW accumulation kernel (shaders/rt_softshadow.comp) + the --rtd1-softshadow(-shot)
+# showcases rest on (the HW==CPU memcmp lives in the Vulkan showcase; needs a GPU). Pins: the 64-entry
+# golden-angle Vogel disc table (strictly in-disc + a PINNED byte digest — the shader mirrors the exact
+# integers); RtdSampleIndex covers all 64 spiral points exactly once over 64 frames for ANY pixel
+# (gcd(39,64)==1 -> the hash-independent ground truth) + pinned first indices + neighbor decorrelation;
+# TraceAnyHitRanged is analytic (occluder before the light occludes, occluder BEYOND the light point —
+# t > kOne — does NOT: the far bound RT3's directional test lacks) AND order-independent; the temporal
+# accumulation is EXACT (vis[0,8) == the sum of the 8 per-frame accumulations; the 64-frame truth == the
+# direct full-table sum per pixel); the integer shade is monotone in vis, ambient-only at vis=0, analytic
+# at vis=N, background on a miss; the PINNED FNV-1a64 digests of the 8-frame visibility buffer + the
+# accumulated integer image @96x72 (cross-compiler exact, MSVC == clang — the same integers the Vulkan HW
+# readback must reproduce); and the DENOISER IS LOAD-BEARING (float class, inequality pins: penumbra band
+# nonempty, denoised band variance < raw 1-sample STRICT, denoised MAE vs the 64-sample truth < raw
+# 1-sample STRICT, float denoise two-run byte-identical). rtd.h reuses rtrace.h/ssgi.h/pcg.h READ-ONLY
+# (all BYTE-FROZEN). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(rtd_test)
+
 # Hardware Ray Tracing Slice 4 (Slice RT4, FLAGSHIP #28): the CPU-side invariants the HW mirror-reflection
 # kernel (shaders/rt_reflect.comp) rests on. The HW==CPU memcmp proof lives in the --rt4-reflect-shot showcase
 # (needs a GPU); this pure-CPU test pins the deterministic reflection contract: FxReflect is analytic (an

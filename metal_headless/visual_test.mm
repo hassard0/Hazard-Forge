@@ -96,6 +96,7 @@
 #include "render/vt.h"              // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp + the Vulkan --vt-feedback-shot
 #include "render/mc.h"              // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp + the Vulkan --mc-classify-shot
 #include "render/rtrace.h"          // Slice RT1: deterministic Q16.16 SW reference ray tracer (RtScene/RtRay/IntersectSphere/IntersectAabb/TraceClosest/ShadeHitInt/RenderScene/BuildRt1Scene) — Metal runs the CPU reference (rt_trace.comp is int64/Vulkan-only) + the Vulkan --rt1-trace-shot
+#include "render/rtd.h"             // Slice RTD1: deterministic STOCHASTIC RT soft shadows + SVGF-lite denoiser (RtdAreaLight/RtdSampleIndex/TraceAnyHitRanged/AccumulateSoftShadowVis/DenoiseSoftShadowVis) — Metal runs the CPU reference (rt_softshadow.comp is int64+RayQuery/Vulkan-only) + the Vulkan --rtd1-softshadow-shot
 #include "render/gi.h"              // Slice GI1: deterministic integer RT probe trace + shade (GiProbeGrid/kGiProbeDirs/TraceProbeRays/GiProbesToImage/BuildGi1Scene) — Metal runs the CPU reference (gi_probe_trace.comp is int64/Vulkan-only) + the Vulkan --gi1-probe-shot
 #include "sim/fpx.h"                // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp + the Vulkan --fpx-shot
 #include "rt5_simrender_scene.h"    // Slice RT5: the SHARED sim->RT bridge (rt5::BuildRt5World/BuildRt5Stream/BodiesToRtScene) used by --rt5-simrender (here) + the Vulkan --rt5-simrender-shot + rt_simrender_test — lives under tests/ to keep rtrace.h sim-free + fpx.h render-free
@@ -25988,6 +25989,143 @@ static int RunRt3ShadowShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
     std::printf("OK wrote %s (%ux%u) — deterministic METAL HW-RT hard shadows via the RHI seam (%u shadowed)\n",
                 outPath, kRtW, kRtH, shadowed);
+    return 0;
+}
+
+// ===== Slice RTD1 — DETERMINISTIC STOCHASTIC RT SOFT SHADOWS + SVGF-LITE DENOISER showcase
+// (--rtd1-softshadow) (Track-S S9). The Vulkan --rtd1-softshadow-shot wires REAL HW inline ray query (a
+// PRIMARY RayQuery closest-hit THEN a FIXED k-loop of N=8 jittered AREA-LIGHT shadow RayQueries — the
+// deterministic golden-angle Vogel-spiral sample indexed by (PcgHash(pixel) + k*39) & 63, NO RNG/clock)
+// and memcmp's BOTH integer buffers (visibility counts + accumulated image) HW==CPU. rt_softshadow.comp
+// uses HLSL RayQuery + int64 -> Vulkan-SPIR-V-ONLY (glslc/spirv-cross can't lower to MSL), so on Metal
+// --rtd1-softshadow runs the CPU rtd:: reference (the SAME bit-exact accumulation the Vulkan HW==CPU
+// memcmp compares against — the rt1/rt2/rt3 Metal convention; a native-MSL HW twin is a possible METAL-RT
+// follow-on). The SVGF-LITE DENOISE — the fixed-N temporal mean + the ssgi.h bilateral spatial pass
+// (BilateralDenoiseScalar called VERBATIM, edge-guarded by the RT hits' t/normal) — is a HOST FLOAT pass:
+// two runs byte-identical, but float exp/pow -> the DENOISED image is the documented visresolve-class
+// exception (NOT cross-vendor byte-comparable; the INTEGER visibility/accumulation digests printed below
+// ARE cross-platform exact). Builds the SAME RT2 scene + disc area light as the Vulkan side at 320x240,
+// pins the quality bar (penumbra band nonempty; denoised band variance < raw 1-sample STRICT; denoised MAE
+// vs the 64-sample ground truth < raw 1-sample STRICT), writes the DENOISED PNG. New golden
+// tests/golden/metal/rtd1_softshadow.png (Mac-baked by the CONTROLLER; float-class).
+static int RunRtd1SoftShadowShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    namespace rtd = hf::render::rtd;
+    using rt::fx; using rt::FxVec3; using rt::kOne; using rt::F;
+
+    const uint32_t kRtW = 320, kRtH = 240;
+
+    // The RT2 scene (the SAME primitives + camera the Vulkan --rtd1-softshadow-shot defines; rtrace.h is
+    // frozen).
+    std::vector<rt::RtSphere> spheresV;
+    std::vector<rt::RtAabb>   aabbsV;
+    uint32_t nextPrim = 0;
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(-20,1), F(-3,1), F(-20,1)},
+                                FxVec3{F(20,1),  F(-1,1), F(20,1)}, nextPrim++});
+    for (int gz = 0; gz < 4; ++gz) {
+        for (int gx = 0; gx < 4; ++gx) {
+            fx cx = F(2 * gx - 3, 1);
+            fx cz = F(2 + 2 * gz, 1);
+            fx cy = F(0, 1);
+            fx rad = (gz & 1) ? F(3, 4) : F(1, 1);
+            spheresV.push_back(rt::RtSphere{FxVec3{cx, cy, cz}, rad, nextPrim++});
+        }
+    }
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(-9,2), F(-1,1), F(1,1)},
+                                FxVec3{F(-5,2), F(3,2),  F(5,2)}, nextPrim++});
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(5,2),  F(-1,1), F(2,1)},
+                                FxVec3{F(9,2),  F(2,1),  F(7,2)}, nextPrim++});
+
+    rt::RtScene scene{};
+    scene.spheres = std::span<const rt::RtSphere>(spheresV);
+    scene.aabbs   = std::span<const rt::RtAabb>(aabbsV);
+    scene.lightDir = rt::RtNormalize(FxVec3{F(4,10), F(8,10), F(-3,10)});  // unused by rtd (area light); scene parity
+    scene.background = rt::PackRGBA8(34, 40, 56, 255);
+
+    rt::RtCamera cam{};
+    cam.eye     = FxVec3{F(0,1), F(2,1), F(-9,1)};
+    cam.right   = FxVec3{kOne, 0, 0};
+    cam.up      = FxVec3{0, kOne, 0};
+    cam.forward = FxVec3{0, 0, kOne};
+    cam.halfW   = F(7, 10);
+    cam.halfH   = F(7, 10);
+
+    const rtd::RtdAreaLight light = rtd::BuildRtd1Light();
+    const uint32_t kPrimCount = (uint32_t)(spheresV.size() + aabbsV.size());
+    const size_t kPixels = (size_t)kRtW * kRtH;
+    const uint32_t kN = rtd::kRtdAccumFrames;
+
+    // The CPU pipeline (the SAME bit-exact reference the Vulkan HW==CPU memcmp proves against).
+    std::vector<rtd::RtdSurface> surfaces;
+    uint32_t hits = rtd::TracePrimarySurfaces(scene, light, cam, kRtW, kRtH, surfaces);
+    std::vector<uint32_t> vis1(kPixels, 0), vis8(kPixels, 0), vis64(kPixels, 0);
+    rtd::AccumulateSoftShadowVis(scene, light, surfaces, kRtW, kRtH, 0, 1, std::span<uint32_t>(vis1));
+    rtd::AccumulateSoftShadowVis(scene, light, surfaces, kRtW, kRtH, 0, kN, std::span<uint32_t>(vis8));
+    rtd::AccumulateSoftShadowVis(scene, light, surfaces, kRtW, kRtH, 0, rtd::kRtdTruthFrames,
+                                 std::span<uint32_t>(vis64));
+    std::vector<uint32_t> accumImage(kPixels, 0);
+    rtd::RenderSoftShadowImageInt(scene, surfaces, std::span<const uint32_t>(vis8), kN, kRtW, kRtH,
+                                  std::span<uint32_t>(accumImage));
+    std::vector<float> visD = rtd::DenoiseSoftShadowVis(surfaces, std::span<const uint32_t>(vis8), kN,
+                                                        kRtW, kRtH);
+    std::vector<uint32_t> denoisedImage(kPixels, 0);
+    rtd::RenderSoftShadowImageFloat(scene, surfaces, visD, kRtW, kRtH, std::span<uint32_t>(denoisedImage));
+    rtd::RtdMetrics met = rtd::ComputeRtdMetrics(surfaces, std::span<const uint32_t>(vis1),
+                                                 std::span<const uint32_t>(vis8), visD,
+                                                 std::span<const uint32_t>(vis64), kRtW, kRtH);
+
+    // The quality bar (load-bearing, fail loudly — the SAME pins as the Vulkan side).
+    if (met.bandPixels == 0)
+        return fail("rtd1-softshadow: penumbra band EMPTY (no fractional 64-sample visibility)");
+    if (!(met.varD < met.var1))
+        return fail("rtd1-softshadow: denoised band variance NOT < raw 1-sample (denoiser not load-bearing)");
+    if (!(met.maeD < met.mae1))
+        return fail("rtd1-softshadow: denoised MAE NOT < raw 1-sample vs the 64-sample truth");
+
+    uint64_t visDigest   = rtd::RtdFnv1a64(vis8.data(), vis8.size() * sizeof(uint32_t));
+    uint64_t accumDigest = rtd::RtdFnv1a64(accumImage.data(), accumImage.size() * sizeof(uint32_t));
+    std::printf("rtd1-softshadow: {rays:%zu, prims:%u, hits:%u, frames:%u, band:%u} "
+                "visDigest:0x%016llx accumDigest:0x%016llx [INTEGER, cross-platform exact] "
+                "[Metal: CPU rtd:: reference, byte-identical to the Vulkan HW integer buffers by "
+                "construction]\n", kPixels, kPrimCount, hits, kN, met.bandPixels,
+                (unsigned long long)visDigest, (unsigned long long)accumDigest);
+    std::printf("rtd1-softshadow noise (band variance): raw1:%.6f raw8:%.6f denoised:%.6f "
+                "(denoised < raw1 STRICT)\n", met.var1, met.var8, met.varD);
+    std::printf("rtd1-softshadow error vs 64-sample truth (band MAE): raw1:%.6f raw8:%.6f denoised:%.6f "
+                "(denoised < raw1 STRICT)\n", met.mae1, met.mae8, met.maeD);
+
+    // Two-run determinism (the WHOLE pipeline — stochastic accumulation + float denoise — is a pure
+    // function; NO clock/RNG).
+    {
+        std::vector<rtd::RtdSurface> surfaces2;
+        rtd::TracePrimarySurfaces(scene, light, cam, kRtW, kRtH, surfaces2);
+        std::vector<uint32_t> vis8b(kPixels, 0);
+        rtd::AccumulateSoftShadowVis(scene, light, surfaces2, kRtW, kRtH, 0, kN, std::span<uint32_t>(vis8b));
+        std::vector<float> visD2 = rtd::DenoiseSoftShadowVis(surfaces2, std::span<const uint32_t>(vis8b),
+                                                             kN, kRtW, kRtH);
+        std::vector<uint32_t> denoised2(kPixels, 0);
+        rtd::RenderSoftShadowImageFloat(scene, surfaces2, visD2, kRtW, kRtH, std::span<uint32_t>(denoised2));
+        if (std::memcmp(vis8.data(), vis8b.data(), kPixels * sizeof(uint32_t)) != 0 ||
+            std::memcmp(visD.data(), visD2.data(), kPixels * sizeof(float)) != 0 ||
+            std::memcmp(denoisedImage.data(), denoised2.data(), kPixels * sizeof(uint32_t)) != 0)
+            return fail("rtd1-softshadow: two full pipeline runs differ (nondeterministic)");
+        std::printf("rtd1-softshadow determinism: two full pipeline runs (stochastic accumulation + float "
+                    "denoise) BYTE-IDENTICAL\n");
+    }
+
+    // --- Write the DENOISED image (RGBA8 row-major top-first -> BGRA for WritePNG). ---
+    std::vector<uint8_t> bgra(kPixels * 4, 0);
+    for (size_t p = 0; p < kPixels; ++p) {
+        uint32_t px = denoisedImage[p];
+        uint8_t r = (uint8_t)(px & 0xFF);
+        uint8_t gch = (uint8_t)((px >> 8) & 0xFF);
+        uint8_t b = (uint8_t)((px >> 16) & 0xFF);
+        uint8_t a = (uint8_t)((px >> 24) & 0xFF);
+        bgra[p * 4 + 0] = b; bgra[p * 4 + 1] = gch; bgra[p * 4 + 2] = r; bgra[p * 4 + 3] = a;
+    }
+    if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — deterministic stochastic RT soft shadows, SVGF-lite denoised "
+                "(band:%u px)\n", outPath, kRtW, kRtH, met.bandPixels);
     return 0;
 }
 
@@ -77780,6 +77918,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--rt3-shadow") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_rt3_shadow.png";
             try { return RunRt3ShadowShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --rtd1-softshadow <out.png>: render the Slice RTD1 DETERMINISTIC STOCHASTIC RT SOFT SHADOWS +
+        // SVGF-LITE DENOISER showcase (Track-S S9). rt_softshadow.comp uses HLSL RayQuery + int64 ->
+        // Vulkan-SPIR-V-ONLY, so Metal runs the CPU rtd:: reference (the integer accumulation is
+        // byte-identical to the Vulkan HW buffers by construction; the denoised image is the documented
+        // FLOAT visresolve-class output). New golden tests/golden/metal/rtd1_softshadow.png.
+        if (argc > 1 && std::strcmp(argv[1], "--rtd1-softshadow") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_rtd1_softshadow.png";
+            try { return RunRtd1SoftShadowShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --rt4-reflect <out.png>: render the Hardware Ray Tracing DETERMINISTIC RT MIRROR REFLECTIONS

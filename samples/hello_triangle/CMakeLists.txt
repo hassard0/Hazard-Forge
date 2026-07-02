@@ -612,6 +612,19 @@ hf_compile_shaders(
     # MSL) -> NOT in the Metal hf_gen_msl list; on Metal --rt3-shadow runs the CPU rtrace::RenderSceneShadowed
     # (byte-identical by construction). The Vulkan side carries the HW==CPU memcmp proof.
     "shaders/rt_shadow.comp.hlsl:csrq"
+    # Slice RTD1 (Track-S S9): rt_softshadow.comp is the DETERMINISTIC STOCHASTIC RT SOFT-SHADOW
+    # ACCUMULATION kernel — ONE thread per pixel runs the rt_shadow.comp PRIMARY RayQuery body VERBATIM
+    # (closest hit), then LOOPS the FIXED accumulation frames k = 0..accumFrames-1, each casting ONE shadow
+    # RayQuery toward the deterministic golden-angle Vogel-spiral point on the DISC AREA LIGHT selected by
+    # j = (PcgHash(pixel) + k*39) & 63 (NO RNG/clock — engine/render/rtd.h mirrored verbatim), with the
+    # RANGED fx occlusion kRtShadowMinT < t < kOne (the light point at t == kOne). Writes BOTH the raw
+    # visibility counts AND the accumulated INTEGER soft-shadow shade — bit-identical to the CPU
+    # rtd::AccumulateSoftShadowVis + rtd::RenderSoftShadowImageInt (memcmp HW==CPU on both buffers). The
+    # SVGF-lite bilateral denoise is a HOST float pass (the documented visresolve-class exception), NOT in
+    # this kernel. The :csrq stage compiles it cs_6_5 + SPV_KHR_ray_query. VULKAN-SPIR-V-ONLY (RayQuery +
+    # int64 -> glslc/spirv-cross can't lower to MSL) -> NOT in the Metal hf_gen_msl list; on Metal
+    # --rtd1-softshadow runs the CPU rtd:: reference (byte-identical by construction).
+    "shaders/rt_softshadow.comp.hlsl:csrq"
     # Hardware Ray Tracing Slice 4 (Slice RT4, FLAGSHIP #28): rt_reflect.comp is the DETERMINISTIC RT MIRROR
     # REFLECTIONS kernel — ONE thread per pixel runs the rt_shadow.comp PRIMARY closest-hit + PRIMARY shadow
     # body VERBATIM (the shadowed color cS), then if the primary hit is REFLECTIVE casts a REFLECTION ray (the

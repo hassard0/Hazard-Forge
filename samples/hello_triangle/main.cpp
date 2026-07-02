@@ -72,6 +72,7 @@
 #include "render/vt.h"          // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp
 #include "render/mc.h"          // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp
 #include "render/rtrace.h"      // Slice RT1: deterministic Q16.16 SW reference ray tracer (RtScene/RtRay/IntersectSphere/IntersectAabb/TraceClosest/ShadeHitInt/RenderScene/BuildRt1Scene) — shared verbatim with rt_trace.comp (Vulkan-only)
+#include "render/rtd.h"         // Slice RTD1: deterministic STOCHASTIC RT soft shadows + SVGF-lite denoiser (RtdAreaLight/RtdSampleIndex/TraceAnyHitRanged/AccumulateSoftShadowVis/ShadeSoftShadowInt/DenoiseSoftShadowVis) — shared verbatim with rt_softshadow.comp (Vulkan-only)
 #include "render/gi.h"          // Slice GI1: deterministic integer RT probe trace + shade (GiProbeGrid/kGiProbeDirs/TraceProbeRays/GiProbesToImage/BuildGi1Scene) — shared verbatim with gi_probe_trace.comp (Vulkan-only)
 #include "sim/fpx.h"            // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp
 #include "rt5_simrender_scene.h" // Slice RT5: the SHARED sim->RT bridge (rt5::BuildRt5World/BuildRt5Stream/BodiesToRtScene) used by --rt5-simrender-shot (here) + --rt5-simrender (Metal) + rt_simrender_test — lives under tests/ to keep rtrace.h sim-free + fpx.h render-free
@@ -4152,6 +4153,17 @@ int main(int argc, char** argv) {
     const char* rt3ShadowShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--rt3-shadow-shot") == 0) { rt3ShadowShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice RTD1 (Track-S S9): --rtd1-softshadow-shot <out.bmp> (DETERMINISTIC STOCHASTIC RT SOFT SHADOWS +
+    // SVGF-LITE DENOISER). Builds the SAME RT2 scene + accel structure with a DISC AREA LIGHT, and if
+    // SupportsHardwareRayQuery() dispatches shaders/rt_softshadow.comp (HW primary closest-hit + a FIXED
+    // k-loop of jittered area-light shadow rays), reads back BOTH the visibility counts AND the accumulated
+    // integer image, memcmp's BOTH HW==CPU strict; the SVGF-lite denoise (temporal N=8 mean + the ssgi.h
+    // bilateral) runs on the HOST (float, visresolve-class) and the DENOISED image is written. Its OWN loop.
+    const char* rtd1SoftShadowShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--rtd1-softshadow-shot") == 0) { rtd1SoftShadowShotPath = argv[i + 1]; break; }
     }
 
     // Slice RT4: --rt4-reflect-shot <out.bmp> (Hardware Ray Tracing DETERMINISTIC RT MIRROR REFLECTIONS).
@@ -69201,6 +69213,310 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — deterministic HW RT hard shadows (%u shadowed)\n",
                                 rt3ShadowShotPath, kRtW, kRtH, cpuShadowed);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", rt3ShadowShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Slice RTD1 (Track-S S9): DETERMINISTIC STOCHASTIC RT SOFT SHADOWS + SVGF-LITE DENOISER
+        // (--rtd1-softshadow-shot <out.bmp>). The RT2 scene (rtrace.h byte-frozen; defined HERE, identical
+        // to --rt3-shadow-shot) under a DISC AREA LIGHT (rtd::BuildRtd1Light — a radius-3 horizontal disc on
+        // the RT3 directional light's axis). Per pixel per frame k (N = kRtdAccumFrames = 8 fixed frames,
+        // the taa::kAccumFrames convention; static camera, no reprojection — the ssgi_temporal precedent):
+        // ONE shadow ray toward the deterministic golden-angle Vogel-spiral point indexed by
+        // (PcgHash(pixel) + k*39) & 63 — NO RNG, NO clock. The INTEGER visibility counts + the accumulated
+        // integer image are the byte-equal class: if SupportsHardwareRayQuery(), dispatch
+        // shaders/rt_softshadow.comp over the SAME procedural-AABB BLAS/TLAS as --rt3-shadow-shot and
+        // memcmp BOTH buffers HW==CPU STRICT (the RT-arc bar). The SVGF-LITE denoise — the fixed-N temporal
+        // mean + the ssgi.h bilateral spatial pass (BilateralDenoiseScalar called VERBATIM, edge-guarded by
+        // the RT hits' t/normal, the RT "G-buffer") — is a HOST FLOAT pass (the documented visresolve-class
+        // exception: two runs byte-identical, NOT cross-vendor byte-comparable). QUALITY is load-bearing:
+        // the penumbra band (0 < 64-sample truth < 64) must be nonempty, the denoised band variance must sit
+        // STRICTLY below the raw 1-sample's, and the denoised MAE vs the 64-sample ground truth must sit
+        // STRICTLY below the raw 1-sample's — all fail-loudly. Writes the DENOISED image. One BMP -> exit.
+        if (rtd1SoftShadowShotPath) {
+            namespace rt = hf::render::rtrace;
+            namespace rtd = hf::render::rtd;
+            using rt::fx; using rt::FxVec3; using rt::kOne; using rt::F;
+
+            const uint32_t kRtW = 320, kRtH = 240;
+
+            // --- The RT2 scene (defined HERE; rtrace.h byte-frozen) — IDENTICAL to --rt3-shadow-shot ---
+            std::vector<rt::RtSphere> spheresV;
+            std::vector<rt::RtAabb>   aabbsV;
+            uint32_t nextPrim = 0;
+            aabbsV.push_back(rt::RtAabb{FxVec3{F(-20,1), F(-3,1), F(-20,1)},
+                                        FxVec3{F(20,1),  F(-1,1), F(20,1)}, nextPrim++});
+            for (int gz = 0; gz < 4; ++gz) {
+                for (int gx = 0; gx < 4; ++gx) {
+                    fx cx = F(2 * gx - 3, 1);
+                    fx cz = F(2 + 2 * gz, 1);
+                    fx cy = F(0, 1);
+                    fx r  = (gz & 1) ? F(3, 4) : F(1, 1);
+                    spheresV.push_back(rt::RtSphere{FxVec3{cx, cy, cz}, r, nextPrim++});
+                }
+            }
+            aabbsV.push_back(rt::RtAabb{FxVec3{F(-9,2), F(-1,1), F(1,1)},
+                                        FxVec3{F(-5,2), F(3,2),  F(5,2)}, nextPrim++});
+            aabbsV.push_back(rt::RtAabb{FxVec3{F(5,2),  F(-1,1), F(2,1)},
+                                        FxVec3{F(9,2),  F(2,1),  F(7,2)}, nextPrim++});
+
+            rt::RtScene scene{};
+            scene.spheres = std::span<const rt::RtSphere>(spheresV);
+            scene.aabbs   = std::span<const rt::RtAabb>(aabbsV);
+            scene.lightDir = rt::RtNormalize(FxVec3{F(4,10), F(8,10), F(-3,10)});  // unused by rtd (area light); kept for scene parity
+            scene.background = rt::PackRGBA8(34, 40, 56, 255);
+
+            rt::RtCamera cam{};
+            cam.eye     = FxVec3{F(0,1), F(2,1), F(-9,1)};
+            cam.right   = FxVec3{kOne, 0, 0};
+            cam.up      = FxVec3{0, kOne, 0};
+            cam.forward = FxVec3{0, 0, kOne};
+            cam.halfW   = F(7, 10);
+            cam.halfH   = F(7, 10);
+
+            const rtd::RtdAreaLight light = rtd::BuildRtd1Light();
+            const uint32_t kSphereCount = (uint32_t)spheresV.size();
+            const uint32_t kAabbCount   = (uint32_t)aabbsV.size();
+            const uint32_t kPrimCount   = kSphereCount + kAabbCount;
+            const size_t kPixels = (size_t)kRtW * kRtH;
+            const uint32_t kN = rtd::kRtdAccumFrames;
+
+            // === The CPU pipeline (the reference EVERYTHING is proven against) ===
+            std::vector<rtd::RtdSurface> surfaces;
+            uint32_t cpuHits = rtd::TracePrimarySurfaces(scene, light, cam, kRtW, kRtH, surfaces);
+            std::vector<uint32_t> vis1(kPixels, 0), vis8(kPixels, 0), vis64(kPixels, 0);
+            rtd::AccumulateSoftShadowVis(scene, light, surfaces, kRtW, kRtH, 0, 1, std::span<uint32_t>(vis1));
+            rtd::AccumulateSoftShadowVis(scene, light, surfaces, kRtW, kRtH, 0, kN, std::span<uint32_t>(vis8));
+            rtd::AccumulateSoftShadowVis(scene, light, surfaces, kRtW, kRtH, 0, rtd::kRtdTruthFrames,
+                                         std::span<uint32_t>(vis64));
+            std::vector<uint32_t> cpuAccumImage(kPixels, 0);
+            rtd::RenderSoftShadowImageInt(scene, surfaces, std::span<const uint32_t>(vis8), kN, kRtW, kRtH,
+                                          std::span<uint32_t>(cpuAccumImage));
+            std::vector<float> visD = rtd::DenoiseSoftShadowVis(surfaces, std::span<const uint32_t>(vis8),
+                                                                kN, kRtW, kRtH);
+            std::vector<uint32_t> denoisedImage(kPixels, 0);
+            rtd::RenderSoftShadowImageFloat(scene, surfaces, visD, kRtW, kRtH,
+                                            std::span<uint32_t>(denoisedImage));
+            rtd::RtdMetrics met = rtd::ComputeRtdMetrics(surfaces, std::span<const uint32_t>(vis1),
+                                                         std::span<const uint32_t>(vis8), visD,
+                                                         std::span<const uint32_t>(vis64), kRtW, kRtH);
+
+            // PROOF (quality, load-bearing): a real PENUMBRA exists, the denoiser strictly reduces the band
+            // noise vs the 1-sample buffer, and the denoised result sits strictly closer to the 64-sample
+            // ground truth than the raw 1-sample.
+            if (met.bandPixels == 0) {
+                std::fprintf(stderr, "FATAL: rtd1-softshadow penumbra band EMPTY (no fractional 64-sample "
+                             "visibility — the area light degenerated to a point/hard shadow)\n");
+                return 1;
+            }
+            if (!(met.varD < met.var1)) {
+                std::fprintf(stderr, "FATAL: rtd1-softshadow denoised band variance %.6f NOT < raw 1-sample "
+                             "%.6f — the denoiser is not load-bearing\n", met.varD, met.var1);
+                return 1;
+            }
+            if (!(met.maeD < met.mae1)) {
+                std::fprintf(stderr, "FATAL: rtd1-softshadow denoised MAE %.6f NOT < raw 1-sample %.6f vs "
+                             "the 64-sample truth\n", met.maeD, met.mae1);
+                return 1;
+            }
+            uint64_t visDigest   = rtd::RtdFnv1a64(vis8.data(), vis8.size() * sizeof(uint32_t));
+            uint64_t accumDigest = rtd::RtdFnv1a64(cpuAccumImage.data(), cpuAccumImage.size() * sizeof(uint32_t));
+            std::printf("rtd1-softshadow: {rays:%zu, prims:%u, hits:%u, frames:%u, band:%u} "
+                        "visDigest:0x%016llx accumDigest:0x%016llx [INTEGER, cross-platform exact]\n",
+                        kPixels, kPrimCount, cpuHits, kN, met.bandPixels,
+                        (unsigned long long)visDigest, (unsigned long long)accumDigest);
+            std::printf("rtd1-softshadow noise (band variance): raw1:%.6f raw8:%.6f denoised:%.6f "
+                        "(denoised < raw1 STRICT)\n", met.var1, met.var8, met.varD);
+            std::printf("rtd1-softshadow error vs 64-sample truth (band MAE): raw1:%.6f raw8:%.6f "
+                        "denoised:%.6f (denoised < raw1 STRICT)\n", met.mae1, met.mae8, met.maeD);
+
+            // PROOF (determinism): the WHOLE stochastic pipeline (integer accumulation + float denoise) is
+            // clock/RNG-free — a full second run is byte-identical, including the float buffers.
+            {
+                std::vector<rtd::RtdSurface> surfaces2;
+                rtd::TracePrimarySurfaces(scene, light, cam, kRtW, kRtH, surfaces2);
+                std::vector<uint32_t> vis8b(kPixels, 0);
+                rtd::AccumulateSoftShadowVis(scene, light, surfaces2, kRtW, kRtH, 0, kN,
+                                             std::span<uint32_t>(vis8b));
+                std::vector<float> visD2 = rtd::DenoiseSoftShadowVis(surfaces2, std::span<const uint32_t>(vis8b),
+                                                                     kN, kRtW, kRtH);
+                std::vector<uint32_t> denoised2(kPixels, 0);
+                rtd::RenderSoftShadowImageFloat(scene, surfaces2, visD2, kRtW, kRtH,
+                                                std::span<uint32_t>(denoised2));
+                if (std::memcmp(vis8.data(), vis8b.data(), kPixels * sizeof(uint32_t)) != 0 ||
+                    std::memcmp(visD.data(), visD2.data(), kPixels * sizeof(float)) != 0 ||
+                    std::memcmp(denoisedImage.data(), denoised2.data(), kPixels * sizeof(uint32_t)) != 0) {
+                    std::fprintf(stderr, "FATAL: rtd1-softshadow nondeterministic (two full CPU pipeline "
+                                 "runs differ)\n");
+                    return 1;
+                }
+                std::printf("rtd1-softshadow determinism: two full pipeline runs (stochastic accumulation + "
+                            "float denoise) BYTE-IDENTICAL\n");
+            }
+
+            const bool hwRayQuery = device->SupportsHardwareRayQuery();
+            if (hwRayQuery) {
+                // === Upload (the rt_shadow.comp std430 mirrors + the RTD1 params with the disc axes) ===
+                struct GpuSphere { int32_t cx, cy, cz, radius; uint32_t primIndex, _p0, _p1, _p2; };
+                struct GpuAabb   { int32_t lox, loy, loz, hix, hiy, hiz; uint32_t primIndex, _p0; };
+                static_assert(sizeof(GpuSphere) == 32, "GpuSphere std430");
+                static_assert(sizeof(GpuAabb) == 32, "GpuAabb std430");
+                struct GpuParams {
+                    int32_t eye[4]; int32_t right[4]; int32_t up[4]; int32_t forward[4];
+                    int32_t light[4]; int32_t axisU[4]; int32_t axisV[4]; int32_t plane[4];
+                    uint32_t counts[4];
+                };
+                static_assert(sizeof(GpuParams) == 36 * 4, "GpuParams std430");
+
+                std::vector<GpuSphere> gSpheres(kSphereCount);
+                for (uint32_t i = 0; i < kSphereCount; ++i) {
+                    const rt::RtSphere& s = spheresV[i];
+                    gSpheres[i] = GpuSphere{s.center.x, s.center.y, s.center.z, s.radius, s.primIndex, 0,0,0};
+                }
+                std::vector<GpuAabb> gAabbs(kAabbCount);
+                for (uint32_t i = 0; i < kAabbCount; ++i) {
+                    const rt::RtAabb& a = aabbsV[i];
+                    gAabbs[i] = GpuAabb{a.lo.x, a.lo.y, a.lo.z, a.hi.x, a.hi.y, a.hi.z, a.primIndex, 0};
+                }
+
+                GpuParams params{};
+                params.eye[0]=cam.eye.x; params.eye[1]=cam.eye.y; params.eye[2]=cam.eye.z;
+                params.right[0]=cam.right.x; params.right[1]=cam.right.y; params.right[2]=cam.right.z;
+                params.up[0]=cam.up.x; params.up[1]=cam.up.y; params.up[2]=cam.up.z;
+                params.forward[0]=cam.forward.x; params.forward[1]=cam.forward.y; params.forward[2]=cam.forward.z;
+                params.light[0]=light.center.x; params.light[1]=light.center.y; params.light[2]=light.center.z;
+                params.axisU[0]=light.axisU.x; params.axisU[1]=light.axisU.y; params.axisU[2]=light.axisU.z;
+                params.axisV[0]=light.axisV.x; params.axisV[1]=light.axisV.y; params.axisV[2]=light.axisV.z;
+                params.plane[0]=cam.halfW; params.plane[1]=cam.halfH;
+                params.plane[2]=(int32_t)kRtW; params.plane[3]=(int32_t)kRtH;
+                params.counts[0]=kSphereCount; params.counts[1]=kAabbCount;
+                params.counts[2]=scene.background; params.counts[3]=kN;
+
+                auto makeStorage = [&](const void* data, size_t bytes) {
+                    rhi::BufferDesc d; d.size = bytes; d.initialData = data; d.usage = rhi::BufferUsage::Storage;
+                    return device->CreateBuffer(d);
+                };
+                const uint32_t kGroupsX = (kRtW + 7u) / 8u, kGroupsY = (kRtH + 7u) / 8u;
+
+                // === Build one procedural-AABB BLAS per primitive + a TLAS (IDENTICAL to --rt3-shadow-shot) ===
+                auto fxf = [](fx v) -> float { return (float)v / (float)(int)kOne; };
+                std::vector<std::unique_ptr<rhi::IAccelStructure>> blases;
+                std::vector<rhi::TlasInstance> instances;
+                blases.reserve(kPrimCount); instances.reserve(kPrimCount);
+                const uint32_t kAabbTag = 0x800000u;
+                auto addBlas = [&](float lox, float loy, float loz, float hix, float hiy, float hiz, uint32_t tag){
+                    rhi::AccelGeometry geom{};
+                    geom.kind = rhi::AccelGeometry::Kind::AabbProcedural;
+                    geom.lo = math::Vec3(lox, loy, loz); geom.hi = math::Vec3(hix, hiy, hiz);
+                    rhi::BlasDesc bd{}; bd.geoms = std::span<const rhi::AccelGeometry>(&geom, 1);
+                    auto blas = device->CreateBlas(bd);
+                    if (!blas) { std::fprintf(stderr, "FATAL: rtd1-softshadow CreateBlas returned null with HW RT on\n"); return false; }
+                    rhi::TlasInstance inst{}; inst.blas = blas.get(); inst.instanceId = tag;
+                    instances.push_back(inst);
+                    blases.push_back(std::move(blas));
+                    return true;
+                };
+                for (uint32_t i = 0; i < kSphereCount; ++i) {
+                    const rt::RtSphere& s = spheresV[i];
+                    float cx=fxf(s.center.x), cy=fxf(s.center.y), cz=fxf(s.center.z), r=fxf(s.radius);
+                    if (!addBlas(cx-r,cy-r,cz-r, cx+r,cy+r,cz+r, i)) { device->WaitIdle(); return 1; }
+                }
+                for (uint32_t i = 0; i < kAabbCount; ++i) {
+                    const rt::RtAabb& a = aabbsV[i];
+                    if (!addBlas(fxf(a.lo.x),fxf(a.lo.y),fxf(a.lo.z), fxf(a.hi.x),fxf(a.hi.y),fxf(a.hi.z),
+                                 kAabbTag | i)) { device->WaitIdle(); return 1; }
+                }
+                rhi::TlasDesc td{}; td.instances = std::span<const rhi::TlasInstance>(instances);
+                auto tlas = device->CreateTlas(td);
+                if (!tlas) { std::fprintf(stderr, "FATAL: rtd1-softshadow CreateTlas returned null with HW RT on\n");
+                    device->WaitIdle(); return 1; }
+
+                // === HW dispatch (rt_softshadow.comp: primary closest-hit + the fixed k-loop of jittered
+                //     area-light shadow queries; writes visibility counts + the accumulated integer image) ===
+                auto hwCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/rt_softshadow.comp.hlsl.spv");
+                auto hwCs = device->CreateShaderModule({std::span<const uint32_t>(hwCsWords)});
+                rhi::ComputePipelineDesc hwDesc;
+                hwDesc.compute = hwCs.get(); hwDesc.storageBufferCount = 5; hwDesc.threadsPerGroupX = 64;
+                hwDesc.accelStructureBinding = 5;   // the TLAS slot the kernel RayQueries
+                auto hwCompute = device->CreateComputePipeline(hwDesc);
+
+                auto runHw = [&](std::vector<uint32_t>& outVis, std::vector<uint32_t>& outImg) {
+                    auto sb = makeStorage(gSpheres.data(), gSpheres.size()*sizeof(GpuSphere));
+                    auto ab = makeStorage(gAabbs.data(), gAabbs.size()*sizeof(GpuAabb));
+                    auto pb = makeStorage(&params, sizeof(GpuParams));
+                    std::vector<uint32_t> z(kPixels, 0);
+                    auto vb = makeStorage(z.data(), z.size()*sizeof(uint32_t));
+                    auto ib = makeStorage(z.data(), z.size()*sizeof(uint32_t));
+                    render::RenderGraph g;
+                    render::RgResource sw = g.ImportSwapchain("swapchain");
+                    g.AddPass("rtd1_softshadow_hw", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd){
+                        cmd.BindComputePipeline(*hwCompute);
+                        cmd.BindStorageBuffer(*sb,0); cmd.BindStorageBuffer(*ab,1);
+                        cmd.BindStorageBuffer(*pb,2); cmd.BindStorageBuffer(*vb,3);
+                        cmd.BindStorageBuffer(*ib,4);
+                        cmd.BindAccelStructure(*tlas, 5);
+                        cmd.DispatchCompute(kGroupsX, kGroupsY, 1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                    });
+                    g.Execute(*device); device->WaitIdle();
+                    outVis.assign(kPixels, 0);
+                    outImg.assign(kPixels, 0);
+                    device->ReadBuffer(*vb, outVis.data(), outVis.size()*sizeof(uint32_t), 0);
+                    device->ReadBuffer(*ib, outImg.data(), outImg.size()*sizeof(uint32_t), 0);
+                };
+
+                std::vector<uint32_t> hwVis, hwImage;
+                runHw(hwVis, hwImage);
+
+                // PROOF (HW==CPU, the RT-arc bar): BOTH integer buffers byte-equal — the raw stochastic
+                // visibility counts AND the accumulated soft-shadow image.
+                if (std::memcmp(hwVis.data(), vis8.data(), kPixels*sizeof(uint32_t)) != 0) {
+                    size_t fd = kPixels;
+                    for (size_t p=0;p<kPixels;++p) if (hwVis[p]!=vis8[p]) { fd=p; break; }
+                    std::fprintf(stderr, "FATAL: rtd1-softshadow HW visibility != CPU (firstDiff:%zu hw=%u "
+                                 "cpu=%u) — a sample-index/disc-point/range mismatch\n", fd,
+                                 fd<kPixels?hwVis[fd]:0, fd<kPixels?vis8[fd]:0);
+                    device->WaitIdle(); return 1;
+                }
+                if (std::memcmp(hwImage.data(), cpuAccumImage.data(), kPixels*sizeof(uint32_t)) != 0) {
+                    size_t fd = kPixels;
+                    for (size_t p=0;p<kPixels;++p) if (hwImage[p]!=cpuAccumImage[p]) { fd=p; break; }
+                    std::fprintf(stderr, "FATAL: rtd1-softshadow HW accumulated image != CPU (firstDiff:%zu "
+                                 "hw=%08x cpu=%08x) — a shade/visFrac mismatch\n", fd,
+                                 fd<kPixels?hwImage[fd]:0, fd<kPixels?cpuAccumImage[fd]:0);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("rtd1-softshadow: HW==CPU BYTE-EQUAL on BOTH integer buffers (visibility counts "
+                            "+ accumulated image) (hwRayQuery:true)\n");
+
+                // PROOF (HW determinism): two HW dispatches byte-identical on both buffers.
+                {
+                    std::vector<uint32_t> hwVis2, hwImage2;
+                    runHw(hwVis2, hwImage2);
+                    if (std::memcmp(hwVis.data(), hwVis2.data(), kPixels*sizeof(uint32_t)) != 0 ||
+                        std::memcmp(hwImage.data(), hwImage2.data(), kPixels*sizeof(uint32_t)) != 0) {
+                        std::fprintf(stderr, "FATAL: rtd1-softshadow HW nondeterministic (two dispatches "
+                                     "differ)\n");
+                        device->WaitIdle(); return 1;
+                    }
+                    std::printf("rtd1-softshadow determinism: two HW dispatches BYTE-IDENTICAL\n");
+                }
+                std::printf("rtd1-softshadow: rhi hw ray query ACTIVE (hwRayQuery:true)\n");
+            } else {
+                std::printf("rtd1-softshadow: rhi hw ray query INACTIVE (hwRayQuery:false) -> SW (CPU rtd:: "
+                            "reference)\n");
+            }
+
+            // --- Write the DENOISED image (the money shot; float visresolve-class — RGBA8 -> BGRA). ---
+            std::vector<uint8_t> bgra(kPixels*4, 0);
+            for (size_t p=0;p<kPixels;++p){uint32_t px=denoisedImage[p];
+                bgra[p*4+0]=(uint8_t)((px>>16)&0xFF); bgra[p*4+1]=(uint8_t)((px>>8)&0xFF);
+                bgra[p*4+2]=(uint8_t)(px&0xFF); bgra[p*4+3]=(uint8_t)((px>>24)&0xFF);}
+            bool ok = WriteBMP(rtd1SoftShadowShotPath, bgra, kRtW, kRtH);
+            if (ok) std::printf("wrote %s (%ux%u) — deterministic stochastic RT soft shadows, SVGF-lite "
+                                "denoised (band:%u px)\n", rtd1SoftShadowShotPath, kRtW, kRtH, met.bandPixels);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", rtd1SoftShadowShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
