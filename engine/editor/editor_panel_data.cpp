@@ -35,6 +35,24 @@ PanelData BuildPanelData(ecs::Registry& registry, const scene::SceneResources& r
         if (state.selectedEntity >= count) state.selectedEntity = count - 1;
     }
 
+    // --- Slice ED4: sanitize the multi-select set against the current entity count (written back,
+    // like the primary clamp): drop out-of-range members, collapse a set shrunk below 2 back to
+    // single-select, and re-anchor the primary into the set if the clamp moved it outside. Keeps
+    // the edit_ops3.h invariant (empty, or size >= 2 sorted ascending containing the primary)
+    // under entity-count changes. A no-op for the (default) empty set. ---
+    {
+        std::vector<int>& ms = state.multiSelection;
+        ms.erase(std::remove_if(ms.begin(), ms.end(),
+                                [count](int v) { return v < 0 || v >= count; }),
+                 ms.end());
+        if (ms.size() < 2) {
+            if (ms.size() == 1) state.selectedEntity = ms[0];
+            ms.clear();
+        } else if (!SelectionContains(ms, state.selectedEntity)) {
+            state.selectedEntity = ms.back();
+        }
+    }
+
     // --- Inspector: the selected entity's transform + material + mesh. ---
     if (state.selectedEntity >= 0 && state.selectedEntity < count) {
         const HierarchyRow& row = out.hierarchy[state.selectedEntity];

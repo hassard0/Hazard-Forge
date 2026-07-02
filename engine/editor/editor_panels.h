@@ -68,6 +68,17 @@ struct EditorUIProbe {
 // With the default (nullptr) the panel behaves EXACTLY as before ED5 — raw ops, no key handling —
 // so existing callers compile + render byte-identically (the static --editor-shot golden).
 //
+// Slice ED4 (multi-select + transform snapping): the Scene Hierarchy supports MULTI-SELECT —
+// plain click single-selects (the pre-ED4 behavior, byte-compatible); Ctrl+click toggles the row
+// in EditorState::multiSelection (edit_ops3.h set semantics; the last-clicked row is the primary
+// the Inspector shows). Committed inspector edits apply the SAME payload to EVERY selected entity
+// through the recorded wrappers — one undo command per entity (Ctrl+Z reverts them LIFO). The N
+// key (no modifier, no active text field) toggles EditorState::snap: while enabled, transform
+// payloads are quantized at the wrapper boundary (SnapTransformEdit: round-to-nearest to
+// posStep/angleStepDeg/scaleStep) so the history records the SNAPPED value. All ED4 chrome
+// (multi-select row highlights, the inspector readout lines) renders ONLY while multi-selected /
+// snap-enabled, so the static single-selection goldens are pixel-untouched.
+//
 // Slice ED6 (asset browser + click-to-place): when `showAssets` is true the Scene Hierarchy panel
 // gains an "Assets" section listing the scene's loadable resources from SceneResources (meshes +
 // textures, sorted map order — deterministic). Each mesh row carries a "+" place affordance:

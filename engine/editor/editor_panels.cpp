@@ -94,6 +94,20 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
         if (history) RecordedApplyMaterialEdit(*history, registry, entity, e);
         else ApplyMaterialEdit(registry, entity, e);
     };
+    // --- Slice ED4: multi-select fan-out + snapping AT THE WRAPPER BOUNDARY. A committed inspector
+    // edit applies the SAME payload to EVERY selected entity (the effective selection, ascending
+    // view order): one recorded command PER ENTITY, so Ctrl+Z reverts them one at a time, LIFO —
+    // undo N restores all N bit-exactly. Transform payloads are SNAPPED FIRST (edit_ops3.h
+    // SnapTransformEdit, a no-op while snap is off), BEFORE the recorded wrapper runs, so the ED5
+    // history records the SNAPPED after-value. With single selection + snap off this is exactly the
+    // pre-ED4 single applyTransform/applyMaterial call (byte-identical behavior). ---
+    auto applyTransformToSelection = [&](const TransformEdit& e) {
+        const TransformEdit se = SnapTransformEdit(e, state.snap);
+        for (int idx : EffectiveSelection(state)) applyTransform(idx, se);
+    };
+    auto applyMaterialToSelection = [&](const MaterialEdit& e) {
+        for (int idx : EffectiveSelection(state)) applyMaterial(idx, e);
+    };
     // --- Slice ED5: Ctrl+Z undo / Ctrl+Y redo (history mode only; suppressed while a text field is
     // active so ImGui's own InputText Ctrl+Z stays local to the field). Key handling only — zero
     // visual chrome, so the static shots are untouched. ---
@@ -104,6 +118,15 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
             if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) Undo(*history, targets);
             if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) Redo(*history, targets);
         }
+    }
+    // --- Slice ED4: the snap toggle key (N, unmodified, while no text field is active — the same
+    // suppression discipline as Ctrl+Z). Key handling only: with snap off (the default) the panel
+    // renders byte-identically, so the static shots are untouched; the snap readout line below is
+    // drawn only while snap is ENABLED (the ED2 edit-mode-only chrome discipline). ---
+    {
+        const ImGuiIO& io = ImGui::GetIO();
+        if (!io.KeyCtrl && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_N, false))
+            state.snap.enabled = !state.snap.enabled;
     }
 
     // --- Panel DATA (pure, ImGui-free, unit-tested): hierarchy rows + inspector + stats. ---
@@ -156,10 +179,18 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
         ImGui::Text("%d entities", count);
         ImGui::Separator();
         if (probe) probe->hierarchyRows.assign(static_cast<size_t>(count), UiRect{});
+        // Slice ED4: plain click = single-select (the pre-ED4 behavior, byte-compatible);
+        // Ctrl+click = toggle membership in the multi-select set (edit_ops3.h semantics — joining
+        // makes the row the primary, leaving re-anchors the primary, a set below 2 collapses back
+        // to single). Multi-select highlight chrome appears ONLY while 2+ rows are selected, so
+        // the static single-selection shots are pixel-untouched.
+        const bool multiActive = state.multiSelection.size() >= 2;
         for (int i = 0; i < count; ++i) {
-            const bool selected = (i == state.selectedEntity);
+            const bool selected =
+                multiActive ? IsRowSelected(state, i) : (i == state.selectedEntity);
             if (ImGui::Selectable(data.hierarchy[i].label.c_str(), selected)) {
-                state.selectedEntity = i;
+                if (ImGui::GetIO().KeyCtrl) ToggleSelect(state, i);
+                else SelectSingle(state, i);
             }
             if (probe) CaptureItemRect(&probe->hierarchyRows[static_cast<size_t>(i)]);
         }
@@ -228,6 +259,15 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
         if (data.inspector.valid) {
             const InspectorData& in = data.inspector;
             ImGui::Text("Selected: %s", in.label.c_str());
+            // Slice ED4: state readout chrome, shown ONLY while the state is active (multi-select
+            // of 2+ rows / snap enabled) — the default single-selection snap-off frame renders
+            // byte-identically, so the static shots are untouched.
+            if (state.multiSelection.size() >= 2)
+                ImGui::Text("Multi-select: %d entities (edits apply to all)",
+                            static_cast<int>(state.multiSelection.size()));
+            if (state.snap.enabled)
+                ImGui::Text("Snap: pos %.3g | angle %.3g deg | scale %.3g", state.snap.posStep,
+                            state.snap.angleStepDeg, state.snap.scaleStep);
             ImGui::Separator();
             ImGui::TextUnformatted("Transform");
             {
@@ -237,7 +277,7 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                     TransformEdit e;
                     e.setPosition = true;
                     e.position = {pos[0], pos[1], pos[2]};
-                    applyTransform(in.index, e);
+                    applyTransformToSelection(e);
                 }
                 float eul[3] = {in.eulerRadians.x, in.eulerRadians.y, in.eulerRadians.z};
                 if (DragRow3("Euler", eul, 0.01f, probe ? &probe->eulerX : nullptr,
@@ -245,7 +285,7 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                     TransformEdit e;
                     e.setEuler = true;
                     e.euler = {eul[0], eul[1], eul[2]};
-                    applyTransform(in.index, e);
+                    applyTransformToSelection(e);
                 }
                 float scl[3] = {in.scale.x, in.scale.y, in.scale.z};
                 if (DragRow3("Scale", scl, 0.01f, probe ? &probe->scaleX : nullptr,
@@ -253,7 +293,7 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                     TransformEdit e;
                     e.setScale = true;
                     e.scale = {scl[0], scl[1], scl[2]};
-                    applyTransform(in.index, e);
+                    applyTransformToSelection(e);
                 }
             }
             ImGui::Separator();
@@ -269,7 +309,7 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                     MaterialEdit e;
                     e.setMetallic = true;
                     e.metallic = metallic;
-                    applyMaterial(in.index, e);
+                    applyMaterialToSelection(e);
                 }
                 if (probe) CaptureItemRect(&probe->metallic);
                 ImGui::SameLine(0.0f, style.ItemInnerSpacing.x);
@@ -281,7 +321,7 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                     MaterialEdit e;
                     e.setRoughness = true;
                     e.roughness = roughness;
-                    applyMaterial(in.index, e);
+                    applyMaterialToSelection(e);
                 }
                 if (probe) CaptureItemRect(&probe->roughness);
                 ImGui::SameLine(0.0f, style.ItemInnerSpacing.x);
@@ -301,7 +341,7 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                             MaterialEdit e;
                             e.setBaseColor = true;
                             e.baseColor = tex;
-                            applyMaterial(in.index, e);
+                            applyMaterialToSelection(e);
                         }
                     }
                     ImGui::EndCombo();

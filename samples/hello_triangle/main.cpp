@@ -134,6 +134,7 @@
 #include "editor/gizmo.h"
 #include "editor/introspect.h"
 #include "editor/edit_ops.h"  // Slice BX: pure-CPU editor live-edit ops (ApplyTransformEdit/Material).
+#include "editor/edit_ops3.h"  // Slice ED4: multi-select set + transform-snap quantizers (SnapConfig).
 #include "editor/edit_history.h"  // Slice ED5: deterministic undo/redo command stack over the edit ops.
 #include "editor/flow_editor_data.h"  // Issue #24: pure flow-graph node-editor view (ImGui-free, golden).
 #include "editor/flow_edit_ops.h"     // Issue #24: deterministic graph edit ops (Add/Connect/Delete).
@@ -794,6 +795,15 @@ int main(int argc, char** argv) {
     // that Ctrl+Y re-spawns it bit-exactly, and that two full passes are byte-identical. Implies
     // --editor.
     bool ed6DryRun = false;
+    // Slice ED4 (multi-select + transform snapping): Ctrl+click a second hierarchy row and assert
+    // BOTH rows are selected (the sorted multi-select set with the last-clicked primary); type a
+    // Position-X into the primary's inspector field and assert BOTH entities carry the exact typed
+    // value (one recorded command per entity); Ctrl+Z twice reverts both bitwise (dump back to the
+    // baseline bytes); toggle snap with the N key and type a non-multiple value, asserting the
+    // stored (and recorded) value is the exact quantized step multiple; prove the gizmo-drag-side
+    // quantization through the same ApplyDrag + SnapTransform* functions the --fly loop drives.
+    // Two full passes byte-identical. Implies --editor.
+    bool ed4DryRun = false;
     // Issue #24 (Blueprint-class visual scripting, editor half): render the deterministic flow-graph
     // node editor over a fixed showcase flow::Graph (FlowGraphView -> BuildFlowEditorUI), write a BMP,
     // print a `flow-editor: {...}` line. Implies --editor (the ImGui overlay path).
@@ -3151,6 +3161,16 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--ed6-dry-run") == 0) {
             editor = true;
             ed6DryRun = true;
+        }
+        // Slice ED4 (multi-select + transform snapping): --ed4-dry-run. A SEPARATE `if` (the else-if
+        // ladder is at MSVC's C1061 limit). Headless synthetic-input proof that Ctrl+click extends
+        // the hierarchy selection, that a committed inspector edit lands on EVERY selected entity
+        // (one recorded command each; Ctrl+Z x N reverts all bitwise), and that snap (N key)
+        // quantizes typed commits AND gizmo-drag results to the exact step multiple at the recorded-
+        // wrapper boundary. Prints `ed4-dry-run: ...` proof lines; exit 0/1. Implies --editor.
+        if (std::strcmp(argv[i], "--ed4-dry-run") == 0) {
+            editor = true;
+            ed4DryRun = true;
         }
         // Issue #5: the TIME-CHANNEL deliverable (--sky-animated-shot <out.bmp>). A SEPARATE `if` (not
         // chained onto the else-if ladder above) because that ladder is already at MSVC's block-nesting
@@ -12703,6 +12723,21 @@ int main(int argc, char** argv) {
             runtime::PlayState play;
             editor::Selection sel;            // starts unselected; a left-click picks.
             sel.index = -1; sel.mode = editor::GizmoMode::Translate;
+            // Slice ED4: the viewport MULTI-SELECT set (edit_ops3.h invariant: empty = single-
+            // select, else size >= 2 sorted ascending containing sel.index, the primary). A plain
+            // pick single-selects (pre-ED4 behavior); Ctrl+pick toggles membership.
+            std::vector<int> selSet;
+            // Slice ED4: the gizmo snap config (N toggles; default OFF so the pre-ED4 drag math is
+            // byte-identical). While enabled, the dragged field of the drag RESULT quantizes to the
+            // step (SnapTransformPosition/Euler/Scale) — the history then records snapped values.
+            editor::SnapConfig flySnap;
+            // The effective selection for a drag/edit: the multi-select set when active, else the
+            // single picked index (matching editor_panel_data.h EffectiveSelection).
+            auto effectiveFlySelection = [&]() -> std::vector<int> {
+                if (!selSet.empty()) return selSet;
+                if (sel.index >= 0) return {sel.index};
+                return {};
+            };
 
             // The LIVE editable scene: real meshes (with bounds) so picking + gizmo drag act on actual
             // geometry. A couple of cubes + a sphere at distinct spots; Ctrl+S serializes THIS registry
@@ -12795,6 +12830,17 @@ int main(int argc, char** argv) {
             math::Ray dragPrevRay{};              // last frame's cursor ray (seeded on grab -> no jump)
             editor::XformState dragBeforeXf{};    // ED5: the transform captured at gizmo grab (undo payload)
             int   dragEntityIndex = -1;           // ED5: the view index a drag command will target
+            // Slice ED4: the primary's UNSNAPPED "virtual" transform accumulated across the drag.
+            // ApplyDrag advances THIS each frame; the live ECS transform is its snapped image, so
+            // sub-step cursor motion accumulates instead of being re-rounded away every frame (the
+            // classic snapped-drag stall). With snap off, live == virtual — the pre-ED4 math,
+            // bit-identical.
+            scene::Transform dragVirtXf{};
+            // Slice ED4: per-entity BEFORE payloads for EVERY selected entity at grab (ascending
+            // view order). At release each becomes ONE recorded Transform command (LIFO undo
+            // reverts the whole multi-drag); a translate drag moves every member by the primary's
+            // virtual delta from these grab positions (no per-frame drift), snapped per entity.
+            std::vector<std::pair<int, editor::XformState>> dragGrabXfs;
 
             // Cursor ray for an input snapshot: framebuffer px -> NDC -> world ray. (The px->NDC map is
             // editor::PixelToNdc, shared with the unit test.) Only meaningful while NOT mouse-looking.
@@ -12826,42 +12872,101 @@ int main(int argc, char** argv) {
                                 // command this drag becomes at release.
                                 dragBeforeXf = editor::CaptureXform(xf);
                                 dragEntityIndex = sel.index;
+                                // ED4: seed the unsnapped virtual transform + capture the BEFORE
+                                // payload of EVERY selected entity (ascending; one recorded
+                                // command each at release).
+                                dragVirtXf = xf;
+                                dragGrabXfs.clear();
+                                for (int idx : effectiveFlySelection()) {
+                                    if (idx >= 0 && idx < (int)ents.size())
+                                        dragGrabXfs.emplace_back(
+                                            idx, editor::CaptureXform(
+                                                     editReg.get<scene::TransformC>(ents[idx]).t));
+                                }
                                 return dragAxis;
                             }
                         }
                     }
-                    // No axis grabbed -> pick the entity under the cursor (or clear on a miss).
+                    // No axis grabbed -> pick the entity under the cursor. ED4: with Ctrl held a
+                    // HIT toggles the entity in the multi-select set (the hierarchy Ctrl+click
+                    // twin; a Ctrl+miss leaves the selection alone); a plain click single-selects
+                    // (or clears on a miss) — the pre-ED4 behavior.
                     std::vector<ecs::Entity> ents; std::vector<editor::PickAabb> boxes;
                     snapshotPickList(ents, boxes);
                     editor::PickResult r = editor::PickNearest(ray, boxes);
-                    sel.index = r.index;   // -1 on a miss = deselect
+                    if (in.Down(runtime::Key::Ctrl)) {
+                        if (r.index >= 0)
+                            editor::ToggleIndexInSelection(selSet, sel.index, r.index);
+                    } else {
+                        sel.index = r.index;   // -1 on a miss = deselect
+                        selSet.clear();
+                    }
                     dragAxis = editor::kAxisNone;
                     return editor::kAxisNone;
                 }
                 if (leftDown && dragAxis != editor::kAxisNone && sel.Has()) {
-                    // Apply the per-frame drag: prevRay (last frame) -> curRay (this frame).
+                    // Apply the per-frame drag: prevRay (last frame) -> curRay (this frame). ED4:
+                    // ApplyDrag advances the UNSNAPPED virtual transform; the live ECS transform is
+                    // its snapped image on the dragged field only (snap off -> live == virtual, the
+                    // pre-ED4 math bit-identically).
                     std::vector<ecs::Entity> ents; std::vector<editor::PickAabb> boxes;
                     snapshotPickList(ents, boxes);
                     if (sel.index >= 0 && sel.index < (int)ents.size()) {
-                        scene::Transform& live = editReg.get<scene::TransformC>(ents[sel.index]).t;
-                        live = editor::ApplyDrag(live, sel.mode, dragAxis, dragPrevRay, ray);
+                        dragVirtXf = editor::ApplyDrag(dragVirtXf, sel.mode, dragAxis, dragPrevRay,
+                                                       ray);
+                        scene::Transform snapped = dragVirtXf;
+                        if (flySnap.enabled) {
+                            if (sel.mode == editor::GizmoMode::Translate)
+                                snapped = editor::SnapTransformPosition(dragVirtXf, flySnap);
+                            else if (sel.mode == editor::GizmoMode::Rotate)
+                                snapped = editor::SnapTransformEuler(dragVirtXf, flySnap);
+                            else
+                                snapped = editor::SnapTransformScale(dragVirtXf, flySnap);
+                        }
+                        editReg.get<scene::TransformC>(ents[sel.index]).t = snapped;
+                        // ED4: a TRANSLATE drag moves EVERY other selected entity by the primary's
+                        // virtual delta from its grab position (then snaps per entity), so the
+                        // whole multi-selection rides the drag with no per-frame drift. Rotate /
+                        // scale manipulate the primary only (documented: a shared angular/scale
+                        // delta about the primary's pivot is ambiguous for the others).
+                        if (sel.mode == editor::GizmoMode::Translate && selSet.size() >= 2) {
+                            const math::Vec3 delta{dragVirtXf.position.x - dragBeforeXf.px,
+                                                   dragVirtXf.position.y - dragBeforeXf.py,
+                                                   dragVirtXf.position.z - dragBeforeXf.pz};
+                            for (const auto& [idx, before] : dragGrabXfs) {
+                                if (idx == sel.index || idx < 0 || idx >= (int)ents.size())
+                                    continue;
+                                scene::Transform t =
+                                    editReg.get<scene::TransformC>(ents[idx]).t;
+                                t.position = {before.px + delta.x, before.py + delta.y,
+                                              before.pz + delta.z};
+                                if (flySnap.enabled)
+                                    t = editor::SnapTransformPosition(t, flySnap);
+                                editReg.get<scene::TransformC>(ents[idx]).t = t;
+                            }
+                        }
                     }
                     dragPrevRay = ray;
                     return dragAxis;
                 }
                 if (!leftDown) {
                     // Release ends the drag. ED5: the completed manipulation becomes ONE recorded
-                    // Transform command (before at grab -> after at release; a no-move drag records
-                    // nothing — RecordTransformState skips bitwise-identical payloads).
-                    if (dragAxis != editor::kAxisNone && dragEntityIndex >= 0) {
+                    // Transform command PER DRAGGED ENTITY (before at grab -> after at release; a
+                    // no-move drag records nothing — RecordTransformState skips bitwise-identical
+                    // payloads). ED4: dragGrabXfs holds every selected entity's grab payload in
+                    // ascending view order, so a multi-drag records one command each and Ctrl+Z
+                    // reverts them LIFO (single-select = one entry = the pre-ED4 behavior).
+                    if (dragAxis != editor::kAxisNone && !dragGrabXfs.empty()) {
                         std::vector<ecs::Entity> ents; std::vector<editor::PickAabb> boxes;
                         snapshotPickList(ents, boxes);
-                        if (dragEntityIndex < (int)ents.size()) {
+                        for (const auto& [idx, before] : dragGrabXfs) {
+                            if (idx < 0 || idx >= (int)ents.size()) continue;
                             const scene::Transform& cur =
-                                editReg.get<scene::TransformC>(ents[dragEntityIndex]).t;
-                            editor::RecordTransformState(flyHistory, dragEntityIndex, dragBeforeXf,
+                                editReg.get<scene::TransformC>(ents[idx]).t;
+                            editor::RecordTransformState(flyHistory, idx, before,
                                                          editor::CaptureXform(cur));
                         }
+                        dragGrabXfs.clear();
                         dragEntityIndex = -1;
                     }
                     dragAxis = editor::kAxisNone;
@@ -12885,6 +12990,7 @@ int main(int argc, char** argv) {
                             scene::LoadScene(fresh, editRes, scenePath.c_str());
                             editReg = std::move(fresh);
                             sel.index = -1; dragAxis = editor::kAxisNone;
+                            selSet.clear(); dragGrabXfs.clear();   // ED4: view indices are stale
                             std::printf("[hot-reload] scene reloaded from %s\n", scenePath.c_str());
                         } catch (const std::exception& ex) {
                             std::printf("[hot-reload] scene reload FAILED (%s) — keeping current\n",
@@ -12994,6 +13100,7 @@ int main(int argc, char** argv) {
                         size_t loaded = fresh.aliveCount();
                         editReg = std::move(fresh);
                         sel.index = -1;
+                        selSet.clear();   // ED4: view indices are stale after a reload
                         reloaded = (loaded == before && loaded > 0);
                     } catch (const std::exception& ex) {
                         std::printf("[hot-reload] dry-run scene reload FAILED (%s)\n", ex.what());
@@ -13015,11 +13122,13 @@ int main(int argc, char** argv) {
             // Live windowed loop. Mouse-look is engaged only while the RIGHT button is held, so the
             // cursor stays visible for LEFT-click picking + gizmo drag (Slice AM). ESC quits.
             std::printf("--fly: WASD move, RIGHT-drag look, Space/E up, Ctrl/Q down, Shift sprint, "
-                        "wheel speed, ESC quit | LEFT-click pick, LEFT-drag gizmo, P play/pause, O "
-                        "step, G/R/T gizmo mode, Ctrl+S save, Ctrl+Z undo, Ctrl+Y redo\n");
+                        "wheel speed, ESC quit | LEFT-click pick (Ctrl+click multi-select), "
+                        "LEFT-drag gizmo, P play/pause, O step, G/R/T gizmo mode, N snap toggle, "
+                        "Ctrl+S save, Ctrl+Z undo, Ctrl+Y redo\n");
 
             bool prevP = false, prevO = false, prevCtrlS = false, prevLeft = false, prevRight = false;
             bool prevCtrlZ = false, prevCtrlY = false;   // ED5: undo/redo edge triggers
+            bool prevN = false;                          // ED4: snap-toggle edge trigger
             int savedCount = 0;
             int liveSteps = 0;
 
@@ -13056,6 +13165,17 @@ int main(int argc, char** argv) {
                 if (in.Down(runtime::Key::G)) sel.mode = editor::GizmoMode::Translate;
                 if (in.Down(runtime::Key::R)) sel.mode = editor::GizmoMode::Rotate;
                 if (in.Down(runtime::Key::T)) sel.mode = editor::GizmoMode::Scale;
+                // --- ED4: N toggles transform snapping (edge-triggered; unmodified N — Ctrl+N is
+                // left free). Gizmo-drag results then quantize to the steps below, and the ED5
+                // history records the snapped values (see editorInteract). ---
+                bool nowN = in.Down(runtime::Key::N) && !in.Down(runtime::Key::Ctrl);
+                if (nowN && !prevN) {
+                    flySnap.enabled = !flySnap.enabled;
+                    std::printf("[editor] snap %s (pos %g, angle %g deg, scale %g)\n",
+                                flySnap.enabled ? "ON" : "OFF", flySnap.posStep,
+                                flySnap.angleStepDeg, flySnap.scaleStep);
+                }
+                prevN = nowN;
                 bool nowCtrlS = in.Down(runtime::Key::Ctrl) && in.Down(runtime::Key::S);
                 if (nowCtrlS && !prevCtrlS) {
                     std::string json = scene::DumpScene(editReg, editRes);
@@ -111607,6 +111727,289 @@ int main(int argc, char** argv) {
                         deterministic ? "yes" : "NO", a.transcript.size());
             const bool ok = placeOk && undoOk && redoOk && deterministic;
             std::printf("ed6-dry-run: %s\n", ok ? "PASS" : "FAIL");
+            teardownEditor();
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Slice ED4: MULTI-SELECT + TRANSFORM SNAPPING dry-run — the headless proof that (1)
+        // Ctrl+click EXTENDS the hierarchy selection (the sorted multi-select set, last-clicked =
+        // primary), (2) a committed inspector edit applies the SAME absolute payload to EVERY
+        // selected entity through the recorded wrappers — ONE command per entity, so Ctrl+Z x N
+        // reverts the whole multi-edit LIFO and bit-exactly (the "make equal" semantics: the edited
+        // field becomes IDENTICAL across the selection, the standard multi-object property-box
+        // behavior), and (3) snapping (toggled by the REAL N-key handling) quantizes typed commits
+        // at the WRAPPER boundary — the ECS value AND the recorded command both carry the exact
+        // step multiple — plus the gizmo-drag-side twin: the same ApplyDrag the --fly loop drives,
+        // its result quantized by the same SnapTransform* functions at the same boundary.
+        //
+        // PROOFS (all must hold; exit 1 otherwise):
+        //   (a) MULTI-SELECT IS REAL: a plain click on row A single-selects (set empty); a
+        //       Ctrl+click on row B yields multiSelection == {A, B} with primary == B (both rows
+        //       report selected through IsRowSelected).
+        //   (b) THE EDIT FANS OUT: ONE typed Position commit (4.625, NOT a 0.25 multiple — also
+        //       proves snap-off passes values through untouched) lands x == 4.625f EXACTLY on BOTH
+        //       entities; the history holds exactly 2 commands targeting A then B (ascending).
+        //   (c) UNDO REVERTS ALL: Ctrl+Z x2 through the REAL key handling restores BOTH entities'
+        //       x bitwise and the scene dump is BYTE-IDENTICAL to the pre-edit baseline.
+        //   (d) SNAP AT THE WRAPPER: the N key (REAL editor key handling) enables snap; typing 3.3
+        //       stores EXACTLY 3.25f (= round(3.3/0.25)*0.25, a binary-fraction step -> the exact
+        //       real multiple) on BOTH entities, and BOTH recorded commands' xAfter.px == 3.25f
+        //       (the history records the SNAPPED value).
+        //   (e) DRAG-SIDE SNAP: ApplyDrag (translate, +X, the --fly gizmo math) produces a
+        //       non-multiple 3.3-ish result that SnapTransformPosition quantizes to exactly 3.25f;
+        //       the angle (0.5 rad -> 2 x 15-degree steps) and scale (0.7 -> 0.75f, the 0.125
+        //       binary-fraction step) quantizers agree with their independently computed multiples.
+        //   (f) DETERMINISTIC: a second full pass (fresh registry from the baseline) yields a
+        //       byte-identical transcript.
+        if (ed4DryRun) {
+            const uint32_t dw = window.FramebufferWidth();
+            const uint32_t dh = window.FramebufferHeight();
+            ImGuiIO& io = ImGui::GetIO();
+
+            const int   kRowA = 1;              // "sphere #1" (the ED1/ED5 target)
+            const int   kRowB = 2;              // "cube #2" — the Ctrl+click extension
+            const float kPosX = 4.625f;         // typed Position-X (exact in float; NOT a 0.25 multiple)
+            const char* kPosXText = "4.625";
+            const char* kSnapText = "3.3";      // typed under snap: NOT a 0.25 multiple
+            const float kSnapExpect = 3.25f;    // round(3.3 / 0.25) * 0.25 — the exact multiple
+
+            // The pre-edit baseline (pass B reloads from this; also the undo byte-identity reference).
+            const std::string baseline = scene::DumpScene(registry, resources);
+
+            struct Ed4Pass {
+                bool rowsOk = false;
+                bool singleOk = false;        // plain click: single-select, set empty
+                bool multiOk = false;         // Ctrl+click: set == {A,B}, primary == B
+                float axBefore = 0, bxBefore = 0;   // pre-edit x (both entities)
+                float axAfter = 0, bxAfter = 0;     // post-multi-edit x (must == kPosX, both)
+                float axUndo = 0, bxUndo = 0;       // post-undo x (must == before, bitwise)
+                std::size_t cmdCount = 0;           // commands after the multi-edit (pinned: 2)
+                bool cmdTargetsOk = false;          // commands target A then B (ascending)
+                bool undoDumpMatch = false;         // post-undo dump == baseline (byte-identical)
+                bool snapToggleOk = false;          // N key enabled snap through the REAL handling
+                float axSnap = 0, bxSnap = 0;       // post-snap-typed x (must == kSnapExpect, both)
+                bool snapRecordedOk = false;        // BOTH recorded commands carry xAfter.px == 3.25f
+                float dragRawX = 0, dragSnapX = 0;  // the ApplyDrag twin: raw vs quantized result
+                bool dragSnapOk = false;            // dragSnapX == 3.25f exactly (and raw differed)
+                bool angleScaleOk = false;          // angle/scale quantizers hit their multiples
+                std::string transcript;             // everything folded -> the determinism compare
+            };
+
+            auto runPass = [&](ecs::Registry& reg) -> Ed4Pass {
+                Ed4Pass r;
+                editor::EditorState st;    // fresh UI state per pass (selection + snap OFF)
+                editor::EditorUIProbe probe;
+                editor::EditHistory hist;  // the ED5 stack the fan-out records on
+                // One CPU-only ImGui frame with the history wired (the ED5 mold).
+                auto uiFrame = [&](editor::EditorUIProbe* p) {
+                    io.DisplaySize = ImVec2((float)dw, (float)dh);
+                    ImGui::NewFrame();
+                    editor::BuildEditorUI(reg, resources, st, dw, dh, p, &hist);
+                    ImGui::Render();
+                };
+                // The ED1/ED5 synthetic-input helpers, verbatim, over this pass's uiFrame.
+                auto clickAt = [&](const editor::UiRect& rc, bool ctrl) {
+                    io.AddMousePosEvent(rc.cx(), rc.cy());
+                    uiFrame(nullptr);
+                    if (ctrl) io.AddKeyEvent(ImGuiMod_Ctrl, true);
+                    io.AddMouseButtonEvent(0, true);
+                    uiFrame(nullptr);
+                    io.AddMouseButtonEvent(0, false);
+                    uiFrame(nullptr);
+                    if (ctrl) { io.AddKeyEvent(ImGuiMod_Ctrl, false); uiFrame(nullptr); }
+                };
+                auto typeIntoField = [&](const editor::UiRect& rc, const char* text) {
+                    clickAt(rc, /*ctrl=*/true);
+                    for (const char* c = text; *c; ++c)
+                        io.AddInputCharacter((unsigned int)(unsigned char)*c);
+                    uiFrame(nullptr);
+                    uiFrame(nullptr);   // flush any trickled remainder before the commit key
+                    io.AddKeyEvent(ImGuiKey_Enter, true);
+                    uiFrame(nullptr);
+                    io.AddKeyEvent(ImGuiKey_Enter, false);
+                    uiFrame(nullptr);
+                };
+                auto idle = [&](int frames) {
+                    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+                    for (int f = 0; f < frames; ++f) uiFrame(nullptr);
+                };
+                auto pressCtrl = [&](ImGuiKey key) {
+                    io.AddKeyEvent(ImGuiMod_Ctrl, true);
+                    uiFrame(nullptr);
+                    io.AddKeyEvent(key, true);
+                    uiFrame(nullptr);  // <- the undo/redo fires on this frame
+                    io.AddKeyEvent(key, false);
+                    uiFrame(nullptr);
+                    io.AddKeyEvent(ImGuiMod_Ctrl, false);
+                    uiFrame(nullptr);
+                };
+                // One unmodified key press (down a frame, up a frame) — the N snap toggle route.
+                auto pressKey = [&](ImGuiKey key) {
+                    io.AddKeyEvent(key, true);
+                    uiFrame(nullptr);
+                    io.AddKeyEvent(key, false);
+                    uiFrame(nullptr);
+                };
+                auto ecsPosX = [&](int row) {
+                    return reg.get<scene::TransformC>(editor::EntityAtViewIndex(reg, row))
+                        .t.position.x;
+                };
+
+                idle(2);
+                uiFrame(&probe);
+                r.rowsOk = (int)probe.hierarchyRows.size() > kRowB &&
+                           probe.hierarchyRows[kRowA].valid && probe.hierarchyRows[kRowB].valid &&
+                           probe.posX.valid;
+                if (!r.rowsOk) return r;
+                r.axBefore = ecsPosX(kRowA);
+                r.bxBefore = ecsPosX(kRowB);
+
+                // 1. Plain click row A: single-select (the pre-ED4 behavior; the set stays empty).
+                clickAt(probe.hierarchyRows[kRowA], /*ctrl=*/false);
+                r.singleOk = (st.selectedEntity == kRowA) && st.multiSelection.empty();
+                idle(4);
+                // 2. Ctrl+click row B: the selection EXTENDS — set {A,B}, primary = B (last-clicked).
+                clickAt(probe.hierarchyRows[kRowB], /*ctrl=*/true);
+                r.multiOk = st.multiSelection.size() == 2 && st.selectedEntity == kRowB &&
+                            editor::IsRowSelected(st, kRowA) && editor::IsRowSelected(st, kRowB);
+                idle(4);
+                uiFrame(&probe);   // re-probe with the new selection (fixed layout, honest capture)
+
+                // 3. ONE typed Position-X commit on the primary -> BOTH entities (2 commands).
+                typeIntoField(probe.posX, kPosXText);
+                idle(4);
+                r.axAfter = ecsPosX(kRowA);
+                r.bxAfter = ecsPosX(kRowB);
+                r.cmdCount = hist.commands.size();
+                r.cmdTargetsOk = r.cmdCount == 2u && hist.commands[0].target == kRowA &&
+                                 hist.commands[1].target == kRowB;
+
+                // 4. Ctrl+Z x2 -> BOTH revert (LIFO: B first, then A); dump == baseline bytes.
+                pressCtrl(ImGuiKey_Z);
+                pressCtrl(ImGuiKey_Z);
+                idle(2);
+                r.axUndo = ecsPosX(kRowA);
+                r.bxUndo = ecsPosX(kRowB);
+                r.undoDumpMatch = (scene::DumpScene(reg, resources) == baseline);
+
+                // 5. N enables snap through the REAL key handling (no modifier, no active text).
+                pressKey(ImGuiKey_N);
+                r.snapToggleOk = st.snap.enabled;
+                idle(2);
+                uiFrame(&probe);   // re-probe: the snap readout line shifts the inspector rows down
+                // 6. Type a NON-multiple (3.3) -> the stored value is the EXACT quantized multiple
+                // (3.25f) on BOTH entities, and BOTH recorded commands carry the snapped after-
+                // value (snap applied at the wrapper boundary, BEFORE recording).
+                typeIntoField(probe.posX, kSnapText);
+                idle(4);
+                r.axSnap = ecsPosX(kRowA);
+                r.bxSnap = ecsPosX(kRowB);
+                r.snapRecordedOk = hist.commands.size() == 2u &&
+                                   hist.commands[0].xAfter.px == kSnapExpect &&
+                                   hist.commands[1].xAfter.px == kSnapExpect;
+
+                // 7. The gizmo-drag-side twin: the SAME ApplyDrag the --fly loop drives (translate
+                // +X between two vertical cursor rays 2.3 world units apart), its result quantized
+                // by the SAME SnapTransformPosition at the SAME boundary. Plus the angle/scale
+                // quantizers against independently computed step multiples.
+                {
+                    editor::SnapConfig dcfg;
+                    dcfg.enabled = true;
+                    scene::Transform t0;
+                    t0.position = {1.0f, 0.5f, 0.0f};
+                    const math::Ray prevRay{{0.0f, 5.0f, 0.0f}, {0.0f, -1.0f, 0.0f}};
+                    const math::Ray curRay{{2.3f, 5.0f, 0.0f}, {0.0f, -1.0f, 0.0f}};
+                    const scene::Transform dragged = editor::ApplyDrag(
+                        t0, editor::GizmoMode::Translate, editor::kAxisX, prevRay, curRay);
+                    const scene::Transform snapped =
+                        editor::SnapTransformPosition(dragged, dcfg);
+                    r.dragRawX = dragged.position.x;    // ~3.3 (1.0 + 2.3): NOT a 0.25 multiple
+                    r.dragSnapX = snapped.position.x;   // must be EXACTLY 3.25f
+                    r.dragSnapOk = (r.dragSnapX == kSnapExpect) && (r.dragRawX != r.dragSnapX);
+                    const float snapAng = editor::SnapAngleRadians(0.5f, dcfg.angleStepDeg);
+                    const float expAng = 2.0f * (dcfg.angleStepDeg * editor::kDegToRad);
+                    const float snapScl = editor::SnapValue(0.7f, dcfg.scaleStep);
+                    r.angleScaleOk = (snapAng == expAng) && (snapScl == 0.75f);
+                }
+
+                // The pass transcript (floats as exact bit patterns + counts + flags folded).
+                auto bits = [](float f) {
+                    uint32_t u;
+                    std::memcpy(&u, &f, sizeof(u));
+                    return u;
+                };
+                char tb[512];
+                std::snprintf(tb, sizeof(tb),
+                              "sel s%d m%d | ax %08x->%08x undo %08x snap %08x | bx %08x->%08x "
+                              "undo %08x snap %08x | cmds=%zu tgt%d | dump u%d | snap t%d rec%d | "
+                              "drag %08x->%08x ok%d as%d",
+                              (int)r.singleOk, (int)r.multiOk, bits(r.axBefore), bits(r.axAfter),
+                              bits(r.axUndo), bits(r.axSnap), bits(r.bxBefore), bits(r.bxAfter),
+                              bits(r.bxUndo), bits(r.bxSnap), r.cmdCount, (int)r.cmdTargetsOk,
+                              (int)r.undoDumpMatch, (int)r.snapToggleOk, (int)r.snapRecordedOk,
+                              bits(r.dragRawX), bits(r.dragSnapX), (int)r.dragSnapOk,
+                              (int)r.angleScaleOk);
+                r.transcript = tb;
+                return r;
+            };
+
+            // Pass A on the live registry; pass B on a fresh registry reloaded from the baseline.
+            Ed4Pass a = runPass(registry);
+            ecs::Registry regB;
+            {
+                std::string tmpScene = std::string(std::tmpnam(nullptr)) + ".json";
+                { std::ofstream f(tmpScene, std::ios::binary); f << baseline; }
+                scene::LoadScene(regB, resources, tmpScene.c_str());
+                std::remove(tmpScene.c_str());
+            }
+            Ed4Pass b = runPass(regB);
+
+            // (a) Multi-select is real (single-click byte-compatible, Ctrl+click extends).
+            const bool selOk = a.rowsOk && a.singleOk && a.multiOk;
+            // (b) The single commit fanned out to BOTH entities exactly (and snap-off passed the
+            // non-multiple 4.625 through untouched), one command per entity, ascending targets.
+            const bool fanOk = a.axAfter == kPosX && a.bxAfter == kPosX && a.axBefore != kPosX &&
+                               a.bxBefore != kPosX && a.cmdCount == 2u && a.cmdTargetsOk;
+            // (c) Undo x2 reverted both bitwise + the dump matches the baseline bytes.
+            const bool undoOk = a.axUndo == a.axBefore && a.bxUndo == a.bxBefore &&
+                                a.undoDumpMatch;
+            // (d) Snap quantized the typed commit at the wrapper boundary, on both entities AND in
+            // both recorded commands.
+            const bool snapOk = a.snapToggleOk && a.axSnap == kSnapExpect &&
+                                a.bxSnap == kSnapExpect && a.snapRecordedOk;
+            // (e) The drag-side quantizers hit their exact multiples.
+            const bool dragOk = a.dragSnapOk && a.angleScaleOk;
+            // (f) Two full passes byte-identical.
+            const bool deterministic = !a.transcript.empty() && a.transcript == b.transcript;
+
+            std::printf("ed4-dry-run: click row %d single=%s | Ctrl+click row %d -> set={%d,%d} "
+                        "primary=%d multi=%s\n",
+                        kRowA, a.singleOk ? "yes" : "NO", kRowB, kRowA, kRowB, kRowB,
+                        a.multiOk ? "yes" : "NO");
+            std::printf("ed4-dry-run: typed posX %s -> A %g->%g B %g->%g both-exact=%s "
+                        "commands=%zu (expected 2, targets ascending=%s)\n",
+                        kPosXText, a.axBefore, a.axAfter, a.bxBefore, a.bxAfter,
+                        (a.axAfter == kPosX && a.bxAfter == kPosX) ? "yes" : "NO", a.cmdCount,
+                        a.cmdTargetsOk ? "yes" : "NO");
+            std::printf("ed4-dry-run: Ctrl+Z x2 -> A %g B %g exact-revert=%s "
+                        "baseline-dump-byte-identical=%s\n",
+                        a.axUndo, a.bxUndo,
+                        (a.axUndo == a.axBefore && a.bxUndo == a.bxBefore) ? "yes" : "NO",
+                        a.undoDumpMatch ? "yes" : "NO");
+            std::printf("ed4-dry-run: N-key snap=%s | typed %s -> A %g B %g quantized==%g "
+                        "exact=%s | history-records-snapped=%s\n",
+                        a.snapToggleOk ? "ON" : "NO", kSnapText, a.axSnap, a.bxSnap, kSnapExpect,
+                        (a.axSnap == kSnapExpect && a.bxSnap == kSnapExpect) ? "yes" : "NO",
+                        a.snapRecordedOk ? "yes" : "NO");
+            std::printf("ed4-dry-run: gizmo ApplyDrag +X -> %g snap-> %g (exact %g multiple=%s) | "
+                        "angle/scale steps exact=%s\n",
+                        a.dragRawX, a.dragSnapX, kSnapExpect, a.dragSnapOk ? "yes" : "NO",
+                        a.angleScaleOk ? "yes" : "NO");
+            std::printf("ed4-dry-run: two passes byte-identical=%s (transcript %zu bytes)\n",
+                        deterministic ? "yes" : "NO", a.transcript.size());
+            const bool ok = selOk && fanOk && undoOk && snapOk && dragOk && deterministic;
+            std::printf("ed4-dry-run: %s\n", ok ? "PASS" : "FAIL");
             teardownEditor();
             device->WaitIdle();
             return ok ? 0 : 1;

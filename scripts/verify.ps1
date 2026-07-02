@@ -887,6 +887,22 @@ Write-Host '--- editor ED6: asset browser + click-to-place dry-run ---'
 if (-not `$ed6Ok) { Write-Host 'ED6 asset-browser dry-run FAILED'; exit 42 }
 Write-Host 'editor ED6: asset-browser dry-run PASS'
 
+# --- Slice ED4: multi-select + transform snapping dry-run. The docked editor's hierarchy is driven
+# HEADLESSLY with synthetic ImGui io events: a plain click single-selects (pre-ED4 byte-compatible),
+# a Ctrl+click EXTENDS the selection (sorted set, last-clicked primary); one typed Position commit
+# on the primary must land the exact value on EVERY selected entity through the recorded wrappers
+# (one undo command per entity; Ctrl+Z x2 reverts both bitwise, dump back to the baseline bytes);
+# the N key toggles snapping and a typed non-multiple (3.3) must store the EXACT quantized step
+# multiple (3.25, round-to-nearest on the binary-fraction 0.25 step) on both entities AND in both
+# recorded commands (snap at the wrapper boundary); the gizmo ApplyDrag result must quantize through
+# the same SnapTransform* functions; two full passes must be byte-identical. ---
+Write-Host '--- editor ED4: multi-select + transform snapping dry-run ---'
+`$ed4 = & `$lmExe --ed4-dry-run 2>&1
+`$ed4 | ForEach-Object { Write-Host `$_ }
+`$ed4Ok = (`$LASTEXITCODE -eq 0) -and (`$ed4 | Select-String -SimpleMatch 'ed4-dry-run: PASS')
+if (-not `$ed4Ok) { Write-Host 'ED4 multi-select/snapping dry-run FAILED'; exit 43 }
+Write-Host 'editor ED4: multi-select + snapping dry-run PASS'
+
 exit 0
 "@
 

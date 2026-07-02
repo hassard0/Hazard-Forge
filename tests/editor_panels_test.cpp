@@ -184,6 +184,92 @@ int main() {
               std::string(l1.statsTitle) == "Stats", "layout panel titles match BuildEditorUI");
     }
 
+    // --- Slice ED4: the multi-select set semantics (edit_ops3.h through the EditorState wrappers).
+    {
+        editor::EditorState st; st.selectedEntity = 0;
+        check(st.multiSelection.empty(), "ED4: default state is single-select (empty set)");
+        check(editor::EffectiveSelection(st) == std::vector<int>{0},
+              "ED4: single-select effective selection == {primary}");
+        // Ctrl+click on the sole selection is a no-op (the selection never empties by toggling).
+        editor::ToggleSelect(st, 0);
+        check(st.multiSelection.empty() && st.selectedEntity == 0,
+              "ED4: toggling the sole selection is a no-op");
+        // Ctrl+click a second row: the set seeds with the primary; last-clicked becomes primary.
+        editor::ToggleSelect(st, 2);
+        check(st.multiSelection == (std::vector<int>{0, 2}) && st.selectedEntity == 2,
+              "ED4: Ctrl+click extends to a sorted {0,2} set with primary 2");
+        check(editor::IsRowSelected(st, 0) && editor::IsRowSelected(st, 2) &&
+              !editor::IsRowSelected(st, 1), "ED4: IsRowSelected reflects the set");
+        // Ctrl+click a third row (out-of-order index sorts in) then toggle the primary OUT: the
+        // primary re-anchors to the largest remaining member.
+        editor::ToggleSelect(st, 1);
+        check(st.multiSelection == (std::vector<int>{0, 1, 2}) && st.selectedEntity == 1,
+              "ED4: set stays sorted ascending; primary = last-clicked");
+        editor::ToggleSelect(st, 1);
+        check(st.multiSelection == (std::vector<int>{0, 2}) && st.selectedEntity == 2,
+              "ED4: toggling the primary out re-anchors to the largest remaining");
+        // Shrinking below 2 collapses back to single-select.
+        editor::ToggleSelect(st, 0);
+        check(st.multiSelection.empty() && st.selectedEntity == 2,
+              "ED4: a set below 2 collapses back to single-select");
+        // A plain click always single-selects (clears any set).
+        editor::ToggleSelect(st, 0);
+        editor::SelectSingle(st, 1);
+        check(st.multiSelection.empty() && st.selectedEntity == 1,
+              "ED4: SelectSingle clears the multi-select set");
+    }
+
+    // --- Slice ED4: BuildPanelData sanitizes the multi-select set (written back like the clamp). --
+    {
+        editor::EditorState st; st.selectedEntity = 0;
+        st.multiSelection = {0, 2, 7};   // 7 is out of range for the 3-entity scene
+        (void)editor::BuildPanelData(reg, res, st);
+        check(st.multiSelection == (std::vector<int>{0, 2}),
+              "ED4: out-of-range set members are dropped");
+        check(st.selectedEntity == 0,
+              "ED4: the primary is untouched while it remains a set member");
+        editor::EditorState st3; st3.selectedEntity = 2;   // valid index but NOT in the set
+        st3.multiSelection = {0, 1};
+        (void)editor::BuildPanelData(reg, res, st3);
+        check(st3.multiSelection == (std::vector<int>{0, 1}) && st3.selectedEntity == 1,
+              "ED4: a primary outside the set re-anchors to the largest member");
+        editor::EditorState st2; st2.selectedEntity = 1;
+        st2.multiSelection = {1, 9};     // only one survivor -> collapse to single-select
+        (void)editor::BuildPanelData(reg, res, st2);
+        check(st2.multiSelection.empty() && st2.selectedEntity == 1,
+              "ED4: a set shrunk below 2 collapses to single-select on the survivor");
+    }
+
+    // --- Slice ED4: snap quantization (round-to-nearest; binary-fraction steps are exact). --------
+    {
+        editor::SnapConfig cfg;   // defaults: OFF, pos 0.25, angle 15 deg, scale 0.125
+        check(!cfg.enabled, "ED4: snap defaults OFF (pre-ED4 behavior preserved)");
+        check(editor::SnapValue(3.3f, 0.25f) == 3.25f, "ED4: SnapValue(3.3, 0.25) == 3.25 exactly");
+        check(editor::SnapValue(3.35f, 0.25f) == 3.25f, "ED4: 3.35 rounds down to 3.25");
+        check(editor::SnapValue(3.4f, 0.25f) == 3.5f, "ED4: 3.4 rounds up to 3.5");
+        check(editor::SnapValue(-3.3f, 0.25f) == -3.25f, "ED4: negative values quantize symmetrically");
+        check(editor::SnapValue(1.0f, 0.0f) == 1.0f, "ED4: step <= 0 passes through");
+        check(editor::SnapValue(0.7f, 0.125f) == 0.75f, "ED4: scale step 0.125 is exact (0.7 -> 0.75)");
+        const float expAng = 2.0f * (15.0f * editor::kDegToRad);
+        check(editor::SnapAngleRadians(0.5f, 15.0f) == expAng,
+              "ED4: 0.5 rad snaps to the 2x15-degree float multiple");
+        // The disabled config passes transforms and edits through bit-untouched.
+        scene::Transform t; t.position = {3.3f, 0.1f, -1.7f}; t.scale = {1.6f, 1.6f, 1.6f};
+        scene::Transform p = editor::SnapTransformPosition(t, cfg);
+        check(p.position.x == 3.3f && p.scale.x == 1.6f, "ED4: disabled snap is a pass-through");
+        cfg.enabled = true;
+        p = editor::SnapTransformPosition(t, cfg);
+        check(p.position.x == 3.25f && p.position.z == -1.75f && p.scale.x == 1.6f,
+              "ED4: SnapTransformPosition quantizes ONLY the position (scale untouched)");
+        editor::TransformEdit e; e.setPosition = true; e.position = {3.3f, 0.0f, 0.0f};
+        editor::TransformEdit se = editor::SnapTransformEdit(e, cfg);
+        check(se.position.x == 3.25f && se.setPosition,
+              "ED4: SnapTransformEdit quantizes the absolute set payload");
+        editor::TransformEdit d; d.addPosition = true; d.positionDelta = {3.3f, 0.0f, 0.0f};
+        editor::TransformEdit sd = editor::SnapTransformEdit(d, cfg);
+        check(sd.positionDelta.x == 3.3f, "ED4: add* deltas pass through the edit snapper");
+    }
+
     if (g_fail == 0) { std::printf("editor_panels_test: ALL PASS\n"); return 0; }
     std::printf("editor_panels_test: %d FAILURE(S)\n", g_fail);
     return 1;

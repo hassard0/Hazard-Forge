@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "ecs/ecs.h"
+#include "editor/edit_ops3.h"  // Slice ED4: SnapConfig + the shared multi-select set primitives.
 #include "math/math.h"
 #include "scene/scene_io.h"
 
@@ -24,9 +25,42 @@ namespace hf::editor {
 
 // Per-editor UI state that persists across frames (the selected entity in the hierarchy). This is the
 // ONLY mutable editor state; everything else in PanelData is derived from the live registry each call.
+//
+// Slice ED4 (multi-select + snapping): `multiSelection` is the SORTED multi-select set of view-order
+// indices with the edit_ops3.h invariant — EMPTY = single-select mode (the pre-ED4 state; the
+// effective selection is {selectedEntity}); NON-EMPTY => size >= 2, ascending, and it CONTAINS
+// selectedEntity (the primary / last-clicked row the inspector shows). `snap` is the transform snap
+// config (default OFF). Both default to the pre-ED4 state so existing callers behave — and render —
+// byte-identically (the static-shot goldens are untouched).
 struct EditorState {
     int selectedEntity = 0;  // index into the scene's drawable-entity list; -1 = none.
+    std::vector<int> multiSelection;  // ED4: sorted multi-select set (see the invariant above).
+    SnapConfig snap;                  // ED4: transform snapping (gizmo drags + inspector commits).
 };
+
+// --- Slice ED4: EditorState selection helpers (thin wrappers over the edit_ops3.h primitives). ----
+
+// Is hierarchy row `index` selected (single OR multi)?
+inline bool IsRowSelected(const EditorState& s, int index) {
+    if (!s.multiSelection.empty()) return SelectionContains(s.multiSelection, index);
+    return index == s.selectedEntity;
+}
+// Plain click: single-select `index` (clears any multi-selection) — the pre-ED4 behavior.
+inline void SelectSingle(EditorState& s, int index) {
+    s.selectedEntity = index;
+    s.multiSelection.clear();
+}
+// Ctrl+click: toggle `index` in the multi-select set (edit_ops3.h ToggleIndexInSelection).
+inline void ToggleSelect(EditorState& s, int index) {
+    ToggleIndexInSelection(s.multiSelection, s.selectedEntity, index);
+}
+// The EFFECTIVE selection, ascending: the multi-select set when active, else {selectedEntity}
+// (empty when nothing is selected). Committed inspector edits apply to every index in this set.
+inline std::vector<int> EffectiveSelection(const EditorState& s) {
+    if (!s.multiSelection.empty()) return s.multiSelection;
+    if (s.selectedEntity >= 0) return {s.selectedEntity};
+    return {};
+}
 
 // One row in the Scene Hierarchy panel: a drawable entity + its display label. The label is the
 // entity's mesh resource name suffixed with its view-order index (e.g. "duck #3"), else "Entity N".
@@ -71,7 +105,10 @@ struct PanelData {
 // [0, count) when at least one entity exists (a >= count selection clamps to the last; a < 0
 // selection with entities present snaps to 0); leaves it < 0 / inspector.valid=false only when the
 // scene has no drawable entities. The clamp is WRITTEN BACK into `state` so the persistent selection
-// stays in range across frames (matching the live --fly behaviour). Pure CPU; no ImGui/rhi/backend.
+// stays in range across frames (matching the live --fly behaviour). Slice ED4: the multi-select set
+// is SANITIZED the same way (also written back): out-of-range members are dropped, a set shrunk
+// below 2 collapses to single-select, and the primary re-anchors into the set if the clamp moved it
+// out. Pure CPU; no ImGui/rhi/backend.
 PanelData BuildPanelData(ecs::Registry& registry, const scene::SceneResources& resources,
                          EditorState& state);
 
