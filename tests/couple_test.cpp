@@ -931,6 +931,277 @@ int main() {
               "CP6 CoupleToRenderInstances: particles-only -> N instances");
     }
 
+    // ============================================================================================
+    // ============ Slice CP7 — SUBMERGED-VOLUME BUOYANCY + SEALED CONTAINMENT tests ===============
+    // ============================================================================================
+    // Track-R R5: closes the two documented CP caveats — (1) linear buoyancy -> the Archimedes
+    // spherical-cap submerged-volume force; (2) leaking static-wall containment -> the hard basin
+    // AABB seal. CP1-CP6 code is byte-UNTOUCHED (append-only); every assertion above stays green.
+
+    // ---- CP4 FROZEN-CODE digest pin: the CP4 bobbing-barrel state after 120 steps hashes to the SAME
+    //      value on every compiler/platform (MSVC == clang) — the identity proof that CP1-CP6 is
+    //      byte-untouched by CP7 (plus CP4's own behavior tests above, all green). ----
+    {
+        couple::CoupleWorld w = buildCoupleWorld(4, 9, 4);
+        couple::StepCoupleSteps(w, kDt, kCpIters, 120);
+        const uint64_t digest = couple::CoupleDigest(w);
+        std::printf("CP7 pin: CP4 frozen-code digest (120 steps) = 0x%016llx\n",
+                    (unsigned long long)digest);
+        check(digest == 0xA7E9A8CA509A885Dull, "CP7: the CP4 frozen-code digest is UNCHANGED (pinned)");
+    }
+
+    // ---- SPHERICAL-CAP UNIT: exact integer pins + clamps + monotonicity. ----
+    {
+        const fx r = (fx)(2 * (int)kOne);   // r = 2.0 (131072)
+        // V(0) = 0 (fully above the surface); negative depth clamps to 0.
+        check(couple::SphereCapVolume(r, 0) == 0, "SphereCapVolume: V(0) == 0");
+        check(couple::SphereCapVolume(r, -kOne) == 0, "SphereCapVolume: V(d<0) == 0 (clamped)");
+        check(couple::SphereCapVolume(0, kOne) == 0, "SphereCapVolume: r<=0 -> 0 (degenerate)");
+        // V(r) = the half sphere: (pi/3) r^2 (2r) = (2/3)pi r^3. EXACT integer pin: the triple product
+        // is a power of two for r=2.0 -> V(r) = kPiOver3 * 16 = 68629*16 = 1098064.
+        const fx vHalf = couple::SphereCapVolume(r, r);
+        check(vHalf == 1098064, "SphereCapVolume: V(r) == 1098064 (the exact half-sphere pin, r=2)");
+        // V(2r) = the FULL sphere (4/3)pi r^3 via the SAME formula: kPiOver3 * 32 = 2196128. Analytic
+        // (4/3)pi*8*65536 = 2196172.5 -> the integer value is 44.5 LSB (~0.002%) low (the documented
+        // kPiOver3 + floor truncation), pinned exactly.
+        const fx vFull = couple::SphereCapVolume(r, r + r);
+        check(vFull == 2196128, "SphereCapVolume: V(2r) == 2196128 (the exact full-sphere pin, r=2)");
+        check(vFull == 2 * vHalf, "SphereCapVolume: V(r) is EXACTLY half of V(2r) (r=2)");
+        check(couple::SphereVolume(r) == vFull, "SphereVolume(r) == SphereCapVolume(r, 2r)");
+        // Over-depth clamps to the full sphere.
+        check(couple::SphereCapVolume(r, 3 * r) == vFull, "SphereCapVolume: V(d>2r) == V(2r) (clamped)");
+        // MONOTONICITY: V is non-decreasing over EVERY LSB of [0, 2r] (the exact-triple-product
+        // construction guarantees it; assert exhaustively).
+        bool monotone = true;
+        fx prev = 0;
+        for (fx d = 0; d <= r + r; ++d) {
+            const fx v = couple::SphereCapVolume(r, d);
+            if (v < prev) { monotone = false; break; }
+            prev = v;
+        }
+        check(monotone, "SphereCapVolume: monotone non-decreasing over every LSB of [0, 2r]");
+    }
+
+    // ---- BodyFromDensity: invMass = 1/(rho*V); rho<=0 -> static (degenerate). ----
+    {
+        const fx r = (fx)(kOne * 3 / 2);   // 1.5
+        const fpx::FxBody b = couple::BodyFromDensity(fpx::FxVec3{0, 0, 0}, r, kOne / 2);
+        check((b.flags & fpx::kFlagDynamic) != 0u && b.invMass > 0,
+              "BodyFromDensity: a positive density gives a dynamic body");
+        // invMass == fxdiv(kOne, fxmul(rho, V)) exactly (re-derive).
+        const fx expect = fpx::fxdiv(kOne, fpx::fxmul(kOne / 2, couple::SphereVolume(r)));
+        check(b.invMass == expect, "BodyFromDensity: invMass == 1/(rho*V) exactly");
+        const fpx::FxBody s = couple::BodyFromDensity(fpx::FxVec3{0, 0, 0}, r, 0);
+        check(s.invMass == 0 && s.flags == 0u, "BodyFromDensity: rho<=0 -> static (deterministic degenerate)");
+    }
+
+    // ---- The V2 scene builder: the CP4 static basin, the kernel REBUILT with rho0 = the probe MAX
+    //      density (the CF1 no-burst lesson — the CP4 MEAN recipe fires a violent PBF startup burst
+    //      that erupts the pool and corrupts the surface estimate), + a density-derived body (r=1.5). --
+    const couple::CoupleV2Params kV2Params{kOne, 4 * (int)kOne, kOne / 8, 0u};   // rho_f=1, drag=4/s, XSPH 1/8
+    const couple::CoupleBasin kV2Basin{fpx::FxVec3{0, 0, 0},
+                                       fpx::FxVec3{FromInt(8), FromInt(40), FromInt(8)}};
+    auto buildV2World = [&](fx rhoBody, int bodyY) -> couple::CoupleWorld {
+        couple::CoupleWorld w = buildCoupleWorld(4, bodyY, 4);   // the CP4 basin (kernel re-derived below)
+        // rho0 = the MAX density of the seeded lattice (C_i <= 0 at seed -> no startup burst).
+        const fx kH = (fx)(2 * (int)kOne);
+        const fluid::FluidGrid pg = fluid::MakeGrid(w.particles, kH);
+        const fluid::FluidCellTable pt = fluid::BuildCellTable(w.particles, pg);
+        const fluid::FluidNeighborList pl = fluid::BuildNeighborList(w.particles, pg, pt, kH);
+        const fluid::FluidKernel kProbe = fluid::BuildKernelTable(kH, kOne, fluid::kKernelBins, kOne / 100);
+        std::vector<fluid::fx> probeRho;
+        fluid::ComputeDensity(w.particles, pl, kProbe, probeRho);
+        fluid::fx rho0 = 0;
+        for (fluid::fx dv : probeRho) if (dv > rho0) rho0 = dv;
+        w.kernel = fluid::BuildKernelTable(kH, rho0, fluid::kKernelBins, kOne / 100);
+        w.bodies[0] = couple::BodyFromDensity(
+            fpx::FxVec3{FromInt(4), FromInt(bodyY), FromInt(4)}, (fx)(kOne * 3 / 2), rhoBody);
+        return w;
+    };
+    const int kV2Steps = 600;      // 10 s at dt=1/60 (settled well before the measurement window)
+    const int kV2Window = 120;     // the settled measurement window (the last 2 s)
+
+    // runSettled: step kV2Steps V2 ticks; over the LAST kV2Window steps track the body-y band and the
+    // MEAN measured submerged depth (the windowed estimate — the single-step depth wobbles with the
+    // pool surface quantile; the window mean is the honest settled value).
+    struct SettledStats { fx meanD; fx minD; fx maxD; fx minY; fx maxY; };
+    auto runSettled = [&](couple::CoupleWorld& w) -> SettledStats {
+        SettledStats st{0, 0, 0, 0, 0};
+        int64_t sumD = 0;
+        for (int s = 0; s < kV2Steps; ++s) {
+            couple::StepCoupleV2(w, kV2Basin, kV2Params, kDt, kCpIters);
+            if (s >= kV2Steps - kV2Window) {
+                const fx d = couple::MeasureSubmergedDepth(w, 0);
+                const fx y = w.bodies[0].pos.y;
+                if (s == kV2Steps - kV2Window) { st.minD = st.maxD = d; st.minY = st.maxY = y; }
+                if (d < st.minD) st.minD = d;
+                if (d > st.maxD) st.maxD = d;
+                if (y < st.minY) st.minY = y;
+                if (y > st.maxY) st.maxY = y;
+                sumD += (int64_t)d;
+            }
+        }
+        st.meanD = (fx)(sumD / (int64_t)kV2Window);
+        return st;
+    };
+
+    // ---- ARCHIMEDES: rho_b=0.5 settles half-submerged (d ~ r); rho_b=0.25 settles SHALLOWER
+    //      (analytic d = 0.6527 r); rho_b=1.25 SINKS to the bed (pos.y == groundY + radius exactly).
+    //      The bands are HONEST: the surface estimator is particle-quantized and the equilibrium is a
+    //      damped bob (see the CP7 header caveats) — the settled WINDOW-MEAN depth is pinned within
+    //      0.15 wu of the analytic value, the residual bob band is pinned small, and the end-state
+    //      digests are pinned bit-exact (MSVC == clang). ----
+    {
+        const fx r = (fx)(kOne * 3 / 2);        // 98304 (1.5)
+        const fx kBand = (fx)(kOne * 3 / 20);   // the honest band: 0.15 world units
+
+        // (a) rho_b = 0.5 -> analytic d = r (half-submerged). Two runs (determinism + the measurement).
+        couple::CoupleWorld a = buildV2World(kOne / 2, 7);
+        couple::CoupleWorld b = buildV2World(kOne / 2, 7);
+        const SettledStats s05 = runSettled(a);
+        couple::StepCoupleV2Steps(b, kV2Basin, kV2Params, kDt, kCpIters, kV2Steps);
+        bool same = (std::memcmp(&a.bodies[0], &b.bodies[0], sizeof(fpx::FxBody)) == 0);
+        for (size_t i = 0; same && i < a.particles.size(); ++i)
+            if (std::memcmp(&a.particles[i], &b.particles[i], sizeof(fluid::FluidParticle)) != 0) same = false;
+        check(same, "CP7 StepCoupleV2 is deterministic (two runs byte-identical, fluid + body)");
+
+        const fx vRatio = fpx::fxdiv(couple::SphereCapVolume(r, s05.meanD), couple::SphereVolume(r));
+        std::printf("CP7 Archimedes rho=0.50: meanD=%d in [%d,%d] (analytic r=%d), V(d)/V=%d (analytic "
+                    "32768), settled-y band [%d,%d] (bob %d), digest=0x%016llx\n",
+                    s05.meanD, s05.minD, s05.maxD, r, vRatio, s05.minY, s05.maxY, s05.maxY - s05.minY,
+                    (unsigned long long)couple::CoupleDigest(a));
+        check(s05.meanD > r - kBand && s05.meanD < r + kBand,
+              "CP7 Archimedes rho=0.5: settled HALF-submerged (mean d within 0.15 wu of the analytic r)");
+        check(s05.maxY - s05.minY < kOne / 4,
+              "CP7 Archimedes rho=0.5: the settled bob band is small (< 0.25 wu)");
+        check(couple::CoupleDigest(a) == 0xF646B7CFBB170010ull,
+              "CP7 Archimedes rho=0.5: the settled coupled-state digest is pinned");
+        check(couple::CountOutsideBasin(a.particles, kV2Basin) == 0u,
+              "CP7 Archimedes rho=0.5: zero particles outside the sealed basin");
+
+        // (b) rho_b = 0.25 -> analytic d = 0.6527 r (the x²(3−x) = 4·(ρb/ρf) root) = 64163: SHALLOWER.
+        couple::CoupleWorld c = buildV2World(kOne / 4, 7);
+        const SettledStats s025 = runSettled(c);
+        const fx kAnalytic025 = (fx)(0.65270 * 1.5 * (double)kOne + 0.5);   // 64170
+        std::printf("CP7 Archimedes rho=0.25: meanD=%d in [%d,%d] (analytic %d)\n",
+                    s025.meanD, s025.minD, s025.maxD, kAnalytic025);
+        check(s025.meanD < s05.meanD, "CP7 Archimedes rho=0.25: settles SHALLOWER than rho=0.5");
+        check(s025.meanD > kAnalytic025 - kBand && s025.meanD < kAnalytic025 + kBand,
+              "CP7 Archimedes rho=0.25: mean d within 0.15 wu of the analytic 0.6527 r");
+
+        // (c) rho_b = 1.25 >= rho_f -> SINKS: max buoyancy (full submersion) < gravity -> the body
+        // rests at the bed, pos.y == groundY + radius EXACTLY (the fpx ResolveGround clamp).
+        couple::CoupleWorld s = buildV2World(kOne + kOne / 4, 7);
+        couple::StepCoupleV2Steps(s, kV2Basin, kV2Params, kDt, kCpIters, kV2Steps);
+        const fx dSink = couple::MeasureSubmergedDepth(s, 0);
+        std::printf("CP7 Archimedes rho=1.25: pos.y=%d (bed=%d), d=%d (full=2r=%d)\n",
+                    s.bodies[0].pos.y, r, dSink, r + r);
+        check(s.bodies[0].pos.y == r, "CP7 Archimedes rho=1.25: SINKS to the bed (pos.y == groundY+r)");
+        check(dSink == r + r, "CP7 Archimedes rho=1.25: fully submerged at the bed (d == 2r)");
+    }
+
+    // ---- SEALED CONTAINMENT: the agitated scene (the barrel dropped HARD). The OLD StepCouple leaks
+    //      (the negative control — particles end OUTSIDE the basin interior, some past the wall shell);
+    //      StepCoupleV2's seal ends EVERY tick with zero outside. ----
+    {
+        // The negative control: the ORIGINAL CP4 scene + step, the barrel slammed down at -40 wu/s.
+        couple::CoupleWorld old = buildCoupleWorld(4, 14, 4);
+        old.bodies[0].vel.y = -40 * (int)kOne;
+        couple::StepCoupleSteps(old, kDt, kCpIters, 240);
+        const uint32_t oldOutside = couple::CountOutsideBasin(old.particles, kV2Basin);
+        // "Escaped" = past the static wall shell itself (beyond x/z -1..9) — the hard leak.
+        const couple::CoupleBasin kShell{fpx::FxVec3{FromInt(-1), FromInt(-1), FromInt(-1)},
+                                         fpx::FxVec3{FromInt(9), FromInt(40), FromInt(9)}};
+        const uint32_t oldEscaped = couple::CountOutsideBasin(old.particles, kShell);
+        std::printf("CP7 containment negative control (OLD StepCouple, hard drop): outside-interior=%u, "
+                    "escaped-past-walls=%u (of %u dynamic)\n", oldOutside, oldEscaped,
+                    (uint32_t)old.particles.size());
+        check(oldOutside == 343u,
+              "CP7 containment: the OLD step LEAKS under agitation (the pinned negative control)");
+        check(oldEscaped == 277u,
+              "CP7 containment: the OLD step lets particles ESCAPE past the wall shell (pinned)");
+
+        // The seal: the SAME hard drop through StepCoupleV2 -> zero outside after EVERY tick.
+        couple::CoupleWorld sealed = buildV2World(kOne / 2, 14);
+        sealed.bodies[0].vel.y = -40 * (int)kOne;
+        bool alwaysSealed = true;
+        for (int s = 0; s < 240; ++s) {
+            couple::StepCoupleV2(sealed, kV2Basin, kV2Params, kDt, kCpIters);
+            if (couple::CountOutsideBasin(sealed.particles, kV2Basin) != 0u) alwaysSealed = false;
+        }
+        check(alwaysSealed, "CP7 containment: StepCoupleV2 ends EVERY tick with ZERO particles outside");
+        std::printf("CP7 containment sealed digest=0x%016llx\n",
+                    (unsigned long long)couple::CoupleDigest(sealed));
+        check(couple::CoupleDigest(sealed) == 0xAADE1A3F6189C763ull,
+              "CP7 containment: the sealed agitated end-state digest is pinned");
+    }
+
+    // ---- ClampToBasin / CountOutsideBasin units: statics untouched; the into-wall velocity zeroed. ----
+    {
+        const couple::CoupleBasin basin{fpx::FxVec3{0, 0, 0}, fpx::FxVec3{FromInt(4), FromInt(4), FromInt(4)}};
+        std::vector<fluid::FluidParticle> ps;
+        fluid::FluidParticle out = ParticleAt(6, 2, -1);          // outside on +x and -z
+        out.vel = fpx::FxVec3{3 * (int)kOne, (int)kOne, -2 * (int)kOne};
+        ps.push_back(out);
+        fluid::FluidParticle in = ParticleAt(2, 2, 2);            // inside -> untouched
+        ps.push_back(in);
+        fluid::FluidParticle st = ParticleAt(9, 9, 9);            // static outside -> untouched
+        st.flags = fluid::kFlagStatic;
+        ps.push_back(st);
+        check(couple::CountOutsideBasin(ps, basin) == 1u,
+              "CountOutsideBasin: one dynamic outside (the static is not counted)");
+        const uint32_t clamped = couple::ClampToBasin(ps, basin);
+        check(clamped == 1u, "ClampToBasin: exactly the one outside particle clamped");
+        check(ps[0].pos.x == FromInt(4) && ps[0].pos.z == 0 && ps[0].pos.y == FromInt(2),
+              "ClampToBasin: clamped to the AABB faces (only the violating axes)");
+        check(ps[0].vel.x == 0 && ps[0].vel.z == 0 && ps[0].vel.y == (int)kOne,
+              "ClampToBasin: the into-wall velocity components zeroed, the rest kept");
+        check(ps[1].pos.x == FromInt(2) && ps[2].pos.x == FromInt(9),
+              "ClampToBasin: inside + static particles untouched");
+        check(couple::CountOutsideBasin(ps, basin) == 0u, "ClampToBasin: zero outside after the clamp");
+    }
+
+    // ---- The LEGACY identity flag: StepCoupleV2(legacy=1) delegates VERBATIM to the frozen CP4
+    //      StepCouple — byte-identical over a multi-step run (the identity proof). ----
+    {
+        couple::CoupleWorld a = buildCoupleWorld(4, 9, 4), b = buildCoupleWorld(4, 9, 4);
+        couple::StepCoupleSteps(a, kDt, kCpIters, 20);
+        const couple::CoupleV2Params legacy{0, 0, 0, 1u};
+        couple::StepCoupleV2Steps(b, kV2Basin, legacy, kDt, kCpIters, 20);
+        bool same = (std::memcmp(&a.bodies[0], &b.bodies[0], sizeof(fpx::FxBody)) == 0);
+        for (size_t i = 0; same && i < a.particles.size(); ++i)
+            if (std::memcmp(&a.particles[i], &b.particles[i], sizeof(fluid::FluidParticle)) != 0) same = false;
+        check(same, "CP7 legacy flag: StepCoupleV2(legacy) == StepCouple BYTE-IDENTICAL (the identity)");
+    }
+
+    // ---- CP7 LOCKSTEP: authority == replica bit-for-bit from inputs alone (the CP5 mold, V2 step). ----
+    {
+        couple::CoupleWorld init = buildV2World(kOne / 2, 7);
+        const int kTicks = 30;
+        const std::vector<couple::CoupleCommand> stream = {
+            couple::CoupleCommand{2,  couple::kCmdBodyShove, 0, fpx::FxVec3{6 * (int)kOne, 0, 0}},
+            couple::CoupleCommand{8,  couple::kCmdBodyShove, 0, fpx::FxVec3{0, 0, 4 * (int)kOne}},
+            couple::CoupleCommand{14, couple::kCmdBodyMove,  0, fpx::FxVec3{0, (int)kOne, 0}},
+        };
+        const couple::CoupleWorld auth =
+            couple::RunCoupleLockstepV2(init, kV2Basin, kV2Params, stream, kTicks, kDt, kCpIters);
+        const couple::CoupleWorld replica =
+            couple::RunCoupleLockstepV2(init, kV2Basin, kV2Params, stream, kTicks, kDt, kCpIters);
+        bool same = (auth.bodies.size() == replica.bodies.size()) &&
+                    (auth.particles.size() == replica.particles.size());
+        for (size_t i = 0; same && i < auth.bodies.size(); ++i)
+            if (std::memcmp(&auth.bodies[i], &replica.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+        for (size_t i = 0; same && i < auth.particles.size(); ++i)
+            if (std::memcmp(&auth.particles[i], &replica.particles[i], sizeof(fluid::FluidParticle)) != 0)
+                same = false;
+        check(same, "CP7 RunCoupleLockstepV2: authority == replica BIT-EXACT (bodies AND fluid)");
+        std::printf("CP7 lockstep digest=0x%016llx\n", (unsigned long long)couple::CoupleDigest(auth));
+        check(couple::CoupleDigest(auth) == 0xCC5A973126865804ull,
+              "CP7 lockstep: the authority coupled-state digest is pinned (MSVC == clang)");
+        check(couple::CountOutsideBasin(auth.particles, kV2Basin) == 0u,
+              "CP7 lockstep: the shoved run stays sealed (zero outside)");
+    }
+
     if (g_fail == 0) std::printf("couple_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

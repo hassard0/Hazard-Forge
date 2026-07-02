@@ -727,5 +727,440 @@ inline std::vector<math::Mat4> CoupleToRenderInstances(const CoupleWorld& world,
     return out;
 }
 
+// ===== Slice CP7 — SUBMERGED-VOLUME BUOYANCY + SEALED CONTAINMENT (Track-R R5, the CP refinement) =====
+// FLAGSHIP #11 (CP1-CP6) shipped with TWO documented caveats: (1) "linear buoyancy only" — CP2's buoyant
+// force is kBuoyPerParticle * gatheredCount, a linear proxy of the displaced volume (NOT Archimedes-exact);
+// (2) "static-wall containment leaks" — the CP4 basin is a shell of STATIC boundary particles whose ONLY
+// hold on the dynamic fluid is the SOFT, UNILATERAL FL4 density constraint (λ=0 when under-dense) plus the
+// CP4 predict-time floor clamp; there is NO hard positional barrier, so an agitated particle (the barrel
+// dropped hard) can (a) be splashed OVER the one-particle rim (y > wall top) and land OUTSIDE the basin
+// footprint where nothing brings it back, or (b) be density-pushed laterally INTO/THROUGH the
+// one-particle-thick wall layer between solver iterations (the constraint is not a projection against a
+// plane). CP7 closes BOTH caveats, APPEND-ONLY below CP6 (CP1-CP6 code byte-untouched; fluid.h/fpx.h
+// byte-untouched):
+//   (1) SUBMERGED-VOLUME BUOYANCY (the Archimedes upgrade): the body proxy is a SPHERE (the CP
+//       convention — fpx::FxBody carries pos + radius); the EXACT submerged volume at depth d below the
+//       fluid surface is the spherical-cap volume V(d) = π d² (3r − d) / 3 for 0 <= d <= 2r (0 above,
+//       the full (4/3)πr³ below — V(2r) IS the full-sphere volume, same formula). Implemented in pure
+//       Q16.16 integer (SphereCapVolume below); buoyant force = ρ_fluid · |g| · V_submerged along
+//       -normalize(gravity). The fluid SURFACE height is derived deterministically from the particles:
+//       the POOL-SURFACE QUANTILE — the 90th-percentile pos.y over ALL NON-STATIC particles (a sorted
+//       integer select, FluidSurfaceY below; static basin walls are excluded so a wall top is never
+//       read as "water"), gated per body by water CONTACT (the body's CP1 gathered list must contain a
+//       non-static particle, else free-fall). THE ESTIMATOR LESSON (documented — the first design was
+//       rejected empirically): a LOCAL max-y over the body's gathered list reads a body-RIDING splash
+//       plume as "surface" (CP3's drag reaction accelerates nearby particles with the body, so a rising
+//       body carries a column of riders whose max-y tracks the body) — a positive feedback that rockets
+//       the body out of the pool. The global bulk quantile is immune: a few dozen airborne riders
+//       cannot shift the 90th percentile of the pool. The Archimedes floating condition falls out
+//       exactly: a body settles where V(d)/V_total == ρ_body/ρ_fluid (ρ_b = 0.5 -> half-submerged, d = r).
+//   (2) SEALED CONTAINMENT: after the composed step, every NON-STATIC fluid particle is CLAMPED to the
+//       basin's AABB interior (per-axis position clamp + the into-wall velocity component zeroed — the
+//       FL1 floor-clamp form applied to all six faces). A hard, deterministic seal: ZERO particles
+//       outside the basin AABB after every StepCoupleV2 tick, BY CONSTRUCTION.
+//   (3) StepCoupleV2: CP4's locked order with the NEW buoyancy swapped in for the old per-iteration
+//       linear model (buoyancy+drag run ONCE per step, post the fluid velocity derivation — the GF4
+//       "velocity couplings run once" lesson) + the sealed containment as the final pass. The IDENTITY
+//       FLAG: CoupleV2Params::legacy != 0 -> StepCoupleV2 delegates VERBATIM to the frozen CP4
+//       StepCouple (byte-identical by construction — the identity proof), basin/params ignored.
+//   (4) LOCKSTEP: RunCoupleLockstepV2 via the CP5 mold (CoupleCommand/ApplyCoupleCommand/SnapshotCouple
+//       reused VERBATIM; only the step fn is swapped).
+//
+// THE GPU CONVENTION FOR CP7 (documented decision — the CF1/FR8/HR1 precedent): CP7 ships PURE CPU on
+// BOTH backends (NO GPU dispatch, NO new shader, NO new RHI) — both Vulkan-Windows and Metal-Mac run
+// THIS identical CPU code, so the integer showcase golden is bit-identical cross-backend BY
+// CONSTRUCTION. CP2's GPU path (couple_buoyancy.comp, the OLD linear model) stays UNTOUCHED and keeps
+// serving the frozen CP2/CP4 showcases; the V2 math is int64 (fxmul/fxdiv/FxLength) so a future GPU
+// kernel would be DXC/Vulkan-only + Metal CPU-reference (the established fluid_dp.comp convention).
+//
+// HONEST CAVEATS: (a) the surface estimator is the max PARTICLE-CENTER y over the gathered box — it is
+// quantized by the particle spacing, splash-sensitive, and a particle riding the body's top can inflate
+// it; the equilibrium depth is therefore pinned within an honest band around the analytic Archimedes
+// depth, not exactly on it. (b) The equilibrium is a damped BOB (the CP4 caveat) — the drag relaxes it
+// but the settled depth oscillates within a small band. (c) The V2 drag is a MASS-INDEPENDENT velocity
+// relaxation toward the local fluid mean (a documented model choice — physical drag scales with area,
+// not mass; it keeps heavy bodies from ringing for hundreds of steps), unlike CP2's invMass-scaled
+// drag. (d) SphereCapVolume's int64 triple product bounds the body radius to r <= 16 world units
+// (4r³ < 2^63 in raw Q16.16³).
+
+// kPiOver3: π/3 in Q16.16, host-snapped ONCE at compile time (round-to-nearest — the cloth.h restLen /
+// fluid.h BuildKernelTable snap discipline). The ONE transcendental constant of the cap volume.
+inline constexpr fx kPiOver3 = (fx)(1.0471975511965976 * (double)kOne + 0.5);   // 68629 (Q16.16 π/3)
+
+// SphereCapVolume(r, d): the EXACT spherical-cap volume V(d) = (π/3) · d² · (3r − d), Q16.16 integer.
+// d is the submersion depth measured from the sphere's BOTTOM; d <= 0 -> 0 (fully above the surface);
+// d >= 2r -> clamped to 2r, where V(2r) = (π/3)(2r)²(r) = (4/3)πr³ IS the full-sphere volume (the same
+// formula — no separate branch). ROUNDING (documented): the triple product P = d·d·(3r−d) is formed
+// EXACTLY in int64 (Q48.48; bound 4r³ -> r <= 16 world units), then P >> 32 floors it to Q16.16, then
+// the kPiOver3 multiply floors again (the fxmul arithmetic shift) — two floor truncations of <= 1 LSB
+// each, and P is exactly monotone non-decreasing in d on [0, 2r] (the real cubic is non-decreasing
+// there), so the integer V(d) is MONOTONE NON-DECREASING by construction. Pure integer, deterministic.
+inline fx SphereCapVolume(fx r, fx d) {
+    if (r <= 0 || d <= 0) return 0;
+    const fx full = r + r;                                     // 2r (the full-submersion depth)
+    if (d > full) d = full;                                    // below the surface -> the full sphere
+    const int64_t dd  = (int64_t)d * (int64_t)d;               // d² exactly (Q32.32)
+    const int64_t rem = 3 * (int64_t)r - (int64_t)d;           // (3r − d) >= r > 0 (Q16.16)
+    const int64_t P   = dd * rem;                              // d²(3r−d) exactly (Q48.48; bound 4r³)
+    const int64_t v16 = P >> 32;                               // floor to Q16.16 of d²(3r−d)
+    return (fx)(((int64_t)kPiOver3 * v16) >> kFrac);           // · π/3 (Q16.16, floor)
+}
+
+// SphereVolume(r): the full sphere volume (4/3)πr³ == SphereCapVolume(r, 2r) (the d=2r cap IS the whole
+// sphere). The V_total of the Archimedes floating condition V_sub/V_total == ρ_b/ρ_f.
+inline fx SphereVolume(fx r) { return SphereCapVolume(r, r + r); }
+
+// BodyFromDensity(pos, radius, rhoBody): build a DYNAMIC sphere FxBody whose mass follows from its
+// density: m = ρ_body · V_sphere(radius), invMass = fxdiv(kOne, m). This is what makes the Archimedes
+// floating condition exact in the per-step balance: gravity Δv = g·dt; buoyancy Δv = ρ_f·g·V(d)·invMass·dt;
+// equal exactly when V(d) = m/ρ_f, i.e. V(d)/V_total = ρ_b/ρ_f. rhoBody/radius must be > 0 (else a
+// static body is returned — invMass 0, deterministic degenerate). Pure integer (fxdiv/fxmul).
+inline fpx::FxBody BodyFromDensity(const FxVec3& pos, fx radius, fx rhoBody) {
+    fpx::FxBody b;
+    b.pos = pos;
+    b.radius = radius;
+    const fx vol = SphereVolume(radius);
+    const fx mass = fpx::fxmul(rhoBody, vol);
+    if (mass > 0) {
+        b.invMass = fpx::fxdiv(kOne, mass);
+        b.flags = fpx::kFlagDynamic;
+    }
+    return b;
+}
+
+// ----- The deterministic fluid-surface probe (the documented estimator) -----------------------------------
+// FluidSurfaceY(particles): the POOL SURFACE height = the 90th-percentile pos.y over the NON-STATIC
+// particles — the k-th smallest y with k = (count−1)·9/10, found by a VALUE-SPACE BINARY SEARCH (count
+// how many y's are <= mid, halve the [minY, maxY] range; <= 32 passes; NO sort, NO <algorithm>, NO
+// allocation — pure integer compares, exactly deterministic). STATIC particles (the basin walls/floor)
+// are EXCLUDED — a wall top is never read as "water". THE ESTIMATOR CHOICE (documented, empirically
+// forced): the naive LOCAL max-y over a body's gathered list reads a body-riding splash plume as
+// "surface" (CP3's drag reaction makes nearby particles ride a moving body), a positive feedback that
+// rockets the body; the BULK quantile is immune (airborne splash is < 10% of the pool) and matches the
+// basin scene's flat shared surface. samples == 0 (no dynamic water at all) -> surfaceY invalid.
+// HONEST: the quantile of particle CENTERS sits ~half a particle spacing below the visual surface and
+// is spacing-quantized — the Archimedes proof band covers this.
+struct SurfaceProbe {
+    uint32_t samples = 0;    // the number of NON-STATIC particles the probe saw (the pool size)
+    fx       surfaceY = 0;   // the 90th-percentile pos.y over them (valid iff samples > 0)
+};
+inline SurfaceProbe FluidSurfaceY(const std::vector<fluid::FluidParticle>& particles) {
+    SurfaceProbe p;
+    fx lo = 0, hi = 0;
+    for (const fluid::FluidParticle& fp : particles) {
+        if (fp.flags & fluid::kFlagStatic) continue;
+        if (p.samples == 0u) { lo = hi = fp.pos.y; }
+        else { if (fp.pos.y < lo) lo = fp.pos.y; if (fp.pos.y > hi) hi = fp.pos.y; }
+        ++p.samples;
+    }
+    if (p.samples == 0u) return p;
+    // The k-th smallest (0-based k = (count−1)·9/10) by value-space bisection: the smallest value v in
+    // [lo, hi] with #{y <= v} >= k+1. Integer floor midpoint (int64 to avoid overflow on the sum).
+    const uint32_t k = (uint32_t)(((uint64_t)(p.samples - 1u) * 9u) / 10u);
+    while (lo < hi) {
+        const fx mid = (fx)(((int64_t)lo + (int64_t)hi) >> 1);   // floor midpoint (never == hi)
+        uint32_t cnt = 0;
+        for (const fluid::FluidParticle& fp : particles)
+            if (!(fp.flags & fluid::kFlagStatic) && fp.pos.y <= mid) ++cnt;
+        if (cnt >= k + 1u) hi = mid;
+        else lo = mid + 1;
+    }
+    p.surfaceY = lo;
+    return p;
+}
+
+// CountBodyWaterContacts(world, query, i): the per-body water-contact GATE — the number of NON-STATIC
+// particles in body i's CP1 gathered list (the FIXED ascending order). 0 -> the body is clear of the
+// water -> free-fall (no buoyancy, no drag — the CP2 no-gather contract). Deterministic, pure integer.
+inline uint32_t CountBodyWaterContacts(const CoupleWorld& world, const CoupleQuery& query, uint32_t i) {
+    uint32_t contacts = 0;
+    const uint32_t s0 = query.bodyStart[(size_t)i];
+    const uint32_t s1 = query.bodyStart[(size_t)i + 1u];
+    for (uint32_t s = s0; s < s1; ++s)
+        if (!(world.particles[(size_t)query.bodyParticles[(size_t)s]].flags & fluid::kFlagStatic))
+            ++contacts;
+    return contacts;
+}
+
+// SubmergedDepth(body, surfaceY): the sphere's submersion depth d = surfaceY − (pos.y − radius), measured
+// from the sphere's BOTTOM up to the fluid surface, clamped to [0, 2r] (the SphereCapVolume domain).
+inline fx SubmergedDepth(const fpx::FxBody& b, fx surfaceY) {
+    fx d = surfaceY - (b.pos.y - b.radius);
+    if (d < 0) d = 0;
+    const fx full = b.radius + b.radius;
+    if (d > full) d = full;
+    return d;
+}
+
+// ----- The V2 coupling parameters + the sealed basin ------------------------------------------------------
+// rhoFluid: the fluid density ρ_f of the Archimedes force (Q16.16; 0 -> buoyancy OFF). drag: the
+// MASS-INDEPENDENT velocity-relaxation coefficient toward the local fluid mean velocity (per second,
+// Q16.16; 0 -> drag OFF; see the honest-caveat note — this is a model choice, not CP2's invMass-scaled
+// drag). legacy != 0 -> StepCoupleV2 delegates VERBATIM to the frozen CP4 StepCouple (the identity flag;
+// basin + the other params are ignored on that path).
+struct CoupleV2Params {
+    fx       rhoFluid  = 0;  // ρ_f (Q16.16); buoyant force = ρ_f · |g| · V_submerged
+    fx       drag      = 0;  // velocity relaxation toward the local fluid mean (per second, Q16.16)
+    fx       viscosity = 0;  // FL7 XSPH coefficient applied to the POOL each step (0 -> exact no-op, the
+                             // FL7 identity-at-zero) — calms the PBF slosh so the float line settles
+    uint32_t legacy    = 0;  // != 0 -> byte-identical CP4 StepCouple delegation (the identity proof)
+};
+
+// CoupleBasin: the sealed AABB interior the fluid is clamped to (Q16.16 world corners, lo <= hi). The
+// CP4 scene's basin of static wall particles becomes this hard interior box (the walls stay in the scene
+// for the density interaction; the AABB is the final positional authority).
+struct CoupleBasin {
+    FxVec3 lo, hi;
+};
+
+// UnboundedBasin(): the no-op basin (the whole int32 range) — ClampToBasin never fires (the containment
+// off-switch, for the identity/ablation runs).
+inline CoupleBasin UnboundedBasin() {
+    constexpr fx kMin = (fx)0x80000000;   // INT32_MIN
+    constexpr fx kMax = 0x7FFFFFFF;       // INT32_MAX
+    return CoupleBasin{FxVec3{kMin, kMin, kMin}, FxVec3{kMax, kMax, kMax}};
+}
+
+// ClampToBasin(particles, basin): the SEAL — clamp every NON-STATIC particle to the basin AABB interior,
+// per axis: pos < lo -> pos = lo (and the into-wall velocity component, if still pointing out, is zeroed
+// — the FL1 floor-clamp form); pos > hi mirrored. STATIC particles (the wall shell itself, which lives
+// OUTSIDE the interior) are untouched. Returns the number of particles that needed at least one clamp
+// (a coverage stat). Deterministic (per-particle independent), pure integer compare.
+inline uint32_t ClampToBasin(std::vector<fluid::FluidParticle>& particles, const CoupleBasin& basin) {
+    uint32_t clamped = 0;
+    const size_t n = particles.size();
+    for (size_t i = 0; i < n; ++i) {
+        fluid::FluidParticle& p = particles[i];
+        if (p.flags & fluid::kFlagStatic) continue;
+        bool hit = false;
+        if (p.pos.x < basin.lo.x) { p.pos.x = basin.lo.x; if (p.vel.x < 0) p.vel.x = 0; hit = true; }
+        if (p.pos.x > basin.hi.x) { p.pos.x = basin.hi.x; if (p.vel.x > 0) p.vel.x = 0; hit = true; }
+        if (p.pos.y < basin.lo.y) { p.pos.y = basin.lo.y; if (p.vel.y < 0) p.vel.y = 0; hit = true; }
+        if (p.pos.y > basin.hi.y) { p.pos.y = basin.hi.y; if (p.vel.y > 0) p.vel.y = 0; hit = true; }
+        if (p.pos.z < basin.lo.z) { p.pos.z = basin.lo.z; if (p.vel.z < 0) p.vel.z = 0; hit = true; }
+        if (p.pos.z > basin.hi.z) { p.pos.z = basin.hi.z; if (p.vel.z > 0) p.vel.z = 0; hit = true; }
+        if (hit) ++clamped;
+    }
+    return clamped;
+}
+
+// CountOutsideBasin(particles, basin): the containment proof metric — the number of NON-STATIC particles
+// STRICTLY outside the basin AABB on any axis. StepCoupleV2 ends every tick with this == 0 BY
+// CONSTRUCTION (the seal); the OLD StepCouple under agitation is the leaking negative control. Pure
+// integer compare, deterministic.
+inline uint32_t CountOutsideBasin(const std::vector<fluid::FluidParticle>& particles,
+                                  const CoupleBasin& basin) {
+    uint32_t outside = 0;
+    for (const fluid::FluidParticle& p : particles) {
+        if (p.flags & fluid::kFlagStatic) continue;
+        if (p.pos.x < basin.lo.x || p.pos.x > basin.hi.x ||
+            p.pos.y < basin.lo.y || p.pos.y > basin.hi.y ||
+            p.pos.z < basin.lo.z || p.pos.z > basin.hi.z) ++outside;
+    }
+    return outside;
+}
+
+// ----- AccumBodyForcesV2: the ARCHIMEDES buoyancy + drag exchange (fluid->body, run ONCE per step) --------
+// probe = FluidSurfaceY(particles) ONCE (the pool-surface quantile). Then for each DYNAMIC body i over
+// its CP1 gathered list (the FIXED ascending order — the CP2 reduction discipline):
+//   * contacts = CountBodyWaterContacts. 0 -> free-fall (no buoyancy, no drag — the body is clear of
+//     the water; the CP2 no-gather contract). This gate also kills the airborne case: a body carried
+//     above the pool computes d = clamp(surface − (pos.y − r)) = 0 -> zero buoyant force anyway.
+//   * d = SubmergedDepth(body, probe.surfaceY); V = SphereCapVolume(radius, d).
+//   * BUOYANCY (a force): up = -FxNormalize(gravity) (the CP2 direction, +Y fallback at gravity 0);
+//     buoyMag = fxmul(fxmul(ρ_f, |g|), V) with |g| = FxLength(gravity);
+//     vel += up · buoyMag · invMass · dt (the invMass-scaled force -> the Archimedes balance).
+//   * DRAG (a velocity relaxation, mass-INDEPENDENT — the documented V2 model choice): vFluidAvg = the
+//     fixed-order int64 mean velocity of the NON-STATIC gathered particles;
+//     vel += fxmul(drag, vFluidAvg − vel) · dt per axis.
+// int64 (fxmul/fxdiv/FxLength/FxNormalize). Deterministic (fixed gathered order, fixed op order).
+inline void AccumBodyForcesV2(CoupleWorld& world, const CoupleQuery& query, const CoupleV2Params& params,
+                              fx dt) {
+    const uint32_t bodyCount = (uint32_t)world.bodies.size();
+    const FxVec3 up = fpx::FxNormalize(FxVec3{-world.gravity.x, -world.gravity.y, -world.gravity.z});
+    const fx gmag = FxLength(world.gravity);
+    const SurfaceProbe probe = FluidSurfaceY(world.particles);   // the pool surface, ONCE per step
+    if (probe.samples == 0u) return;                             // no dynamic water -> nothing to exchange
+    for (uint32_t i = 0; i < bodyCount; ++i) {
+        fpx::FxBody& b = world.bodies[(size_t)i];
+        if (!(b.flags & fpx::kFlagDynamic)) continue;       // static/kinematic -> untouched
+        if (CountBodyWaterContacts(world, query, i) == 0u) continue;   // clear of the water -> free-fall
+
+        // BUOYANCY: F = ρ_f · |g| · V_submerged along up; Δv = F · invMass · dt.
+        if (params.rhoFluid > 0) {
+            const fx d = SubmergedDepth(b, probe.surfaceY);
+            const fx vol = SphereCapVolume(b.radius, d);
+            const fx buoyMag = fxmul(fxmul(params.rhoFluid, gmag), vol);
+            const FxVec3 dvel = FxScale(FxScale(FxScale(up, buoyMag), b.invMass), dt);
+            b.vel = FxAdd(b.vel, dvel);
+        }
+
+        // DRAG: Δv = drag · (vFluidAvg − vel) · dt (mass-independent relaxation; the fixed-order int64
+        // mean over the NON-STATIC gathered particles — the CP2 sum discipline, statics excluded).
+        if (params.drag > 0) {
+            int64_t sumX = 0, sumY = 0, sumZ = 0, cnt = 0;
+            const uint32_t s0 = query.bodyStart[(size_t)i];
+            const uint32_t s1 = query.bodyStart[(size_t)i + 1u];
+            for (uint32_t s = s0; s < s1; ++s) {
+                const fluid::FluidParticle& p = world.particles[(size_t)query.bodyParticles[(size_t)s]];
+                if (p.flags & fluid::kFlagStatic) continue;
+                sumX += (int64_t)p.vel.x; sumY += (int64_t)p.vel.y; sumZ += (int64_t)p.vel.z;
+                ++cnt;
+            }
+            if (cnt > 0) {
+                const FxVec3 vAvg{(fx)(sumX / cnt), (fx)(sumY / cnt), (fx)(sumZ / cnt)};
+                const FxVec3 dv = FxSub(vAvg, b.vel);
+                b.vel.x += fxmul(fxmul(params.drag, dv.x), dt);
+                b.vel.y += fxmul(fxmul(params.drag, dv.y), dt);
+                b.vel.z += fxmul(fxmul(params.drag, dv.z), dt);
+            }
+        }
+    }
+}
+
+// ----- StepCoupleV2: the composed V2 tick (Archimedes buoyancy swapped in + the sealed containment) -------
+// params.legacy != 0 -> VERBATIM delegation to the frozen CP4 StepCouple (byte-identical by construction
+// — the identity flag; basin/params ignored). Otherwise the CP4 locked order with the buoyancy exchange
+// moved OUT of the K iterations (run ONCE, post the fluid velocity derivation — the GF4 lesson) and the
+// seal appended:
+//   (1) PREDICT:  fluid IntegrateFluid; each DYNAMIC body vel += gravity·dt (velocity only)   [CP4 (1)]
+//   (2) BUILD:    FL2 grid/table/neighbour list + the CP1 query, ONCE per step                [CP4 (2)]
+//   (3) ITERATE (K JACOBI iters): FL4 density solve -> CP3 ApplyBodyToFluid                   [CP4 (3a,3b);
+//                 the old per-iteration CP2 AccumBodyForces (3c) is NOT run — the V2 swap]
+//   (4) FLUID VELOCITY: vel = (pos − prev)/dt                                                 [CP4 (4)]
+//   (4b) POOL VISCOSITY: FL7 StepFluidViscosity (XSPH; viscosity==0 -> EXACT no-op)           [NEW]
+//   (4c) EXCHANGE: AccumBodyForcesV2 ONCE (Archimedes buoyancy + drag, over the step's query)  [NEW]
+//   (5) BODY INTEGRATE: pos += vel·dt; ResolveGround                                          [CP4 (5)]
+//   (6) SEAL: ClampToBasin (the hard AABB clamp — the final authority on fluid positions)     [NEW]
+// The query is built at (2) from the predicted fluid + the pre-step body pos (the CP4 convention); (4b)
+// reads the CURRENT particle state through those fixed indices — deterministic. Pure integer, fixed op
+// order -> two runs bit-identical, cross-backend identical (pure CPU on both — the CP7 GPU convention).
+inline void StepCoupleV2(CoupleWorld& world, const CoupleBasin& basin, const CoupleV2Params& params,
+                         fx dt, int iters) {
+    if (params.legacy != 0u) { StepCouple(world, dt, iters); return; }   // the identity flag (CP4 verbatim)
+    const size_t n = world.particles.size();
+    // (1) PREDICT.
+    fluid::IntegrateFluid(world.particles, world.gravity, dt, world.groundY);
+    for (fpx::FxBody& b : world.bodies) {
+        if (!(b.flags & fpx::kFlagDynamic)) continue;
+        b.vel.x += fpx::fxmul(world.gravity.x, dt);
+        b.vel.y += fpx::fxmul(world.gravity.y, dt);
+        b.vel.z += fpx::fxmul(world.gravity.z, dt);
+    }
+    // (2) BUILD.
+    const fluid::FluidGrid grid = fluid::MakeGrid(world.particles, world.kernel.h);
+    const fluid::FluidCellTable table = fluid::BuildCellTable(world.particles, grid);
+    const fluid::FluidNeighborList list = fluid::BuildNeighborList(world.particles, grid, table, world.kernel.h);
+    const CoupleQuery query = GatherBodyParticles(world);
+    // (3) K JACOBI iterations: FL4 density solve -> CP3 body->fluid (NO per-iteration buoyancy — V2).
+    std::vector<fx> density, lambda;
+    std::vector<FxVec3> dp;
+    for (int it = 0; it < iters; ++it) {
+        fluid::ComputeDensity(world.particles, list, world.kernel, density);
+        fluid::ComputeLambda(world.particles, list, world.kernel, density, lambda);
+        fluid::SolveDensityConstraint(world.particles, list, world.kernel, lambda, dp);
+        for (size_t i = 0; i < n; ++i) {
+            if (world.particles[i].flags & fluid::kFlagStatic) continue;
+            world.particles[i].pos = FxAdd(world.particles[i].pos, dp[i]);
+        }
+        ApplyBodyToFluid(world, dt);
+    }
+    // (4) FLUID VELOCITY: vel = (pos − prev)/dt.
+    if (dt != 0) {
+        for (size_t i = 0; i < n; ++i) {
+            if (world.particles[i].flags & fluid::kFlagStatic) continue;
+            const FxVec3 dpos = FxSub(world.particles[i].pos, world.particles[i].prev);
+            world.particles[i].vel =
+                FxVec3{fpx::fxdiv(dpos.x, dt), fpx::fxdiv(dpos.y, dt), fpx::fxdiv(dpos.z, dt)};
+        }
+    }
+    // (4b) POOL VISCOSITY: the FL7 XSPH smooth (fluid.h::StepFluidViscosity, reused AS-IS — its own
+    // neighbour build + the two Jacobi passes + the (vel, prev) re-encode; params.viscosity == 0 -> the
+    // FL7 identity-at-zero EXACT no-op). Calms the PBF slosh so the Archimedes float line settles.
+    fluid::StepFluidViscosity(world.particles, world.kernel, params.viscosity, dt);
+    // (4c) THE V2 EXCHANGE: Archimedes buoyancy + drag, ONCE per step (post the smoothed velocities).
+    AccumBodyForcesV2(world, query, params, dt);
+    // (5) BODY INTEGRATE + the radius-aware bed clamp.
+    for (fpx::FxBody& b : world.bodies) {
+        if (!(b.flags & fpx::kFlagDynamic)) continue;
+        b.pos.x += fpx::fxmul(b.vel.x, dt);
+        b.pos.y += fpx::fxmul(b.vel.y, dt);
+        b.pos.z += fpx::fxmul(b.vel.z, dt);
+        fpx::ResolveGround(b, world.groundY);
+    }
+    // (6) THE SEAL: the hard basin clamp (zero particles outside, by construction).
+    ClampToBasin(world.particles, basin);
+}
+
+// StepCoupleV2Steps(world, basin, params, dt, iters, steps): run K V2 ticks (the showcase/test driver).
+inline void StepCoupleV2Steps(CoupleWorld& world, const CoupleBasin& basin, const CoupleV2Params& params,
+                              fx dt, int iters, int steps) {
+    for (int s = 0; s < steps; ++s) StepCoupleV2(world, basin, params, dt, iters);
+}
+
+// MeasureSubmergedDepth(world, bodyIndex): the reporting stat — the body's SubmergedDepth against the
+// FluidSurfaceY pool-surface estimate, gated by water contact (0 if the body gathers no water, exactly
+// like the force path). Deterministic Q16.16; the Archimedes proof pins this against the analytic depth
+// within the honest band.
+inline fx MeasureSubmergedDepth(const CoupleWorld& world, uint32_t bodyIndex) {
+    if (bodyIndex >= (uint32_t)world.bodies.size()) return 0;
+    const CoupleQuery query = GatherBodyParticles(world);
+    if (CountBodyWaterContacts(world, query, bodyIndex) == 0u) return 0;
+    const SurfaceProbe probe = FluidSurfaceY(world.particles);
+    if (probe.samples == 0u) return 0;
+    return SubmergedDepth(world.bodies[(size_t)bodyIndex], probe.surfaceY);
+}
+
+// ----- CP7 LOCKSTEP: the CP5 mold with the step fn swapped (commands/snapshot reused VERBATIM) ------------
+// SimCoupleTickV2: apply the tick's commands in ARRAY ORDER (ApplyCoupleCommand — CP5 verbatim), then ONE
+// StepCoupleV2. RunCoupleLockstepV2: run `ticks` V2 ticks from a COPY of init — authority and replica fed
+// the SAME init + stream re-derive the coupled state (bodies AND fluid) bit-for-bit.
+inline void SimCoupleTickV2(CoupleWorld& world, const CoupleBasin& basin, const CoupleV2Params& params,
+                            const std::vector<CoupleCommand>& stream, uint32_t tick, fx dt, int iters) {
+    for (const CoupleCommand& c : stream)
+        if (c.tick == tick) ApplyCoupleCommand(world, c);
+    StepCoupleV2(world, basin, params, dt, iters);
+}
+
+inline CoupleWorld RunCoupleLockstepV2(const CoupleWorld& init, const CoupleBasin& basin,
+                                       const CoupleV2Params& params,
+                                       const std::vector<CoupleCommand>& stream, int ticks, fx dt,
+                                       int iters) {
+    CoupleWorld world = init;
+    for (int t = 0; t < ticks; ++t)
+        SimCoupleTickV2(world, basin, params, stream, (uint32_t)t, dt, iters);
+    return world;
+}
+
+// ----- CoupleDigest: the deterministic FNV-1a-64 digest of the whole coupled state (the pin) --------------
+// Hashes every body's int32 words FIELD-WISE (pos/vel/invMass/flags/radius/orient/angVel) then every
+// fluid particle's (pos/prev/vel/invMass/flags) — explicit byte shifts, NO reinterpret_cast, so the
+// digest is layout/padding-independent and identical on every compiler/platform (the fluid.h FluidDigest
+// mold over the TWO heterogeneous body sets). The golden-discipline pin the CP7 tests + showcase print.
+inline uint64_t CoupleDigest(const CoupleWorld& world) {
+    uint64_t h = 1469598103934665603ull;                    // FNV-1a 64 offset basis
+    auto mix = [&h](uint32_t v) {
+        for (int b = 0; b < 4; ++b) {
+            h ^= (uint64_t)((v >> (b * 8)) & 0xFFu);
+            h *= 1099511628211ull;                          // FNV-1a 64 prime
+        }
+    };
+    for (const fpx::FxBody& b : world.bodies) {
+        mix((uint32_t)b.pos.x);    mix((uint32_t)b.pos.y);    mix((uint32_t)b.pos.z);
+        mix((uint32_t)b.vel.x);    mix((uint32_t)b.vel.y);    mix((uint32_t)b.vel.z);
+        mix((uint32_t)b.invMass);  mix(b.flags);              mix((uint32_t)b.radius);
+        mix((uint32_t)b.orient.x); mix((uint32_t)b.orient.y); mix((uint32_t)b.orient.z);
+        mix((uint32_t)b.orient.w);
+        mix((uint32_t)b.angVel.x); mix((uint32_t)b.angVel.y); mix((uint32_t)b.angVel.z);
+    }
+    for (const fluid::FluidParticle& p : world.particles) {
+        mix((uint32_t)p.pos.x);  mix((uint32_t)p.pos.y);  mix((uint32_t)p.pos.z);
+        mix((uint32_t)p.prev.x); mix((uint32_t)p.prev.y); mix((uint32_t)p.prev.z);
+        mix((uint32_t)p.vel.x);  mix((uint32_t)p.vel.y);  mix((uint32_t)p.vel.z);
+        mix((uint32_t)p.invMass); mix(p.flags);
+    }
+    return h;
+}
+
 }  // namespace couple
 }  // namespace hf::sim

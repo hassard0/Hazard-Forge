@@ -33183,6 +33183,203 @@ static int RunCf1CoupleShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CP7 — SUBMERGED-VOLUME BUOYANCY + SEALED CONTAINMENT showcase (--cp7-float-shot) ==============
+// Track-R R5 of docs/SUPERIORITY_ROADMAP.md — closes the CP flagship's two documented caveats: (1) the CP2
+// linear buoyancy -> the ARCHIMEDES spherical-cap force rho_f*|g|*V(d) (couple.h::SphereCapVolume, exact
+// int64 triple product; fluid surface = the deterministic pool 90th-percentile quantile FluidSurfaceY —
+// the local max-y estimator was rejected: it reads a body-riding splash plume as "surface" and rockets the
+// body); (2) the leaking static-wall containment -> the hard basin-AABB seal (ClampToBasin every tick ->
+// ZERO particles outside BY CONSTRUCTION; the OLD StepCouple leaks 343/277 under the couple_test hard-drop
+// negative control). PURE CPU (the CF1/FR8/HR1 convention: NO GPU compute, NO new shader, NO new RHI):
+// this harness runs the IDENTICAL CPU code (couple.h::StepCoupleV2 — CP4's locked order with the buoyancy
+// exchange swapped to ONCE-per-step Archimedes + FL7 XSPH pool viscosity + the seal) on Metal-Mac that the
+// Vulkan --cp7-float-shot runs on Windows -> the settled golden is bit-identical cross-backend BY
+// CONSTRUCTION (the strict zero-differing-pixel bar). THE ARCHIMEDES LINEUP: three spheres of density
+// 0.25/0.5/0.9 (r=1.5, mass = rho*V via BodyFromDensity) settle at visibly different depths — window-mean
+// d pinned within 0.15 wu of the analytic cap-volume roots (0.979/1.500/2.411 wu). PROOFS: (1) two runs
+// BYTE-IDENTICAL (bodies AND fluid); (2) zero outside after EVERY tick; (3) the strict depth ordering +
+// the analytic bands. Stat line: bodies/particles/steps/CoupleDigest/depths. New golden
+// tests/golden/metal/cp7_float.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+// couple.h CP1-CP6 + fluid.h/fpx.h byte-UNTOUCHED (CP7 is append-only below CP6).
+static int RunCp7FloatShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace couple = hf::sim::couple;
+    namespace fluid  = hf::sim::fluid;
+    namespace fpx    = hf::sim::fpx;
+
+    // The scene (== the Vulkan --cp7-float-shot config): a sealed 17x7 basin (dynamic pool x in [0,16],
+    // z in [0,6], y in [0,5]; one-particle static shell) + the three-density lineup.
+    const couple::fx kOne = couple::kOne;
+    const couple::fx kGravY = -9 * (int)kOne;
+    const couple::fx kDt = kOne / 60;
+    const int kIters = 3;
+    const int kSteps = 600;
+    const int kWindow = 120;                       // the settled measurement window (the last 2 s)
+    const couple::fx kH = (couple::fx)(2 * (int)kOne);
+    const couple::fx kR = (couple::fx)(kOne * 3 / 2);   // body radius 1.5
+
+    couple::CoupleWorld world;
+    const int HX = 16, HZ = 6;
+    auto Part = [&](int x, int y, int z, bool stat) {
+        fluid::FluidParticle p;
+        p.pos = fluid::FxVec3{(couple::fx)(x * (int)kOne), (couple::fx)(y * (int)kOne),
+                              (couple::fx)(z * (int)kOne)};
+        p.prev = p.pos; p.vel = fluid::FxVec3{0, 0, 0};
+        p.invMass = stat ? 0 : kOne; p.flags = stat ? fluid::kFlagStatic : 0u;
+        return p;
+    };
+    for (int py = -1; py <= 6; ++py)
+        for (int pz = -1; pz <= HZ + 1; ++pz)
+            for (int px = -1; px <= HX + 1; ++px) {
+                const bool wall = (px == -1 || px == HX + 1 || pz == -1 || pz == HZ + 1 || py == -1);
+                const bool inside = (px >= 0 && px <= HX && pz >= 0 && pz <= HZ && py >= 0 && py <= 5);
+                if (wall) world.particles.push_back(Part(px, py, pz, true));
+                else if (inside) world.particles.push_back(Part(px, py, pz, false));
+            }
+    // rho0 = the probe MAX density (the CF1 no-burst recipe — the CP4 MEAN recipe fires a PBF startup
+    // burst that erupts the pool and corrupts the surface quantile).
+    {
+        const fluid::FluidGrid pg = fluid::MakeGrid(world.particles, kH);
+        const fluid::FluidCellTable pt = fluid::BuildCellTable(world.particles, pg);
+        const fluid::FluidNeighborList pl = fluid::BuildNeighborList(world.particles, pg, pt, kH);
+        const fluid::FluidKernel kProbe = fluid::BuildKernelTable(kH, kOne, fluid::kKernelBins, kOne / 100);
+        std::vector<couple::fx> probeRho;
+        fluid::ComputeDensity(world.particles, pl, kProbe, probeRho);
+        couple::fx rho0 = 0;
+        for (couple::fx d : probeRho) if (d > rho0) rho0 = d;
+        world.kernel = fluid::BuildKernelTable(kH, rho0, fluid::kKernelBins, kOne / 100);
+    }
+    world.gravity = fpx::FxVec3{0, kGravY, 0};
+    world.dt = kDt;
+    world.groundY = 0;
+    // THE ARCHIMEDES LINEUP: rho_b = 0.25 / 0.5 / 0.9, mass = rho_b * V(sphere) each.
+    world.bodies = {
+        couple::BodyFromDensity(fpx::FxVec3{3 * (int)kOne, 7 * (int)kOne, 3 * (int)kOne}, kR, kOne / 4),
+        couple::BodyFromDensity(fpx::FxVec3{8 * (int)kOne, 7 * (int)kOne, 3 * (int)kOne}, kR, kOne / 2),
+        couple::BodyFromDensity(fpx::FxVec3{13 * (int)kOne, 7 * (int)kOne, 3 * (int)kOne}, kR,
+                                (couple::fx)(kOne * 9 / 10)),
+    };
+    const couple::CoupleV2Params params{kOne, 4 * (int)kOne, kOne / 8, 0u};
+    const couple::CoupleBasin basin{fpx::FxVec3{0, 0, 0},
+                                    fpx::FxVec3{16 * (int)kOne, 40 * (int)kOne, 6 * (int)kOne}};
+    const int kBodyCount = (int)world.bodies.size();
+    const int kParticleCount = (int)world.particles.size();
+
+    // === The V2 run: window-mean settled depths + the every-tick seal proof. ===
+    couple::CoupleWorld run2 = world;   // the determinism twin
+    int64_t sumD[3] = {0, 0, 0};
+    bool sealedAll = true;
+    for (int s = 0; s < kSteps; ++s) {
+        couple::StepCoupleV2(world, basin, params, kDt, kIters);
+        if (couple::CountOutsideBasin(world.particles, basin) != 0u) sealedAll = false;
+        if (s >= kSteps - kWindow) {
+            const couple::CoupleQuery q = couple::GatherBodyParticles(world);
+            const couple::SurfaceProbe pr = couple::FluidSurfaceY(world.particles);
+            for (int b = 0; b < kBodyCount; ++b) {
+                couple::fx d = 0;
+                if (couple::CountBodyWaterContacts(world, q, (uint32_t)b) > 0u && pr.samples > 0u)
+                    d = couple::SubmergedDepth(world.bodies[(size_t)b], pr.surfaceY);
+                sumD[b] += (int64_t)d;
+            }
+        }
+    }
+    const couple::fx d0 = (couple::fx)(sumD[0] / kWindow);
+    const couple::fx d1 = (couple::fx)(sumD[1] / kWindow);
+    const couple::fx d2 = (couple::fx)(sumD[2] / kWindow);
+
+    // PROOF (1) determinism: two V2 runs byte-identical (bodies AND fluid).
+    couple::StepCoupleV2Steps(run2, basin, params, kDt, kIters, kSteps);
+    const bool kSame =
+        std::memcmp(world.bodies.data(), run2.bodies.data(),
+                    world.bodies.size() * sizeof(fpx::FxBody)) == 0 &&
+        std::memcmp(world.particles.data(), run2.particles.data(),
+                    world.particles.size() * sizeof(fluid::FluidParticle)) == 0;
+    if (!kSame) return fail("cp7-float: two runs differ (nondeterministic)");
+    std::printf("cp7-float determinism: two runs BYTE-IDENTICAL (bodies AND fluid)\n");
+
+    // PROOF (2) the SEAL: zero particles outside the basin AABB after EVERY tick.
+    if (!sealedAll) return fail("cp7-float: particles escaped the sealed basin");
+    std::printf("cp7-float sealed: ZERO particles outside the basin AABB after every tick\n");
+
+    // PROOF (3) the ARCHIMEDES lineup: strictly deeper with density, each within the honest 0.15-wu
+    // band of the analytic cap-volume root (0.979 / 1.500 / 2.411 wu for r=1.5).
+    const couple::fx kA0 = (couple::fx)(0.97905 * (double)kOne + 0.5);   // rho 0.25 (0.6527 r)
+    const couple::fx kA1 = kR;                                            // rho 0.50 -> d = r
+    const couple::fx kA2 = (couple::fx)(2.41275 * (double)kOne + 0.5);   // rho 0.90 (1.6085 r)
+    const couple::fx kBand = (couple::fx)(kOne * 3 / 20);                       // 0.15 wu
+    auto inBand = [&](couple::fx d, couple::fx a) { return d > a - kBand && d < a + kBand; };
+    if (!(d0 < d1 && d1 < d2)) return fail("cp7-float: depth ordering broken");
+    if (!inBand(d0, kA0) || !inBand(d1, kA1) || !inBand(d2, kA2))
+        return fail("cp7-float: depths off the analytic bands");
+    std::printf("cp7-float Archimedes: depths [%d,%d,%d] vs analytic [%d,%d,%d] (each within 0.15 wu — "
+                "rho 0.25/0.5/0.9 float strictly deeper)\n", d0, d1, d2, kA0, kA1, kA2);
+
+    const uint64_t kDigest = couple::CoupleDigest(world);
+    std::printf("cp7-float: {bodies:%d, particles:%d, steps:%d, digest:0x%016llx, depths:[%d,%d,%d]}\n",
+                kBodyCount, kParticleCount, kSteps, (unsigned long long)kDigest, d0, d1, d2);
+
+    // --- Golden: the integer side-view of the settled lineup (IDENTICAL to the Vulkan --cp7-float-shot
+    // BY CONSTRUCTION; static shell dim grey, fluid cyan, the three bodies warm discs — lighter = less
+    // dense = floats higher). ---
+    const int kPxPerUnit = 24, kImgMargin = 18;
+    const int kWorldLoX = -2, kWorldW = 20;
+    const int kWorldLoY = -2, kWorldH = 11;
+    const uint32_t imgW = (uint32_t)(kImgMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kImgMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int64_t loX = (int64_t)kWorldLoX << couple::kFrac;
+        const int64_t loY = (int64_t)kWorldLoY << couple::kFrac;
+        cx = kImgMargin + (int)(((int64_t)wxFx - loX) * kPxPerUnit >> couple::kFrac);
+        cy = (int)imgH - kImgMargin - (int)(((int64_t)wyFx - loY) * kPxPerUnit >> couple::kFrac);
+    };
+    auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    auto disc = [&](int cx, int cy, const Vec3& col, int rad) {
+        for (int dy = -rad; dy <= rad; ++dy)
+            for (int dx = -rad; dx <= rad; ++dx) {
+                if (dx * dx + dy * dy > rad * rad) continue;
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kParticleCount; ++i) {
+        const fluid::FluidParticle& p = world.particles[(size_t)i];
+        int cx, cy; toPx(p.pos.x, p.pos.y, cx, cy);
+        const bool stat = (p.flags & fluid::kFlagStatic) != 0u;
+        plot(cx, cy, stat ? Vec3{0.30f, 0.30f, 0.33f} : Vec3{0.22f, 0.64f, 0.97f}, stat ? 1 : 2);
+    }
+    const Vec3 kBodyCols[3] = {Vec3{0.95f, 0.82f, 0.45f},    // rho 0.25 (light gold, floats high)
+                               Vec3{0.90f, 0.55f, 0.20f},    // rho 0.50 (orange, half-submerged)
+                               Vec3{0.75f, 0.25f, 0.15f}};   // rho 0.90 (deep red, rides low)
+    for (int b = 0; b < kBodyCount; ++b) {
+        int cx, cy; toPx(world.bodies[(size_t)b].pos.x, world.bodies[(size_t)b].pos.y, cx, cy);
+        disc(cx, cy, kBodyCols[b], (int)(((int64_t)kR * kPxPerUnit) >> couple::kFrac));
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cp7 Archimedes lineup settled state (%d bodies, %d particles)\n",
+                outPath, imgW, imgH, kBodyCount, kParticleCount);
+    return 0;
+}
+
 // ===== Slice HR1 — DETERMINISTIC STRAND/HAIR SIMULATION CORE showcase (--hr1-hair-shot) ====================
 // Track-S S2 of docs/SUPERIORITY_ROADMAP.md — the ONE deterministic-sim material family still missing
 // (rigid/cloth/fluid/grain/fracture/particles/vehicles/ragdoll all shipped); UE5's Groom is float /
@@ -76970,6 +77167,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--sb1-soft-shot") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_sb1_soft.png";
             try { return RunSb1SoftShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cp7-float-shot <out.png>: render the SUBMERGED-VOLUME BUOYANCY + SEALED CONTAINMENT showcase
+        // (Slice CP7, Track-R R5 of docs/SUPERIORITY_ROADMAP.md — closes the CP flagship's two documented
+        // caveats: linear-only buoyancy -> the Archimedes spherical-cap force; leaking static-wall
+        // containment -> the hard basin-AABB seal). PURE CPU (the CF1/FR8/HR1 convention): the harness
+        // runs the IDENTICAL CPU code (couple.h::StepCoupleV2 — SphereCapVolume + FluidSurfaceY quantile
+        // + FL7 XSPH pool viscosity + ClampToBasin) on Metal-Mac that the Vulkan --cp7-float-shot runs on
+        // Windows -> the settled Archimedes-lineup golden is bit-identical cross-backend BY CONSTRUCTION.
+        // THREE spheres of density 0.25/0.5/0.9 float at visibly different settled depths in one sealed
+        // basin. New golden tests/golden/metal/cp7_float.png; two runs DIFF 0.0000. NO GPU compute, NO
+        // new shader, NO new RHI; couple.h CP1-CP6 + fluid.h/fpx.h byte-UNTOUCHED (CP7 is append-only).
+        if (argc > 1 && std::strcmp(argv[1], "--cp7-float-shot") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cp7_float.png";
+            try { return RunCp7FloatShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --cgrain-support <out.png>: render the Deterministic Rigid<->Grain Coupling CONTACT SUPPORT + DRAG
