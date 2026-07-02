@@ -45153,6 +45153,262 @@ static int RunNav7MLShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice NAV8 (Track-R R8 remainder) — OBSTACLE HOLE-CARVING + CONVEX POLY MERGE + INTER-REGION
+// PORTALS + FUNNEL STRING-PULLING showcase (--nav8-funnel-shot): closes the three flagship-#7
+// sub-caveats NAV7 deferred ("no hole-carving", "triangles-as-polys", "no inter-region portals").
+// PURE CPU — NO GPU compute, NO new shader, NO new RHI; the navmesh.h NAV8 pipeline
+// (TraceContoursWithHoles8 -> BuildPolyMesh8 -> MergeConvexPolys8 -> BuildPortals8 +
+// FilterPortalsByClimb8 -> FindPathML over the portal CSR -> BuildFunnelChannel8 + StringPull8) is
+// header-only integer math, so Metal runs the IDENTICAL pillar-room scene + pipeline + pure-integer
+// top-down viz the Vulkan --nav8-funnel-shot runs on Windows -> the golden is bit-identical
+// cross-backend BY CONSTRUCTION (strict zero-differing-pixel). THE MONEY SHOT: the taut orange
+// funnel path hugs the carved pillar hole (bends at the pillar's lattice corner, runs along its
+// boundary) vs the cyan grid staircase — funnel 16053 Q8 STRICTLY shorter than grid 17920 Q8. The
+// proof lines + digest (0x86a81e1c22025a98, the nav_test NAV8 pin) match the Vulkan side EXACTLY.
+// New golden tests/golden/metal/nav8_funnel.png (baked on the Mac by the controller).
+static int RunNav8FunnelShowcase(const char* outPath) {
+    namespace nav = hf::nav;
+
+    // The deterministic 32x32 pillar-room scene (== the nav_test NAV8 config).
+    const int kW = 32, kH = 32;
+    nav::Heightfield hf;
+    hf.w = kW; hf.h = kH;
+    hf.bminX = 0; hf.bminY = 0; hf.bminZ = 0;
+    hf.bmaxX = kW; hf.bmaxY = 64; hf.bmaxZ = kH;
+    hf.cs = 1; hf.ch = 1;
+    nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+    std::vector<std::vector<nav::Span>> merged;
+    const nav::PillarRoomLayout8 L = nav::MakePillarRoomSpans8(hf, merged);
+    std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+    nav::FilterWalkableSpans(hf, cfg, merged, walkable, surfaceY);
+    // Single-region assignment (documented: hole-carving consumes ANY partition; a symmetric
+    // annulus legitimately watersheds into multiple basins, none enclosing the pillar).
+    std::vector<uint32_t> region(walkable.begin(), walkable.end());
+
+    // The NAV8 pipeline (contours+holes -> polys -> merge -> portals -> A* -> funnel + grid).
+    auto runNav8 = [&](std::vector<nav::RegionContours8>& rcs, std::vector<nav::Poly8>& polys,
+                       uint32_t& triCount, uint32_t& merges, std::vector<nav::Portal8>& portals,
+                       std::vector<uint32_t>& corridor, std::vector<nav::NavPoint8>& funnel,
+                       std::vector<uint32_t>& gridCor, std::vector<int32_t>& gcx,
+                       std::vector<int32_t>& gcz, int64_t& funnelLen, int64_t& gridLen) {
+        nav::TraceContoursWithHoles8(hf, region, 1u, rcs);
+        nav::BuildPolyMesh8(hf, rcs, region, polys);
+        triCount = (uint32_t)polys.size();
+        merges = nav::MergeConvexPolys8(polys);
+        nav::BuildPortals8(polys, portals);
+        nav::FilterPortalsByClimb8(hf, cfg, walkable, surfaceY, portals);
+        std::vector<uint32_t> nOff, nCnt, nList;
+        nav::PortalsToCsr8((uint32_t)polys.size(), portals, nOff, nCnt, nList);
+        std::vector<int32_t> pcx, pcz;
+        nav::PolyCenters8(polys, pcx, pcz);
+        // Start/goal on the SAME ROW on opposite sides of the pillar: every route MUST detour, so
+        // the optimal corridor hugs the pillar edge and the funnel pulls taut around it.
+        const nav::NavPoint8 startD{2 * 2 + 1, 2 * 16 + 1};    // cell (2,16) centre, doubled
+        const nav::NavPoint8 goalD{2 * 29 + 1, 2 * 16 + 1};   // cell (29,16) centre, doubled
+        const uint32_t sp = nav::FindContainingPoly8(polys, startD.x, startD.z);
+        const uint32_t gp = nav::FindContainingPoly8(polys, goalD.x, goalD.z);
+        nav::FindPathML(nOff, nCnt, nList, pcx, pcz, sp, gp, corridor);
+        std::vector<nav::NavPoint8> fl, fr;
+        nav::BuildFunnelChannel8(corridor, portals, startD, goalD, fl, fr);
+        nav::StringPull8(fl, fr, funnel);
+        funnelLen = nav::PolylineLenQ8_8(funnel);
+        std::vector<uint32_t> gOff, gCnt, gList;
+        nav::BuildCellGridCsr8(hf, cfg, walkable, surfaceY, gOff, gCnt, gList, gcx, gcz);
+        nav::FindPathML(gOff, gCnt, gList, gcx, gcz, (uint32_t)hf.columnId(2, 16),
+                        (uint32_t)hf.columnId(29, 16), gridCor);
+        std::vector<nav::NavPoint8> gridPts;
+        for (uint32_t id : gridCor)
+            gridPts.push_back(nav::NavPoint8{2 * gcx[id] + 1, 2 * gcz[id] + 1});
+        gridLen = nav::PolylineLenQ8_8(gridPts);
+    };
+    std::vector<nav::RegionContours8> rcs;
+    std::vector<nav::Poly8> polys;
+    std::vector<nav::Portal8> portals;
+    std::vector<uint32_t> corridor, gridCor;
+    std::vector<int32_t> gcx, gcz;
+    std::vector<nav::NavPoint8> funnel;
+    uint32_t triCount = 0u, merges = 0u;
+    int64_t funnelLen = 0, gridLen = 0;
+    runNav8(rcs, polys, triCount, merges, portals, corridor, funnel, gridCor, gcx, gcz,
+            funnelLen, gridLen);
+
+    // PROOF (1) THE CARVE: 1 outer + 1 hole + the integer-shoelace carve identity.
+    const bool carveOk = rcs.size() == 1u && rcs[0].outer.verts.size() == 4u &&
+        rcs[0].holes.size() == 1u && rcs[0].holes[0].verts.size() == 4u &&
+        nav::ContourArea2_8(rcs[0].outer.verts) == 2048 &&
+        nav::ContourArea2_8(rcs[0].holes[0].verts) == 128;
+    if (!carveOk) return fail("nav8: carve off the pins");
+    std::printf("nav8 carve: 1 outer (4 verts) + 1 HOLE (4 verts, the pillar) — shoelace "
+                "identity outer 2048 - hole 128 == 2*960 walkable cells\n");
+
+    // PROOF (2) THE MERGE: pinned 4:1 drop, every poly convex, coverage area-exact, and NO poly
+    // covers a pillar cell (the carve respected by construction).
+    bool allConvex = true;
+    int64_t areaSum = 0;
+    for (const auto& p : polys) {
+        if (!nav::IsConvexPoly8(p)) allConvex = false;
+        areaSum += nav::PolyArea2_8(p);
+    }
+    bool pillarCovered = false;
+    for (const auto& p : polys)
+        if (nav::PointInConvexPoly8Scaled(p, 2 * 15 + 1, 2 * 15 + 1, 2)) pillarCovered = true;
+    if (triCount != 1920u || polys.size() != 480u || merges != 1440u || !allConvex ||
+        areaSum != 1920 || pillarCovered)
+        return fail("nav8: merge off the pins");
+    std::printf("nav8 merge: 1920 tris -> 480 CONVEX polys (1440 merges, area2 1920 preserved "
+                "EXACTLY, no poly on the pillar)\n");
+
+    // PROOF (3) PORTALS + THE FUNNEL vs THE GRID STAIRCASE (all pinned).
+    const bool funnelPts = funnel.size() == 6u &&
+        funnel[0].x == 5 && funnel[0].z == 33 && funnel[1].x == 22 && funnel[1].z == 34 &&
+        funnel[2].x == 24 && funnel[2].z == 40 && funnel[3].x == 42 && funnel[3].z == 40 &&
+        funnel[4].x == 44 && funnel[4].z == 34 && funnel[5].x == 59 && funnel[5].z == 33;
+    if (portals.size() != 1360u || corridor.size() != 22u || gridCor.size() != 36u || !funnelPts ||
+        funnelLen != 16053 || gridLen != 17920 || funnelLen >= gridLen)
+        return fail("nav8: funnel/grid off the pins");
+    std::printf("nav8 funnel: corridor 22 polys THROUGH 1360 portals -> the 6-point taut polyline, "
+                "lenQ8 16053 vs grid 36 cells lenQ8 17920 — STRICTLY shorter, bends at the pillar "
+                "corner (24,40) and hugs its boundary\n");
+
+    // PROOF (4) CONTAINMENT: every funnel segment inside the corridor polys (16 samples per
+    // segment, exact integers) and NEVER strictly inside the pillar rect.
+    {
+        bool inside = true, hitsPillar = false;
+        const int32_t K = 16;
+        for (size_t s = 0; s + 1 < funnel.size(); ++s)
+            for (int32_t j = 0; j <= K; ++j) {
+                const int32_t px = funnel[s].x * K + (funnel[s + 1].x - funnel[s].x) * j;
+                const int32_t pz = funnel[s].z * K + (funnel[s + 1].z - funnel[s].z) * j;
+                bool in = false;
+                for (uint32_t id : corridor) {
+                    if (nav::PointInConvexPoly8Scaled(polys[(size_t)id], px, pz, 2 * K)) {
+                        in = true;
+                        break;
+                    }
+                }
+                if (!in) inside = false;
+                const int32_t s2K = 2 * K;
+                if (px > L.px0 * s2K && px < (L.px1 + 1) * s2K &&
+                    pz > L.pz0 * s2K && pz < (L.pz1 + 1) * s2K) hitsPillar = true;
+            }
+        if (!inside || hitsPillar) return fail("nav8: containment off");
+        std::printf("nav8 containment: every funnel segment stays inside walkable polys; the "
+                    "pillar is NEVER entered (routes AROUND the carved hole)\n");
+    }
+
+    // PROOF (5) DETERMINISM: the full pipeline twice -> byte-identical everything.
+    {
+        std::vector<nav::RegionContours8> rcs2;
+        std::vector<nav::Poly8> polys2;
+        std::vector<nav::Portal8> portals2;
+        std::vector<uint32_t> corridor2, gridCor2;
+        std::vector<int32_t> gcx2, gcz2;
+        std::vector<nav::NavPoint8> funnel2;
+        uint32_t triCount2 = 0u, merges2 = 0u;
+        int64_t funnelLen2 = 0, gridLen2 = 0;
+        runNav8(rcs2, polys2, triCount2, merges2, portals2, corridor2, funnel2, gridCor2,
+                gcx2, gcz2, funnelLen2, gridLen2);
+        const bool same = polys2.size() == polys.size() &&
+            std::memcmp(polys2.data(), polys.data(), polys.size() * sizeof(nav::Poly8)) == 0 &&
+            portals2.size() == portals.size() &&
+            std::memcmp(portals2.data(), portals.data(), portals.size() * sizeof(nav::Portal8)) == 0 &&
+            corridor2 == corridor && gridCor2 == gridCor &&
+            funnel2.size() == funnel.size() &&
+            std::memcmp(funnel2.data(), funnel.data(), funnel.size() * sizeof(nav::NavPoint8)) == 0 &&
+            funnelLen2 == funnelLen && gridLen2 == gridLen;
+        if (!same) return fail("nav8: two runs differ (nondeterministic)");
+        std::printf("nav8 determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // --- Golden: the PURE-INTEGER top-down viz, IDENTICAL to the Vulkan --nav8-funnel-shot by
+    // construction (same fills, same edges, same polylines, same dots — integer arithmetic only). ---
+    const int kCell = 16;
+    const uint32_t imgW = (uint32_t)(kW * kCell), imgH = (uint32_t)(kH * kCell);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int x, int y, uint8_t r, uint8_t g2, uint8_t b2) {
+        if (x < 0 || y < 0 || x >= (int)imgW || y >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)y * imgW + x) * 4];
+        dst[0] = b2; dst[1] = g2; dst[2] = r; dst[3] = 255;
+    };
+    for (int cz = 0; cz < kH; ++cz)
+        for (int cx = 0; cx < kW; ++cx) {
+            const size_t c = (size_t)hf.columnId(cx, cz);
+            uint8_t r = 26, g = 42, b = 30;                       // walkable ground (dark green)
+            if (walkable[c] == 0u) { r = 120; g = 48; b = 40; }   // the pillar (brick)
+            for (int dy = 0; dy < kCell; ++dy)
+                for (int dx = 0; dx < kCell; ++dx)
+                    putPx(cx * kCell + dx, cz * kCell + dy, r, g, b);
+        }
+    auto drawSegPx = [&](int px0, int py0, int px1, int py1, uint8_t r, uint8_t g2, uint8_t b2,
+                         int thick) {
+        int dx = px1 - px0, dy = py1 - py0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int steps = adx > ady ? adx : ady;
+        if (steps == 0) { putPx(px0, py0, r, g2, b2); return; }
+        for (int s = 0; s <= steps; ++s) {
+            const int px = px0 + (dx * s + (dx < 0 ? -steps / 2 : steps / 2)) / steps;
+            const int py = py0 + (dy * s + (dy < 0 ? -steps / 2 : steps / 2)) / steps;
+            for (int oy = -thick; oy <= thick; ++oy)
+                for (int ox = -thick; ox <= thick; ++ox)
+                    putPx(px + ox, py + oy, r, g2, b2);
+        }
+    };
+    // The merged-poly edges (faint): the merge and the carved hole read directly.
+    for (const auto& p : polys)
+        for (uint32_t e = 0; e < p.nverts; ++e) {
+            const uint32_t e1 = (e + 1u) % p.nverts;
+            drawSegPx(p.vx[e] * kCell, p.vz[e] * kCell, p.vx[e1] * kCell, p.vz[e1] * kCell,
+                      58, 62, 66, 0);
+        }
+    // The hole contour (bright red): the carve proof outline around the pillar.
+    {
+        const auto& hv = rcs[0].holes[0].verts;
+        for (size_t e = 0; e < hv.size(); ++e) {
+            const size_t e1 = (e + 1u) % hv.size();
+            drawSegPx(hv[e].x * kCell, hv[e].z * kCell, hv[e1].x * kCell, hv[e1].z * kCell,
+                      230, 60, 50, 1);
+        }
+    }
+    // The grid staircase (cyan) through cell centres, then the taut funnel (orange) on top.
+    for (size_t i = 0; i + 1 < gridCor.size(); ++i) {
+        const uint32_t a = gridCor[i], b = gridCor[i + 1];
+        drawSegPx(gcx[a] * kCell + kCell / 2, gcz[a] * kCell + kCell / 2,
+                  gcx[b] * kCell + kCell / 2, gcz[b] * kCell + kCell / 2, 40, 220, 235, 1);
+    }
+    for (size_t i = 0; i + 1 < funnel.size(); ++i)
+        drawSegPx(funnel[i].x * (kCell / 2), funnel[i].z * (kCell / 2),
+                  funnel[i + 1].x * (kCell / 2), funnel[i + 1].z * (kCell / 2), 250, 150, 40, 1);
+    auto markDot = [&](int px, int py, uint8_t r, uint8_t g2, uint8_t b2) {
+        for (int dy = -3; dy <= 3; ++dy)
+            for (int dx = -3; dx <= 3; ++dx)
+                if (dx * dx + dy * dy <= 9) putPx(px + dx, py + dy, r, g2, b2);
+    };
+    if (!funnel.empty()) {
+        markDot(funnel.front().x * (kCell / 2), funnel.front().z * (kCell / 2), 40, 230, 60);
+        markDot(funnel.back().x * (kCell / 2), funnel.back().z * (kCell / 2), 235, 40, 40);
+    }
+
+    // The cross-compiler/cross-backend digest (== the nav_test NAV8 pin 0x86a81e1c22025a98).
+    uint64_t digest = nav::Fnv1a64ML(polys.data(), polys.size() * sizeof(nav::Poly8));
+    digest = nav::Fnv1a64ML(portals.data(), portals.size() * sizeof(nav::Portal8), digest);
+    digest = nav::Fnv1a64ML(corridor.data(), corridor.size() * sizeof(uint32_t), digest);
+    digest = nav::Fnv1a64ML(funnel.data(), funnel.size() * sizeof(nav::NavPoint8), digest);
+    digest = nav::Fnv1a64ML(&funnelLen, sizeof(funnelLen), digest);
+    digest = nav::Fnv1a64ML(&gridLen, sizeof(gridLen), digest);
+    if (digest != 0x86a81e1c22025a98ull) return fail("nav8: digest off the pinned constant");
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — nav8 hole-carve+merge+funnel {polys:%u, portals:%u, "
+                "holeContours:%u, funnelLenQ8:%lld, gridLenQ8:%lld, digest:0x%016llx}\n",
+                outPath, imgW, imgH, (unsigned)polys.size(), (unsigned)portals.size(),
+                (unsigned)rcs[0].holes.size(), (long long)funnelLen, (long long)gridLen,
+                (unsigned long long)digest);
+    return 0;
+}
+
 // ===== Slice AI1 — Deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK showcase
 // (--ai1-tree) (the BEACHHEAD of the DETERMINISTIC AI flagship #28, hf::ai). PURE CPU — NO GPU compute, NO new
 // shader, NO new RHI; the ai.h decision-tree tick is header-only integer logic, so on Metal it runs the IDENTICAL
@@ -79903,6 +80159,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && (std::strcmp(argv[1], "--nav7-ml-shot") == 0 || std::strcmp(argv[1], "--nav7-ml") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_nav7_ml.png";
             try { return RunNav7MLShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --nav8-funnel-shot <out.png> (alias --nav8-funnel): render the HOLE-CARVING + CONVEX POLY MERGE +
+        // INTER-REGION PORTALS + FUNNEL STRING-PULLING showcase (Slice NAV8, the Track-R R8 remainder —
+        // closes the flagship-#7 "no hole-carving"/"triangles-as-polys"/"no inter-region portals" caveats).
+        // PURE CPU — the navmesh.h NAV8 pipeline (TraceContoursWithHoles8 -> BuildPolyMesh8 ->
+        // MergeConvexPolys8 -> BuildPortals8/FilterPortalsByClimb8 -> FindPathML -> StringPull8) is
+        // header-only integer math, so Metal runs the IDENTICAL pillar-room scene + pure-integer top-down
+        // viz the Vulkan --nav8-funnel-shot runs on Windows: the taut orange funnel hugs the carved pillar
+        // hole vs the cyan grid staircase (16053 < 17920 Q8, pinned) -> the golden is bit-identical
+        // cross-backend BY CONSTRUCTION (strict-zero). NO GPU compute, NO new shader, NO new RHI. New
+        // golden tests/golden/metal/nav8_funnel.png.
+        if (argc > 1 && (std::strcmp(argv[1], "--nav8-funnel-shot") == 0 || std::strcmp(argv[1], "--nav8-funnel") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_nav8_funnel.png";
+            try { return RunNav8FunnelShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fric-ramp / --fric-stack <out.png>: render the Deterministic Contact Friction THE FRICTION-LOCKED

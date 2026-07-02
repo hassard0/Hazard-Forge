@@ -1038,6 +1038,549 @@ int main() {
               "NAV7 digest: pinned cross-compiler constant (MSVC == clang == every platform)");
     }
 
+    // ================= NAV8: TraceContoursWithHoles8 — donut -> 1 outer + 1 hole =====================
+    {
+        // 5x5 grid; region 1 = the ring [1,3]^2 minus the centre (2,2) (8 cells around 1 pocket).
+        nav::Heightfield hf = MakeHf(5, 5);
+        std::vector<uint32_t> region((size_t)hf.columnCount(), 0u);
+        for (int z = 1; z <= 3; ++z)
+            for (int x = 1; x <= 3; ++x)
+                if (!(x == 2 && z == 2)) region[(size_t)hf.columnId(x, z)] = 1u;
+        std::vector<nav::RegionContours8> rcs;
+        nav::TraceContoursWithHoles8(hf, region, 1u, rcs);
+        check(rcs.size() == 1u, "NAV8 donut: one region's contours");
+        check(!rcs.empty() && rcs[0].outer.verts.size() == 4u, "NAV8 donut: outer loop has 4 corners");
+        check(!rcs.empty() && rcs[0].holes.size() == 1u, "NAV8 donut: exactly 1 hole contour");
+        if (!rcs.empty() && rcs[0].holes.size() == 1u) {
+            const auto& hv = rcs[0].holes[0].verts;
+            check(hv.size() == 4u, "NAV8 donut: hole loop has 4 corners");
+            const bool corners = hv.size() == 4u && hv[0].x == 2 && hv[0].z == 2 && hv[1].x == 3 &&
+                                 hv[1].z == 2 && hv[2].x == 3 && hv[2].z == 3 && hv[3].x == 2 && hv[3].z == 3;
+            check(corners, "NAV8 donut: hole corners (2,2)(3,2)(3,3)(2,3)");
+            // Winding/area-sign classification (integer shoelace): both traced loops POSITIVE; the
+            // carve identity SUBTRACTS the hole: 2*cells == outerArea2 - holeArea2 (16 == 18 - 2).
+            const int64_t oa = nav::ContourArea2_8(rcs[0].outer.verts);
+            const int64_t ha = nav::ContourArea2_8(hv);
+            check(oa == 18 && ha == 2, "NAV8 donut: shoelace outer 18, hole 2 (both traced positive)");
+            check(oa - ha == 16, "NAV8 donut: carve identity 2*regionCells == outer - hole (16)");
+        }
+        // The outer loop is BIT-IDENTICAL to the NAV4 TraceContours outer walk (the append-only pin).
+        std::vector<nav::Contour> nav4;
+        nav::TraceContours(hf, region, 1u, nav4);
+        check(nav4.size() == 1u && !rcs.empty() &&
+              nav4[0].verts.size() == rcs[0].outer.verts.size() &&
+              std::memcmp(nav4[0].verts.data(), rcs[0].outer.verts.data(),
+                          nav4[0].verts.size() * sizeof(nav::ContourVertex)) == 0,
+              "NAV8 donut: outer loop BIT-IDENTICAL to NAV4 TraceContours");
+
+        // A BAY (a notch open to the border) is NOT a hole: cut (2,1) whose neighbour column reaches
+        // the border through non-region cells -> the outside flood absorbs it.
+        std::vector<uint32_t> bay((size_t)hf.columnCount(), 0u);
+        for (int z = 1; z <= 3; ++z)
+            for (int x = 1; x <= 3; ++x)
+                if (!(x == 2 && z == 1)) bay[(size_t)hf.columnId(x, z)] = 1u;
+        std::vector<nav::RegionContours8> rcs2;
+        nav::TraceContoursWithHoles8(hf, bay, 1u, rcs2);
+        check(rcs2.size() == 1u && rcs2[0].holes.empty(), "NAV8 bay: border-open notch is NOT a hole");
+
+        // Polygonize the donut (holes -> hole-cells-excluded per-cell triangulation): 8 cells -> 16
+        // triangles, NO poly covers the hole cell (its doubled centre (5,5)), area sum == 2*cells.
+        std::vector<nav::Poly8> polys;
+        nav::BuildPolyMesh8(hf, rcs, region, polys);
+        check(polys.size() == 16u, "NAV8 donut: 8 ring cells -> 16 cell triangles");
+        int64_t areaSum = 0;
+        bool allPos = true;
+        for (const auto& p : polys) {
+            const int64_t a2 = nav::PolyArea2_8(p);
+            areaSum += a2;
+            if (a2 <= 0) allPos = false;
+        }
+        check(allPos, "NAV8 donut: every triangle positive winding");
+        check(areaSum == 16, "NAV8 donut: triangle area2 sum == 2*regionCells (16)");
+        bool holeCovered = false;
+        for (const auto& p : polys)
+            if (nav::PointInConvexPoly8Scaled(p, 5, 5, 2)) holeCovered = true;
+        check(!holeCovered, "NAV8 donut: NO polygon covers the hole cell (centre (2,2))");
+
+        // MERGE: the count drops, every poly convex, coverage identical, hole still uncovered.
+        std::vector<nav::Poly8> merged = polys;
+        const uint32_t merges = nav::MergeConvexPolys8(merged);
+        check(merged.size() == polys.size() - merges, "NAV8 donut: size shrinks by the merge count");
+        check(merged.size() < polys.size(), "NAV8 donut: merge reduces the poly count");
+        bool allConvex = true;
+        int64_t areaSum2 = 0;
+        for (const auto& p : merged) {
+            if (!nav::IsConvexPoly8(p)) allConvex = false;
+            areaSum2 += nav::PolyArea2_8(p);
+        }
+        check(allConvex, "NAV8 donut: every merged poly convex (non-strict integer cross checks)");
+        check(areaSum2 == areaSum, "NAV8 donut: merge coverage EXACT (area2 sum invariant)");
+        bool holeCovered2 = false;
+        for (const auto& p : merged)
+            if (nav::PointInConvexPoly8Scaled(p, 5, 5, 2)) holeCovered2 = true;
+        check(!holeCovered2, "NAV8 donut: NO merged polygon covers the hole cell");
+        check(merged.size() == 4u && merges == 12u,
+              "NAV8 donut: 16 tris -> 4 convex polys (12 merges, pinned)");
+        std::printf("NAV8 donut merge: %u tris -> %u polys (%u merges)\n",
+                    (unsigned)polys.size(), (unsigned)merged.size(), merges);
+    }
+
+    // ================= NAV8: merge unit — two square triangles -> ONE convex quad ====================
+    {
+        // The NAV4 unit square (2 ear-clip triangles) merges into the quad (the triangles-as-polys
+        // caveat closed at its smallest instance).
+        nav::Poly8 a{};
+        a.nverts = 3u; a.region = 1u;
+        a.vx[0] = 0; a.vz[0] = 0; a.vx[1] = 1; a.vz[1] = 0; a.vx[2] = 1; a.vz[2] = 1;
+        nav::Poly8 b{};
+        b.nverts = 3u; b.region = 1u;
+        b.vx[0] = 0; b.vz[0] = 0; b.vx[1] = 1; b.vz[1] = 1; b.vx[2] = 0; b.vz[2] = 1;
+        std::vector<nav::Poly8> polys{a, b};
+        const uint32_t merges = nav::MergeConvexPolys8(polys);
+        check(merges == 1u && polys.size() == 1u, "NAV8 merge unit: 2 triangles -> 1 poly");
+        check(polys.size() == 1u && polys[0].nverts == 4u, "NAV8 merge unit: the quad has 4 verts");
+        check(polys.size() == 1u && nav::IsConvexPoly8(polys[0]), "NAV8 merge unit: the quad is convex");
+        check(polys.size() == 1u && nav::PolyArea2_8(polys[0]) == 2, "NAV8 merge unit: area2 == 2 (the cell)");
+        // Different regions do NOT merge (region borders survive as portal geometry).
+        nav::Poly8 c = b; c.region = 2u;
+        std::vector<nav::Poly8> polys2{a, c};
+        check(nav::MergeConvexPolys8(polys2) == 0u && polys2.size() == 2u,
+              "NAV8 merge unit: different regions never merge");
+    }
+
+    // ================= NAV8: portals — full edge, partial overlap, climb filter ======================
+    {
+        // Two side-by-side unit quads share the full lattice edge x=1: one portal, endpoints exact,
+        // oriented along polyA's winding ((1,0)->(1,1) is A's boundary direction on that edge).
+        auto quad = [](int32_t x, int32_t z, uint32_t region) {
+            nav::Poly8 p{};
+            p.nverts = 4u; p.region = region;
+            p.vx[0] = x;     p.vz[0] = z;
+            p.vx[1] = x + 1; p.vz[1] = z;
+            p.vx[2] = x + 1; p.vz[2] = z + 1;
+            p.vx[3] = x;     p.vz[3] = z + 1;
+            return p;
+        };
+        std::vector<nav::Poly8> polys{quad(0, 0, 1u), quad(1, 0, 1u)};
+        std::vector<nav::Portal8> portals;
+        nav::BuildPortals8(polys, portals);
+        check(portals.size() == 1u, "NAV8 portals: side-by-side quads -> exactly 1 portal");
+        check(!portals.empty() && portals[0].polyA == 0u && portals[0].polyB == 1u,
+              "NAV8 portals: polyA < polyB");
+        check(!portals.empty() && portals[0].ax == 1 && portals[0].az == 0 && portals[0].bx == 1 &&
+              portals[0].bz == 1, "NAV8 portals: full-edge portal (1,0)->(1,1) along polyA's winding");
+
+        // PARTIAL collinear overlap: a 2x1 rectangle over a unit quad offset to its right half ->
+        // the portal is the 1-unit overlap, endpoints exact input vertices (no division).
+        nav::Poly8 rect{};
+        rect.nverts = 4u; rect.region = 1u;
+        rect.vx[0] = 0; rect.vz[0] = 0; rect.vx[1] = 2; rect.vz[1] = 0;
+        rect.vx[2] = 2; rect.vz[2] = 1; rect.vx[3] = 0; rect.vz[3] = 1;
+        std::vector<nav::Poly8> polys2{rect, quad(1, 1, 1u)};
+        std::vector<nav::Portal8> portals2;
+        nav::BuildPortals8(polys2, portals2);
+        check(portals2.size() == 1u, "NAV8 portals: partial overlap -> exactly 1 portal");
+        check(!portals2.empty() && portals2[0].ax == 2 && portals2[0].az == 1 &&
+              portals2[0].bx == 1 && portals2[0].bz == 1,
+              "NAV8 portals: partial-overlap endpoints (2,1)->(1,1) (polyA's winding, exact verts)");
+        // Point-touch (zero-length overlap) is NOT a portal.
+        std::vector<nav::Poly8> polys3{quad(0, 0, 1u), quad(1, 1, 1u)};   // corner-touch only
+        std::vector<nav::Portal8> portals3;
+        nav::BuildPortals8(polys3, portals3);
+        check(portals3.empty(), "NAV8 portals: corner point-touch is NOT a portal");
+
+        // CLIMB FILTER: two 1-cell regions across a 20-voxel step (the NAV3 wall-split config) get a
+        // geometric portal that the climb filter REMOVES (no portal up a cliff).
+        nav::Heightfield hf = MakeHf(5, 5);
+        std::vector<uint32_t> walkable((size_t)hf.columnCount(), 0u);
+        std::vector<int32_t> surfaceY((size_t)hf.columnCount(), 0);
+        walkable[(size_t)hf.columnId(1, 1)] = 1u; surfaceY[(size_t)hf.columnId(1, 1)] = 0;
+        walkable[(size_t)hf.columnId(2, 1)] = 1u; surfaceY[(size_t)hf.columnId(2, 1)] = 20;
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<nav::Poly8> step{quad(1, 1, 1u), quad(2, 1, 2u)};
+        std::vector<nav::Portal8> stepPortals;
+        nav::BuildPortals8(step, stepPortals);
+        check(stepPortals.size() == 1u, "NAV8 climb: the step pair has a GEOMETRIC portal");
+        nav::FilterPortalsByClimb8(hf, cfg, walkable, surfaceY, stepPortals);
+        check(stepPortals.empty(), "NAV8 climb: the too-tall step portal is FILTERED (no cliff path)");
+        // The same pair at the same height KEEPS its portal.
+        surfaceY[(size_t)hf.columnId(2, 1)] = 0;
+        std::vector<nav::Portal8> flatPortals;
+        nav::BuildPortals8(step, flatPortals);
+        nav::FilterPortalsByClimb8(hf, cfg, walkable, surfaceY, flatPortals);
+        check(flatPortals.size() == 1u, "NAV8 climb: the flat pair keeps its portal");
+    }
+
+    // ================= NAV8: the L two-region field — inter-region portal + corner-cut funnel ========
+    {
+        nav::Heightfield hf = MakeHf(24, 24);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<uint32_t> region, walkable;
+        std::vector<int32_t> surfaceY;
+        const nav::LTwoRegionLayout8 L = nav::MakeLTwoRegionGrid8(hf, region, walkable, surfaceY);
+        check(L.ax0 == 2 && L.ax1 == 9 && L.az0 == 2 && L.az1 == 21 && L.bx0 == 10 && L.bx1 == 21 &&
+              L.bz0 == 14 && L.bz1 == 21 && L.startX == 5 && L.startZ == 4 && L.goalX == 19 && L.goalZ == 17,
+              "NAV8 L: the pinned 24x24 two-region layout");
+
+        std::vector<nav::RegionContours8> rcs;
+        nav::TraceContoursWithHoles8(hf, region, 2u, rcs);
+        check(rcs.size() == 2u && rcs[0].holes.empty() && rcs[1].holes.empty(),
+              "NAV8 L: two regions, no holes");
+        std::vector<nav::Poly8> polys;
+        nav::BuildPolyMesh8(hf, rcs, region, polys);
+        const uint32_t triCount = (uint32_t)polys.size();
+        const uint32_t merges = nav::MergeConvexPolys8(polys);
+        check(triCount == 4u && polys.size() == 2u && merges == 2u,
+              "NAV8 L: 2 rectangles after merge (2 ear-clip tris per region -> 1 quad each)");
+        std::vector<nav::Portal8> portals;
+        nav::BuildPortals8(polys, portals);
+        nav::FilterPortalsByClimb8(hf, cfg, walkable, surfaceY, portals);
+        check(portals.size() == 1u, "NAV8 L: exactly 1 INTER-REGION portal at the seam");
+        uint32_t interRegion = 0u;
+        for (const auto& pt : portals)
+            if (polys[pt.polyA].region != polys[pt.polyB].region) ++interRegion;
+        check(interRegion == 1u, "NAV8 L: the portal crosses the region border");
+        check(!portals.empty() && portals[0].ax == 10 && portals[0].bx == 10,
+              "NAV8 L: the portal lies on the seam lattice line x == 10");
+
+        // The poly A* THROUGH the portal (FindPathML reused verbatim) + the integer funnel.
+        std::vector<uint32_t> nOff, nCnt, nList;
+        nav::PortalsToCsr8((uint32_t)polys.size(), portals, nOff, nCnt, nList);
+        std::vector<int32_t> pcx, pcz;
+        nav::PolyCenters8(polys, pcx, pcz);
+        const nav::NavPoint8 startD{2 * L.startX + 1, 2 * L.startZ + 1};
+        const nav::NavPoint8 goalD{2 * L.goalX + 1, 2 * L.goalZ + 1};
+        const uint32_t sp = nav::FindContainingPoly8(polys, startD.x, startD.z);
+        const uint32_t gp = nav::FindContainingPoly8(polys, goalD.x, goalD.z);
+        check(sp != nav::kNoCameFrom && gp != nav::kNoCameFrom && sp != gp,
+              "NAV8 L: start/goal resolve to distinct polys");
+        std::vector<uint32_t> corridor;
+        nav::FindPathML(nOff, nCnt, nList, pcx, pcz, sp, gp, corridor);
+        check(corridor.size() == 2u, "NAV8 L: region-to-region corridor of 2 polys THROUGH the portal");
+        std::vector<nav::NavPoint8> fl, fr, funnel;
+        check(nav::BuildFunnelChannel8(corridor, portals, startD, goalD, fl, fr),
+              "NAV8 L: funnel channel built");
+        nav::StringPull8(fl, fr, funnel);
+        // THE CORNER CUT: the taut path is start -> the inner corner (10,14) (doubled (20,28)) -> goal.
+        check(funnel.size() == 3u, "NAV8 L: funnel path has 3 points (one corner)");
+        check(funnel.size() == 3u && funnel[0].x == startD.x && funnel[0].z == startD.z &&
+              funnel[2].x == goalD.x && funnel[2].z == goalD.z,
+              "NAV8 L: funnel endpoints == start/goal");
+        check(funnel.size() == 3u && funnel[1].x == 20 && funnel[1].z == 28,
+              "NAV8 L: the funnel bends EXACTLY at the inner corner (10,14)");
+
+        // The grid staircase baseline + the strict length win (pinned Q8 values).
+        std::vector<uint32_t> gOff, gCnt, gList;
+        std::vector<int32_t> gcx, gcz;
+        nav::BuildCellGridCsr8(hf, cfg, walkable, surfaceY, gOff, gCnt, gList, gcx, gcz);
+        std::vector<uint32_t> gridCor;
+        nav::FindPathML(gOff, gCnt, gList, gcx, gcz,
+                        (uint32_t)hf.columnId(L.startX, L.startZ),
+                        (uint32_t)hf.columnId(L.goalX, L.goalZ), gridCor);
+        check(gridCor.size() == 28u, "NAV8 L: grid staircase corridor 28 cells (Manhattan 27)");
+        std::vector<nav::NavPoint8> gridPts;
+        for (uint32_t id : gridCor) gridPts.push_back(nav::NavPoint8{2 * gcx[id] + 1, 2 * gcz[id] + 1});
+        const int64_t funnelLen = nav::PolylineLenQ8_8(funnel);
+        const int64_t gridLen = nav::PolylineLenQ8_8(gridPts);
+        check(funnelLen == 10565, "NAV8 L: funnel length 10565 Q8 (pinned)");
+        check(gridLen == 13824, "NAV8 L: grid staircase length 13824 Q8 (27 * 512, pinned)");
+        check(funnelLen < gridLen, "NAV8 L: the funnel is STRICTLY shorter than the grid staircase");
+        // Containment: every funnel segment stays inside the corridor polys (16 samples/segment).
+        bool inside = true;
+        const int32_t K = 16;
+        for (size_t s = 0; s + 1 < funnel.size(); ++s)
+            for (int32_t j = 0; j <= K; ++j) {
+                const int32_t px = funnel[s].x * K + (funnel[s + 1].x - funnel[s].x) * j;
+                const int32_t pz = funnel[s].z * K + (funnel[s + 1].z - funnel[s].z) * j;
+                bool in = false;
+                for (uint32_t id : corridor)
+                    if (nav::PointInConvexPoly8Scaled(polys[(size_t)id], px, pz, 2 * K)) { in = true; break; }
+                if (!in) inside = false;
+            }
+        check(inside, "NAV8 L: every funnel segment stays inside the corridor polys (point-in-poly)");
+        std::printf("NAV8 L: funnelLen %lld vs gridLen %lld (Q8, doubled coords)\n",
+                    (long long)funnelLen, (long long)gridLen);
+    }
+
+    // ================= NAV8: nested region inside another region's hole -> portals ===================
+    {
+        // 5x5: region 1 = the ring, region 2 = the centre cell. Region 1 gets ONE hole (the pocket
+        // covers region 2's cell); region 2 gets its own outer; their coincident boundaries yield
+        // INTER-REGION portals (the region-in-a-hole case).
+        nav::Heightfield hf = MakeHf(5, 5);
+        std::vector<uint32_t> region((size_t)hf.columnCount(), 0u);
+        std::vector<uint32_t> walkable((size_t)hf.columnCount(), 0u);
+        std::vector<int32_t> surfaceY((size_t)hf.columnCount(), 0);
+        for (int z = 1; z <= 3; ++z)
+            for (int x = 1; x <= 3; ++x) {
+                const size_t c = (size_t)hf.columnId(x, z);
+                region[c] = (x == 2 && z == 2) ? 2u : 1u;
+                walkable[c] = 1u;
+            }
+        std::vector<nav::RegionContours8> rcs;
+        nav::TraceContoursWithHoles8(hf, region, 2u, rcs);
+        check(rcs.size() == 2u, "NAV8 nested: both regions traced");
+        check(rcs.size() == 2u && rcs[0].holes.size() == 1u, "NAV8 nested: the ring has 1 hole");
+        check(rcs.size() == 2u && rcs[1].holes.empty(), "NAV8 nested: the island has no hole");
+        std::vector<nav::Poly8> polys;
+        nav::BuildPolyMesh8(hf, rcs, region, polys);
+        nav::MergeConvexPolys8(polys);
+        std::vector<nav::Portal8> portals;
+        nav::BuildPortals8(polys, portals);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        nav::FilterPortalsByClimb8(hf, cfg, walkable, surfaceY, portals);
+        uint32_t interRegion = 0u;
+        for (const auto& pt : portals)
+            if (polys[pt.polyA].region != polys[pt.polyB].region) ++interRegion;
+        check(interRegion >= 1u, "NAV8 nested: the hole boundary yields inter-region portals");
+        // The island is REACHABLE: a corridor from a ring poly into the island poly exists.
+        std::vector<uint32_t> nOff, nCnt, nList;
+        nav::PortalsToCsr8((uint32_t)polys.size(), portals, nOff, nCnt, nList);
+        std::vector<int32_t> pcx, pcz;
+        nav::PolyCenters8(polys, pcx, pcz);
+        uint32_t islandPoly = nav::kNoCameFrom, ringPoly = nav::kNoCameFrom;
+        for (uint32_t p = 0; p < (uint32_t)polys.size(); ++p) {
+            if (polys[p].region == 2u && islandPoly == nav::kNoCameFrom) islandPoly = p;
+            if (polys[p].region == 1u && ringPoly == nav::kNoCameFrom) ringPoly = p;
+        }
+        std::vector<uint32_t> corridor;
+        nav::FindPathML(nOff, nCnt, nList, pcx, pcz, ringPoly, islandPoly, corridor);
+        check(!corridor.empty() && corridor.back() == islandPoly,
+              "NAV8 nested: the island-in-a-hole is reachable region-to-region");
+    }
+
+    // ================= NAV8: hole-free single-region IDENTITY with NAV5 ==============================
+    {
+        // A plain rectangle region: the NAV8 pipeline must agree with NAV4/NAV5 — same triangle count
+        // pre-merge, ONE convex quad post-merge, and the funnel between NAV5's start/goal centroids IS
+        // the straight centroid segment (funnel endpoints == NAV5 path endpoints; funnelLen == the
+        // NAV5 corridor-polyline length — equality BECAUSE the merge collapses the region to one poly).
+        nav::Heightfield hf = MakeHf(16, 12);
+        std::vector<uint32_t> region((size_t)hf.columnCount(), 0u);
+        for (int z = 1; z <= 8; ++z)
+            for (int x = 1; x <= 12; ++x) region[(size_t)hf.columnId(x, z)] = 1u;
+        // The NAV4/NAV5 pipeline.
+        std::vector<nav::Contour> contours;
+        nav::TraceContours(hf, region, 1u, contours);
+        for (auto& c : contours) {
+            std::vector<nav::ContourVertex> s;
+            nav::SimplifyContour(c.verts, 0, s);
+            c.verts = s;
+        }
+        std::vector<nav::Poly> navPolys;
+        nav::BuildPolyMesh(contours, navPolys);
+        std::vector<int32_t> flat;
+        std::vector<uint32_t> vbase;
+        for (const auto& c : contours)
+            for (const auto& v : c.verts) { flat.push_back(v.x); flat.push_back(v.z); }
+        vbase.assign(navPolys.size(), 0u);   // one contour -> base 0 for every poly
+        std::vector<int32_t> cx5, cz5;
+        nav::ComputePolyCentroids(navPolys, flat, vbase, cx5, cz5);
+        uint32_t s5, g5;
+        check(nav::SelectStartGoal(navPolys, cx5, cz5, s5, g5), "NAV8 identity: NAV5 start/goal");
+        std::vector<uint32_t> cor5;
+        nav::FindPath(navPolys, cx5, cz5, s5, g5, cor5);
+        check(navPolys.size() == 2u && cor5.size() == 2u, "NAV8 identity: NAV5 = 2 tris, corridor 2");
+
+        // The NAV8 pipeline on the same field.
+        std::vector<nav::RegionContours8> rcs;
+        nav::TraceContoursWithHoles8(hf, region, 1u, rcs);
+        check(rcs.size() == 1u && rcs[0].holes.empty(), "NAV8 identity: hole-free");
+        std::vector<nav::Poly8> polys;
+        nav::BuildPolyMesh8(hf, rcs, region, polys);
+        check(polys.size() == navPolys.size(), "NAV8 identity: pre-merge triangle count == NAV4's");
+        nav::MergeConvexPolys8(polys);
+        check(polys.size() == 1u && polys[0].nverts == 4u && nav::IsConvexPoly8(polys[0]),
+              "NAV8 identity: the rectangle merges to ONE convex quad");
+        // Funnel between NAV5's endpoints (the doubled centroids): the straight segment.
+        const nav::NavPoint8 startD{2 * cx5[s5], 2 * cz5[s5]};
+        const nav::NavPoint8 goalD{2 * cx5[g5], 2 * cz5[g5]};
+        const uint32_t sp = nav::FindContainingPoly8(polys, startD.x, startD.z);
+        const uint32_t gp = nav::FindContainingPoly8(polys, goalD.x, goalD.z);
+        check(sp == 0u && gp == 0u, "NAV8 identity: both endpoints inside the single quad");
+        std::vector<uint32_t> corridor{0u};
+        std::vector<nav::Portal8> portals;   // none needed: single poly
+        std::vector<nav::NavPoint8> fl, fr, funnel;
+        check(nav::BuildFunnelChannel8(corridor, portals, startD, goalD, fl, fr),
+              "NAV8 identity: single-poly channel");
+        nav::StringPull8(fl, fr, funnel);
+        check(funnel.size() == 2u && funnel[0].x == startD.x && funnel[0].z == startD.z &&
+              funnel[1].x == goalD.x && funnel[1].z == goalD.z,
+              "NAV8 identity: funnel endpoints == NAV5 path endpoints (straight segment)");
+        // NAV5's corridor polyline between the same centroids, in the same doubled-Q8 metric.
+        std::vector<nav::NavPoint8> nav5Pts;
+        for (uint32_t id : cor5) nav5Pts.push_back(nav::NavPoint8{2 * cx5[id], 2 * cz5[id]});
+        const int64_t funnelLen = nav::PolylineLenQ8_8(funnel);
+        const int64_t nav5Len = nav::PolylineLenQ8_8(nav5Pts);
+        check(funnelLen == nav5Len, "NAV8 identity: funnelLen == NAV5 corridor length (single poly)");
+        // Centroids (5,3)/(9,6) -> the doubled delta (8,6) is the exact 6-8-10 triangle: 10*256.
+        check(funnelLen == 2560, "NAV8 identity: pinned length 2560 Q8 (256 * 10, exact)");
+    }
+
+    // ================= NAV8: THE PILLAR ROOM — hole-carve + merge + funnel-vs-grid ===================
+    {
+        // The proof scene (a): 32x32 ground with the sealed 8x8 pillar [12,19]^2 (span-level obstacle
+        // -> NAV2 non-walkable -> the carve). Single-region assignment (documented: hole-carving
+        // consumes any partition; a symmetric annulus watersheds into multiple basins).
+        nav::Heightfield hf = MakeHf(32, 32);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged;
+        const nav::PillarRoomLayout8 L = nav::MakePillarRoomSpans8(hf, merged);
+        check(L.px0 == 12 && L.px1 == 19 && L.pz0 == 12 && L.pz1 == 19,
+              "NAV8 room: the pinned 8x8 pillar rect");
+        std::vector<uint32_t> walkable;
+        std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, merged, walkable, surfaceY);
+        uint32_t walkCount = 0u;
+        for (uint32_t w2 : walkable) walkCount += w2;
+        check(walkCount == 960u, "NAV8 room: 960 walkable columns (1024 - the 64 pillar columns)");
+        check(walkable[(size_t)hf.columnId(15, 15)] == 0u,
+              "NAV8 room: the pillar columns are NAV2-non-walkable (the span-level obstacle premise)");
+        std::vector<uint32_t> region(walkable.begin(), walkable.end());   // region 1 == walkable
+
+        auto runNav8 = [&](std::vector<nav::RegionContours8>& rcs, std::vector<nav::Poly8>& polys,
+                           uint32_t& triCount, uint32_t& merges, std::vector<nav::Portal8>& portals,
+                           std::vector<uint32_t>& corridor, std::vector<nav::NavPoint8>& funnel,
+                           std::vector<uint32_t>& gridCor, int64_t& funnelLen, int64_t& gridLen) {
+            nav::TraceContoursWithHoles8(hf, region, 1u, rcs);
+            nav::BuildPolyMesh8(hf, rcs, region, polys);
+            triCount = (uint32_t)polys.size();
+            merges = nav::MergeConvexPolys8(polys);
+            nav::BuildPortals8(polys, portals);
+            nav::FilterPortalsByClimb8(hf, cfg, walkable, surfaceY, portals);
+            std::vector<uint32_t> nOff, nCnt, nList;
+            nav::PortalsToCsr8((uint32_t)polys.size(), portals, nOff, nCnt, nList);
+            std::vector<int32_t> pcx, pcz;
+            nav::PolyCenters8(polys, pcx, pcz);
+            // Start/goal on the SAME ROW on OPPOSITE sides of the pillar: every route MUST detour
+            // around it (no Manhattan-tie outside-L exists at equal cost), so the optimal corridor
+            // hugs the pillar's near edge and the funnel pulls taut around its corners.
+            const nav::NavPoint8 startD{2 * 2 + 1, 2 * 16 + 1};     // cell (2,16) centre
+            const nav::NavPoint8 goalD{2 * 29 + 1, 2 * 16 + 1};     // cell (29,16) centre
+            const uint32_t sp = nav::FindContainingPoly8(polys, startD.x, startD.z);
+            const uint32_t gp = nav::FindContainingPoly8(polys, goalD.x, goalD.z);
+            nav::FindPathML(nOff, nCnt, nList, pcx, pcz, sp, gp, corridor);
+            std::vector<nav::NavPoint8> fl, fr;
+            nav::BuildFunnelChannel8(corridor, portals, startD, goalD, fl, fr);
+            nav::StringPull8(fl, fr, funnel);
+            funnelLen = nav::PolylineLenQ8_8(funnel);
+            std::vector<uint32_t> gOff, gCnt, gList;
+            std::vector<int32_t> gcx, gcz;
+            nav::BuildCellGridCsr8(hf, cfg, walkable, surfaceY, gOff, gCnt, gList, gcx, gcz);
+            nav::FindPathML(gOff, gCnt, gList, gcx, gcz, (uint32_t)hf.columnId(2, 16),
+                            (uint32_t)hf.columnId(29, 16), gridCor);
+            std::vector<nav::NavPoint8> gridPts;
+            for (uint32_t id : gridCor) gridPts.push_back(nav::NavPoint8{2 * gcx[id] + 1, 2 * gcz[id] + 1});
+            gridLen = nav::PolylineLenQ8_8(gridPts);
+        };
+        std::vector<nav::RegionContours8> rcs;
+        std::vector<nav::Poly8> polys;
+        std::vector<nav::Portal8> portals;
+        std::vector<uint32_t> corridor, gridCor;
+        std::vector<nav::NavPoint8> funnel;
+        uint32_t triCount = 0u, merges = 0u;
+        int64_t funnelLen = 0, gridLen = 0;
+        runNav8(rcs, polys, triCount, merges, portals, corridor, funnel, gridCor, funnelLen, gridLen);
+
+        // (1) THE CARVE: 1 outer (the room rect) + 1 hole (the pillar rect) + the shoelace identity.
+        check(rcs.size() == 1u && rcs[0].outer.verts.size() == 4u && rcs[0].holes.size() == 1u,
+              "NAV8 room: 1 outer + 1 hole contour");
+        if (rcs.size() == 1u && rcs[0].holes.size() == 1u) {
+            const auto& hv = rcs[0].holes[0].verts;
+            check(hv.size() == 4u && hv[0].x == 12 && hv[0].z == 12 && hv[2].x == 20 && hv[2].z == 20,
+                  "NAV8 room: the hole IS the pillar rect (corners (12,12)..(20,20))");
+            check(nav::ContourArea2_8(rcs[0].outer.verts) - nav::ContourArea2_8(hv) == 2 * 960,
+                  "NAV8 room: carve identity outer - hole == 2*walkableCells (1920)");
+        }
+        // (2) THE MERGE: count drop pinned, all convex, coverage exact, no poly on the pillar.
+        check(triCount == 1920u, "NAV8 room: 960 cells -> 1920 triangles pre-merge");
+        check(polys.size() == 480u && merges == 1440u,
+              "NAV8 room: merge 1920 tris -> 480 convex polys (4:1, pinned)");
+        check(portals.size() == 1360u, "NAV8 room: 1360 portals after the climb filter (pinned)");
+        std::printf("NAV8 room merge: %u tris -> %u polys (%u merges)\n",
+                    triCount, (unsigned)polys.size(), merges);
+        bool allConvex = true;
+        int64_t areaSum = 0;
+        for (const auto& p : polys) {
+            if (!nav::IsConvexPoly8(p)) allConvex = false;
+            areaSum += nav::PolyArea2_8(p);
+        }
+        check(allConvex, "NAV8 room: every merged poly convex");
+        check(areaSum == 2 * 960, "NAV8 room: merged coverage == 2*walkableCells (area-exact)");
+        bool pillarCovered = false;
+        for (const auto& p : polys)
+            if (nav::PointInConvexPoly8Scaled(p, 2 * 15 + 1, 2 * 15 + 1, 2)) pillarCovered = true;
+        check(!pillarCovered, "NAV8 room: NO poly covers a pillar cell");
+        // (3) THE FUNNEL vs THE GRID STAIRCASE: strictly shorter, taut around the pillar corner.
+        check(corridor.size() == 22u, "NAV8 room: poly corridor 22 polys (pinned)");
+        check(gridCor.size() == 36u, "NAV8 room: grid staircase 36 cells (Manhattan 27 + detour 8)");
+        check(funnel.size() == 6u, "NAV8 room: funnel path 6 points (pinned)");
+        const bool funnelPts = funnel.size() == 6u &&
+            funnel[0].x == 5 && funnel[0].z == 33 && funnel[1].x == 22 && funnel[1].z == 34 &&
+            funnel[2].x == 24 && funnel[2].z == 40 && funnel[3].x == 42 && funnel[3].z == 40 &&
+            funnel[4].x == 44 && funnel[4].z == 34 && funnel[5].x == 59 && funnel[5].z == 33;
+        check(funnelPts, "NAV8 room: pinned funnel polyline (5,33)(22,34)(24,40)(42,40)(44,34)(59,33)");
+        // (24,40) IS the pillar's bottom-left lattice corner (12,20) doubled; the (24,40)->(42,40)
+        // segment runs taut ALONG the pillar's bottom boundary z=20 — the hole-hugging money shot.
+        check(funnelLen == 16053, "NAV8 room: funnel length 16053 Q8 (pinned)");
+        check(gridLen == 17920, "NAV8 room: grid staircase length 17920 Q8 (35 * 512, pinned)");
+        check(funnelLen < gridLen, "NAV8 room: funnel STRICTLY shorter than the grid staircase");
+        std::printf("NAV8 room: funnelLen %lld vs gridLen %lld, funnel %u pts, corridor %u polys, "
+                    "grid %u cells, portals %u\n",
+                    (long long)funnelLen, (long long)gridLen, (unsigned)funnel.size(),
+                    (unsigned)corridor.size(), (unsigned)gridCor.size(), (unsigned)portals.size());
+        // Containment: every funnel segment inside the corridor polys AND never strictly inside the
+        // pillar rect (16 samples/segment, exact integer).
+        bool inside = true, hitsPillar = false;
+        const int32_t K = 16;
+        for (size_t s = 0; s + 1 < funnel.size(); ++s)
+            for (int32_t j = 0; j <= K; ++j) {
+                const int32_t px = funnel[s].x * K + (funnel[s + 1].x - funnel[s].x) * j;
+                const int32_t pz = funnel[s].z * K + (funnel[s + 1].z - funnel[s].z) * j;
+                bool in = false;
+                for (uint32_t id : corridor)
+                    if (nav::PointInConvexPoly8Scaled(polys[(size_t)id], px, pz, 2 * K)) { in = true; break; }
+                if (!in) inside = false;
+                // Strictly inside the pillar rect (boundary touch is legal: the taut path hugs it).
+                const int32_t s2K = 2 * K;
+                if (px > 12 * s2K && px < 20 * s2K && pz > 12 * s2K && pz < 20 * s2K) hitsPillar = true;
+            }
+        check(inside, "NAV8 room: every funnel segment stays inside walkable polys");
+        check(!hitsPillar, "NAV8 room: the funnel NEVER enters the pillar (routes AROUND it)");
+
+        // (4) DETERMINISM + the cross-compiler digest (polys+portals+corridor+funnel+lengths).
+        std::vector<nav::RegionContours8> rcs2;
+        std::vector<nav::Poly8> polys2;
+        std::vector<nav::Portal8> portals2;
+        std::vector<uint32_t> corridor2, gridCor2;
+        std::vector<nav::NavPoint8> funnel2;
+        uint32_t triCount2 = 0u, merges2 = 0u;
+        int64_t funnelLen2 = 0, gridLen2 = 0;
+        runNav8(rcs2, polys2, triCount2, merges2, portals2, corridor2, funnel2, gridCor2,
+                funnelLen2, gridLen2);
+        const bool det = polys2.size() == polys.size() &&
+            std::memcmp(polys2.data(), polys.data(), polys.size() * sizeof(nav::Poly8)) == 0 &&
+            portals2.size() == portals.size() &&
+            (portals.empty() ||
+             std::memcmp(portals2.data(), portals.data(), portals.size() * sizeof(nav::Portal8)) == 0) &&
+            corridor2 == corridor && gridCor2 == gridCor &&
+            funnel2.size() == funnel.size() &&
+            std::memcmp(funnel2.data(), funnel.data(), funnel.size() * sizeof(nav::NavPoint8)) == 0 &&
+            funnelLen2 == funnelLen && gridLen2 == gridLen;
+        check(det, "NAV8 determinism: two full pipeline runs BYTE-IDENTICAL");
+        uint64_t digest = nav::Fnv1a64ML(polys.data(), polys.size() * sizeof(nav::Poly8));
+        digest = nav::Fnv1a64ML(portals.data(), portals.size() * sizeof(nav::Portal8), digest);
+        digest = nav::Fnv1a64ML(corridor.data(), corridor.size() * sizeof(uint32_t), digest);
+        digest = nav::Fnv1a64ML(funnel.data(), funnel.size() * sizeof(nav::NavPoint8), digest);
+        digest = nav::Fnv1a64ML(&funnelLen, sizeof(funnelLen), digest);
+        digest = nav::Fnv1a64ML(&gridLen, sizeof(gridLen), digest);
+        std::printf("NAV8 digest: 0x%016llx (polys:%u portals:%u holes:%u funnel:%u)\n",
+                    (unsigned long long)digest, (unsigned)polys.size(), (unsigned)portals.size(),
+                    (unsigned)(rcs.empty() ? 0u : rcs[0].holes.size()), (unsigned)funnel.size());
+        check(digest == 0x86a81e1c22025a98ULL,
+              "NAV8 digest: pinned cross-compiler constant (MSVC == clang == every platform)");
+    }
+
     if (g_fail == 0) { std::printf("nav_test OK\n"); return 0; }
     std::printf("nav_test: %d failures\n", g_fail);
     return 1;
