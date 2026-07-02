@@ -1501,6 +1501,23 @@ hf_add_pure_test(cgrain_test)
 # ASan-eligible. couple_gf.h #includes fpx.h + grain.h + fluid.h read-only.
 hf_add_pure_test(cgf_test)
 
+# Deterministic Cloth<->Fluid Coupling Slice CF1 (Track-S S1 of docs/SUPERIORITY_ROADMAP.md — the WET-CLOTH
+# CORE, the FOURTH material-interaction pairing after rigid<->fluid / rigid<->grain / grain<->fluid): the
+# unified cloth+fluid two-pool world (engine/sim/couple_cf.h) + the shared-grid cross query (the GF1 twin
+# over cloth verts) + the TWO-WAY XSPH-style drag (v=(pos-prev)/dt both pools, Jacobi scratch, prev
+# re-encode, pinned/static hold) + the cross-pool vert-sphere CONTACT barrier (the CL7 projection mold,
+# inverse-mass split, the documented POROUS-barrier limit) + the composed StepClothFluid (StepFluid +
+# StepClothSelf called AS-IS -> contact -> drag; identity-at-zero: kDrag=0 + radii=0 == the uncoupled steps
+# BIT-IDENTICAL) + the GF5-twin LOCKSTEP/ROLLBACK over BOTH pools. Pins the cross-query vs a naive O(C*F)
+# oracle + symmetry + no-ops, the exact contact separation / pinned-full-push / static-full-push / rSum=0
+# no-op, the EXACT Q16.16 drag exchange + kDrag=0 no-op + pinned hold, pool-invariance (40 steps, both
+# pools memcmp), THE PHYSICS (a fluid block falling onto a pinned-border horizontal sheet: WITHOUT coupling
+# it passes through, WITH coupling it is caught + the sheet SAGS — the two-way proof), the momentum-drift
+# bound after a drag pass (<=256 LSB/axis, the FL7-scale honest bound), two-run determinism + digests, and
+# lockstep/rollback (authority==replica, rollback corrects a real misprediction, snapshot round-trip). Pure
+# C++ (hf_core), ASan-eligible. couple_cf.h #includes fpx.h + cloth.h + fluid.h read-only (byte-unchanged).
+hf_add_pure_test(cfl_test)
+
 # Deterministic GPU Navmesh Slice 1 (Slice NAV1, the BEACHHEAD of FLAGSHIP #7): the integer HEIGHTFIELD
 # SPAN RASTERIZATION core (engine/nav/navmesh.h) the GPU shaders/nav_raster_count/scan/emit.comp.hlsl
 # copy VERBATIM + prove bit-identical. Pins QuantizeCoord (world->voxel column via FloorDiv incl NEGATIVE
