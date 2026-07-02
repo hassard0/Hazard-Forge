@@ -405,6 +405,7 @@ $Goldens = @(
     @{ Name = 'seq_editor';      Flag = '--seq-editor-shot' }    # Issue #25 sequencer timeline editor (view digest 0xf7a649c83eba8e7f; registration back-filled)
     @{ Name = 'widget_editor';   Flag = '--widget-editor-shot' } # Issue #30 widget/UI editor (view digest 0xc208ea031ced1608; registration back-filled)
     @{ Name = 'cl8_ride';        Flag = '--cl8-ride-shot' }      # CL8 cloth dynamic colliders + Coulomb friction (R3 remainder; the cloth rides the moving body, digest 0xbc5de9aa3b86f976)
+    @{ Name = 'nav8_funnel';     Flag = '--nav8-funnel-shot' }   # NAV8 hole-carving + convex-poly merge + portals + integer funnel (R8 remainder; taut path around the carved pillar, digest 0x86a81e1c22025a98)
 )
 
 $winResult = 'SKIP'
