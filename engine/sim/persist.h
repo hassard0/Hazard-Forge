@@ -1115,3 +1115,683 @@ inline convex::ConvexRenderInstances PersistToRenderInstances(const ConvexWorld&
 
 }  // namespace persist
 }  // namespace hf::sim
+
+// =========================================================================================================
+// Slice PS7 — SPATIAL ISLAND PARTITIONING + GENERAL-HULL CONTACT PERSISTENCE (Track-R R7 of
+// docs/SUPERIORITY_ROADMAP.md, closing the flagship #21 structural caveats). APPENDED AT EOF — PS1-PS6's
+// lines above are BYTE-FROZEN (the namespaces are REOPENED below; zero modified lines in the frozen slices).
+//
+// THE TWO CAVEATS PS7 CLOSES:
+//   (1) "islands are all-pairs": persist::PropagateWake (PS4) and warmhull::PropagateWakeHull (WH4) both
+//       build an O(n^2) adjacency MATRIX by running the narrowphase on EVERY i<j pair, then propagate
+//       wakefulness with up to n relaxation passes (O(n^3) worst case). PS7 makes island discovery SPATIAL:
+//       broadphase candidate pairs (the FROZEN flagship-#23 broad.h grid, reused VERBATIM) -> narrowphase
+//       confirm on candidates only -> UNION-FIND -> the island partition, touching O(n*k) pairs. The
+//       partition is PROVABLY THE SAME as the all-pairs one (see THE EQUIVALENCE ARGUMENT below), and the
+//       spatial warm+sleep steps are BIT-IDENTICAL to the frozen all-pairs steps on the canonical scenes
+//       (the pinned memcmp proofs in persist_test).
+//   (2) "the contact cache speaks boxes only": THE HONEST SCOPE CORRECTION — general-hull contact caching
+//       + warm-start + sleeping ALREADY SHIPPED as flagship #26 (engine/sim/warmhull.h, WH1-WH6: real
+//       per-face geometric-provenance HullContactKeys — STRONGER than the body-pair-keyed v1 this slice's
+//       spec anticipated — plus HullCache/SolveHullManifoldWarm/StepWarmSleepHullWorld/WH5 lockstep). The
+//       roadmap row predates #26. PS7 therefore does NOT duplicate that machinery; it REUSES it VERBATIM
+//       (read-only #include) and contributes the piece #26 still lacks: SPATIAL-ISLAND variants of the hull
+//       warm+sleep step + the persist-convention lockstep/rollback over that spatial step, so hull piles get
+//       warm-start + sleeping THROUGH the O(n*k) island path. The hull cache key is the WH1 HullContactKey
+//       (bodyA/bodyB order-normalized + reference-face + incident-source-feature provenance); its documented
+//       sliding caveat carries over unchanged: a ref/inc face flip or a slide onto a new feature CHANGES the
+//       key -> a warm-start MISS at that contact (the same honest boundary as the box feature-ID scheme).
+//
+// THE EQUIVALENCE ARGUMENT (spatial islands == all-pairs islands):
+//   * The all-pairs wake propagation (PS4/WH4) seeds "awake" ONLY on dynamic bodies and propagates ONLY
+//     through adjacency to an AWAKE body. Statics are never awake and never flip, so wakefulness flows
+//     EXCLUSIVELY along DYNAMIC-DYNAMIC overlap edges: a dynamic body ends up awake iff SOME dynamic body in
+//     its dyn-dyn-overlap connected component is a seed. That is EXACTLY "union-find islands over the
+//     dyn-dyn overlap edges + island-level any-seed-awake".
+//   * The broadphase candidate set is a conservative SUPERSET of the overlapping pairs (box: the L1-pad
+//     proxy radius hx+hy+hz >= ProjectedRadius on every axis, so SAT-overlapping boxes always have
+//     overlapping proxy AABBs; hull: the FROZEN BP4 inflated true-AABB builder incl. the GJK phantom-band
+//     margin). Narrowphase-confirming the candidates therefore yields EXACTLY the same edge set as the
+//     all-pairs narrowphase scan -> the SAME union-find partition -> the SAME asleep flags.
+//   * UNION-FIND DETERMINISM: union always attaches the LARGER root under the SMALLER, so a component's
+//     final root is its MINIMUM body index REGARDLESS of the edge processing order (path compression only
+//     shortens paths, never changes roots) -> the canonical labels (roots relabelled in ascending body
+//     order) are a pure ORDER-INDEPENDENT function of the edge SET. Pinned by the shuffled-edge test.
+//
+// THE BIT-IDENTITY ARGUMENT (spatial step == all-pairs step): the frozen steps' solve/de-pen loops iterate
+// ALL i<j pairs but SKIP any pair whose narrowphase finds no contact; the spatial steps iterate the SORTED
+// (i,j)-ascending candidate list with the SAME loop bodies (the broad.h BP3/BP4 Gauss-Seidel-order crux,
+// reused as-is). Every contact-bearing pair is a candidate (conservative superset), and the skipped
+// non-candidates are narrowphase no-ops in the all-pairs loop -> the SAME pair sequence mutates the SAME
+// state in the SAME order -> byte-identical. CAVEAT (documented, the BP3/BP4 precedent): the candidate list
+// is built ONCE per tick (post-integrate); positions move slightly DURING the de-pen sweeps, so the formal
+// superset guarantee is at build time — the conservative pads (box L1 pad, hull 0.5-unit margin) cover the
+// intra-tick motion on the canonical scenes, and the pinned memcmp equivalence tests are the on-scene proof.
+//
+// PURE CPU (NO new shader, NO new RHI — the persist/warmhull lockstep convention; both backends run the
+// IDENTICAL header-only integer code, so goldens are bit-identical BY CONSTRUCTION). Pure integer Q16.16.
+//
+// REUSE MAP (ALL read-only, ALL BYTE-FROZEN): broad.h BuildBroadphasePairsWithStatics (BP3, the static-aware
+// box broadphase) / BuildHullBroadphasePairsWithStatics (BP4, the inflated true-AABB hull broadphase) /
+// SortPairsCanonical; warmhull.h HullCache/BuildKeyedHullManifold/MatchHullCache/SolveHullManifoldWarm/
+// HullSleepState/HullSleepConfig/KineticEnergyHull/UpdateHullQuietTicks/MeasureHullSleep + the WH5 snapshot
+// machinery (SnapshotWarmHull/RestoreWarmHull/WarmHullStatesEqual/WarmHullState); manifold.h HullContactMulti
+// + the FULL inertia; gjk.h HullWorld/ApplyHullCommands; fpx.h FxPair; persist PS2-PS5 (the box cache/solver/
+// sleep/lockstep, frozen above).
+#include "sim/warmhull.h"   // read-only: warmhull (flagship #26 hull cache/warm/sleep/lockstep) + transitively
+                            // manifold/ccd/broad/gjk (flagship #23 broadphase). NO cycle: nothing in that
+                            // chain includes persist.h (verified: warmhull->manifold->ccd->broad->gjk->convex).
+
+namespace hf::sim {
+namespace persist {
+
+// ----- PersistFnv1a64(data, bytes): the deterministic 64-bit FNV-1a digest (the PS7 pin primitive) ---------
+// Canonical FNV-1a over raw bytes. Every struct it digests here is all-int32 POD (FxBody = 17 x int32, no
+// padding; the island labels are uint32) -> the digest is identical across MSVC/clang/gcc and across
+// platforms (the cross-compiler pin the test asserts). Pure integer.
+inline uint64_t PersistFnv1a64(const void* data, size_t bytes) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    uint64_t h = 14695981039346656037ull;           // FNV offset basis
+    for (size_t i = 0; i < bytes; ++i) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ull;                       // FNV prime
+    }
+    return h;
+}
+
+// DigestBodyWorld(bodies): the FNV-1a digest of a flat FxBody vector (the world-state pin).
+inline uint64_t DigestBodyWorld(const std::vector<fpx::FxBody>& bodies) {
+    if (bodies.empty()) return PersistFnv1a64(&bodies, 0);   // the empty-world sentinel (basis value)
+    return PersistFnv1a64(bodies.data(), bodies.size() * sizeof(fpx::FxBody));
+}
+
+// ----- IslandPartition: the canonical island labelling of a body world -------------------------------------
+// islandOf[i] = the canonical island label of body i: dynamic bodies get 0..islandCount-1 (islands numbered
+// by ascending minimum-member body index — the canonical order); statics get kStaticIslandLabel (inert, never
+// part of a wake island — the PS4/WH4 "the floor is not an island-waker" discipline). islandCount = the
+// number of dynamic islands. A pure ORDER-INDEPENDENT function of (bodies, edge SET).
+inline constexpr uint32_t kStaticIslandLabel = 0xFFFFFFFFu;
+struct IslandPartition {
+    std::vector<uint32_t> islandOf;
+    uint32_t              islandCount = 0;
+};
+
+// IslandRoot(parent, x): union-find root with PATH HALVING. Compression only shortens paths — it never
+// changes any component's root — so the final partition stays order-independent (documented above).
+inline uint32_t IslandRoot(std::vector<uint32_t>& parent, uint32_t x) {
+    while (parent[x] != x) {
+        parent[x] = parent[parent[x]];   // path halving (root-preserving)
+        x = parent[x];
+    }
+    return x;
+}
+
+// IslandUnion(parent, a, b): union by SMALLEST ROOT INDEX — the larger root is attached under the smaller,
+// so every component's root is its MINIMUM member index regardless of the edge processing order (THE
+// determinism crux — the canonical labels below are then order-independent).
+inline void IslandUnion(std::vector<uint32_t>& parent, uint32_t a, uint32_t b) {
+    const uint32_t ra = IslandRoot(parent, a);
+    const uint32_t rb = IslandRoot(parent, b);
+    if (ra == rb) return;
+    if (ra < rb) parent[rb] = ra;
+    else         parent[ra] = rb;
+}
+
+// IslandsFromEdges(bodies, dynDynEdges): union-find over the DYNAMIC-DYNAMIC contact edges -> the canonical
+// partition. The caller supplies edges between DYNAMIC bodies only (the wake-relevant graph — see THE
+// EQUIVALENCE ARGUMENT). Roots are relabelled 0.. in ascending body order (root == min member index, so the
+// first-encounter order IS ascending-min-index — canonical). Statics -> kStaticIslandLabel.
+inline IslandPartition IslandsFromEdges(const std::vector<fpx::FxBody>& bodies,
+                                        const std::vector<fpx::FxPair>& dynDynEdges) {
+    const uint32_t n = (uint32_t)bodies.size();
+    std::vector<uint32_t> parent(n);
+    for (uint32_t i = 0; i < n; ++i) parent[i] = i;
+    for (const fpx::FxPair& e : dynDynEdges) IslandUnion(parent, e.i, e.j);
+    IslandPartition p;
+    p.islandOf.assign((size_t)n, kStaticIslandLabel);
+    std::vector<uint32_t> rootLabel((size_t)n, kStaticIslandLabel);
+    uint32_t next = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!IsDynamic(bodies[i])) continue;                       // static -> inert label
+        const uint32_t r = IslandRoot(parent, i);
+        if (rootLabel[r] == kStaticIslandLabel) rootLabel[r] = next++;
+        p.islandOf[i] = rootLabel[r];
+    }
+    p.islandCount = next;
+    return p;
+}
+
+// IslandPartitionsEqual(a, b): exact field equality of two canonical partitions (the equivalence memcmp).
+inline bool IslandPartitionsEqual(const IslandPartition& a, const IslandPartition& b) {
+    if (a.islandCount != b.islandCount) return false;
+    if (a.islandOf.size() != b.islandOf.size()) return false;
+    if (a.islandOf.empty()) return true;
+    return std::memcmp(a.islandOf.data(), b.islandOf.data(),
+                       a.islandOf.size() * sizeof(uint32_t)) == 0;
+}
+
+// IslandPartitionDigest(p): the canonical FNV-1a digest of a partition (labels + count) — the pinned
+// equivalence value (spatial digest MUST EQUAL the all-pairs digest on the same scene).
+inline uint64_t IslandPartitionDigest(const IslandPartition& p) {
+    uint64_t h = p.islandOf.empty()
+        ? PersistFnv1a64(&p, 0)
+        : PersistFnv1a64(p.islandOf.data(), p.islandOf.size() * sizeof(uint32_t));
+    // fold in the count (a partition with trailing statics only differs by count from a truncated one).
+    h ^= (uint64_t)p.islandCount + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    return h;
+}
+
+// =========================================================================================================
+// ----- THE BOX (ConvexWorld) SPATIAL-ISLAND PATH ------------------------------------------------------------
+
+// BuildBoxBroadphaseCandidates(world, cellSize, pairsOut): the SORTED (i,j)-ascending candidate-pair list over
+// a convex::ConvexWorld via the FROZEN BP3 static-aware grid broadphase. The frozen builder keys AABBs on
+// fpx::BodyAabb (pos +/- body.radius), and the persist scenes leave radius defaulted to 0 — so PS7 feeds it a
+// PROXY body set with radius = hx+hy+hz (the box's L1 half-extent pad). CONSERVATIVE BY CONSTRUCTION: the
+// oriented box's projected half-width on ANY axis is ProjectedRadius(L) = sum_i |L.axis_i|*h_i <= h_x+h_y+h_z
+// (each |L.axis_i| <= 1), so SAT-overlapping boxes ALWAYS have overlapping proxy AABBs -> the candidate set is
+// a superset of the overlapping set (rotation-invariant, no re-derive on spin). cellSize must be >= the max
+// dynamic proxy AABB diameter (2*(hx+hy+hz)) for the frozen +/-1-stencil exactness (the BP2 bound; asserted by
+// the pinned equivalence tests). O(n*k). The list is sorted canonical (i,j) — the Gauss-Seidel order crux.
+inline void BuildBoxBroadphaseCandidates(const ConvexWorld& world, fx cellSize,
+                                         std::vector<fpx::FxPair>& pairsOut) {
+    ConvexWorld proxy;
+    proxy.bodies = world.bodies;
+    for (size_t i = 0; i < proxy.bodies.size(); ++i) {
+        const convex::FxVec3& h = world.boxes[i].halfExtents;
+        proxy.bodies[i].radius = h.x + h.y + h.z;   // the L1 pad (>= any projected half-width)
+    }
+    hf::sim::broad::BuildBroadphasePairsWithStatics(proxy, cellSize, pairsOut);
+    hf::sim::broad::SortPairsCanonical(pairsOut);
+}
+
+// BuildBoxIslandEdges(world, candidates, edgesOut): narrowphase-confirm the candidates into the DYN-DYN
+// overlap edge set (the wake graph). The SAME overlap test PropagateWake uses (convex::BoxSatStable) so the
+// edge set — and therefore the partition — matches the all-pairs one exactly. FIXED candidate order.
+inline void BuildBoxIslandEdges(const ConvexWorld& world, const std::vector<fpx::FxPair>& candidates,
+                                std::vector<fpx::FxPair>& edgesOut) {
+    edgesOut.clear();
+    for (const fpx::FxPair& p : candidates) {
+        if (!IsDynamic(world.bodies[p.i]) || !IsDynamic(world.bodies[p.j])) continue;   // dyn-dyn only
+        const SatResult sat = BoxSatStable(world.bodies[p.i], world.boxes[p.i],
+                                           world.bodies[p.j], world.boxes[p.j]);
+        if (sat.overlap) edgesOut.push_back(p);
+    }
+}
+
+// BuildIslandsAllPairs(world): THE ALL-PAIRS REFERENCE partition — every i<j dyn-dyn pair narrowphase-tested
+// (O(n^2), the caveat under closure; kept as the equivalence oracle the spatial path is pinned against).
+inline IslandPartition BuildIslandsAllPairs(const ConvexWorld& world) {
+    const uint32_t n = (uint32_t)world.bodies.size();
+    std::vector<fpx::FxPair> edges;
+    for (uint32_t i = 0; i < n; ++i) {
+        for (uint32_t j = i + 1; j < n; ++j) {
+            if (!IsDynamic(world.bodies[i]) || !IsDynamic(world.bodies[j])) continue;
+            const SatResult sat = BoxSatStable(world.bodies[i], world.boxes[i],
+                                               world.bodies[j], world.boxes[j]);
+            if (sat.overlap) edges.push_back(fpx::FxPair{i, j});
+        }
+    }
+    return IslandsFromEdges(world.bodies, edges);
+}
+
+// BuildIslandsSpatial(world, cellSize, outCandidatePairs): the SPATIAL partition — broadphase candidates ->
+// narrowphase confirm -> union-find. == BuildIslandsAllPairs on the same scene (the pinned equivalence) while
+// touching only O(n*k) candidate pairs (reported through outCandidatePairs — the perf-structure pin vs n^2).
+inline IslandPartition BuildIslandsSpatial(const ConvexWorld& world, fx cellSize,
+                                           uint32_t* outCandidatePairs = nullptr) {
+    std::vector<fpx::FxPair> cand;
+    BuildBoxBroadphaseCandidates(world, cellSize, cand);
+    if (outCandidatePairs) *outCandidatePairs = (uint32_t)cand.size();
+    std::vector<fpx::FxPair> edges;
+    BuildBoxIslandEdges(world, cand, edges);
+    return IslandsFromEdges(world.bodies, edges);
+}
+
+// PropagateWakeSpatial(world, sleep, sleepDelay, cellSize): the SPATIAL twin of the frozen PropagateWake —
+// identical OUTPUT (see THE EQUIVALENCE ARGUMENT), O(n*k) instead of the O(n^2) adjacency matrix + O(n^3)
+// worst-case relaxation. A dynamic body sleeps iff EVERY dynamic body in its island is a sleep candidate
+// (quietTicks >= sleepDelay); statics report asleep=true (inert). Writes sleep[].asleep.
+inline void PropagateWakeSpatial(const ConvexWorld& world, std::vector<SleepState>& sleep,
+                                 uint32_t sleepDelay, fx cellSize) {
+    const size_t n = world.bodies.size();
+    const IslandPartition part = BuildIslandsSpatial(world, cellSize, nullptr);
+    std::vector<uint8_t> islandAwake((size_t)part.islandCount, 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (!IsDynamic(world.bodies[i])) continue;
+        if (sleep[i].quietTicks < sleepDelay) islandAwake[part.islandOf[i]] = 1;   // a seed wakes its island
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i])) sleep[i].asleep = (islandAwake[part.islandOf[i]] == 0);
+        else                            sleep[i].asleep = true;   // static -> inert (never moves)
+    }
+}
+
+// ----- StepWarmSleepWorldSpatial(world, cache, sleep, cfg, cellSize): the SPATIAL warm+sleep box tick --------
+// The FROZEN PS4 StepWarmSleepWorld with EXACTLY three swaps (every other line reproduced VERBATIM):
+//   (2)  PropagateWake            -> PropagateWakeSpatial (pre-integrate positions, as the frozen step);
+//   (4a) the all-pairs solve loop -> the SORTED post-integrate candidate list (same loop body);
+//   (4b) the all-pairs de-pen loop-> the SAME candidate list (same loop body).
+// BIT-IDENTICAL to StepWarmSleepWorld on the canonical scenes (the pinned memcmp proof) — see THE BIT-IDENTITY
+// ARGUMENT above. Two broadphase builds per tick (pre-integrate for the wake islands, post-integrate for the
+// solve/de-pen — positions move in integrate), each O(n*k).
+inline void StepWarmSleepWorldSpatial(ConvexWorld& world, PersistentCache& cache,
+                                      std::vector<SleepState>& sleep, const SleepConfig& cfg, fx cellSize) {
+    const size_t n = world.bodies.size();
+    if (sleep.size() != n) sleep.assign(n, SleepState{});
+    const WarmStepConfig& w = cfg.warm;
+
+    // (1) Per-body KineticEnergy (PRE-integrate) + the hysteresis quietTicks update (== PS4, VERBATIM).
+    for (size_t i = 0; i < n; ++i)
+        UpdateQuietTicks(sleep[i], KineticEnergy(world.bodies[i]), cfg);
+
+    // (2) THE SWAP: spatial island discovery -> the per-body asleep flag (== PropagateWake's output).
+    PropagateWakeSpatial(world, sleep, cfg.sleepDelay, cellSize);
+
+    // (2b) FREEZE every asleep dynamic body (== PS4, VERBATIM).
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i]) && sleep[i].asleep) {
+            world.bodies[i].vel    = FxVec3{0, 0, 0};
+            world.bodies[i].angVel = FxVec3{0, 0, 0};
+        }
+    }
+
+    // (3) Predict-integrate ONLY AWAKE dynamic bodies (== PS4, VERBATIM).
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i]) && !sleep[i].asleep) {
+            fpx::IntegrateBodyFull(world.bodies[i], w.gravity, w.dt);
+            if (w.linDamp != kOne) world.bodies[i].vel = FxScale(world.bodies[i].vel, w.linDamp);
+            if (w.angDamp != kOne) world.bodies[i].angVel = FxScale(world.bodies[i].angVel, w.angDamp);
+        }
+    }
+
+    // (== PS4) The world inverse inertias, recomputed ONCE per tick from the post-integrate orient.
+    std::vector<FxMat3> invIW(n);
+    for (size_t i = 0; i < n; ++i) {
+        const FxVec3 invIbody = FxBoxInvInertiaBody(world.boxes[i], world.bodies[i].invMass);
+        invIW[i] = WorldInvInertia(world.bodies[i], invIbody);
+    }
+
+    // THE SWAP: the post-integrate SORTED candidate list drives (4a)+(4b) (the BP3 GS-order crux).
+    std::vector<fpx::FxPair> pairs;
+    BuildBoxBroadphaseCandidates(world, cellSize, pairs);
+
+    // (== PS4) A pair is ACTIVE iff at least one body is an AWAKE dynamic body.
+    auto pairActive = [&](size_t i, size_t j) {
+        const bool ai = IsDynamic(world.bodies[i]) && !sleep[i].asleep;
+        const bool aj = IsDynamic(world.bodies[j]) && !sleep[j].asleep;
+        return ai || aj;
+    };
+
+    struct PairAcc { size_t i, j; KeyedFrictionManifold keyed; };
+    std::vector<PairAcc> pairAccs;
+
+    // (4a) Impulse solve over the candidate pairs (loop body == PS4, VERBATIM; only the pair source differs).
+    for (const fpx::FxPair& p : pairs) {
+        const size_t i = p.i, j = p.j;
+        if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;  // static-static
+        if (!pairActive(i, j)) continue;                                             // fully-asleep -> skip
+        KeyedFrictionManifold keyed = BuildKeyedManifold((uint32_t)i, (uint32_t)j,
+                                                         world.bodies[i], world.boxes[i],
+                                                         world.bodies[j], world.boxes[j]);
+        if (keyed.fm.count == 0) continue;
+        MatchCache(cache, keyed);   // seed the accumulators from last tick's cache (warm-start)
+        SolveFrictionWarm(world.bodies[i], world.bodies[j], invIW[i], invIW[j], keyed.fm,
+                          w.restitution, w.mu, w.solveIters);
+        pairAccs.push_back(PairAcc{i, j, keyed});
+    }
+
+    // (4b) Position de-penetration over the candidate pairs (loop body == PS4, VERBATIM).
+    for (uint32_t pit = 0; pit < w.posIters; ++pit) {
+        for (const fpx::FxPair& p : pairs) {
+            const size_t i = p.i, j = p.j;
+            const fx invSum = world.bodies[i].invMass + world.bodies[j].invMass;
+            if (invSum == 0) continue;          // both static -> skip
+            if (!pairActive(i, j)) continue;    // fully-asleep -> skip (both stay exactly put)
+            const SatResult sat = BoxSatStable(world.bodies[i], world.boxes[i],
+                                               world.bodies[j], world.boxes[j]);
+            if (!sat.overlap) continue;
+            FxVec3 nrm = sat.axis;
+            if (FxDot(nrm, fpx::FxSub(world.bodies[j].pos, world.bodies[i].pos)) < 0)
+                nrm = FxVec3{-nrm.x, -nrm.y, -nrm.z};
+            fx excess = sat.penetration - w.slop;
+            if (excess <= 0) continue;
+            const fx corrected = fxmul(excess, w.beta);
+            const bool moveI = IsDynamic(world.bodies[i]) && !sleep[i].asleep;
+            const bool moveJ = IsDynamic(world.bodies[j]) && !sleep[j].asleep;
+            fx wi = fxdiv(world.bodies[i].invMass, invSum);
+            fx wj = kOne - wi;
+            if (!moveI && moveJ) { wi = 0; wj = kOne; }
+            else if (moveI && !moveJ) { wi = kOne; wj = 0; }
+            else if (!moveI && !moveJ) continue;   // neither moves (both asleep/static) -> skip
+            const FxVec3 ci = FxScale(nrm, fxmul(corrected, wi));
+            const FxVec3 cj = FxScale(nrm, fxmul(corrected, wj));
+            if (moveI) world.bodies[i].pos = fpx::FxSub(world.bodies[i].pos, ci);
+            if (moveJ) world.bodies[j].pos = FxAdd(world.bodies[j].pos, cj);
+        }
+    }
+
+    // (5) Rebuild the cache (== PS4, VERBATIM: sleeping pairs keep their prior entries, active pairs store
+    // their freshly-converged accumulators).
+    PersistentCache next;
+    for (const CachedContact& e : cache.entries) {
+        const size_t a = e.key.bodyA, b = e.key.bodyB;
+        bool wasActive = (a < n && b < n) && pairActive(a, b);
+        if (!wasActive) next.entries.push_back(e);   // persist the sleeping pair's warm-start untouched
+    }
+    for (const PairAcc& pa : pairAccs) {
+        for (uint32_t k = 0; k < pa.keyed.fm.count; ++k)
+            next.entries.push_back(CachedContact{pa.keyed.keys[k],
+                                                 pa.keyed.fm.pts[k].normalImpulse,
+                                                 pa.keyed.fm.pts[k].tangentImpulse1,
+                                                 pa.keyed.fm.pts[k].tangentImpulse2});
+    }
+    cache.entries.swap(next.entries);
+}
+
+// StepWarmSleepWorldSpatialN: run `ticks` spatial warm+sleep box steps (the cache + sleep persist).
+inline void StepWarmSleepWorldSpatialN(ConvexWorld& world, PersistentCache& cache,
+                                       std::vector<SleepState>& sleep, const SleepConfig& cfg,
+                                       fx cellSize, uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t) StepWarmSleepWorldSpatial(world, cache, sleep, cfg, cellSize);
+}
+
+// NOTE (box lockstep): the box-world lockstep/rollback is the FROZEN PS5 harness over StepWarmSleepWorld;
+// since StepWarmSleepWorldSpatial is BIT-IDENTICAL to it on the canonical scenes (the pinned proof), the PS5
+// netcode guarantees carry to the spatial step unchanged — no duplicate box harness is added.
+
+// =========================================================================================================
+// ----- THE HULL (gjk::HullWorld) SPATIAL-ISLAND WARM+SLEEP PATH ---------------------------------------------
+// The flagship-#26 hull persistence (warmhull.h WH2-WH4: HullContactKey cache + accumulated warm solver +
+// sleeping islands) driven through the SPATIAL island/candidate path. The cache key is the WH1 per-face
+// geometric-provenance HullContactKey (REUSED VERBATIM — stronger than a body-pair v1 key); its warm-start
+// quality caveat is the same documented boundary as the box scheme: a SLIDING contact that changes reference
+// face / incident feature changes the key -> that point cold-starts (an honest miss, not a bug).
+
+// BuildHullBroadphaseCandidates(world, cellSize, pairsOut): the SORTED (i,j) candidate list over a HullWorld
+// via the FROZEN BP4 static-aware hull broadphase (true support-mapped AABBs + the 0.5-unit GJK phantom-band
+// margin, all frozen). O(n*k).
+inline void BuildHullBroadphaseCandidates(const gjk::HullWorld& world, fx cellSize,
+                                          std::vector<fpx::FxPair>& pairsOut) {
+    hf::sim::broad::BuildHullBroadphasePairsWithStatics(world, cellSize, pairsOut);
+    hf::sim::broad::SortPairsCanonical(pairsOut);
+}
+
+// BuildHullIslandEdges(world, candidates, edgesOut): narrowphase-confirm the candidates into the DYN-DYN hull
+// contact edge set. The SAME overlap test warmhull::PropagateWakeHull uses (manifold::HullContactMulti count
+// != 0) so the partition matches the all-pairs one exactly.
+inline void BuildHullIslandEdges(const gjk::HullWorld& world, const std::vector<fpx::FxPair>& candidates,
+                                 std::vector<fpx::FxPair>& edgesOut) {
+    edgesOut.clear();
+    for (const fpx::FxPair& p : candidates) {
+        if (!IsDynamic(world.bodies[p.i]) || !IsDynamic(world.bodies[p.j])) continue;   // dyn-dyn only
+        const convex::ContactManifold m = hf::sim::manifold::HullContactMulti(
+            world.bodies[p.i], world.hulls[p.i], world.bodies[p.j], world.hulls[p.j]);
+        if (m.count != 0) edgesOut.push_back(p);
+    }
+}
+
+// BuildHullIslandsAllPairs(world): THE ALL-PAIRS REFERENCE hull partition (the equivalence oracle).
+inline IslandPartition BuildHullIslandsAllPairs(const gjk::HullWorld& world) {
+    const uint32_t n = (uint32_t)world.bodies.size();
+    std::vector<fpx::FxPair> edges;
+    for (uint32_t i = 0; i < n; ++i) {
+        for (uint32_t j = i + 1; j < n; ++j) {
+            if (!IsDynamic(world.bodies[i]) || !IsDynamic(world.bodies[j])) continue;
+            const convex::ContactManifold m = hf::sim::manifold::HullContactMulti(
+                world.bodies[i], world.hulls[i], world.bodies[j], world.hulls[j]);
+            if (m.count != 0) edges.push_back(fpx::FxPair{i, j});
+        }
+    }
+    return IslandsFromEdges(world.bodies, edges);
+}
+
+// BuildHullIslandsSpatial(world, cellSize, outCandidatePairs): the SPATIAL hull partition (== all-pairs on
+// the same scene, O(n*k) candidates — reported for the perf-structure pin).
+inline IslandPartition BuildHullIslandsSpatial(const gjk::HullWorld& world, fx cellSize,
+                                               uint32_t* outCandidatePairs = nullptr) {
+    std::vector<fpx::FxPair> cand;
+    BuildHullBroadphaseCandidates(world, cellSize, cand);
+    if (outCandidatePairs) *outCandidatePairs = (uint32_t)cand.size();
+    std::vector<fpx::FxPair> edges;
+    BuildHullIslandEdges(world, cand, edges);
+    return IslandsFromEdges(world.bodies, edges);
+}
+
+// PropagateWakeHullSpatial(world, sleep, sleepTicks, cellSize): the SPATIAL twin of the frozen
+// warmhull::PropagateWakeHull — identical output (THE EQUIVALENCE ARGUMENT), O(n*k).
+inline void PropagateWakeHullSpatial(const gjk::HullWorld& world,
+                                     std::vector<hf::sim::warmhull::HullSleepState>& sleep,
+                                     uint32_t sleepTicks, fx cellSize) {
+    const size_t n = world.bodies.size();
+    const IslandPartition part = BuildHullIslandsSpatial(world, cellSize, nullptr);
+    std::vector<uint8_t> islandAwake((size_t)part.islandCount, 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (!IsDynamic(world.bodies[i])) continue;
+        if (sleep[i].lowEnergyTicks < sleepTicks) islandAwake[part.islandOf[i]] = 1;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i])) sleep[i].asleep = (islandAwake[part.islandOf[i]] == 0);
+        else                            sleep[i].asleep = true;   // static -> inert
+    }
+}
+
+// ----- StepWarmSleepHullWorldSpatial(world, cache, sleep, cfg, cellSize): the SPATIAL hull warm+sleep tick ---
+// The FROZEN warmhull::StepWarmSleepHullWorld (WH4) with EXACTLY the PS7 three swaps (island discovery
+// spatial; (4a)/(4b) over the SORTED post-integrate candidate list; every other line VERBATIM). The hull
+// cache warm-start (WH2 MatchHullCache by the per-face HullContactKey), the accumulated warm solve (WH3), the
+// freeze/skip sleep discipline (WH4) and the sleeping-pair cache carry-over are ALL the frozen #26 machinery.
+// BIT-IDENTICAL to StepWarmSleepHullWorld on the canonical scenes (the pinned memcmp proof).
+inline void StepWarmSleepHullWorldSpatial(gjk::HullWorld& world, hf::sim::warmhull::HullCache& cache,
+                                          std::vector<hf::sim::warmhull::HullSleepState>& sleep,
+                                          const hf::sim::warmhull::HullSleepConfig& cfg, fx cellSize) {
+    namespace warmhull = hf::sim::warmhull;
+    namespace manifold = hf::sim::manifold;
+    const size_t n = world.bodies.size();
+    if (sleep.size() != n) sleep.assign(n, warmhull::HullSleepState{});
+    const convex::ConvexStepConfig& w = cfg.warm;
+
+    // (1) Per-body KineticEnergyHull (PRE-integrate) + the hysteresis update (== WH4, VERBATIM).
+    for (size_t i = 0; i < n; ++i)
+        warmhull::UpdateHullQuietTicks(sleep[i], warmhull::KineticEnergyHull(world.bodies[i]), cfg);
+
+    // (2) THE SWAP: spatial hull island discovery -> the per-body asleep flag (== PropagateWakeHull's output).
+    PropagateWakeHullSpatial(world, sleep, cfg.sleepTicks, cellSize);
+
+    // (2b) FREEZE every asleep dynamic body (== WH4, VERBATIM).
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i]) && sleep[i].asleep) {
+            world.bodies[i].vel    = FxVec3{0, 0, 0};
+            world.bodies[i].angVel = FxVec3{0, 0, 0};
+        }
+    }
+
+    // (3) Predict-integrate ONLY AWAKE dynamic bodies (== WH4, VERBATIM).
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i]) && !sleep[i].asleep) {
+            fpx::IntegrateBodyFull(world.bodies[i], w.gravity, w.dt);
+            if (w.linDamp != kOne) world.bodies[i].vel = FxScale(world.bodies[i].vel, w.linDamp);
+            if (w.angDamp != kOne) world.bodies[i].angVel = FxScale(world.bodies[i].angVel, w.angDamp);
+        }
+    }
+
+    // (== WH4) The world inverse inertias once/tick — the FULL tensor.
+    std::vector<FxMat3> invIW(n);
+    for (size_t i = 0; i < n; ++i) {
+        const manifold::FxHullFaces faces = manifold::BuildCanonicalFaces(world.hulls[i]);
+        const FxMat3 invIbody = manifold::FxHullInertiaBodyFull(world.hulls[i], faces, world.bodies[i].invMass);
+        invIW[i] = manifold::WorldInvInertiaFull(world.bodies[i], invIbody);
+    }
+
+    // THE SWAP: the post-integrate SORTED candidate list drives (4a)+(4b) (the BP4 GS-order crux).
+    std::vector<fpx::FxPair> pairs;
+    BuildHullBroadphaseCandidates(world, cellSize, pairs);
+
+    // (== WH4) A pair is ACTIVE iff at least one body is an AWAKE dynamic body.
+    auto pairActive = [&](size_t i, size_t j) {
+        const bool ai = IsDynamic(world.bodies[i]) && !sleep[i].asleep;
+        const bool aj = IsDynamic(world.bodies[j]) && !sleep[j].asleep;
+        return ai || aj;
+    };
+
+    struct WarmPair { size_t i, j; warmhull::KeyedHullManifoldWH2 keyed; };
+    std::vector<WarmPair> wp;
+
+    // (4a) The warm-started accumulated solve over the candidate pairs (loop body == WH4, VERBATIM).
+    for (const fpx::FxPair& p : pairs) {
+        const size_t i = p.i, j = p.j;
+        if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;  // static-static
+        if (!pairActive(i, j)) continue;                                             // fully-asleep -> skip
+        warmhull::KeyedHullManifoldWH2 keyed = warmhull::BuildKeyedHullManifold(
+            (uint32_t)i, world.bodies[i], world.hulls[i],
+            (uint32_t)j, world.bodies[j], world.hulls[j]);
+        if (keyed.manifold.count == 0) continue;
+        warmhull::MatchHullCache(cache, keyed);   // the WH2 warm-start (per-face HullContactKey match)
+        warmhull::SolveHullManifoldWarm(world.bodies[i], world.bodies[j], invIW[i], invIW[j],
+                                        keyed, w.restitution, w.solveIters);
+        wp.push_back(WarmPair{i, j, keyed});
+    }
+
+    // (4b) Position de-penetration over the candidate pairs (loop body == WH4, VERBATIM).
+    for (uint32_t pit = 0; pit < w.posIters; ++pit) {
+        for (const fpx::FxPair& p : pairs) {
+            const size_t i = p.i, j = p.j;
+            const fx invSum = world.bodies[i].invMass + world.bodies[j].invMass;
+            if (invSum == 0) continue;          // both static -> skip
+            if (!pairActive(i, j)) continue;    // fully-asleep -> skip (both stay exactly put)
+            const convex::ContactManifold m = manifold::HullContactMulti(world.bodies[i], world.hulls[i],
+                                                                         world.bodies[j], world.hulls[j]);
+            if (m.count == 0) continue;
+            FxVec3 nrm = m.normal;
+            if (FxDot(nrm, fpx::FxSub(world.bodies[j].pos, world.bodies[i].pos)) < 0)
+                nrm = FxVec3{-nrm.x, -nrm.y, -nrm.z};
+            const fx excess = m.depths[0] - w.slop;
+            if (excess <= 0) continue;
+            const fx corrected = fxmul(excess, w.beta);
+            const bool moveI = IsDynamic(world.bodies[i]) && !sleep[i].asleep;
+            const bool moveJ = IsDynamic(world.bodies[j]) && !sleep[j].asleep;
+            fx wi = fxdiv(world.bodies[i].invMass, invSum);
+            fx wj = kOne - wi;
+            if (!moveI && moveJ)      { wi = 0;    wj = kOne; }
+            else if (moveI && !moveJ) { wi = kOne; wj = 0; }
+            else if (!moveI && !moveJ) continue;   // neither moves (both asleep/static) -> skip
+            const FxVec3 ci = FxScale(nrm, fxmul(corrected, wi));
+            const FxVec3 cj = FxScale(nrm, fxmul(corrected, wj));
+            if (moveI) world.bodies[i].pos = fpx::FxSub(world.bodies[i].pos, ci);
+            if (moveJ) world.bodies[j].pos = FxAdd(world.bodies[j].pos, cj);
+        }
+    }
+
+    // (5) Rebuild the cache (== WH4, VERBATIM: sleeping pairs keep their prior entries — a sleeping island's
+    // warm-start survives for the moment it wakes; active pairs store the freshly-converged accumulators).
+    warmhull::HullCache next;
+    for (const warmhull::CachedHullContact& e : cache.entries) {
+        const size_t a = e.key.bodyA, b = e.key.bodyB;
+        const bool wasActive = (a < n && b < n) && pairActive(a, b);
+        if (!wasActive) next.entries.push_back(e);
+    }
+    for (const WarmPair& pa : wp) {
+        const uint32_t c = pa.keyed.manifold.count < 4u ? pa.keyed.manifold.count : 4u;
+        for (uint32_t pi = 0; pi < c; ++pi)
+            next.entries.push_back(warmhull::CachedHullContact{pa.keyed.keys[pi], pa.keyed.normalImpulse[pi]});
+    }
+    cache.entries.swap(next.entries);
+}
+
+// StepWarmSleepHullWorldSpatialN: run `ticks` spatial hull warm+sleep steps (cache + sleep persist).
+inline void StepWarmSleepHullWorldSpatialN(gjk::HullWorld& world, hf::sim::warmhull::HullCache& cache,
+                                           std::vector<hf::sim::warmhull::HullSleepState>& sleep,
+                                           const hf::sim::warmhull::HullSleepConfig& cfg, fx cellSize,
+                                           uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t) StepWarmSleepHullWorldSpatial(world, cache, sleep, cfg, cellSize);
+}
+
+// =========================================================================================================
+// ----- LOCKSTEP + ROLLBACK over the SPATIAL hull-persist world (the established command+snapshot mold) ------
+// The WH5 harness shapes RE-TARGETED over StepWarmSleepHullWorldSpatial — the snapshot/equality machinery is
+// the FROZEN WH5 TRIPLE (bodies + HullCache + HullSleepState[], SnapshotWarmHull/RestoreWarmHull/
+// WarmHullStatesEqual, reused VERBATIM; the broadphase grid + candidate list + island partition are RE-DERIVED
+// each tick from current positions, so they are NOT snapshot state — the BP5 lesson). PURE CPU.
+
+// SimPersistHullTick: ApplyHullCommands (the frozen GJ5 input apply) + ONE spatial warm+sleep hull tick.
+inline void SimPersistHullTick(gjk::HullWorld& world, hf::sim::warmhull::HullCache& cache,
+                               std::vector<hf::sim::warmhull::HullSleepState>& sleep,
+                               const hf::sim::warmhull::HullSleepConfig& cfg, fx cellSize,
+                               const std::vector<ConvexCommand>& commands, uint32_t tick) {
+    gjk::ApplyHullCommands(world, commands, tick);
+    StepWarmSleepHullWorldSpatial(world, cache, sleep, cfg, cellSize);
+}
+
+// RunPersistHullLockstep: two peers fed inputs alone converge BIT-IDENTICAL over the TRIPLE (the WH5
+// RunWarmHullLockstep control flow over SimPersistHullTick). Returns the converged AUTHORITY triple.
+inline hf::sim::warmhull::WarmHullState RunPersistHullLockstep(
+        const gjk::HullWorld& world0, const hf::sim::warmhull::HullSleepConfig& cfg, fx cellSize,
+        const std::vector<ConvexCommand>& commands, uint32_t ticks, bool* outIdentical = nullptr) {
+    namespace warmhull = hf::sim::warmhull;
+    gjk::HullWorld                        authWorld = world0;
+    warmhull::HullCache                   authCache;
+    std::vector<warmhull::HullSleepState> authSleep;
+    gjk::HullWorld                        repWorld = world0;
+    warmhull::HullCache                   repCache;
+    std::vector<warmhull::HullSleepState> repSleep;
+    for (uint32_t t = 0; t < ticks; ++t) {
+        SimPersistHullTick(authWorld, authCache, authSleep, cfg, cellSize, commands, t);
+        SimPersistHullTick(repWorld,  repCache,  repSleep,  cfg, cellSize, commands, t);
+    }
+    if (outIdentical)
+        *outIdentical = warmhull::WarmHullStatesEqual(authWorld.bodies, authCache, authSleep,
+                                                      repWorld.bodies,  repCache,  repSleep);
+    warmhull::WarmHullState out;
+    out.world = std::move(authWorld);
+    out.cache = std::move(authCache);
+    out.sleep = std::move(authSleep);
+    return out;
+}
+
+// RunPersistHullRollback: the WH5 RunWarmHullRollback control flow over SimPersistHullTick — snapshot the
+// FULL TRIPLE at rollbackAt, speculate <=3 mispredicted ticks, restore + re-sim the correct stream; the
+// corrected triple must equal the authority BIT-EXACT and the speculative triple must have genuinely diverged.
+inline gjk::HullWorld RunPersistHullRollback(
+        const gjk::HullWorld& world0, const hf::sim::warmhull::HullSleepConfig& cfg, fx cellSize,
+        const std::vector<ConvexCommand>& authStream, const std::vector<ConvexCommand>& mispredictStream,
+        uint32_t ticks, uint32_t rollbackAt,
+        bool* outCorrectedEqAuthority = nullptr, bool* outMispredictDiverged = nullptr) {
+    namespace warmhull = hf::sim::warmhull;
+    gjk::HullWorld                        w = world0;
+    warmhull::HullCache                   cache;
+    std::vector<warmhull::HullSleepState> sleep;
+    for (uint32_t t = 0; t < rollbackAt; ++t)
+        SimPersistHullTick(w, cache, sleep, cfg, cellSize, authStream, t);
+    const warmhull::WarmHullSnapshot snap = warmhull::SnapshotWarmHull(w, cache, sleep, rollbackAt);
+    uint32_t specTicks = ticks - rollbackAt;
+    if (specTicks > 3u) specTicks = 3u;
+    for (uint32_t s = 0; s < specTicks; ++s)
+        SimPersistHullTick(w, cache, sleep, cfg, cellSize, mispredictStream, rollbackAt + s);
+    gjk::HullWorld                        specWorld = w;
+    warmhull::HullCache                   specCache = cache;
+    std::vector<warmhull::HullSleepState> specSleep = sleep;
+    warmhull::RestoreWarmHull(w, cache, sleep, snap);
+    for (uint32_t t = rollbackAt; t < ticks; ++t)
+        SimPersistHullTick(w, cache, sleep, cfg, cellSize, authStream, t);
+
+    if (outCorrectedEqAuthority || outMispredictDiverged) {
+        gjk::HullWorld                        authWorld = world0;
+        warmhull::HullCache                   authCache;
+        std::vector<warmhull::HullSleepState> authSleep;
+        for (uint32_t t = 0; t < rollbackAt + specTicks; ++t)
+            SimPersistHullTick(authWorld, authCache, authSleep, cfg, cellSize, authStream, t);
+        if (outMispredictDiverged)
+            *outMispredictDiverged = !warmhull::WarmHullStatesEqual(specWorld.bodies, specCache, specSleep,
+                                                                    authWorld.bodies, authCache, authSleep);
+        if (outCorrectedEqAuthority) {
+            const warmhull::WarmHullState authFinal =
+                RunPersistHullLockstep(world0, cfg, cellSize, authStream, ticks, nullptr);
+            *outCorrectedEqAuthority = warmhull::WarmHullStatesEqual(
+                w.bodies, cache, sleep, authFinal.world.bodies, authFinal.cache, authFinal.sleep);
+        }
+    }
+    return w;
+}
+
+}  // namespace persist
+}  // namespace hf::sim

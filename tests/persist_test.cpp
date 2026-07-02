@@ -928,6 +928,395 @@ int main() {
         }
     }
 
+    // =========================================================================================================
+    // Slice PS7 — SPATIAL ISLAND PARTITIONING + GENERAL-HULL CONTACT PERSISTENCE (Track-R R7). What this block
+    // PINS:
+    //   (a) the existing PS1-PS6 assertions above are UNTOUCHED (the frozen-behavior regression gate);
+    //   (b) ISLAND EQUIVALENCE — the spatial (broadphase-candidates -> narrowphase-confirm -> union-find)
+    //       partition == the all-pairs partition, canonical-digest-EQUAL, on a dense scene AND a spread field;
+    //       the candidate-pair count is pinned << n(n-1)/2 on the spread scene (the perf-structure proof);
+    //   (c) STEP BIT-IDENTITY — the spatial warm+sleep steps (box AND hull) == the frozen all-pairs steps
+    //       BYTE-IDENTICAL over full runs incl. sleep + wake (bodies + cache + sleep, the strongest proof);
+    //   (d) HULL SLEEP — a mixed tetra/octa/box pile settles + goes FULLY ASLEEP at a pinned step through the
+    //       spatial hull path; a struck sleeping hull WAKES (and the untouched islands STAY asleep — the
+    //       partial-world wake only an island partition delivers) + re-settles at a pinned step; an all-asleep
+    //       step is a body-byte-no-op (the sleeping-path cost floor);
+    //   (e) HULL WARM-START METRICS — pinned honestly (on this pile the cache shows NO measurable benefit:
+    //       warm == cold bit-for-bit; the structural warm-start benefit proof remains WH3's frozen tower test);
+    //   (f) LOCKSTEP + ROLLBACK — the spatial hull-persist world through the WH5 command+snapshot mold;
+    //   (g) DIGESTS — pinned FNV-1a values (asserted identical under MSVC and clang builds).
+    // All initial-pose constants are EXACT Q16.16 integers (no libm in the scene builders -> the pinned digests
+    // are compiler-independent by construction).
+    {
+        namespace warmhull = hf::sim::warmhull;
+        namespace gjk = hf::sim::gjk;
+        const convex::fx kOne = convex::kOne;
+        auto fi = [&](int v) { return (convex::fx)(v * (int)kOne); };
+        const convex::fx kGravY = (convex::fx)(-9.8 * (double)kOne - 0.5);
+        auto makeBody = [&](convex::fx x, convex::fx y, convex::fx z, bool dyn) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = fpx::FxQuat{0, 0, 0, kOne};
+            b.invMass = dyn ? kOne : 0;
+            b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            return b;
+        };
+
+        // ================= (1) union-find canonical partition: order-independence + labels =================
+        {
+            // 6 bodies: 0 static, 1-5 dynamic. Edges {1-2, 2-3} and {4-5} -> islands {1,2,3} and {4,5}.
+            std::vector<fpx::FxBody> bodies;
+            for (int i = 0; i < 6; ++i) bodies.push_back(makeBody(0, 0, 0, i != 0));
+            const std::vector<fpx::FxPair> fwd = {{1u,2u},{2u,3u},{4u,5u}};
+            const std::vector<fpx::FxPair> rev = {{4u,5u},{2u,3u},{1u,2u}};   // reversed processing order
+            const std::vector<fpx::FxPair> shf = {{2u,3u},{4u,5u},{1u,2u}};   // shuffled
+            const persist::IslandPartition pf = persist::IslandsFromEdges(bodies, fwd);
+            const persist::IslandPartition pr = persist::IslandsFromEdges(bodies, rev);
+            const persist::IslandPartition ps = persist::IslandsFromEdges(bodies, shf);
+            check(pf.islandCount == 2u, "PS7 union-find: two islands from {1-2-3} + {4-5}");
+            check(pf.islandOf[0] == persist::kStaticIslandLabel, "PS7 union-find: the static body carries the inert label");
+            check(pf.islandOf[1] == 0u && pf.islandOf[2] == 0u && pf.islandOf[3] == 0u,
+                  "PS7 union-find: {1,2,3} share canonical island 0 (min-member order)");
+            check(pf.islandOf[4] == 1u && pf.islandOf[5] == 1u, "PS7 union-find: {4,5} share canonical island 1");
+            check(persist::IslandPartitionsEqual(pf, pr) && persist::IslandPartitionsEqual(pf, ps),
+                  "PS7 union-find: the partition is ORDER-INDEPENDENT (forward == reversed == shuffled edges)");
+            check(persist::IslandPartitionDigest(pf) == persist::IslandPartitionDigest(ps),
+                  "PS7 union-find: equal partitions -> equal canonical digests");
+        }
+
+        // ================= (2) BOX: spatial islands == all-pairs + spatial step bit-identity =================
+        const convex::FxBox kFloor{convex::FxVec3{fi(8), kOne, fi(8)}};
+        const convex::FxBox kSlab{convex::FxVec3{fi(3) / 2, kOne / 2, fi(3) / 2}};   // 3 x 1 x 3
+        persist::SleepConfig bcfg;
+        bcfg.warm.gravity     = convex::FxVec3{0, kGravY, 0};
+        bcfg.warm.dt          = kOne / 60;
+        bcfg.warm.solveIters  = 20;
+        bcfg.warm.restitution = 0;
+        bcfg.warm.slop        = kOne / 64;
+        bcfg.warm.beta        = (convex::fx)((int64_t)4 * kOne / 10);    // 0.4
+        bcfg.warm.linDamp     = (convex::fx)((int64_t)98 * kOne / 100);  // 0.98
+        bcfg.warm.angDamp     = (convex::fx)((int64_t)90 * kOne / 100);  // 0.90
+        bcfg.warm.posIters    = 4;
+        bcfg.warm.mu          = kOne;
+        bcfg.sleepThreshold   = kOne;
+        bcfg.wakeThreshold    = (convex::fx)(2 * (int)kOne);
+        bcfg.sleepDelay       = 30;
+        const convex::fx kBoxCell = fi(8);   // >= 2*(hx+hy+hz) = 7 for the slab (the BP2 stencil bound)
+
+        // --- (2a) dense scene: TWO 2-slab towers on the floor -> exactly 2 islands, spatial == all-pairs ---
+        {
+            convex::ConvexWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false)); w.boxes.push_back(kFloor);
+            w.bodies.push_back(makeBody(-fi(4), fi(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(-fi(4), fi(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody( fi(4), fi(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody( fi(4), fi(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            persist::PersistentCache c; std::vector<persist::SleepState> s;
+            persist::StepWarmSleepWorldN(w, c, s, bcfg, 60u);   // mid-settle: contacts formed
+            uint32_t cand = 0;
+            const persist::IslandPartition ap = persist::BuildIslandsAllPairs(w);
+            const persist::IslandPartition sp = persist::BuildIslandsSpatial(w, kBoxCell, &cand);
+            check(persist::IslandPartitionsEqual(ap, sp),
+                  "PS7 box islands (dense): spatial partition == all-pairs partition");
+            check(persist::IslandPartitionDigest(ap) == persist::IslandPartitionDigest(sp),
+                  "PS7 box islands (dense): canonical digests EQUAL");
+            check(persist::IslandPartitionDigest(sp) == 0x354e38ccb032fa56ull,
+                  "PS7 box islands (dense): the pinned partition digest");
+            check(sp.islandCount == 2u, "PS7 box islands (dense): the two towers are TWO islands");
+            check(cand == 6u && cand < 10u,
+                  "PS7 box islands (dense): pinned candidate pairs 6 < all-pairs 10");
+        }
+
+        // --- (2b) spread field: 24 slabs 8 units apart -> candidates << n^2 (the perf-structure pin) ---
+        {
+            convex::ConvexWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false));
+            w.boxes.push_back(convex::FxBox{convex::FxVec3{fi(120), kOne, fi(120)}});
+            for (int k = 0; k < 24; ++k) {
+                w.bodies.push_back(makeBody(fi(-92 + 8 * k), fi(1) + kOne * 5 / 8, 0, true));
+                w.boxes.push_back(kSlab);
+            }
+            persist::PersistentCache c; std::vector<persist::SleepState> s;
+            persist::StepWarmSleepWorldN(w, c, s, bcfg, 40u);
+            uint32_t cand = 0;
+            const persist::IslandPartition ap = persist::BuildIslandsAllPairs(w);
+            const persist::IslandPartition sp = persist::BuildIslandsSpatial(w, kBoxCell, &cand);
+            const uint32_t n = (uint32_t)w.bodies.size();
+            const uint32_t allPairs = n * (n - 1u) / 2u;   // 300
+            check(persist::IslandPartitionsEqual(ap, sp),
+                  "PS7 box islands (spread): spatial partition == all-pairs partition");
+            check(persist::IslandPartitionDigest(sp) == 0x65e62d6300b10260ull,
+                  "PS7 box islands (spread): the pinned partition digest");
+            check(sp.islandCount == 24u, "PS7 box islands (spread): 24 isolated slabs -> 24 singleton islands");
+            check(allPairs == 300u && cand == 24u,
+                  "PS7 box islands (spread): pinned 24 candidate pairs << 300 all-pairs (O(n*k) vs O(n^2))");
+            std::printf("ps7 spread-field: candidatePairs=%u allPairs=%u (islands=%u)\n",
+                        cand, allPairs, sp.islandCount);
+            // The spatial STEP is bit-identical on the spread scene too (60 further ticks).
+            convex::ConvexWorld wa = w; persist::PersistentCache ca = c; std::vector<persist::SleepState> sa = s;
+            convex::ConvexWorld ws = w; persist::PersistentCache cs = c; std::vector<persist::SleepState> ss = s;
+            persist::StepWarmSleepWorldN(wa, ca, sa, bcfg, 60u);
+            persist::StepWarmSleepWorldSpatialN(ws, cs, ss, bcfg, kBoxCell, 60u);
+            check(persist::PersistStatesEqual(wa.bodies, ca, sa, ws.bodies, cs, ss),
+                  "PS7 box step (spread): spatial == all-pairs BIT-IDENTICAL (bodies + cache + sleep)");
+        }
+
+        // --- (2c) the PS4 tower: spatial step == all-pairs step over settle + SLEEP (300 ticks) ---
+        auto buildTower = [&]() {
+            convex::ConvexWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false)); w.boxes.push_back(kFloor);
+            w.bodies.push_back(makeBody(0, fi(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(0, fi(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(0, fi(3) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            return w;
+        };
+        {
+            convex::ConvexWorld wa = buildTower(); persist::PersistentCache ca; std::vector<persist::SleepState> sa;
+            persist::StepWarmSleepWorldN(wa, ca, sa, bcfg, 300u);
+            convex::ConvexWorld ws = buildTower(); persist::PersistentCache cs; std::vector<persist::SleepState> ss;
+            persist::StepWarmSleepWorldSpatialN(ws, cs, ss, bcfg, kBoxCell, 300u);
+            check(persist::PersistStatesEqual(wa.bodies, ca, sa, ws.bodies, cs, ss),
+                  "PS7 box step (tower settle+sleep): spatial == all-pairs BIT-IDENTICAL over 300 ticks");
+            check(persist::DigestBodyWorld(ws.bodies) == 0xa0e687263ec6171cull,
+                  "PS7 box step (tower): the pinned settled-asleep body digest (MSVC == clang)");
+        }
+
+        // --- (2d) the PS5 command stream (nudges + a wake-impulse at 160): identity holds THROUGH wake ---
+        {
+            std::vector<convex::ConvexCommand> stream;
+            stream.push_back(convex::ConvexCommand{2u,   convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{fi(1) / 2, 0, 0}});
+            stream.push_back(convex::ConvexCommand{5u,   convex::kConvexCmdAddImpulse, 2u, convex::FxVec3{-fi(1) / 4, 0, 0}});
+            stream.push_back(convex::ConvexCommand{160u, convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{fi(6), 0, 0}});
+            convex::ConvexWorld wa = buildTower(); persist::PersistentCache ca; std::vector<persist::SleepState> sa;
+            convex::ConvexWorld ws = buildTower(); persist::PersistentCache cs; std::vector<persist::SleepState> ss;
+            for (uint32_t t = 0; t < 220u; ++t) {
+                persist::SimPersistTick(wa, ca, sa, bcfg, stream, t);            // the frozen PS5 tick (all-pairs)
+                convex::ApplyConvexCommands(ws, stream, t);                      // the same inputs
+                persist::StepWarmSleepWorldSpatial(ws, cs, ss, bcfg, kBoxCell);  // the spatial tick
+            }
+            check(persist::PersistStatesEqual(wa.bodies, ca, sa, ws.bodies, cs, ss),
+                  "PS7 box step (PS5 command run): spatial == all-pairs BIT-IDENTICAL through sleep + WAKE");
+            check(persist::DigestBodyWorld(ws.bodies) == 0xd586b89433fa0c0aull,
+                  "PS7 box step (PS5 command run): the pinned final body digest");
+        }
+
+        // ================= (3) HULL: spatial islands + the spatial warm+sleep hull path =================
+        // Exact Q16.16 orientation constants (host-precomputed; no libm -> compiler-independent digests):
+        const fpx::FxQuat kTiltZp05{0, 0, (convex::fx)1638,  (convex::fx)65515};   // tiltZ(+0.05 rad)
+        const fpx::FxQuat kTiltZp02{0, 0, (convex::fx)655,   (convex::fx)65532};   // tiltZ(+0.02 rad)
+        const fpx::FxQuat kTiltZn02{0, 0, (convex::fx)-655,  (convex::fx)65532};   // tiltZ(-0.02 rad)
+        const convex::fx kHullCell = fi(6);   // >= 2*(sqrt(3) + 0.5-margin) AABB diameter of a tumbling unit hull
+
+        // --- (3a) the WH4 box-hull tower: spatial hull step == the frozen WH4 step over 800 ticks ---
+        {
+            warmhull::HullSleepConfig scfg;
+            scfg.warm.gravity = convex::FxVec3{0, kGravY, 0};
+            scfg.warm.dt = kOne / 60; scfg.warm.solveIters = 8; scfg.warm.restitution = 0;
+            scfg.warm.slop = kOne / 64;
+            scfg.warm.beta = (convex::fx)((int64_t)2 * kOne / 10);      // 0.2
+            scfg.warm.linDamp = (convex::fx)((int64_t)95 * kOne / 100); // 0.95
+            scfg.warm.angDamp = kOne;                                   // OFF — the WH4 headline config
+            scfg.warm.posIters = 4;
+            scfg.sleepThreshold = kOne; scfg.wakeThreshold = (convex::fx)(2 * (int)kOne); scfg.sleepTicks = 30;
+            // The WH4 tower: a unit static support + 4 dynamic unit box hulls, 0.02 above rest, alternating
+            // +-0.02 tilts (the exact WH4 scene; Y constants are the exact fd() integers).
+            const convex::fx kTowerY[4] = {(convex::fx)132382, (convex::fx)264765,
+                                           (convex::fx)397148, (convex::fx)529530};
+            auto buildHullTower = [&]() {
+                gjk::HullWorld w;
+                w.bodies.push_back(makeBody(0, 0, 0, false));
+                w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+                for (int k = 0; k < 4; ++k) {
+                    fpx::FxBody b = makeBody(0, kTowerY[k], 0, true);
+                    b.orient = (k % 2) ? kTiltZp02 : kTiltZn02;
+                    w.bodies.push_back(b);
+                    w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+                }
+                return w;
+            };
+            gjk::HullWorld wa = buildHullTower(); warmhull::HullCache ca; std::vector<warmhull::HullSleepState> sa;
+            warmhull::StepWarmSleepHullWorldN(wa, ca, sa, scfg, 800u);
+            gjk::HullWorld ws = buildHullTower(); warmhull::HullCache cs; std::vector<warmhull::HullSleepState> ss;
+            persist::StepWarmSleepHullWorldSpatialN(ws, cs, ss, scfg, kHullCell, 800u);
+            check(warmhull::WarmHullStatesEqual(wa.bodies, ca, sa, ws.bodies, cs, ss),
+                  "PS7 hull step (WH4 tower): spatial == frozen all-pairs BIT-IDENTICAL over 800 ticks");
+            const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(ws, ss);
+            check(sm.asleepCount == 4u && sm.maxSpeed == 0,
+                  "PS7 hull step (WH4 tower): the tower is FULLY ASLEEP through the spatial path");
+            check(persist::DigestBodyWorld(ws.bodies) == 0x4bda223ac42f8adfull,
+                  "PS7 hull step (WH4 tower): the pinned asleep body digest");
+            uint32_t cand = 0;
+            const persist::IslandPartition ap = persist::BuildHullIslandsAllPairs(ws);
+            const persist::IslandPartition sp = persist::BuildHullIslandsSpatial(ws, kHullCell, &cand);
+            check(persist::IslandPartitionsEqual(ap, sp),
+                  "PS7 hull islands (tower): spatial partition == all-pairs partition");
+            check(sp.islandCount == 1u && cand == 4u,
+                  "PS7 hull islands (tower): ONE island, pinned 4 candidate pairs < all-pairs 10");
+            check(persist::IslandPartitionDigest(sp) == 0x1794dcb0bf7e0c2bull,
+                  "PS7 hull islands (tower): the pinned partition digest");
+        }
+
+        // --- (3b-3f) THE MIXED-HULL PILE (tetra/octa/box on a floor hull — the GJ6 shapes) ---
+        // The PS7 hull-sleep scene: gentle near-rest drops (the WH4 recipe — the frozen accumulated warm
+        // solver is NOT validated for hard drops; a large fall pumps energy through GJK near-field phantom
+        // contacts, the documented gjk.h iteration-cap band) + angDamp 0.3 (the GJ4 stability knob — the 0.9
+        // retain leaves tetra/octa rocking above the sleep threshold forever).
+        warmhull::HullSleepConfig pcfg;
+        pcfg.warm.gravity = convex::FxVec3{0, kGravY, 0};
+        pcfg.warm.dt = kOne / 60; pcfg.warm.solveIters = 8; pcfg.warm.restitution = 0;
+        pcfg.warm.slop = kOne / 64;
+        pcfg.warm.beta = (convex::fx)((int64_t)2 * kOne / 10);      // 0.2
+        pcfg.warm.linDamp = (convex::fx)((int64_t)95 * kOne / 100); // 0.95
+        pcfg.warm.angDamp = (convex::fx)((int64_t)30 * kOne / 100); // 0.30 — the GJ4 knob
+        pcfg.warm.posIters = 4;
+        pcfg.sleepThreshold = kOne; pcfg.wakeThreshold = (convex::fx)(2 * (int)kOne); pcfg.sleepTicks = 30;
+        auto buildPile = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false));
+            w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));                 // 0 floor (half 4 x 1 x 4)
+            { fpx::FxBody b = makeBody((convex::fx)-144179, (convex::fx)134348, 0, true);   // (-2.2, 2.05)
+              w.bodies.push_back(b); w.hulls.push_back(gjk::MakeTetra(kOne)); }  // 1 tetra
+            { fpx::FxBody b = makeBody(0, (convex::fx)134348, 0, true);          // (0, 2.05)
+              b.orient = kTiltZp05;
+              w.bodies.push_back(b); w.hulls.push_back(gjk::MakeOcta(kOne)); }   // 2 octa
+            { fpx::FxBody b = makeBody((convex::fx)144179, (convex::fx)132382, 0, true);    // (2.2, 2.02)
+              w.bodies.push_back(b); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne)); }   // 3 box
+            return w;
+        };
+
+        // (3b) the pile settles + goes FULLY ASLEEP at the PINNED step through the spatial path.
+        gjk::HullWorld pw = buildPile();
+        warmhull::HullCache pc; std::vector<warmhull::HullSleepState> psl;
+        uint32_t firstAllAsleep = 0;
+        for (uint32_t t = 0; t < 400u; ++t) {
+            persist::StepWarmSleepHullWorldSpatial(pw, pc, psl, pcfg, kHullCell);
+            const warmhull::HullSleepMeasure m = warmhull::MeasureHullSleep(pw, psl);
+            if (firstAllAsleep == 0 && m.asleepCount == m.dynamicCount) firstAllAsleep = t + 1;
+        }
+        check(firstAllAsleep == 38u,
+              "PS7 hull sleep: the mixed tetra/octa/box pile goes FULLY ASLEEP at the pinned step 38");
+        {
+            const warmhull::HullSleepMeasure m = warmhull::MeasureHullSleep(pw, psl);
+            check(m.asleepCount == 3u && m.maxSpeed == 0,
+                  "PS7 hull sleep: all 3 dynamic hulls asleep at 400 ticks, zero residual");
+            check(persist::DigestBodyWorld(pw.bodies) == 0x95549e6550d6aa85ull,
+                  "PS7 hull sleep: the pinned settled-asleep pile digest (MSVC == clang)");
+            std::printf("ps7 hull pile: firstAllAsleep=%u asleep=%u/%u\n",
+                        firstAllAsleep, m.asleepCount, m.dynamicCount);
+        }
+        // The pile's islands: 3 singletons (the hulls rest apart), spatial == all-pairs, 5 candidates < 6.
+        {
+            uint32_t cand = 0;
+            const persist::IslandPartition ap = persist::BuildHullIslandsAllPairs(pw);
+            const persist::IslandPartition sp = persist::BuildHullIslandsSpatial(pw, kHullCell, &cand);
+            check(persist::IslandPartitionsEqual(ap, sp),
+                  "PS7 hull islands (pile): spatial partition == all-pairs partition");
+            check(sp.islandCount == 3u && cand == 5u,
+                  "PS7 hull islands (pile): 3 singleton islands, pinned 5 candidate pairs < all-pairs 6");
+        }
+        // (3c) an all-asleep step is a BODY-BYTE-NO-OP (the sleeping-path cost floor: no integrate, no solve,
+        // no de-pen touches any body — the step's remaining work is the O(n*k) island scan alone).
+        {
+            const gjk::HullWorld before = pw;
+            gjk::HullWorld w2 = pw; warmhull::HullCache c2 = pc; std::vector<warmhull::HullSleepState> s2 = psl;
+            persist::StepWarmSleepHullWorldSpatial(w2, c2, s2, pcfg, kHullCell);
+            check(gjk::HullBodiesEqual(w2.bodies, before.bodies),
+                  "PS7 hull sleep: stepping the all-asleep pile is a body-byte-NO-OP (zero drift)");
+        }
+        // (3d) a struck sleeping hull WAKES; the other islands STAY ASLEEP (the partial-world wake the island
+        // partition delivers); the pile RE-SETTLES fully asleep at the pinned step.
+        {
+            pw.bodies[3].vel = convex::FxVec3{fi(3), 0, 0};   // strike the box (KE 3.0 > wakeThreshold 2.0)
+            persist::StepWarmSleepHullWorldSpatial(pw, pc, psl, pcfg, kHullCell);
+            check(!psl[3].asleep, "PS7 hull wake: the struck sleeping box WAKES");
+            check(psl[1].asleep && psl[2].asleep,
+                  "PS7 hull wake: the untouched tetra + octa islands STAY ASLEEP (partial-world wake)");
+            uint32_t reAsleep = 0;
+            for (uint32_t t = 0; t < 1200u; ++t) {
+                persist::StepWarmSleepHullWorldSpatial(pw, pc, psl, pcfg, kHullCell);
+                const warmhull::HullSleepMeasure mm = warmhull::MeasureHullSleep(pw, psl);
+                if (mm.asleepCount == mm.dynamicCount) { reAsleep = t + 1; break; }
+            }
+            check(reAsleep == 141u,
+                  "PS7 hull wake: the struck box re-settles -> the pile is FULLY ASLEEP again at the pinned step 141");
+            check(persist::DigestBodyWorld(pw.bodies) == 0x98d8e3e056a9433eull,
+                  "PS7 hull wake: the pinned re-settled pile digest");
+        }
+        // (3e) HULL WARM-START METRICS (the honest pin): on THIS pile at low iters the persistent cache shows
+        // NO measurable benefit — the warm and cold runs are BIT-IDENTICAL (the pile's floor contacts flicker
+        // tick-to-tick, so the per-face keys rarely re-match; the structural warm-start benefit proof remains
+        // WH3's frozen tower test, where deep persistent contacts DO re-match). Pinned as equality — NOT faked.
+        {
+            warmhull::HullSleepConfig wcfg = pcfg;
+            wcfg.sleepTicks = 0x7FFFFFFFu;   // sleep disabled -> the pure warm-vs-cold lever
+            wcfg.warm.solveIters = 2;        // a deliberately LOW iteration count
+            const uint32_t K = 240;
+            gjk::HullWorld ww = buildPile(); warmhull::HullCache wc; std::vector<warmhull::HullSleepState> wsl;
+            persist::StepWarmSleepHullWorldSpatialN(ww, wc, wsl, wcfg, kHullCell, K);
+            const gjk::HullStackMeasure wm = gjk::MeasureHullStack(ww);
+            gjk::HullWorld cw = buildPile(); std::vector<warmhull::HullSleepState> csl;
+            for (uint32_t t = 0; t < K; ++t) {
+                warmhull::HullCache fresh;   // force-cleared each tick -> every contact cold-starts
+                persist::StepWarmSleepHullWorldSpatial(cw, fresh, csl, wcfg, kHullCell);
+            }
+            const gjk::HullStackMeasure cm = gjk::MeasureHullStack(cw);
+            check(wm.maxSpeed == 127317 && wm.maxPenetration == 0,
+                  "PS7 warm-start metrics: pinned WARM pile metrics {maxSpeed 127317, maxPen 0}");
+            check(cm.maxSpeed == 127317 && cm.maxPenetration == 0,
+                  "PS7 warm-start metrics: pinned COLD pile metrics {maxSpeed 127317, maxPen 0}");
+            check(wm.maxSpeed == cm.maxSpeed && wm.maxPenetration == cm.maxPenetration,
+                  "PS7 warm-start metrics: warm == cold on this scene (NO measurable benefit — reported honestly)");
+            std::printf("ps7 warm-vs-cold (pile, iters=2, K=%u): warm{maxSpeed=%d,maxPen=%d} == "
+                        "cold{maxSpeed=%d,maxPen=%d} (no benefit on this scene; WH3's tower carries the benefit proof)\n",
+                        K, (int)wm.maxSpeed, (int)wm.maxPenetration, (int)cm.maxSpeed, (int)cm.maxPenetration);
+        }
+        // (3f) LOCKSTEP + ROLLBACK over the spatial hull-persist world (the WH5 command+snapshot mold):
+        // settle -> SLEEP -> a wake-impulse at tick 60 -> re-settle -> fully ASLEEP at the final tick; the
+        // replayable state is the TRIPLE (bodies + HullCache + HullSleepState[]).
+        {
+            const uint32_t kTicks = 260, kWakeTick = 60, kRollbackAt = 60;
+            std::vector<convex::ConvexCommand> auth;
+            auth.push_back(convex::ConvexCommand{5u, convex::kConvexCmdAddImpulse, 1u,
+                                                 convex::FxVec3{(convex::fx)32768, 0, 0}});   // a 0.5 nudge
+            auth.push_back(convex::ConvexCommand{kWakeTick, convex::kConvexCmdAddImpulse, 3u,
+                                                 convex::FxVec3{fi(3), 0, 0}});               // the wake kick
+            std::vector<convex::ConvexCommand> mis = auth;
+            mis.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 2u,
+                                                convex::FxVec3{-fi(8), 0, fi(2)}});           // the WRONG impulse
+            const gjk::HullWorld w0 = buildPile();
+            bool identical = false;
+            const warmhull::WarmHullState a1 =
+                persist::RunPersistHullLockstep(w0, pcfg, kHullCell, auth, kTicks, &identical);
+            check(identical,
+                  "PS7 lockstep: authority == replica BIT-IDENTICAL (bodies + hull cache + sleep) from inputs alone");
+            const warmhull::WarmHullState a2 =
+                persist::RunPersistHullLockstep(w0, pcfg, kHullCell, auth, kTicks);
+            check(warmhull::WarmHullStatesEqual(a1.world.bodies, a1.cache, a1.sleep,
+                                                a2.world.bodies, a2.cache, a2.sleep),
+                  "PS7 lockstep: two RunPersistHullLockstep runs BYTE-IDENTICAL (determinism)");
+            bool corrected = false, diverged = false;
+            persist::RunPersistHullRollback(w0, pcfg, kHullCell, auth, mis, kTicks, kRollbackAt,
+                                            &corrected, &diverged);
+            check(diverged, "PS7 rollback: the mispredicted triple genuinely DIVERGED (a real divergence)");
+            check(corrected, "PS7 rollback: the corrected re-sim == authority BIT-EXACT over the TRIPLE");
+            const warmhull::HullSleepMeasure m = warmhull::MeasureHullSleep(a1.world, a1.sleep);
+            check(m.asleepCount == 3u && m.maxSpeed == 0,
+                  "PS7 lockstep: the converged world is FULLY ASLEEP (settle -> wake -> re-settle replayed)");
+            check(persist::DigestBodyWorld(a1.world.bodies) == 0x3a49757d1f7d6750ull,
+                  "PS7 lockstep: the pinned converged authority digest");
+            uint32_t cand = 0;
+            const persist::IslandPartition sp = persist::BuildHullIslandsSpatial(a1.world, kHullCell, &cand);
+            check(persist::IslandPartitionDigest(sp) == 0x23e749cf0720569aull && sp.islandCount == 3u,
+                  "PS7 lockstep: the pinned final island partition (3 islands)");
+            std::printf("ps7 lockstep: {hulls:%zu, ticks:%u, asleep:%u/%u, islands:%u, candidatePairs:%u, "
+                        "digest:0x%016llx}\n",
+                        a1.world.bodies.size(), kTicks, m.asleepCount, m.dynamicCount, sp.islandCount, cand,
+                        (unsigned long long)persist::DigestBodyWorld(a1.world.bodies));
+        }
+    }
+
     if (g_fail == 0) std::printf("persist_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

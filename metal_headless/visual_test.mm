@@ -43453,6 +43453,215 @@ static int RunGjkLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PS7 — SPATIAL ISLAND PARTITIONING + GENERAL-HULL CONTACT PERSISTENCE showcase (--ps7-hullsleep)
+// (Track-R R7 closing the flagship-#21 structural caveats). PURE CPU — NO GPU compute, NO new shader, NO new
+// RHI; the persist.h PS7 harness (RunPersistHullLockstep / RunPersistHullRollback over the spatial-island hull
+// warm+sleep step, reusing the frozen flagship-#26 warmhull cache/solver/sleep + the frozen flagship-#23
+// broadphase) is header-only integer math, so on Metal it runs the IDENTICAL pure-CPU scene + command stream
+// the Vulkan --ps7-hullsleep-shot runs on Windows -> the converged authority-world golden is bit-identical
+// cross-backend BY CONSTRUCTION. THE SCENE: a mixed tetra/octa/box hull pile settles -> FULLY ASLEEP through
+// the O(n*k) spatial island path -> a wake-impulse at tick 60 wakes ONLY the struck island -> re-settles ->
+// ASLEEP. Proof lines match the Vulkan side EXACTLY. The image is the GJ5 PURE-INTEGER 2D side-view; SLEEPING
+// hulls tinted cool slate (the wh4 convention). New golden tests/golden/metal/ps7_hullsleep.png (Mac-baked by
+// the controller).
+static int RunPs7HullSleepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace persist  = hf::sim::persist;
+    namespace warmhull = hf::sim::warmhull;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+
+    // The deterministic warm+sleep config (== the Vulkan --ps7-hullsleep-shot + the persist_test PS7 pile).
+    const fx kGravY = (fx)(-9.8 * (double)kOne - 0.5);
+    warmhull::HullSleepConfig kCfg;
+    kCfg.warm.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.warm.dt          = kOne / 60;
+    kCfg.warm.solveIters  = 8;
+    kCfg.warm.restitution = 0;
+    kCfg.warm.slop        = kOne / 64;
+    kCfg.warm.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
+    kCfg.warm.linDamp     = (fx)((int64_t)95 * kOne / 100);  // 0.95
+    kCfg.warm.angDamp     = (fx)((int64_t)30 * kOne / 100);  // 0.30 — the GJ4 stability knob
+    kCfg.warm.posIters    = 4;
+    kCfg.sleepThreshold   = kOne;
+    kCfg.wakeThreshold    = (fx)(2 * (int)kOne);
+    kCfg.sleepTicks       = 30;
+    const fx kCell = fi(6);
+    const uint32_t kTicks = 260u;
+    const uint32_t kWakeTick = 60u;
+    const uint32_t kRollbackAt = 60u;
+
+    auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = fpx::FxQuat{0, 0, 0, kOne};
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    // THE SCENE (== the Vulkan side, EXACT Q16.16 integer constants — no libm).
+    const fpx::FxQuat kTiltZp05{0, 0, (fx)1638, (fx)65515};   // tiltZ(+0.05 rad), host-snapped
+    auto buildScene = [&]() {
+        gjk::HullWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, false));
+        w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));                     // 0 floor
+        { fpx::FxBody b = makeBody((fx)-144179, (fx)134348, 0, true);            // (-2.2, 2.05)
+          w.bodies.push_back(b); w.hulls.push_back(gjk::MakeTetra(kOne)); }      // 1 tetra
+        { fpx::FxBody b = makeBody(0, (fx)134348, 0, true);                      // (0, 2.05)
+          b.orient = kTiltZp05;
+          w.bodies.push_back(b); w.hulls.push_back(gjk::MakeOcta(kOne)); }       // 2 octa
+        { fpx::FxBody b = makeBody((fx)144179, (fx)132382, 0, true);             // (2.2, 2.02)
+          w.bodies.push_back(b); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne)); }  // 3 box
+        return w;
+    };
+    const gjk::HullWorld kInit = buildScene();
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+
+    // The scripted command streams (== the Vulkan side, verbatim).
+    std::vector<convex::ConvexCommand> authStream;
+    authStream.push_back(convex::ConvexCommand{5u, convex::kConvexCmdAddImpulse, 1u,
+                                               convex::FxVec3{(fx)32768, 0, 0}});
+    authStream.push_back(convex::ConvexCommand{kWakeTick, convex::kConvexCmdAddImpulse, 3u,
+                                               convex::FxVec3{fi(3), 0, 0}});
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+    std::vector<convex::ConvexCommand> mispredictStream = authStream;
+    mispredictStream.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 2u,
+                                                     convex::FxVec3{-fi(8), 0, fi(2)}});
+
+    // === The harness (PURE CPU) ===
+    bool lockstepIdentical = false;
+    const warmhull::WarmHullState authority =
+        persist::RunPersistHullLockstep(kInit, kCfg, kCell, authStream, kTicks, &lockstepIdentical);
+    bool rollbackCorrected = false, mispredictDiverged = false;
+    persist::RunPersistHullRollback(kInit, kCfg, kCell, authStream, mispredictStream,
+                                    kTicks, kRollbackAt, &rollbackCorrected, &mispredictDiverged);
+
+    // PROOF (1) LOCKSTEP.
+    if (!lockstepIdentical)
+        return fail("ps7-hullsleep: authority != replica (inputs-only re-sim diverged)");
+    std::printf("ps7-hullsleep: {hulls:%u, ticks:%u, commands:%u} authority==replica BIT-IDENTICAL "
+                "(bodies + hull cache + sleep)\n", kBodyCount, kTicks, kCommandCount);
+
+    // PROOF (2) DETERMINISM.
+    const warmhull::WarmHullState authority2 =
+        persist::RunPersistHullLockstep(kInit, kCfg, kCell, authStream, kTicks);
+    if (!warmhull::WarmHullStatesEqual(authority.world.bodies, authority.cache, authority.sleep,
+                                       authority2.world.bodies, authority2.cache, authority2.sleep))
+        return fail("ps7-hullsleep: two runs differ (nondeterministic)");
+    std::printf("ps7-hullsleep determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) ROLLBACK.
+    if (!rollbackCorrected || !mispredictDiverged)
+        return fail("ps7-hullsleep: rollback failed (corrected/diverged proof)");
+    std::printf("ps7-hullsleep rollback: corrected==authority BIT-EXACT (mispredict genuinely diverged)\n");
+
+    // PROOF (4) SPATIAL ISLANDS == ALL-PAIRS + FULLY ASLEEP.
+    uint32_t candidatePairs = 0;
+    const persist::IslandPartition spatialIslands =
+        persist::BuildHullIslandsSpatial(authority.world, kCell, &candidatePairs);
+    const persist::IslandPartition allPairsIslands =
+        persist::BuildHullIslandsAllPairs(authority.world);
+    if (!persist::IslandPartitionsEqual(spatialIslands, allPairsIslands))
+        return fail("ps7-hullsleep: spatial islands != all-pairs islands");
+    const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(authority.world, authority.sleep);
+    if (sm.asleepCount != sm.dynamicCount || sm.maxSpeed != 0)
+        return fail("ps7-hullsleep: the converged pile is NOT fully asleep");
+    std::printf("ps7-hullsleep islands: spatial==all-pairs (%u islands, %u candidate pairs vs %u all-pairs); "
+                "pile FULLY ASLEEP (settle -> wake tick %u -> re-settle)\n",
+                spatialIslands.islandCount, candidatePairs, kBodyCount * (kBodyCount - 1u) / 2u, kWakeTick);
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view as the Vulkan --ps7-hullsleep-shot (identical by
+    // construction); sleeping hulls tinted cool slate, awake warm amber (the wh4 convention). ---
+    const gjk::HullWorld& cw = authority.world;
+    const int kPxPerUnit = 48, kMargin = 24;
+    const int kWorldHalfX = 6, kWorldHalfY = 5;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    drawHullXY(cw.bodies[0], kInit.hulls[0], Vec3{0.30f, 0.40f, 0.55f});   // static floor (cool grey)
+    for (uint32_t i = 1; i < kBodyCount; ++i) {
+        const Vec3 col = (i < authority.sleep.size() && authority.sleep[i].asleep)
+                             ? Vec3{0.40f, 0.62f, 0.82f} : Vec3{0.88f, 0.62f, 0.28f};
+        drawHullXY(cw.bodies[i], kInit.hulls[i], col);
+    }
+
+    const uint64_t digest = persist::DigestBodyWorld(cw.bodies);
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — ps7 hull-persist spatial-island sleep "
+                "{hulls:%u, steps:%u, digest:0x%016llx, asleepCount:%u, islandCount:%u, candidatePairs:%u}\n",
+                outPath, imgW, imgH, kBodyCount, kTicks, (unsigned long long)digest,
+                sm.asleepCount, spatialIslands.islandCount, candidatePairs);
+    return 0;
+}
+
 // ===== Slice AI1 — Deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK showcase
 // (--ai1-tree) (the BEACHHEAD of the DETERMINISTIC AI flagship #28, hf::ai). PURE CPU — NO GPU compute, NO new
 // shader, NO new RHI; the ai.h decision-tree tick is header-only integer logic, so on Metal it runs the IDENTICAL
@@ -78087,6 +78296,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gjk-lockstep") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gjk_lockstep.png";
             try { return RunGjkLockstepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ps7-hullsleep <out.png>: render the SPATIAL ISLAND PARTITIONING + GENERAL-HULL CONTACT PERSISTENCE
+        // showcase (Slice PS7, Track-R R7 — the flagship-#21 caveat-closure slice). PURE CPU — the persist.h
+        // PS7 harness (RunPersistHullLockstep over the spatial-island hull warm+sleep step, reusing the frozen
+        // flagship-#26 warmhull machinery + the frozen flagship-#23 broadphase) is header-only integer math, so
+        // Metal runs the IDENTICAL scene + command stream the Vulkan --ps7-hullsleep-shot runs on Windows ->
+        // the converged FULLY-ASLEEP mixed-hull-pile golden is bit-identical cross-backend BY CONSTRUCTION.
+        // NO GPU compute, NO new shader, NO new RHI. New golden tests/golden/metal/ps7_hullsleep.png.
+        if (argc > 1 && std::strcmp(argv[1], "--ps7-hullsleep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ps7_hullsleep.png";
+            try { return RunPs7HullSleepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fric-ramp / --fric-stack <out.png>: render the Deterministic Contact Friction THE FRICTION-LOCKED
