@@ -400,6 +400,7 @@ $Goldens = @(
     @{ Name = 'jt7_machine';   Flag = '--jt7-machine' }      # JT7 motorized crank-slider (superiority R12; lockstep actuation, digest 0xf947a5e58a21d4ac)
     @{ Name = 'rtd1_softshadow'; Flag = '--rtd1-softshadow' } # RTD1 deterministic stochastic RT soft shadows + SVGF-lite denoise (superiority S9; integer digests 0xf38663819426b236/0xc93c6d134aa489aa cross-platform exact; the denoised image is the float-class golden)
     @{ Name = 'pa1_fountain';    Flag = '--pa1-fountain' }    # PA1 flow-VM-authored particle effect (superiority S11; edit-ops-built pulsing fountain, composed digest 0x745c02a3574c687f)
+    @{ Name = 'mm1_locomotion';  Flag = '--mm1-locomotion-shot' } # MM1 deterministic motion matching (superiority S4 / flagship #33; idle->walk->idle selection timeline, trace digest 0xb37aa47b7bc7d69b)
 )
 
 $winResult = 'SKIP'
