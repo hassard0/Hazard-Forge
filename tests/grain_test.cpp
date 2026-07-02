@@ -1063,6 +1063,431 @@ int main() {
               "GR6 GrainToRenderInstances: empty pool -> empty (the empty no-op)");
     }
 
+    // ============================ Slice GR7 — POLYDISPERSE GRANULAR MATERIAL ========================
+    // The Track-R R6 refinement: closes the documented "monodisperse grains" caveat of FLAGSHIP #10.
+    // GR7 adds the hash-assigned size classes (AssignGrainPolyRadii, the pcg convention), the EXACT r^3
+    // inverse mass (PolyInvMass), the structurally-widened broadphase (StepGrainPoly: hSearch >= 2*r_max,
+    // the largest pair sum) and the GR5-mold lockstep twins. These cases pin: (a) the GR1/GR4/GR5 PINNED
+    // DIGESTS (the append-only proof — canonical pre-GR7 scenes must hash to the exact same state after
+    // GR7 lands; GrainDigest is new in GR7, the values below are the first pinning of those states);
+    // (b) the hash/mass/assignment units (hand-checked exact Q16.16); (c) the IDENTITY-AT-UNIFORM (all
+    // radii equal -> poly pool AND poly step BIT-IDENTICAL to the mono GR1/GR4 path, incl. through the
+    // lockstep harness — THE key append-only proof); (d) the r^3 MASS WEIGHTING (a single big-vs-small
+    // contact pair: the small grain moves further by the exact integer mass-ratio split, pinned); (e) the
+    // BROADPHASE CONTRACT (an under-sized hSearch misses a big-big contact in the raw GR4 step; the poly
+    // step's widened stencil resolves it); (f) THE PHYSICS (a mixed 1/3-big 2/3-small pour settles: min
+    // pair separation >= the pinned honest LSB residual, the pile comes to rest under a pinned velocity
+    // bound, the big/small mean heights pinned HONESTLY — near-equal, segregation NOT forced); (g)
+    // determinism + the GR7 pinned digest (identical MSVC + clang); (h) LOCKSTEP (a peer re-derives the
+    // mixed-size pile bit-for-bit; rollback corrects a misprediction) + the radius-covering snapshot.
+
+    // --- (a) the GR1/GR4/GR5 pinned digests (the append-only proof) ----------------------------------
+    {
+        // GR1: the 5x5x5 integrate determinism scene (grav -10, dt=1/60, groundY 0, K=120).
+        {
+            grain::GrainBlock block; block.W = 5; block.H = 5; block.D = 5; block.spacing = kOne;
+            block.radius = kOne / 4; block.origin = grain::FxVec3{0, FromInt(20), 0};
+            std::vector<grain::GrainParticle> ps = grain::InitGrainBlock(block);
+            grain::IntegrateGrainSteps(ps, grain::FxVec3{0, FromInt(-10), 0}, kOne / 60, 0, 120);
+            const uint64_t d = grain::GrainDigest(ps);
+            std::printf("GR7 pin: GR1 integrate digest = 0x%016llx\n", (unsigned long long)d);
+            check(d == 0x63cf0f047217d7ceull, "GR7 pin(a): GR1 integrate digest UNCHANGED");
+        }
+        // GR4: the 5x5x5 staggered friction cone (the --grain-friction showcase scene, K=70, iters=2).
+        {
+            const grain::FxVec3 grav{0, FromInt(-10), 0};
+            const grain::fx off = (grain::fx)(0.12 * (double)kOne + 0.5);
+            std::vector<grain::GrainParticle> ps;
+            for (int iy = 0; iy < 5; ++iy)
+                for (int iz = 0; iz < 5; ++iz)
+                    for (int ix = 0; ix < 5; ++ix) {
+                        grain::GrainParticle p;
+                        const grain::fx ox = (iy & 1) ? off : 0, oz = (iy & 1) ? off : 0;
+                        p.pos = grain::FxVec3{FromInt(ix) + ox, FromInt(3 + iy), FromInt(iz) + oz};
+                        p.prev = p.pos; p.invMass = kOne; p.radius = kOne / 2; p.flags = 0;
+                        ps.push_back(p);
+                    }
+            const std::vector<grain::GrainSphereCollider> noSpheres;
+            grain::StepGrainFrictionSteps(ps, noSpheres, grav, kOne / 60, 0, FromInt(2),
+                                          grain::kGrainMu, 2, 70);
+            const uint64_t d = grain::GrainDigest(ps);
+            std::printf("GR7 pin: GR4 friction-cone digest = 0x%016llx\n", (unsigned long long)d);
+            check(d == 0xd5b197d2ec8e7bb8ull, "GR7 pin(a): GR4 friction-cone digest UNCHANGED");
+        }
+        // GR5: the lockstep authority (the wind/push stream over the staggered scene, ticks=16).
+        {
+            const grain::fx kGravY = (grain::fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const grain::FxVec3 kGravity{0, kGravY, 0};
+            const grain::fx kStagger = (grain::fx)(0.12 * (double)kOne + 0.5);
+            std::vector<grain::GrainParticle> init;
+            for (int iy = 0; iy < 5; ++iy)
+                for (int iz = 0; iz < 5; ++iz)
+                    for (int ix = 0; ix < 5; ++ix) {
+                        grain::GrainParticle p;
+                        const grain::fx ox = (iy & 1) ? kStagger : 0, oz = (iy & 1) ? kStagger : 0;
+                        p.pos = {FromInt(ix) + ox, FromInt(3 + iy), FromInt(iz) + oz};
+                        p.prev = p.pos; p.invMass = kOne; p.radius = kOne / 2;
+                        init.push_back(p);
+                    }
+            const std::vector<grain::GrainSphereCollider> noSpheres;
+            const std::vector<grain::GrainCommand> authStream{
+                grain::GrainCommand{2,  grain::kCmdWind, 62u, grain::FxVec3{FromInt(8), 0, 0}},
+                grain::GrainCommand{6,  grain::kCmdPush, 62u, grain::FxVec3{0, 0, FromInt(2)}},
+                grain::GrainCommand{10, grain::kCmdWind, 62u, grain::FxVec3{FromInt(4), 0, 0}},
+            };
+            const std::vector<grain::GrainParticle> authority =
+                grain::RunGrainLockstep(init, noSpheres, authStream, 16, kGravity, kOne / 60, 0,
+                                        kOne * 2, grain::kGrainMu, 2);
+            const uint64_t d = grain::GrainDigest(authority);
+            std::printf("GR7 pin: GR5 lockstep authority digest = 0x%016llx\n", (unsigned long long)d);
+            check(d == 0x0f5dd49fcfc39517ull, "GR7 pin(a): GR5 lockstep-authority digest UNCHANGED");
+        }
+    }
+
+    // --- (b) the units: GrainPolyHash / PolyInvMass / AssignGrainPolyRadii / InitGrainPolyBlock -------
+    {
+        // GrainPolyHash: deterministic (same in == same out), seed- and index-sensitive.
+        check(grain::GrainPolyHash(7u, 0u) == grain::GrainPolyHash(7u, 0u),
+              "GR7 hash: deterministic (same seed+index -> same value)");
+        check(grain::GrainPolyHash(7u, 0u) != grain::GrainPolyHash(8u, 0u),
+              "GR7 hash: seed-sensitive");
+        check(grain::GrainPolyHash(7u, 0u) != grain::GrainPolyHash(7u, 1u),
+              "GR7 hash: index-sensitive");
+
+        // PolyInvMass: EXACT integer values. r == ref -> kOne EXACTLY (the identity anchor). r = 2*ref ->
+        // mass 8x -> invMass kOne/8 EXACTLY (kOne/4 cubes to 1024, kOne/2 to 8192; fxdiv(1024,8192)=8192).
+        check(grain::PolyInvMass(kOne / 4, kOne / 4) == kOne,
+              "GR7 PolyInvMass: r == refRadius -> EXACTLY kOne (identity-at-uniform anchor)");
+        check(grain::PolyInvMass(kOne / 2, kOne / 4) == kOne / 8,
+              "GR7 PolyInvMass: r == 2*ref -> EXACTLY kOne/8 (mass = r^3 = 8x, exact integers)");
+        check(grain::PolyInvMass(kOne, kOne / 2) == kOne / 8,
+              "GR7 PolyInvMass: the r^3 law holds at another exact scale (1.0 vs 0.5 -> kOne/8)");
+        check(grain::PolyInvMass(0, kOne / 4) == 0 && grain::PolyInvMass(kOne / 4, 0) == 0,
+              "GR7 PolyInvMass: zero/negative radius -> invMass 0 (deterministic degenerate)");
+
+        // AssignGrainPolyRadii: every radius comes from the class table; static grains untouched;
+        // determinism (two assignments byte-identical); the class mix is hash-driven (both classes hit).
+        grain::GrainBlock block; block.W = 5; block.H = 5; block.D = 5; block.spacing = kOne;
+        block.radius = kOne / 4; block.origin = grain::FxVec3{0, FromInt(3), 0};
+        const std::vector<grain::fx> classes{kOne / 4, kOne / 4, kOne / 2};   // 2/3 small + 1/3 big
+        std::vector<grain::GrainParticle> ps = grain::InitGrainBlock(block);
+        ps[7].flags = grain::kFlagStatic; ps[7].invMass = 0;                  // a boundary grain
+        const grain::GrainParticle staticBefore = ps[7];
+        grain::AssignGrainPolyRadii(ps, classes, 7u);
+        int nSmall = 0, nBig = 0; bool fromTable = true, massOk = true;
+        for (size_t i = 0; i < ps.size(); ++i) {
+            if (i == 7) continue;
+            if (ps[i].radius == kOne / 4)      { ++nSmall; if (ps[i].invMass != kOne)     massOk = false; }
+            else if (ps[i].radius == kOne / 2) { ++nBig;   if (ps[i].invMass != kOne / 8) massOk = false; }
+            else fromTable = false;
+        }
+        std::printf("GR7 assign: 125-pool classes -> %d small + %d big (+1 static)\n", nSmall, nBig);
+        check(fromTable, "GR7 assign: every assigned radius comes from the class table");
+        check(nSmall > 0 && nBig > 0, "GR7 assign: both size classes present (hash-driven mix)");
+        check(nSmall == 77 && nBig == 47, "GR7 assign: pinned class split (77 small / 47 big, seed 7)");
+        check(massOk, "GR7 assign: invMass == PolyInvMass(radius, minClassRadius) per class (exact)");
+        check(std::memcmp(&ps[7], &staticBefore, sizeof(grain::GrainParticle)) == 0,
+              "GR7 assign: a STATIC boundary grain is BYTE-UNTOUCHED");
+        std::vector<grain::GrainParticle> ps2 = grain::InitGrainBlock(block);
+        ps2[7].flags = grain::kFlagStatic; ps2[7].invMass = 0;
+        grain::AssignGrainPolyRadii(ps2, classes, 7u);
+        check(std::memcmp(ps.data(), ps2.data(), ps.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR7 assign: two assignments byte-identical (deterministic)");
+        // Empty class table -> no-op.
+        std::vector<grain::GrainParticle> noop = grain::InitGrainBlock(block);
+        const std::vector<grain::GrainParticle> noopBefore = noop;
+        grain::AssignGrainPolyRadii(noop, {}, 7u);
+        check(std::memcmp(noop.data(), noopBefore.data(), noop.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR7 assign: empty class table -> no-op");
+        // MaxGrainRadius over the mixed pool == the big class.
+        check(grain::MaxGrainRadius(ps) == kOne / 2, "GR7 MaxGrainRadius: == the largest class radius");
+    }
+
+    // --- (c) IDENTITY-AT-UNIFORM: one class == the monodisperse pool + step BIT-IDENTICAL -------------
+    {
+        const grain::FxVec3 grav{0, FromInt(-10), 0};
+        const fx dt = kOne / 60, groundY = 0, hSearch = FromInt(2);
+        const fx mu = grain::kGrainMu;
+        const int iters = 2, steps = 40;
+        grain::GrainBlock block; block.W = 4; block.H = 4; block.D = 4; block.spacing = kOne;
+        block.radius = kOne / 2; block.origin = grain::FxVec3{0, FromInt(3), 0};
+        const std::vector<grain::GrainSphereCollider> noSpheres;
+
+        // The POOL identity: one class {r0} -> InitGrainPolyBlock == InitGrainBlock byte-for-byte.
+        const std::vector<grain::GrainParticle> mono = grain::InitGrainBlock(block);
+        const std::vector<grain::GrainParticle> poly =
+            grain::InitGrainPolyBlock(block, {block.radius}, 7u);
+        check(mono.size() == poly.size() &&
+              std::memcmp(mono.data(), poly.data(), mono.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR7 identity: one-class InitGrainPolyBlock == InitGrainBlock BYTE-IDENTICAL");
+
+        // The STEP identity: uniform radii -> StepGrainPolySteps == StepGrainFrictionSteps BIT-IDENTICAL
+        // (hSearch already >= 2*r_max, so the poly widen is a no-op and the GR4 step runs verbatim).
+        std::vector<grain::GrainParticle> a = poly, b = mono;
+        grain::StepGrainPolySteps(a, noSpheres, grav, dt, groundY, hSearch, mu, iters, steps);
+        grain::StepGrainFrictionSteps(b, noSpheres, grav, dt, groundY, hSearch, mu, iters, steps);
+        check(a.size() == b.size() &&
+              std::memcmp(a.data(), b.data(), a.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR7 identity-at-uniform: poly step (all radii == r0) == mono GR4 step BIT-IDENTICAL");
+
+        // ... and through the lockstep harness (the composed identity, the CL7 (d) twin).
+        const std::vector<grain::GrainCommand> stream{
+            grain::GrainCommand{3, grain::kCmdWind, 21u, grain::FxVec3{FromInt(5), 0, 0}},
+        };
+        const std::vector<grain::GrainParticle> lsMono =
+            grain::RunGrainLockstep(mono, noSpheres, stream, 12, grav, dt, groundY, hSearch, mu, iters);
+        const std::vector<grain::GrainParticle> lsPoly =
+            grain::RunGrainPolyLockstep(poly, noSpheres, stream, 12, grav, dt, groundY, hSearch, mu, iters);
+        check(lsMono.size() == lsPoly.size() &&
+              std::memcmp(lsMono.data(), lsPoly.data(), lsMono.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR7 identity-at-uniform: RunGrainPolyLockstep(uniform) == RunGrainLockstep BIT-IDENTICAL");
+    }
+
+    // --- (d) the r^3 MASS WEIGHTING: a single big-vs-small contact pair, the exact displacement split --
+    {
+        // Big grain (r = 0.5, invMass kOne/8) at the origin; small grain (r = 0.25, invMass kOne) at
+        // (0.6, 0, 0). Contact: r_i + r_j = 0.75 (49152), dist = 0.6 (39321) -> pen = 9831 LSBs. The
+        // inverse-mass split (fxdiv truncation documented): share_small = fxdiv(kOne, kOne + kOne/8) =
+        // 58254, share_big = fxdiv(kOne/8, kOne + kOne/8) = 7281 (sum 65535 = kOne − 1 LSB, the truncation).
+        // dp_small = fxmul(fxmul(58254, 9831), +kOne) = +8738; dp_big = fxmul(fxmul(7281, 9831), −kOne) =
+        // −1092. The SMALL grain moves 8738/1092 ≈ 8.0x further — the EXACT integer image of the r^3 = 8
+        // mass ratio (the physical asymmetry: gravel shoves sand, not vice versa).
+        const fx rBig = kOne / 2, rSmall = kOne / 4;
+        const fx hSearch = FromInt(2);
+        std::vector<grain::GrainParticle> pair(2);
+        pair[0].pos = {0, 0, 0};             pair[0].radius = rBig;
+        pair[0].invMass = grain::PolyInvMass(rBig, rSmall);      // kOne/8 exact
+        pair[1].pos = {kOne * 6 / 10, 0, 0}; pair[1].radius = rSmall;
+        pair[1].invMass = grain::PolyInvMass(rSmall, rSmall);    // kOne exact
+        grain::GrainGrid g = grain::MakeGrainGrid(pair, hSearch);
+        grain::GrainCellTable t = grain::BuildGrainCellTable(pair, g);
+        grain::GrainNeighborList nl = grain::BuildGrainNeighborList(pair, g, t, hSearch);
+        std::vector<grain::FxVec3> dp;
+        grain::SolveGrainContact(pair, nl, dp);
+        std::printf("GR7 mass split: big dp.x = %d, small dp.x = %d (pen 9831, ratio ~8x)\n",
+                    (int)dp[0].x, (int)dp[1].x);
+        check(dp[0].x == -1092 && dp[0].y == 0 && dp[0].z == 0,
+              "GR7 mass weighting: the BIG grain takes the small share (dp.x == −1092 exact)");
+        check(dp[1].x == 8738 && dp[1].y == 0 && dp[1].z == 0,
+              "GR7 mass weighting: the SMALL grain takes the big share (dp.x == +8738 exact)");
+        // The split ratio is the r^3 mass ratio within integer truncation: 8738 = 8*1092 + 2 LSBs.
+        check(dp[1].x >= 8 * (-dp[0].x) && dp[1].x <= 8 * (-dp[0].x) + 8,
+              "GR7 mass weighting: displacement ratio == the r^3 mass ratio 8 (within LSB truncation)");
+    }
+
+    // --- (e) the BROADPHASE CONTRACT: the widened stencil reaches the largest pair sum -----------------
+    {
+        // Two BIG grains (r = 0.5 each, contact diameter 1.0) 0.8 apart, an UNDER-SIZED hSearch = 0.5:
+        // the raw GR4 step at hSearch 0.5 box-rejects the pair (|dx| = 0.8 > 0.5) -> the contact is
+        // MISSED (positions unchanged; zero gravity isolates the broadphase). StepGrainPoly widens the
+        // cell size to 2*r_max = 1.0 -> the pair is a candidate (0.8 < 1.0) -> the overlap (pen 0.2) is
+        // RESOLVED. This is the polydisperse broadphase contract made structural.
+        const grain::FxVec3 noGrav{0, 0, 0};
+        const fx dt = kOne / 60, groundY = FromInt(-1000);
+        const fx tinySearch = kOne / 2;
+        const std::vector<grain::GrainSphereCollider> noSpheres;
+        auto makePair = []() {
+            std::vector<grain::GrainParticle> p(2);
+            p[0].pos = {0, 0, 0};             p[0].prev = p[0].pos; p[0].invMass = kOne; p[0].radius = kOne / 2;
+            p[1].pos = {kOne * 8 / 10, 0, 0}; p[1].prev = p[1].pos; p[1].invMass = kOne; p[1].radius = kOne / 2;
+            return p;
+        };
+        std::vector<grain::GrainParticle> raw = makePair();
+        const std::vector<grain::GrainParticle> before = raw;
+        grain::StepGrainFriction(raw, noSpheres, noGrav, dt, groundY, tinySearch, grain::kGrainMu, 4);
+        check(std::memcmp(raw.data(), before.data(), raw.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR7 broadphase: the raw GR4 step at hSearch < 2*r_max MISSES the big-big contact (control)");
+        std::vector<grain::GrainParticle> poly = makePair();
+        grain::StepGrainPoly(poly, noSpheres, noGrav, dt, groundY, tinySearch, grain::kGrainMu, 4);
+        const fx sepBefore = grain::GrainPolyMinSeparation(before);
+        const fx sepAfter = grain::GrainPolyMinSeparation(poly);
+        std::printf("GR7 broadphase: pair separation %d -> %d LSBs (poly widened stencil)\n",
+                    (int)sepBefore, (int)sepAfter);
+        check(sepBefore < 0, "GR7 broadphase: the pair starts overlapping (sep < 0, pen 0.2)");
+        check(sepAfter > sepBefore,
+              "GR7 broadphase: StepGrainPoly RESOLVES the contact the under-sized hSearch missed");
+    }
+
+    // --- the GR7 MIXED-POUR scene builder (shared by the physics/determinism/lockstep cases; == the ----
+    // --- --gr7-poly-shot showcase scene) ---------------------------------------------------------------
+    // A staggered 5x5x5 POLYDISPERSE block — 2/3 small (r=0.25) + 1/3 big (r=0.5) assigned by index hash
+    // (seed 7), r^3 masses (big grains 8x heavier), spacing 1.0 >= 2*r_max (non-overlapping start even for
+    // two adjacent big grains) — poured GENTLY (drop from y=1) onto a STATIC ROUGH BED: a dense layer of
+    // STATIC small grains (r=0.25 at 0.5 spacing, GR1's kFlagStatic boundary grains) covering x,z in
+    // [-6,10]. WHY THE BED (the honest scene-design finding, measured): the GR family has NO grain-floor
+    // tangential friction — GR4's Coulomb clamp is GRAIN-GRAIN only and CollideGrainPlane is a frictionless
+    // clamp — so on BARE floor any grain that exits the pile with horizontal velocity slides FOREVER and
+    // the pour never rests (measured: an open pour's median speed plateaus ~1.8 u/s as a spreading
+    // monolayer; the MONO GR4 cone has the same slow-spread property — its showcase pins a K=70 snapshot).
+    // A rough bed is the standard granular-experiment floor: sliders rub the static bed grains, GR4
+    // friction arrests them, and the pour SETTLES into a stable mixed mound. Gravel + sand in ONE pile,
+    // zero new physics — only GR1 static grains + GR4 friction, composed.
+    const auto buildPolyPour = []() {
+        const grain::fx kStagger = (grain::fx)(0.12 * (double)kOne + 0.5);
+        std::vector<grain::GrainParticle> ps;
+        // The 125 DYNAMIC grains first (indices 0..124 — the lockstep command targets stay dynamic).
+        for (int iy = 0; iy < 5; ++iy)
+            for (int iz = 0; iz < 5; ++iz)
+                for (int ix = 0; ix < 5; ++ix) {
+                    grain::GrainParticle p;
+                    const grain::fx ox = (iy & 1) ? kStagger : 0, oz = (iy & 1) ? kStagger : 0;
+                    p.pos = {FromInt(ix) + ox, FromInt(1 + iy), FromInt(iz) + oz};
+                    p.prev = p.pos; p.invMass = kOne; p.radius = kOne / 4; p.flags = 0;
+                    ps.push_back(p);
+                }
+        grain::AssignGrainPolyRadii(ps, {kOne / 4, kOne / 4, kOne / 2}, 7u);
+        // The STATIC rough bed (33x33 = 1089 grains): r=0.25 at 0.5 spacing (touching), centers y=0.25.
+        // AssignGrainPolyRadii ran FIRST and skips static grains by contract anyway.
+        for (int gx = -12; gx <= 20; ++gx)
+            for (int gz = -12; gz <= 20; ++gz) {
+                grain::GrainParticle w;
+                w.pos = {(fx)(gx * (int)(kOne / 2)), kOne / 4, (fx)(gz * (int)(kOne / 2))};
+                w.prev = w.pos; w.vel = {0, 0, 0};
+                w.invMass = 0; w.radius = kOne / 4; w.flags = grain::kFlagStatic;
+                ps.push_back(w);
+            }
+        return ps;
+    };
+    const int kPolyDynamic = 125;                 // dynamic grains are indices 0..124; the rest is the bed
+    const grain::fx kPolyGravY = (grain::fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const grain::FxVec3 kPolyGrav{0, kPolyGravY, 0};
+    const fx kPolyDt = kOne / 60, kPolyGroundY = 0, kPolyHSearch = FromInt(2);
+    const fx kPolyMu = grain::kGrainMu;
+    const int kPolyIters = 4, kPolySteps = 280;
+    // The honest Jacobi LSB residual bound (the CL7 slack discipline): 4 Jacobi iterations/step leave a
+    // deterministic-but-nonzero pair penetration; the settled pour's deepest pair penetration is measured +
+    // pinned below, and this bound brackets it without masking a broadphase miss (a missed contact under
+    // gravity compresses to MANY THOUSANDS of LSBs — a full small radius is 16384).
+    const fx kPolyResidualBound = 4096;   // LSBs (0.0625 world units, 25% of the small radius)
+
+    // --- (f) THE PHYSICS: the mixed pour settles — non-penetration, rest, honest size structure --------
+    {
+        const std::vector<grain::GrainSphereCollider> noSpheres;
+        std::vector<grain::GrainParticle> pour = buildPolyPour();
+        grain::StepGrainPolySteps(pour, noSpheres, kPolyGrav, kPolyDt, kPolyGroundY, kPolyHSearch,
+                                  kPolyMu, kPolyIters, kPolySteps);
+
+        // (i) NO interpenetration beyond the honest residual: min pair separation (over the FULL pool,
+        // dynamic AND bed — the brute-force metric does not share the solver's broadphase) >= −bound.
+        const fx minSep = grain::GrainPolyMinSeparation(pour);
+        std::printf("GR7 physics: settled min pair separation = %d LSBs (honest Jacobi residual)\n",
+                    (int)minSep);
+        check(minSep >= -kPolyResidualBound,
+              "GR7 physics(i): min pair separation >= -(pinned residual bound) — no deep interpenetration");
+        check(minSep == -1306,
+              "GR7 physics(i) pin: the exact settled residual == -1306 LSBs (~8% of the small radius)");
+
+        // (ii) the pile comes to REST: max DYNAMIC grain speed under the pinned bound at the pinned settle
+        // step. HONEST framing: the family has no sleep threshold, so the Jacobi contact churn keeps a
+        // small fluctuating jitter alive forever — this is the PINNED-STEP bound (every grain under 0.5
+        // world-units/s at K=280), not an asymptotic zero.
+        const std::vector<grain::GrainParticle> dyn(pour.begin(), pour.begin() + kPolyDynamic);
+        const fx maxSpeed = grain::MaxGrainSpeed(dyn);
+        std::printf("GR7 physics: settled max dynamic grain speed = %d LSBs/s\n", (int)maxSpeed);
+        check(maxSpeed < kOne / 2,
+              "GR7 physics(ii): the pour is at rest (EVERY grain < 0.5 world units/s at the settle step)");
+        check(maxSpeed == 32723,
+              "GR7 physics(ii) pin: the exact settled max speed == 32723 LSBs/s (deterministic)");
+
+        // (iii) the HONEST size-structure metric: mean height of big vs small DYNAMIC grains after
+        // settling. The "Brazil-nut" segregation is shaking-driven and EMERGENT — this is a single settled
+        // pour, so the signal is WEAK: mean center heights big 115145 vs small 87182; subtracting each
+        // class's radius (the geometric offset), the big grains' UNDERSIDES sit 82377 vs 70798 — ~0.18
+        // world units higher, the Brazil-nut DIRECTION present but weak. We PIN the exact deterministic
+        // values and report them honestly (the load-bearing proofs are (i), (ii) and the (d) mass-weighted
+        // split — segregation is NOT forced).
+        const grain::GrainSizeHeights hts = grain::MeasureGrainSizeHeights(dyn, kOne / 2);
+        std::printf("GR7 physics: mean height big = %d, small = %d LSBs (%d big / %d small); undersides "
+                    "big %d vs small %d — weak Brazil-nut direction, reported honestly\n",
+                    (int)hts.meanYLarge, (int)hts.meanYSmall, hts.nLarge, hts.nSmall,
+                    (int)(hts.meanYLarge - kOne / 2), (int)(hts.meanYSmall - kOne / 4));
+        check(hts.nLarge == 47 && hts.nSmall == 78,
+              "GR7 physics(iii): the pour splits 47 big / 78 small (the pinned hash mix, seed 7)");
+        check(hts.meanYLarge == 115145 && hts.meanYSmall == 87182,
+              "GR7 physics(iii) pin: exact mean heights (big 115145, small 87182 LSBs — a stable mixed "
+              "MOUND, not a monolayer: the bed arrests the spread)");
+
+        // Every grain ends at/above the floor (radius-aware, within the collide eps).
+        bool aboveFloor = true;
+        for (const grain::GrainParticle& p : pour)
+            if (p.pos.y < kPolyGroundY + p.radius - grain::kGrainCollideEps) aboveFloor = false;
+        check(aboveFloor, "GR7 physics: no grain ends below groundY + its OWN radius (mixed radii, eps)");
+    }
+
+    // --- (g) determinism + the GR7 pinned digest (identical MSVC + clang) ------------------------------
+    {
+        const std::vector<grain::GrainSphereCollider> noSpheres;
+        std::vector<grain::GrainParticle> a = buildPolyPour(), b = buildPolyPour();
+        grain::StepGrainPolySteps(a, noSpheres, kPolyGrav, kPolyDt, kPolyGroundY, kPolyHSearch,
+                                  kPolyMu, kPolyIters, kPolySteps);
+        grain::StepGrainPolySteps(b, noSpheres, kPolyGrav, kPolyDt, kPolyGroundY, kPolyHSearch,
+                                  kPolyMu, kPolyIters, kPolySteps);
+        check(a.size() == b.size() &&
+              std::memcmp(a.data(), b.data(), a.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR7 determinism: two mixed-pour runs BYTE-IDENTICAL");
+        const uint64_t d = grain::GrainDigest(a);
+        std::printf("GR7 pin: GR7 settled mixed-pour digest = 0x%016llx\n", (unsigned long long)d);
+        check(d == 0xb3325f416aff93ceull, "GR7 pin(g): mixed-pour digest == the pinned value");
+    }
+
+    // --- (h) LOCKSTEP + ROLLBACK over the mixed-size pile + the radius-covering snapshot ----------------
+    {
+        const std::vector<grain::GrainSphereCollider> noSpheres;
+        const std::vector<grain::GrainParticle> init = buildPolyPour();
+        const int ticks = 16, mispredictTick = 6;
+        const uint32_t wIdx = 62u;
+        const std::vector<grain::GrainCommand> authStream{
+            grain::GrainCommand{2,  grain::kCmdWind, wIdx, grain::FxVec3{FromInt(8), 0, 0}},
+            grain::GrainCommand{6,  grain::kCmdPush, wIdx, grain::FxVec3{0, 0, FromInt(2)}},
+            grain::GrainCommand{10, grain::kCmdWind, wIdx, grain::FxVec3{FromInt(4), 0, 0}},
+        };
+        std::vector<grain::GrainCommand> mispredictStream = authStream;
+        mispredictStream.push_back(grain::GrainCommand{(uint32_t)mispredictTick, grain::kCmdWind, wIdx,
+                                                       grain::FxVec3{FromInt(60), 0, 0}});
+
+        const std::vector<grain::GrainParticle> authority =
+            grain::RunGrainPolyLockstep(init, noSpheres, authStream, ticks, kPolyGrav, kPolyDt,
+                                        kPolyGroundY, kPolyHSearch, kPolyMu, kPolyIters);
+        const std::vector<grain::GrainParticle> replica =
+            grain::RunGrainPolyLockstep(init, noSpheres, authStream, ticks, kPolyGrav, kPolyDt,
+                                        kPolyGroundY, kPolyHSearch, kPolyMu, kPolyIters);
+        check(authority.size() == replica.size() &&
+              std::memcmp(authority.data(), replica.data(),
+                          authority.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR7 lockstep: mixed-size replica == authority BIT-EXACT (inputs-only re-sim)");
+        const uint64_t d = grain::GrainDigest(authority);
+        std::printf("GR7 pin: GR7 lockstep authority digest = 0x%016llx\n", (unsigned long long)d);
+        check(d == 0x1b0add58d5bb8496ull, "GR7 pin(h): mixed-size lockstep digest == the pinned value");
+
+        // ROLLBACK: corrected to authority BIT-EXACT; the misprediction was a REAL divergence.
+        const std::vector<grain::GrainParticle> rolledBack =
+            grain::RunGrainPolyRollback(init, noSpheres, authStream, mispredictStream, ticks,
+                                        mispredictTick, kPolyGrav, kPolyDt, kPolyGroundY, kPolyHSearch,
+                                        kPolyMu, kPolyIters);
+        check(rolledBack.size() == authority.size() &&
+              std::memcmp(rolledBack.data(), authority.data(),
+                          authority.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR7 rollback: corrected to authority BIT-EXACT (positive control)");
+        const std::vector<grain::GrainParticle> mispredicted =
+            grain::RunGrainPolyLockstep(init, noSpheres, mispredictStream, ticks, kPolyGrav, kPolyDt,
+                                        kPolyGroundY, kPolyHSearch, kPolyMu, kPolyIters);
+        check(mispredicted.size() == authority.size() &&
+              std::memcmp(mispredicted.data(), authority.data(),
+                          authority.size() * sizeof(grain::GrainParticle)) != 0,
+              "GR7 rollback: mispredicted state DIFFERS from authority (negative control)");
+
+        // The snapshot COVERS the radius array (radius is a first-class GrainParticle field): mutate a
+        // grain's radius after snapshotting, restore, and the ORIGINAL radius is back byte-for-byte.
+        std::vector<grain::GrainParticle> ps = authority;
+        const std::vector<grain::GrainParticle> snap = grain::SnapshotGrain(ps);
+        ps[3].radius = FromInt(9);                             // corrupt a radius (not just positions)
+        ps[3].pos.x += FromInt(1);
+        grain::RestoreGrain(ps, snap);
+        check(ps.size() == snap.size() &&
+              std::memcmp(ps.data(), snap.data(), snap.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR7 snapshot: SnapshotGrain/RestoreGrain round-trips the per-grain RADIUS bit-exactly");
+    }
+
     if (g_fail == 0) std::printf("grain_test: ALL PASS\n");
     else std::printf("grain_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

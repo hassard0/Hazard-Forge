@@ -1020,5 +1020,272 @@ inline std::vector<math::Mat4> GrainToRenderInstances(const std::vector<GrainPar
     return out;
 }
 
+// ===== Slice GR7 — POLYDISPERSE GRANULAR MATERIAL (mixed grain sizes; the Track-R R6 refinement) =========
+// FLAGSHIP #10 shipped with the DOCUMENTED caveat "monodisperse grains" — every grain in a pool shares one
+// radius. GR7 closes it: PER-GRAIN radii (gravel + sand in ONE pile) with mixed-size contact resolution and
+// r^3 mass asymmetry, bit-exact + lockstep-replayable. ALL APPEND-ONLY below GR6 (GR1-GR6 byte-unchanged),
+// pure integer, NO float on the sim path. The CL7 (cloth self-collision) Track-R mold.
+//
+// THE HONEST ARCHITECTURAL FINDING (documented, not hidden): the GR3/GR4 solver was ALREADY written
+// pair-generally — SolveGrainContact/SolveGrainFriction project at pen = (r_i + r_j) − |p_i − p_j| and weight
+// by fxdiv(w_i, w_i + w_j) (grain.h:510/716), and GrainParticle carried a first-class per-grain `radius` +
+// `invMass` since the GR1 beachhead ("the buffer layout is FINAL from the beachhead", grain.h:79). What was
+// MISSING for polydisperse is exactly three things, which GR7 adds:
+//   (1) THE POOL: no builder ever ASSIGNED mixed radii or SIZE-DEPENDENT masses — every GR1-GR6 scene sets
+//       radius = const, invMass = kOne (a 50/50 contact split even for gravel-vs-sand). GR7 adds the
+//       deterministic index-hash size-class assignment (AssignGrainPolyRadii — the pcg.h::PcgHash convention)
+//       + the EXACT integer r^3 inverse-mass (PolyInvMass: mass ∝ r^3, so a big grain pushes a small grain
+//       ~(r_big/r_small)^3 times further than vice versa — the physical asymmetry).
+//   (2) THE BROADPHASE CONTRACT: GR2's grid cell size == hSearch and the fixed 27-cell stencil; the box
+//       accept is per-axis |d| < hSearch. A pair in contact has |d| per axis < r_i + r_j <= 2*r_max, so the
+//       stencil reaches EVERY contact iff hSearch >= 2*r_max (the LARGEST pair sum, r_max + r_max). Mono
+//       callers eyeballed this ("caller asserts hSearch >= 2*maxRadius"); polydisperse makes it structural:
+//       StepGrainPoly WIDENS hSearch to max(hSearch, 2*MaxGrainRadius(pool)) — a deterministic clamp, the
+//       documented choice (widen the EXISTING cell size, NOT a new stencil: cell size == the search radius
+//       keeps the 27-stencil complete, the FL2/GR2 cell-size==h argument verbatim).
+//   (3) THE PROOFS + HARNESS: StepGrainPoly / RunGrainPolyLockstep / RunGrainPolyRollback (the GR5 mold) +
+//       the polydisperse metrics (min pair separation, size-split mean heights, max speed) + GrainDigest.
+//
+// THE IDENTITY-AT-UNIFORM DISCIPLINE (the identity-at-zero twin, THE key append-only proof): all radii equal
+// r0 -> AssignGrainPolyRadii sets invMass = PolyInvMass(r0, r0) == kOne EXACTLY (fxdiv(x, x) == kOne for any
+// x > 0) -> the poly pool is BYTE-IDENTICAL to the mono pool, and StepGrainPoly (with hSearch already >=
+// 2*r_max, so the widen is a no-op) delegates to the UNTOUCHED StepGrainFriction -> BIT-IDENTICAL to the
+// monodisperse GR4 step (and RunGrainPolyLockstep == RunGrainLockstep through the harness).
+//
+// SNAPSHOT / LOCKSTEP SHAPE (documented deviation from "extend the snapshot"): the per-grain radius is a
+// first-class GrainParticle field (GR1), so SnapshotGrain/RestoreGrain (a deep vector copy) ALREADY carry the
+// radius array losslessly — NO new snapshot type is needed and GR5's machinery is reused VERBATIM (read-only;
+// the GR7 harness functions below are the additive twins over StepGrainPoly, GR5's own functions untouched).
+//
+// GPU CHOICE (documented): PURE CPU on BOTH backends (the GR5/FL5/CL7-reference precedent for Track-R
+// refinements). The GR3/GR4 GPU shaders (grain_contact_dp/grain_friction, Vulkan-only int64) already read the
+// per-grain radius + invMass from the 48-byte GrainParticle SSBO — the math generalizes — but the poly slice
+// ships the CPU-both-backends proof (byte-identical cross-backend BY CONSTRUCTION, zero new shaders/RHI); a
+// GPU poly showcase is a mechanical follow-up, not a correctness gap.
+//
+// HONEST CAVEATS: the Jacobi contact residual stays nonzero (the GR3/FL4 caveat — the tests pin the exact
+// LSB residual, the CL7 honesty precedent); size SEGREGATION ("Brazil-nut") is an emergent, shaking-driven
+// statistic — in a small settled pour the big/small mean heights land near-equal (pinned honestly below, NOT
+// forced); fxdiv truncation makes the pair share split sum to kOne − 1 LSB for unequal masses (documented).
+
+// ----- GrainPolyHash: the deterministic seeded index hash (the pcg.h::PcgHash body VERBATIM) -------------
+// A fixed uint32 wrapping xorshift/multiply avalanche over (seed, index) — pure uint32 arithmetic (defined +
+// identical on every vendor/compiler), NO RNG, NO clock, NO float. A LOCAL COPY of engine/pcg/pcg.h::PcgHash
+// (the CL7 "local twin" convention — grain.h stays self-contained; pcg.h is not included mid-family). The
+// size-class assignment is classRadii[GrainPolyHash(seed, i) % n] — replay-stable per (seed, index).
+inline uint32_t GrainPolyHash(uint32_t seed, uint32_t index) {
+    uint32_t h = seed * 2654435761u;               // Knuth multiplicative
+    h ^= (index + 0x9E3779B9u + (h << 6) + (h >> 2));
+    h += index * 0x85EBCA6Bu;
+    h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; h *= 0x297A2D39u; h ^= h >> 15;
+    return h;
+}
+
+// ----- PolyInvMass: the EXACT integer r^3 inverse mass (mass ∝ radius^3, unit mass at refRadius) ---------
+// invMass(r) = (refRadius^3) / (r^3) in Q16.16: cube = fxmul(fxmul(r, r), r) (each fxmul the int64
+// intermediate >> kFrac, TRUNCATING toward -inf — the documented rounding: the cube of a sub-LSB-exact radius
+// is exact when r's square has no bits below 2^-16, e.g. kOne/4 and kOne/2 cube exactly to 1024 / 8192), then
+// fxdiv(refCube, cube) (int64 (a<<kFrac)/b, truncating toward zero). IDENTITY: r == refRadius -> fxdiv(x, x)
+// == kOne EXACTLY for any x > 0 (the identity-at-uniform anchor). r or refRadius <= 0, or a zero cube ->
+// invMass 0 (deterministic degenerate: the grain is STATIC — an honest guard, not a physics claim). With
+// refRadius = the SMALLEST class radius, the smallest grain has unit mass and bigger grains are heavier
+// (invMass < kOne): a big grain pushes a small grain (r_b/r_s)^3 times further than vice versa.
+inline fx PolyInvMass(fx radius, fx refRadius) {
+    if (radius <= 0 || refRadius <= 0) return 0;
+    const fx cube = fxmul(fxmul(radius, radius), radius);
+    const fx refCube = fxmul(fxmul(refRadius, refRadius), refRadius);
+    if (cube <= 0 || refCube <= 0) return 0;
+    return fxdiv(refCube, cube);
+}
+
+// ----- AssignGrainPolyRadii: deterministic index-hash size-class assignment over an EXISTING pool --------
+// For each NON-STATIC grain i: radius = classRadii[GrainPolyHash(seed, i) % classRadii.size()], invMass =
+// PolyInvMass(radius, min(classRadii)) (the smallest class is the unit mass). Static grains (kFlagStatic)
+// are UNTOUCHED (boundary grains keep their authored radius + invMass 0). Empty classRadii -> no-op
+// (deterministic). Class MIX is encoded by repetition: {small, small, big} -> 2/3 small + 1/3 big (mod 3).
+// Pure integer + uint32 hash; the same (pool, classRadii, seed) always yields the same byte-identical pool.
+inline void AssignGrainPolyRadii(std::vector<GrainParticle>& grains, const std::vector<fx>& classRadii,
+                                 uint32_t seed) {
+    const uint32_t n = (uint32_t)classRadii.size();
+    if (n == 0) return;
+    fx refRadius = classRadii[0];
+    for (uint32_t c = 1; c < n; ++c)
+        if (classRadii[c] < refRadius) refRadius = classRadii[c];
+    const uint32_t count = (uint32_t)grains.size();
+    for (uint32_t i = 0; i < count; ++i) {
+        GrainParticle& p = grains[(size_t)i];
+        if (p.flags & kFlagStatic) continue;          // boundary grains hold their authored radius/mass
+        p.radius  = classRadii[GrainPolyHash(seed, i) % n];
+        p.invMass = PolyInvMass(p.radius, refRadius);
+    }
+}
+
+// ----- InitGrainPolyBlock: the polydisperse dropped block (the GR1 lattice + hash-assigned sizes) --------
+// InitGrainBlock (the GR1 builder VERBATIM — block.radius is the pre-assignment placeholder) then
+// AssignGrainPolyRadii. IDENTITY: classRadii == {block.radius} (one class) -> every grain gets radius ==
+// block.radius + invMass == kOne -> BYTE-IDENTICAL to InitGrainBlock (the identity-at-uniform pool proof).
+// NON-OVERLAP CONTRACT: the caller picks block.spacing >= 2*max(classRadii) so even two adjacent LARGEST
+// grains start non-overlapping (the GR1 "spacing >= 2*radius" contract at the max class).
+inline std::vector<GrainParticle> InitGrainPolyBlock(const GrainBlock& block,
+                                                     const std::vector<fx>& classRadii, uint32_t seed) {
+    std::vector<GrainParticle> grains = InitGrainBlock(block);
+    AssignGrainPolyRadii(grains, classRadii, seed);
+    return grains;
+}
+
+// ----- MaxGrainRadius: the pool's largest radius (the broadphase-contract input) --------------------------
+inline fx MaxGrainRadius(const std::vector<GrainParticle>& grains) {
+    fx r = 0;
+    for (const GrainParticle& p : grains)
+        if (p.radius > r) r = p.radius;
+    return r;
+}
+
+// ----- StepGrainPoly: one polydisperse contact+friction step (the broadphase contract made structural) ----
+// THE ONE STEP DELTA vs GR4: the GR2 grid cell size / search radius is WIDENED to cover the largest pair sum
+// — hSearch' = max(hSearch, 2*MaxGrainRadius(grains)) — then the UNTOUCHED GR4 StepGrainFriction runs (its
+// SolveGrainContact/SolveGrainFriction already project at (r_i + r_j) with fxdiv(w_i, w_i+w_j) weighting, so
+// mixed radii + r^3 masses are consumed pair-generally with ZERO solver changes). WHY sufficient: a contact
+// pair satisfies |p_i − p_j| < r_i + r_j <= 2*r_max <= hSearch' per axis, so the GR2 box accept at cell size
+// hSearch' (the 27-cell stencil, cell size == search radius) NEVER misses a contact — the FL2/GR2
+// cell-size==h completeness argument at the polydisperse maximum. The widen is a pure integer max ->
+// deterministic; when the caller already passes hSearch >= 2*r_max (every mono scene) it is a NO-OP and
+// StepGrainPoly is BIT-IDENTICAL to StepGrainFriction (the identity-at-uniform step proof). Returns the
+// collider contact count (the GR4 semantics).
+inline int StepGrainPoly(std::vector<GrainParticle>& grains,
+                         const std::vector<GrainSphereCollider>& spheres, const FxVec3& gravity, fx dt,
+                         fx groundY, fx hSearch, fx mu, int iters) {
+    const fx dMax = 2 * MaxGrainRadius(grains);       // the largest pair sum r_max + r_max
+    const fx hPoly = hSearch > dMax ? hSearch : dMax; // widen the cell size to reach every contact
+    return StepGrainFriction(grains, spheres, gravity, dt, groundY, hPoly, mu, iters);
+}
+
+// ----- StepGrainPolySteps: run K polydisperse steps (the showcase / K-step driver) ------------------------
+inline int StepGrainPolySteps(std::vector<GrainParticle>& grains,
+                              const std::vector<GrainSphereCollider>& spheres, const FxVec3& gravity,
+                              fx dt, fx groundY, fx hSearch, fx mu, int iters, int steps) {
+    int contacts = 0;
+    for (int s = 0; s < steps; ++s)
+        contacts = StepGrainPoly(grains, spheres, gravity, dt, groundY, hSearch, mu, iters);
+    return contacts;
+}
+
+// ----- SimGrainPolyTick / RunGrainPolyLockstep / RunGrainPolyRollback: the GR5 harness over the poly step -
+// The GR5 machinery applies VERBATIM (GrainCommand / ApplyGrainCommand / SnapshotGrain / RestoreGrain reused
+// read-only — the snapshot ALREADY carries the per-grain radius, a first-class GrainParticle field); only the
+// step fn is swapped (StepGrainFriction -> StepGrainPoly), the CL7 RunClothLockstepSelf mold. A peer fed the
+// input stream alone re-derives the MIXED-SIZE pile bit-for-bit; uniform radii -> identical to
+// SimGrainTick/RunGrainLockstep by the identity-at-uniform.
+inline void SimGrainPolyTick(std::vector<GrainParticle>& grains,
+                             const std::vector<GrainSphereCollider>& spheres,
+                             const std::vector<GrainCommand>& stream, uint32_t tick,
+                             const FxVec3& gravity, fx dt, fx groundY, fx hSearch, fx mu, int iters) {
+    for (const GrainCommand& c : stream)
+        if (c.tick == tick) ApplyGrainCommand(grains, c);
+    StepGrainPoly(grains, spheres, gravity, dt, groundY, hSearch, mu, iters);
+}
+
+inline std::vector<GrainParticle> RunGrainPolyLockstep(const std::vector<GrainParticle>& init,
+                                                       const std::vector<GrainSphereCollider>& spheres,
+                                                       const std::vector<GrainCommand>& stream, int ticks,
+                                                       const FxVec3& gravity, fx dt, fx groundY, fx hSearch,
+                                                       fx mu, int iters) {
+    std::vector<GrainParticle> grains = init;
+    for (int t = 0; t < ticks; ++t)
+        SimGrainPolyTick(grains, spheres, stream, (uint32_t)t, gravity, dt, groundY, hSearch, mu, iters);
+    return grains;
+}
+
+inline std::vector<GrainParticle> RunGrainPolyRollback(const std::vector<GrainParticle>& init,
+                                                       const std::vector<GrainSphereCollider>& spheres,
+                                                       const std::vector<GrainCommand>& authStream,
+                                                       const std::vector<GrainCommand>& mispredictStream,
+                                                       int ticks, int mispredictTick,
+                                                       const FxVec3& gravity, fx dt, fx groundY, fx hSearch,
+                                                       fx mu, int iters) {
+    std::vector<GrainParticle> grains = init;
+    for (int t = 0; t < mispredictTick; ++t)
+        SimGrainPolyTick(grains, spheres, authStream, (uint32_t)t, gravity, dt, groundY, hSearch, mu, iters);
+    const std::vector<GrainParticle> snap = SnapshotGrain(grains);
+    int specTicks = ticks - mispredictTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimGrainPolyTick(grains, spheres, mispredictStream, (uint32_t)(mispredictTick + s),
+                         gravity, dt, groundY, hSearch, mu, iters);
+    RestoreGrain(grains, snap);
+    for (int t = mispredictTick; t < ticks; ++t)
+        SimGrainPolyTick(grains, spheres, authStream, (uint32_t)t, gravity, dt, groundY, hSearch, mu, iters);
+    return grains;
+}
+
+// ----- GrainPolyMinSeparation: the deterministic min pair separation (the CL7 MinSelfDistance twin) -------
+// min over ALL unordered pairs (i < j) of FxLength(p_i − p_j) − (r_i + r_j), in Q16.16 LSBs. NEGATIVE ==
+// residual pair penetration (the deepest); the tests pin the exact honest LSB residual (the Jacobi solve is
+// iterative — the CL7/GR3 honesty precedent: relieved + pinned, NOT zero). Deliberately BRUTE-FORCE O(n^2)
+// (a test/diagnostic helper, NOT the sim path) so the metric does NOT share the GR2 grid broadphase with the
+// solver — a broadphase reach bug shows up HERE. < 2 grains -> INT32_MAX (deterministic sentinel).
+inline fx GrainPolyMinSeparation(const std::vector<GrainParticle>& grains) {
+    const uint32_t n = (uint32_t)grains.size();
+    fx best = INT32_MAX;
+    for (uint32_t i = 0; i < n; ++i)
+        for (uint32_t j = i + 1u; j < n; ++j) {
+            const FxVec3 d = FxSub(grains[(size_t)i].pos, grains[(size_t)j].pos);
+            const fx sep = FxLength(d) - (grains[(size_t)i].radius + grains[(size_t)j].radius);
+            if (sep < best) best = sep;
+        }
+    return best;
+}
+
+// ----- MaxGrainSpeed: the deterministic max |vel| over the pool (the settled/at-rest bound) ---------------
+inline fx MaxGrainSpeed(const std::vector<GrainParticle>& grains) {
+    fx best = 0;
+    for (const GrainParticle& p : grains) {
+        const fx s = FxLength(p.vel);
+        if (s > best) best = s;
+    }
+    return best;
+}
+
+// ----- MeasureGrainSizeHeights: the size-split mean-height metric (the HONEST segregation statistic) ------
+// Splits the pool at `splitRadius` (radius >= splitRadius -> LARGE, else SMALL) and returns the int64-
+// accumulated integer mean pos.y of each class (+ the class counts). The "Brazil-nut" size segregation is an
+// EMERGENT, shaking-driven statistic — a small settled pour lands near-equal means; the tests PIN the exact
+// deterministic values and report them honestly (the load-bearing proofs are non-penetration + rest + the
+// r^3 mass-weighted split, NOT a forced segregation claim). Empty class -> mean 0 (deterministic degenerate).
+struct GrainSizeHeights { fx meanYLarge = 0; fx meanYSmall = 0; int nLarge = 0; int nSmall = 0; };
+inline GrainSizeHeights MeasureGrainSizeHeights(const std::vector<GrainParticle>& grains, fx splitRadius) {
+    GrainSizeHeights out;
+    int64_t sumLarge = 0, sumSmall = 0;
+    for (const GrainParticle& p : grains) {
+        if (p.radius >= splitRadius) { sumLarge += (int64_t)p.pos.y; ++out.nLarge; }
+        else                         { sumSmall += (int64_t)p.pos.y; ++out.nSmall; }
+    }
+    if (out.nLarge > 0) out.meanYLarge = (fx)(sumLarge / (int64_t)out.nLarge);
+    if (out.nSmall > 0) out.meanYSmall = (fx)(sumSmall / (int64_t)out.nSmall);
+    return out;
+}
+
+// ----- GrainDigest: the deterministic FNV-1a-64 digest of the whole grain state (the pin) -----------------
+// Hashes every grain's 12 int32 words FIELD-WISE (pos/prev/vel/invMass/radius/flags, little-endian byte order
+// by explicit shifts — NO reinterpret_cast, so the digest is layout/padding-independent and identical on
+// every compiler/platform). The golden-discipline pin the GR7 tests + showcases print (the cloth.h::
+// ClothDigest twin over GrainParticle — note the GR7-specific 12th word: the per-grain radius IS digested).
+inline uint64_t GrainDigest(const std::vector<GrainParticle>& grains) {
+    uint64_t h = 1469598103934665603ull;                    // FNV-1a 64 offset basis
+    auto mix = [&h](uint32_t v) {
+        for (int b = 0; b < 4; ++b) {
+            h ^= (uint64_t)((v >> (b * 8)) & 0xFFu);
+            h *= 1099511628211ull;                          // FNV-1a 64 prime
+        }
+    };
+    for (const GrainParticle& p : grains) {
+        mix((uint32_t)p.pos.x);  mix((uint32_t)p.pos.y);  mix((uint32_t)p.pos.z);
+        mix((uint32_t)p.prev.x); mix((uint32_t)p.prev.y); mix((uint32_t)p.prev.z);
+        mix((uint32_t)p.vel.x);  mix((uint32_t)p.vel.y);  mix((uint32_t)p.vel.z);
+        mix((uint32_t)p.invMass); mix((uint32_t)p.radius); mix(p.flags);
+    }
+    return h;
+}
+
 }  // namespace grain
 }  // namespace hf::sim

@@ -599,6 +599,7 @@ int main(int argc, char** argv) {
     const char* grainContactShotPath = nullptr; // --grain-contact-shot <out.bmp> (Slice GR3: Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION, the 3rd slice of FLAGSHIP #10, the FL4 Jacobi-solve twin — a dropped grain block over the ground + a static FxBody sphere is settled into a LOOSE frictionless HEAP by StepGrainContactSteps K steps x iters JACOBI contact iterations (predict[GR1] -> GR2 neighbours[rebuilt from the predicted positions] -> {SolveGrainContact(Δp_i = Σ (w_i/(w_i+w_j))·pen·unit(p_i−p_j) over the overlapping neighbours, into a SEPARATE dp buffer) -> apply p+=dp}×iters -> vel=(pos-prev)/dt -> CollideGrainPlane(pos.y>=groundY+radius)+CollideGrainSpheres(centre->sphereR+grainR)). The K-step loop is HOST-driven over MULTI-THREAD per-grain passes (grain_contact_dp + grain_contact_apply + grain_collide, ONE thread per grain, ComputeToComputeBarrier between — Jacobi -> NO atomics, NO single-thread, NO TDR), int64 -> Vulkan-only; Metal runs the CPU StepGrainContact. GPU==CPU grain array bit-exact vs grain.h::StepGrainContactSteps, a deterministic penetration metric RELIEVED (penAfter < penBefore, the FL4 honesty — not zero), integer side-view of the settled loose pile. NO friction (GR4 — the pile spreads flat), NO lockstep (GR5), NO float render (GR6))
     const char* grainFrictionShotPath = nullptr; // --grain-friction-shot <out.bmp> (Slice GR4: Deterministic GPU Granular/Sand TANGENTIAL COULOMB FRICTION — the angle-of-repose money-shot, the SIGNATURE slice of FLAGSHIP #10. A 5x5x5 staggered grain block dropped onto FLAT ground (NO collider sphere — friction alone holds the heap) is settled into a self-supporting CONE by StepGrainFrictionSteps K steps x iters JACOBI iterations, EACH adding a TANGENTIAL friction sub-pass (grain_friction Δp_i = Σ −share·corr where corr is the tangential relative displacement Δx_t clamped to the Coulomb cone fxmul(μ,pen)) after the GR3 NORMAL push (grain_contact_dp -> apply): {grain_contact_dp -> apply -> grain_friction -> apply}×iters -> vel -> grain_collide. The K-step loop is HOST-driven over MULTI-THREAD per-grain passes; GPU==CPU grain array bit-exact vs grain.h::StepGrainFrictionSteps (memcmp). The HONEST slope-stability metric (MeasureGrainRepose {height,baseRadius,slope}): the repose angle is EMERGENT + deterministic + two-run byte-identical, slope clearly > the μ=0 frictionless control, within a μ-implied band — NOT an exact degree. int64 -> grain_friction Vulkan-only; Metal --grain-friction runs the CPU StepGrainFriction. REUSES grain_contact_apply + grain_collide (GR3). NO lockstep (GR5), NO float render (GR6), NO new RHI)
     const char* grainLockstepShotPath = nullptr; // --grain-lockstep-shot <out.bmp> (Slice GR5: Deterministic GPU Granular/Sand LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #10 — PURE-CPU harness over the GR1-GR4 granular sim WITH friction (the FL5/CL5/FPX5 twin): a 5x5x5 staggered grain block (the GR4 friction scene, μ=0.8) fed a scripted wind/push command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-grain-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
+    const char* gr7PolyShotPath = nullptr; // --gr7-poly-shot <out.bmp> (Slice GR7: POLYDISPERSE GRANULAR MATERIAL, the Track-R R6 refinement closing FLAGSHIP #10's documented "monodisperse grains" caveat — PURE-CPU on BOTH backends (the GR5/CL7 Track-R precedent; NO GPU dispatch, NO new shader, NO new RHI): a staggered 5x5x5 MIXED-SIZE pour (2/3 small r=0.25 + 1/3 big r=0.5 assigned by the deterministic index hash seed 7, EXACT r^3 inverse masses via PolyInvMass — big grains 8x heavier so gravel shoves sand ~8x further, the physical asymmetry) settles K=280 steps x iters=4 via StepGrainPolySteps (the GR4 friction step with the broadphase contract made structural: hSearch widened to >= 2*maxRadius, the largest pair sum) onto a STATIC ROUGH BED of 1089 boundary grains (the honest scene finding: the family has NO grain-floor tangential friction, so a bare-floor pour never rests — the rough bed arrests sliders via GR4 grain-grain friction, zero new physics). Proofs: IDENTITY-AT-UNIFORM (all radii equal -> StepGrainPoly BIT-IDENTICAL to the mono GR4 StepGrainFriction), determinism (two runs byte-identical), rest (every dynamic grain < 0.5 u/s at the settle step) + the pinned honest Jacobi residual. Integer strict-zero side-view golden (bed dim gray, small grains sand 5px, big grains orange 9px — color-coded by SIZE CLASS); stat line = grains/sizes/steps/digest/minPairResidual; identical to the Metal --gr7-poly by construction)
     const char* pt5LockstepShotPath = nullptr; // --pt5-lockstep-shot <out.bmp> (Slice PT5: Deterministic GPU Particles LOCKSTEP + ROLLBACK proof, the NETCODE HEADLINE of FLAGSHIP #19 — PURE-CPU harness over the bit-exact PT4 StepParticles (the GR5/FL5/CL5/FPX5 twin): the PT4 fountain scene (emitter + vortex field + ground + 2 spheres, capacity 240, T 240) fed a scripted ParticleCommand stream (a kCmdGust shoves the spray sideways + a kCmdBurst puff); authority==replica BIT-EXACT inputs-only (ParticleStatesEqual over particles+freeList+spawnCursor+tick) + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged) + snapshot-completeness control (omit freeList/spawnCursor -> diverges); converged-pool side-view golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* fluidNeighborsShotPath = nullptr; // --fluid-neighbors-shot <out.bmp> (Slice FL2: Deterministic GPU Fluid GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #9 — the FL1 1000-particle dam-break block bucketed into a uniform spatial-hash grid (BuildCellTable) + a per-particle 27-cell-stencil candidate NEIGHBOR LIST (BuildNeighborList) via PURE-INT32 count->scan->emit (fluid_cell_{count,scan,emit} + fluid_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-particle neighbor-count heat viz; NO density/kernel (FL3), NO radial r<h cull)
     const char* fluidDensityShotPath = nullptr; // --fluid-density-shot <out.bmp> (Slice FL3, the MAKE-OR-BREAK of FLAGSHIP #9: Deterministic GPU Fluid PBF DENSITY + λ — the FL1 dam-break block (settled) -> BuildNeighborList (FL2) -> BuildKernelTable (host-snapped Q16.16 poly6/spiky LUT) -> ComputeDensity (ρ_i = W[0] + Σ W[bin(r²)] over neighbours, int64 r²) -> ComputeLambda (λ_i = −C_i/(Σ|∇C_i|²+ε), C_i = ρ_i/ρ0−1, unilateral clamp) by fluid_density.comp + fluid_lambda.comp (ONE thread per particle, int64 -> Vulkan-only; Metal runs the CPU reference). GPU==CPU ρ+λ bit-exact, per-particle density heat viz; the only genuinely fluid-specific slice. NO PBF position solve (FL4))
@@ -1428,6 +1429,18 @@ int main(int argc, char** argv) {
         // --shot else-if chain) to avoid MSVC's nested-block parse limit (the FPX5/CL5/FL5 lesson).
         if (std::strcmp(argv[i], "--grain-lockstep-shot") == 0 && i + 1 < argc) {
             grainLockstepShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice GR7: --gr7-poly-shot <out.bmp> — POLYDISPERSE GRANULAR MATERIAL (the Track-R R6 refinement,
+        // closes the documented "monodisperse grains" caveat of FLAGSHIP #10). PURE CPU on BOTH backends:
+        // runs the grain.h GR7 poly step (StepGrainPolySteps — mixed radii, r^3 masses, the widened
+        // broadphase) over the rough-bed mixed-pour scene, asserts identity-at-uniform + determinism + the
+        // rest/residual bounds, writes the size-class-coded integer side-view golden. NO GPU dispatch, NO
+        // new shader, NO new RHI. STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's
+        // nested-block parse limit (the FPX5/CL5/FL5/GR5 lesson).
+        if (std::strcmp(argv[i], "--gr7-poly-shot") == 0 && i + 1 < argc) {
+            gr7PolyShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -41100,6 +41113,188 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — grain lockstep+rollback converged state (%d grain px)\n",
                                 grainLockstepShotPath, imgW, imgH, grainPx);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", grainLockstepShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- POLYDISPERSE GRANULAR MATERIAL (--gr7-poly-shot <out.bmp>, Slice GR7, the Track-R R6
+        // refinement — closes FLAGSHIP #10's documented "monodisperse grains" caveat). PURE CPU — NO GPU
+        // dispatch, NO new shader, NO new RHI; both Vulkan-Windows and Metal-Mac run the IDENTICAL CPU
+        // GR7 step (grain.h::StepGrainPolySteps) so the settled-pile golden is bit-identical cross-backend
+        // BY CONSTRUCTION (the GR5/CL7 Track-R convention). The scene (== tests/grain_test.cpp's GR7
+        // mixed-pour): a staggered 5x5x5 POLYDISPERSE block — 2/3 small r=0.25 + 1/3 big r=0.5 by index
+        // hash (seed 7), EXACT r^3 inverse masses (big grains 8x heavier) — poured gently onto a STATIC
+        // ROUGH BED of 1089 boundary grains (the family has no grain-floor friction; the bed arrests
+        // sliders via GR4 grain-grain friction so the pour SETTLES — the honest scene finding, zero new
+        // physics). Proofs: identity-at-uniform, determinism, rest + the pinned honest Jacobi residual.
+        // Golden: the size-class-coded integer side-view. (STANDALONE branch — the MSVC C1061 lesson.)
+        if (gr7PolyShotPath) {
+            namespace grain = hf::sim::grain;
+
+            const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const grain::fx kDt = grain::kOne / 60;
+            const grain::fx kGroundY = 0;
+            const grain::FxVec3 kGravity{0, kGravY, 0};
+            const grain::fx kSmallR = grain::kOne / 4;        // the small class (sand), r = 0.25
+            const grain::fx kBigR = grain::kOne / 2;          // the big class (gravel), r = 0.5
+            const grain::fx kStagger = (grain::fx)(0.12 * (double)grain::kOne + 0.5);
+            const grain::fx kHSearch = grain::kOne * 2;       // >= 2*r_max = 1.0 (the poly widen is a no-op)
+            const grain::fx kMu = grain::kGrainMu;            // 0.8 grain-grain Coulomb friction
+            const uint32_t kSeed = 7u;
+            const int kSide = 5;                              // 5x5x5 -> 125 dynamic grains
+            const int kDynamic = kSide * kSide * kSide;
+            const int kIters = 4;
+            const int kSteps = 280;                           // the pinned settle step
+            const int kSizeClasses = 2;
+
+            // The mixed pour + the static rough bed (dynamic grains FIRST, indices 0..124).
+            auto buildScene = [&]() {
+                std::vector<grain::GrainParticle> ps;
+                for (int iy = 0; iy < kSide; ++iy)
+                    for (int iz = 0; iz < kSide; ++iz)
+                        for (int ix = 0; ix < kSide; ++ix) {
+                            grain::GrainParticle p;
+                            const grain::fx ox = (iy & 1) ? kStagger : 0, oz = (iy & 1) ? kStagger : 0;
+                            p.pos = grain::FxVec3{(grain::fx)(ix * (int)grain::kOne) + ox,
+                                                  (grain::fx)((1 + iy) * (int)grain::kOne),
+                                                  (grain::fx)(iz * (int)grain::kOne) + oz};
+                            p.prev = p.pos; p.invMass = grain::kOne; p.radius = kSmallR; p.flags = 0;
+                            ps.push_back(p);
+                        }
+                grain::AssignGrainPolyRadii(ps, {kSmallR, kSmallR, kBigR}, kSeed);   // 2/3 small + 1/3 big
+                for (int gx = -12; gx <= 20; ++gx)
+                    for (int gz = -12; gz <= 20; ++gz) {
+                        grain::GrainParticle w;
+                        w.pos = grain::FxVec3{(grain::fx)(gx * (int)(grain::kOne / 2)), grain::kOne / 4,
+                                              (grain::fx)(gz * (int)(grain::kOne / 2))};
+                        w.prev = w.pos; w.vel = grain::FxVec3{0, 0, 0};
+                        w.invMass = 0; w.radius = kSmallR; w.flags = grain::kFlagStatic;
+                        ps.push_back(w);
+                    }
+                return ps;
+            };
+            const std::vector<grain::GrainParticle> init = buildScene();
+            const int kGrainCount = (int)init.size();
+            const std::vector<grain::GrainSphereCollider> noSpheres;
+
+            // PROOF (1) IDENTITY-AT-UNIFORM: all radii equal -> StepGrainPoly == the mono GR4
+            // StepGrainFriction BIT-IDENTICAL (THE key append-only proof — GR1-GR6 are byte-unchanged and
+            // the poly step degenerates to them exactly).
+            {
+                grain::GrainBlock ub; ub.W = 4; ub.H = 4; ub.D = 4; ub.spacing = grain::kOne;
+                ub.radius = kBigR; ub.origin = grain::FxVec3{0, 3 * (int)grain::kOne, 0};
+                std::vector<grain::GrainParticle> uPoly = grain::InitGrainPolyBlock(ub, {ub.radius}, kSeed);
+                std::vector<grain::GrainParticle> uMono = grain::InitGrainBlock(ub);
+                if (uPoly.size() != uMono.size() ||
+                    std::memcmp(uPoly.data(), uMono.data(), uMono.size() * sizeof(grain::GrainParticle)) != 0) {
+                    std::fprintf(stderr, "FATAL: gr7-poly identity: one-class InitGrainPolyBlock != InitGrainBlock\n");
+                    device->WaitIdle(); return 1;
+                }
+                grain::StepGrainPolySteps(uPoly, noSpheres, kGravity, kDt, kGroundY, kHSearch, kMu, kIters, 30);
+                grain::StepGrainFrictionSteps(uMono, noSpheres, kGravity, kDt, kGroundY, kHSearch, kMu, kIters, 30);
+                if (std::memcmp(uPoly.data(), uMono.data(), uMono.size() * sizeof(grain::GrainParticle)) != 0) {
+                    std::fprintf(stderr, "FATAL: gr7-poly identity-at-uniform: poly step != mono GR4 step\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("gr7-poly identity-at-uniform: uniform radii -> poly == mono GR4 BIT-IDENTICAL\n");
+            }
+
+            // === The settle ===
+            std::vector<grain::GrainParticle> settled = init;
+            grain::StepGrainPolySteps(settled, noSpheres, kGravity, kDt, kGroundY, kHSearch, kMu, kIters, kSteps);
+
+            // PROOF (2) determinism: two full runs byte-identical.
+            {
+                std::vector<grain::GrainParticle> b = init;
+                grain::StepGrainPolySteps(b, noSpheres, kGravity, kDt, kGroundY, kHSearch, kMu, kIters, kSteps);
+                if (b.size() != settled.size() ||
+                    std::memcmp(b.data(), settled.data(), settled.size() * sizeof(grain::GrainParticle)) != 0) {
+                    std::fprintf(stderr, "FATAL: gr7-poly two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("gr7-poly determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) the pile SETTLES: every dynamic grain under 0.5 u/s at the pinned settle step, and
+            // the deepest pair penetration stays within the honest Jacobi residual band (the CL7 honesty:
+            // pinned + relieved, NOT zero).
+            const grain::fx kMinSep = grain::GrainPolyMinSeparation(settled);
+            {
+                const std::vector<grain::GrainParticle> dyn(settled.begin(), settled.begin() + kDynamic);
+                const grain::fx maxSpeed = grain::MaxGrainSpeed(dyn);
+                if (maxSpeed >= grain::kOne / 2) {
+                    std::fprintf(stderr, "FATAL: gr7-poly rest: max dynamic speed %d >= kOne/2 (not settled)\n",
+                                 (int)maxSpeed);
+                    device->WaitIdle(); return 1;
+                }
+                if (kMinSep < -4096) {
+                    std::fprintf(stderr, "FATAL: gr7-poly residual: min pair separation %d < -4096 LSBs "
+                                 "(deep interpenetration — a broadphase miss?)\n", (int)kMinSep);
+                    device->WaitIdle(); return 1;
+                }
+                const grain::GrainSizeHeights hts = grain::MeasureGrainSizeHeights(dyn, kBigR);
+                std::printf("gr7-poly settle: maxSpeed=%d LSBs/s, minPairSep=%d LSBs, meanY big=%d small=%d "
+                            "(%d big / %d small)\n", (int)maxSpeed, (int)kMinSep,
+                            (int)hts.meanYLarge, (int)hts.meanYSmall, hts.nLarge, hts.nSmall);
+            }
+
+            const uint64_t kDigest = grain::GrainDigest(settled);
+
+            // --- Golden: the PURE-INTEGER settled mixed-pile side-view, color-coded by SIZE CLASS (==
+            // the Metal --gr7-poly by construction). Bed grains dim gray (the static substrate), SMALL
+            // grains sand-colored 5px, BIG grains orange 9px (splats scale with the class radius) — gravel + sand in one pile. ---
+            const int kPxPerUnit = 14, kMargin = 20;
+            const int kXLo = -8, kWorldW = 20, kWorldH = 12;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            // SUB-UNIT pixel mapping (pure integer, strict-zero): world Q16.16 -> pixels via
+            // ((w − lo) · pxPerUnit) >> kFrac, so the half-unit bed lattice and the mixed-size mound
+            // render at 14 px/world-unit precision (the GR4 whole-unit truncation would collapse the
+            // 0.5-spaced bed onto integer columns and hide the size classes).
+            auto toPx = [&](grain::fx wxFx, grain::fx wyFx, int& cx, int& cy) {
+                const int64_t px =
+                    ((int64_t)(wxFx - (grain::fx)(kXLo * (int)grain::kOne)) * kPxPerUnit) >> grain::kFrac;
+                const int64_t py = ((int64_t)wyFx * kPxPerUnit) >> grain::kFrac;
+                cx = kMargin + (int)px;
+                cy = (int)imgH - kMargin - (int)py;
+            };
+            auto splat = [&](int cx, int cy, int size, uint8_t b, uint8_t g, uint8_t r) {
+                for (int dy = 0; dy < size; ++dy)
+                    for (int dx = 0; dx < size; ++dx) {
+                        const int ix = cx - size / 2 + dx, iy = cy - size / 2 + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = b; dst[1] = g; dst[2] = r; dst[3] = 255;
+                    }
+            };
+            int grainPx = 0;
+            // The static bed first (the substrate layer), then small, then big (the biggest on top).
+            // Splat sizes scale with the class radius (small d=0.5 -> 5 px, big d=1.0 -> 9 px @14px/unit).
+            for (int i = kDynamic; i < kGrainCount; ++i) {
+                int cx, cy; toPx(settled[(size_t)i].pos.x, settled[(size_t)i].pos.y, cx, cy);
+                splat(cx, cy, 3, 46, 40, 40); ++grainPx;                 // bed: dim gray
+            }
+            for (int i = 0; i < kDynamic; ++i) {
+                if (settled[(size_t)i].radius != kSmallR) continue;
+                int cx, cy; toPx(settled[(size_t)i].pos.x, settled[(size_t)i].pos.y, cx, cy);
+                splat(cx, cy, 5, 90, 170, 214); ++grainPx;               // small: warm sand
+            }
+            for (int i = 0; i < kDynamic; ++i) {
+                if (settled[(size_t)i].radius != kBigR) continue;
+                int cx, cy; toPx(settled[(size_t)i].pos.x, settled[(size_t)i].pos.y, cx, cy);
+                splat(cx, cy, 9, 60, 100, 230); ++grainPx;               // big: gravel orange
+            }
+            std::printf("gr7-poly: {grains:%d, dynamic:%d, sizes:%d, steps:%d, digest:0x%016llx, "
+                        "minPairResidual:%d}\n", kGrainCount, kDynamic, kSizeClasses, kSteps,
+                        (unsigned long long)kDigest, (int)kMinSep);
+            bool ok = WriteBMP(gr7PolyShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — polydisperse settled mixed pile (%d grain splats)\n",
+                                gr7PolyShotPath, imgW, imgH, grainPx);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gr7PolyShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

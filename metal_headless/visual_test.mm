@@ -30577,6 +30577,175 @@ static int RunGrainLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GR7 — POLYDISPERSE GRANULAR MATERIAL showcase (--gr7-poly) (the Track-R R6 refinement,
+// closes FLAGSHIP #10's documented "monodisperse grains" caveat). PURE CPU on BOTH backends — NO GPU
+// dispatch, NO new shader, NO new RHI: Vulkan-Windows (--gr7-poly-shot) and Metal-Mac run the IDENTICAL
+// CPU GR7 step (engine/sim/grain.h::StepGrainPolySteps — per-grain radii, EXACT r^3 inverse masses,
+// the broadphase widened to 2*maxRadius) so the settled-pile golden is bit-identical cross-backend BY
+// CONSTRUCTION (the GR5/CL7 Track-R convention). THE SCENE (== the Vulkan --gr7-poly-shot AND
+// tests/grain_test.cpp's GR7 mixed-pour, byte-identical): a staggered 5x5x5 POLYDISPERSE block — 2/3
+// small r=0.25 + 1/3 big r=0.5 by index hash (seed 7), big grains 8x heavier — poured gently (drop y=1)
+// onto a STATIC ROUGH BED of 1089 boundary grains (the honest scene finding: the family has NO
+// grain-floor tangential friction, so a bare-floor pour never rests; the rough bed arrests sliders via
+// GR4 grain-grain friction — zero new physics, only GR1 static grains + GR4 friction composed), settled
+// K=280 steps x iters=4. Proofs: identity-at-uniform (poly == mono GR4 BIT-IDENTICAL on uniform radii),
+// determinism, rest (every dynamic grain < 0.5 u/s at the pinned settle step) + the honest Jacobi
+// residual band. Golden: the size-class-coded integer side-view (bed dim gray, small sand 5px, big
+// orange 9px). New golden tests/golden/metal/gr7_poly.png; two runs DIFF 0.0000.
+static int RunGrainPolyShowcase(const char* outPath) {
+    namespace grain = hf::sim::grain;
+
+    const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const grain::fx kDt = grain::kOne / 60;
+    const grain::fx kGroundY = 0;
+    const grain::FxVec3 kGravity{0, kGravY, 0};
+    const grain::fx kSmallR = grain::kOne / 4;        // the small class (sand), r = 0.25
+    const grain::fx kBigR = grain::kOne / 2;          // the big class (gravel), r = 0.5
+    const grain::fx kStagger = (grain::fx)(0.12 * (double)grain::kOne + 0.5);
+    const grain::fx kHSearch = grain::kOne * 2;       // >= 2*r_max = 1.0 (the poly widen is a no-op)
+    const grain::fx kMu = grain::kGrainMu;            // 0.8 grain-grain Coulomb friction
+    const uint32_t kSeed = 7u;
+    const int kSide = 5;                              // 5x5x5 -> 125 dynamic grains
+    const int kDynamic = kSide * kSide * kSide;
+    const int kIters = 4;
+    const int kSteps = 280;                           // the pinned settle step
+    const int kSizeClasses = 2;
+
+    // The mixed pour + the static rough bed (dynamic grains FIRST, indices 0..124).
+    auto buildScene = [&]() {
+        std::vector<grain::GrainParticle> ps;
+        for (int iy = 0; iy < kSide; ++iy)
+            for (int iz = 0; iz < kSide; ++iz)
+                for (int ix = 0; ix < kSide; ++ix) {
+                    grain::GrainParticle p;
+                    const grain::fx ox = (iy & 1) ? kStagger : 0, oz = (iy & 1) ? kStagger : 0;
+                    p.pos = grain::FxVec3{(grain::fx)(ix * (int)grain::kOne) + ox,
+                                          (grain::fx)((1 + iy) * (int)grain::kOne),
+                                          (grain::fx)(iz * (int)grain::kOne) + oz};
+                    p.prev = p.pos; p.invMass = grain::kOne; p.radius = kSmallR; p.flags = 0;
+                    ps.push_back(p);
+                }
+        grain::AssignGrainPolyRadii(ps, {kSmallR, kSmallR, kBigR}, kSeed);   // 2/3 small + 1/3 big
+        for (int gx = -12; gx <= 20; ++gx)
+            for (int gz = -12; gz <= 20; ++gz) {
+                grain::GrainParticle w;
+                w.pos = grain::FxVec3{(grain::fx)(gx * (int)(grain::kOne / 2)), grain::kOne / 4,
+                                      (grain::fx)(gz * (int)(grain::kOne / 2))};
+                w.prev = w.pos; w.vel = grain::FxVec3{0, 0, 0};
+                w.invMass = 0; w.radius = kSmallR; w.flags = grain::kFlagStatic;
+                ps.push_back(w);
+            }
+        return ps;
+    };
+    const std::vector<grain::GrainParticle> init = buildScene();
+    const int kGrainCount = (int)init.size();
+    const std::vector<grain::GrainSphereCollider> noSpheres;
+
+    // PROOF (1) IDENTITY-AT-UNIFORM: all radii equal -> StepGrainPoly == the mono GR4 StepGrainFriction
+    // BIT-IDENTICAL (THE key append-only proof).
+    {
+        grain::GrainBlock ub; ub.W = 4; ub.H = 4; ub.D = 4; ub.spacing = grain::kOne;
+        ub.radius = kBigR; ub.origin = grain::FxVec3{0, 3 * (int)grain::kOne, 0};
+        std::vector<grain::GrainParticle> uPoly = grain::InitGrainPolyBlock(ub, {ub.radius}, kSeed);
+        std::vector<grain::GrainParticle> uMono = grain::InitGrainBlock(ub);
+        if (uPoly.size() != uMono.size() ||
+            std::memcmp(uPoly.data(), uMono.data(), uMono.size() * sizeof(grain::GrainParticle)) != 0)
+            return fail("gr7-poly identity: one-class InitGrainPolyBlock != InitGrainBlock");
+        grain::StepGrainPolySteps(uPoly, noSpheres, kGravity, kDt, kGroundY, kHSearch, kMu, kIters, 30);
+        grain::StepGrainFrictionSteps(uMono, noSpheres, kGravity, kDt, kGroundY, kHSearch, kMu, kIters, 30);
+        if (std::memcmp(uPoly.data(), uMono.data(), uMono.size() * sizeof(grain::GrainParticle)) != 0)
+            return fail("gr7-poly identity-at-uniform: poly step != mono GR4 step");
+        std::printf("gr7-poly identity-at-uniform: uniform radii -> poly == mono GR4 BIT-IDENTICAL\n");
+    }
+
+    // === The settle ===
+    std::vector<grain::GrainParticle> settled = init;
+    grain::StepGrainPolySteps(settled, noSpheres, kGravity, kDt, kGroundY, kHSearch, kMu, kIters, kSteps);
+
+    // PROOF (2) determinism: two full runs byte-identical.
+    {
+        std::vector<grain::GrainParticle> b = init;
+        grain::StepGrainPolySteps(b, noSpheres, kGravity, kDt, kGroundY, kHSearch, kMu, kIters, kSteps);
+        if (b.size() != settled.size() ||
+            std::memcmp(b.data(), settled.data(), settled.size() * sizeof(grain::GrainParticle)) != 0)
+            return fail("gr7-poly: two runs differ (nondeterministic)");
+        std::printf("gr7-poly determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) the pile SETTLES: every dynamic grain under 0.5 u/s at the pinned settle step, and the
+    // deepest pair penetration stays within the honest Jacobi residual band (pinned, NOT zero).
+    const grain::fx kMinSep = grain::GrainPolyMinSeparation(settled);
+    {
+        const std::vector<grain::GrainParticle> dyn(settled.begin(), settled.begin() + kDynamic);
+        const grain::fx maxSpeed = grain::MaxGrainSpeed(dyn);
+        if (maxSpeed >= grain::kOne / 2)
+            return fail("gr7-poly rest: max dynamic speed >= kOne/2 (not settled)");
+        if (kMinSep < -4096)
+            return fail("gr7-poly residual: min pair separation < -4096 LSBs (a broadphase miss?)");
+        const grain::GrainSizeHeights hts = grain::MeasureGrainSizeHeights(dyn, kBigR);
+        std::printf("gr7-poly settle: maxSpeed=%d LSBs/s, minPairSep=%d LSBs, meanY big=%d small=%d "
+                    "(%d big / %d small)\n", (int)maxSpeed, (int)kMinSep,
+                    (int)hts.meanYLarge, (int)hts.meanYSmall, hts.nLarge, hts.nSmall);
+    }
+
+    const uint64_t kDigest = grain::GrainDigest(settled);
+
+    // --- Golden: the PURE-INTEGER settled mixed-pile side-view, color-coded by SIZE CLASS (IDENTICAL to
+    // the Vulkan --gr7-poly-shot by construction). Bed dim gray, small sand 5px, big orange 9px (splats scale with the class radius). ---
+    const int kPxPerUnit = 14, kMargin = 20;
+    const int kXLo = -8, kWorldW = 20, kWorldH = 12;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    // SUB-UNIT pixel mapping (pure integer, strict-zero): world Q16.16 -> pixels via
+    // ((w − lo) · pxPerUnit) >> kFrac, so the half-unit bed lattice and the mixed-size mound render at
+    // 14 px/world-unit precision (the GR4 whole-unit truncation would collapse the 0.5-spaced bed onto
+    // integer columns and hide the size classes).
+    auto toPx = [&](grain::fx wxFx, grain::fx wyFx, int& cx, int& cy) {
+        const int64_t px =
+            ((int64_t)(wxFx - (grain::fx)(kXLo * (int)grain::kOne)) * kPxPerUnit) >> grain::kFrac;
+        const int64_t py = ((int64_t)wyFx * kPxPerUnit) >> grain::kFrac;
+        cx = kMargin + (int)px;
+        cy = (int)imgH - kMargin - (int)py;
+    };
+    auto splat = [&](int cx, int cy, int size, uint8_t b, uint8_t g, uint8_t r) {
+        for (int dy = 0; dy < size; ++dy)
+            for (int dx = 0; dx < size; ++dx) {
+                const int ix = cx - size / 2 + dx, iy = cy - size / 2 + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = b; dst[1] = g; dst[2] = r; dst[3] = 255;
+            }
+    };
+    int grainPx = 0;
+    // Bed first (the substrate layer), then small, then big (the biggest on top). Splat sizes scale with
+    // the class radius (small d=0.5 -> 5 px, big d=1.0 -> 9 px @14px/unit).
+    for (int i = kDynamic; i < kGrainCount; ++i) {
+        int cx, cy; toPx(settled[(size_t)i].pos.x, settled[(size_t)i].pos.y, cx, cy);
+        splat(cx, cy, 3, 46, 40, 40); ++grainPx;                 // bed: dim gray
+    }
+    for (int i = 0; i < kDynamic; ++i) {
+        if (settled[(size_t)i].radius != kSmallR) continue;
+        int cx, cy; toPx(settled[(size_t)i].pos.x, settled[(size_t)i].pos.y, cx, cy);
+        splat(cx, cy, 5, 90, 170, 214); ++grainPx;               // small: warm sand
+    }
+    for (int i = 0; i < kDynamic; ++i) {
+        if (settled[(size_t)i].radius != kBigR) continue;
+        int cx, cy; toPx(settled[(size_t)i].pos.x, settled[(size_t)i].pos.y, cx, cy);
+        splat(cx, cy, 9, 60, 100, 230); ++grainPx;               // big: gravel orange
+    }
+    std::printf("gr7-poly: {grains:%d, dynamic:%d, sizes:%d, steps:%d, digest:0x%016llx, "
+                "minPairResidual:%d}\n", kGrainCount, kDynamic, kSizeClasses, kSteps,
+                (unsigned long long)kDigest, (int)kMinSep);
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — polydisperse settled mixed pile (%d grain splats)\n",
+                outPath, imgW, imgH, grainPx);
+    return 0;
+}
+
 // ===== Slice PT5 — Deterministic GPU Particles LOCKSTEP + ROLLBACK proof showcase (--pt5-lockstep) (the
 // NETCODE HEADLINE of FLAGSHIP #19, the GR5/FL5/CL5/FPX5 twin over PARTICLES). PURE CPU — NO GPU dispatch,
 // NO new shader, NO new RHI; both Vulkan-Windows (--pt5-lockstep-shot) and Metal-Mac run the IDENTICAL CPU
@@ -77407,6 +77576,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--grain-lockstep") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_grain_lockstep.png";
             try { return RunGrainLockstepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gr7-poly <out.png>: render the POLYDISPERSE GRANULAR MATERIAL showcase (Slice GR7, the Track-R
+        // R6 refinement — closes FLAGSHIP #10's documented "monodisperse grains" caveat). PURE CPU on BOTH
+        // backends (the GR5/CL7 Track-R convention): runs grain.h::StepGrainPolySteps (mixed radii, EXACT
+        // r^3 inverse masses, the broadphase widened to 2*maxRadius) over the rough-bed mixed-pour scene;
+        // identity-at-uniform (poly == mono GR4 BIT-IDENTICAL) + determinism + rest + the honest Jacobi
+        // residual. The size-class-coded integer side-view golden is identical to the Vulkan
+        // --gr7-poly-shot BY CONSTRUCTION. New golden tests/golden/metal/gr7_poly.png.
+        if (argc > 1 && (std::strcmp(argv[1], "--gr7-poly") == 0 ||
+                         std::strcmp(argv[1], "--gr7-poly-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_gr7_poly.png";
+            try { return RunGrainPolyShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fluid-render <out.png>: render the Deterministic GPU Fluid LIT 3D RENDER capstone showcase
