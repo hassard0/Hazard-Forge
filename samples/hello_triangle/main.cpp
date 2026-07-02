@@ -4201,6 +4201,19 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--rt6-hero-shot") == 0) { rt6HeroShotPath = argv[i + 1]; break; }
     }
 
+    // Slice RT7: --rt7-instanced-shot <out.bmp> (Hardware Ray Tracing REAL MULTI-INSTANCE TLAS — Track-R
+    // R9). Builds ONE sphere-cluster BLAS instanced THREE times with per-instance transforms (translate +
+    // a 90-degree rotation, exact in float AND Q16.16), and if SupportsHardwareRayQuery() dispatches
+    // shaders/rt_instanced.comp (HW inline ray query mapping each candidate TWO-LEVEL: instanceCustomIndex
+    // -> the cluster, CandidatePrimitiveIndex -> the local sphere), reads back the image + the per-pixel
+    // winning INSTANCE id, memcmp's both against the CPU rtrace:: reference over the same host-
+    // pretransformed world spheres + pins per-instance hit counts; else writes the CPU image + prints
+    // hwRayQuery:false -> SW fallback. Its OWN loop.
+    const char* rt7InstancedShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--rt7-instanced-shot") == 0) { rt7InstancedShotPath = argv[i + 1]; break; }
+    }
+
     // Slice GI1: --gi1-probe-shot <out.bmp> (Deterministic Lumen-class GI INTEGER RT PROBE TRACE + SHADE —
     // the BEACHHEAD of FLAGSHIP #29). Builds gi::BuildGi1Scene (a Cornell-ish enclosure) + a 4x4x4
     // GiProbeGrid, and if SupportsHardwareRayQuery() builds the SAME procedural-AABB BLAS/TLAS as
@@ -67255,6 +67268,249 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — deterministic HW ray-query scene (%u CPU hits)\n",
                                 rt2QueryShotPath, kRtW, kRtH, cpuHits);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", rt2QueryShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Hardware Ray Tracing REAL MULTI-INSTANCE TLAS (--rt7-instanced-shot <out.bmp>, Slice RT7 /
+        // Track-R R9). THE SAME small scene built as THREE instances of ONE sphere-cluster BLAS at three
+        // different transforms (translate + a 90-degree rotation — entries in {-1,0,1} + exactly-float-
+        // representable translations, so the instance transform is EXACT in float AND Q16.16). The HW
+        // kernel (shaders/rt_instanced.comp) maps each candidate TWO-LEVEL — instanceCustomIndex (the
+        // cluster k) x CandidatePrimitiveIndex (the local sphere j) — into a HOST-PRETRANSFORMED world-
+        // space sphere SSBO [k*K+j] and runs the frozen fx math on it, so correctness never touches the
+        // driver's float transform (the rt2 determinism contract on a two-level structure). PROOFS:
+        // (a) HW image == CPU rtrace:: reference over the same world spheres, byte-equal; (b) the per-pixel
+        // winning INSTANCE id read back from the kernel == primIndex/K, byte-equal + per-instance hit
+        // counts all nonzero; (c) two HW runs byte-identical. The Metal twin is --rt7-instanced
+        // (visual_test.mm) over the SAME CPU reference. One BMP -> exit.
+        if (rt7InstancedShotPath) {
+            namespace rt = hf::render::rtrace;
+            using rt::fx; using rt::FxVec3; using rt::kOne; using rt::F;
+
+            const uint32_t kRtW = 320, kRtH = 240;
+            const size_t kPixels = (size_t)kRtW * kRtH;
+
+            // --- The PINNED RT7 instanced scene: ONE local sphere cluster x THREE instances ---
+            // Local cluster (Q16.16): a big hub + three satellites along +X/+Y/+Z so each 90-degree
+            // rotation VISIBLY re-aims the satellites per instance.
+            const uint32_t kPrimsPerInstance = 4;
+            const FxVec3 kLocalC[4] = {
+                FxVec3{0, 0, 0}, FxVec3{F(3,2), 0, 0}, FxVec3{0, F(3,2), 0}, FxVec3{0, 0, F(3,2)}};
+            const fx kLocalR[4] = {F(3,4), F(1,2), F(1,2), F(1,2)};
+            // Three instances: {row-major int 3x3 rotation (entries in {-1,0,1}), fx translation}.
+            struct Rt7Inst { int rot[9]; FxVec3 t; };
+            const uint32_t kInstanceCount = 3;
+            const Rt7Inst kInsts[3] = {
+                {{1,0,0,  0,1,0,  0,0,1}, FxVec3{F(-3,1), F(0,1), F(2,1)}},   // k0: identity
+                {{0,0,1,  0,1,0, -1,0,0}, FxVec3{F(0,1),  F(1,2), F(9,2)}},   // k1: rotY +90
+                {{0,-1,0, 1,0,0,  0,0,1}, FxVec3{F(3,1),  F(0,1), F(2,1)}},   // k2: rotZ +90
+            };
+
+            // Host-pretransform: world sphere (k,j) = R_k * c_j + t_k (plain integer multiply by {-1,0,1}
+            // -> EXACT in fx), radius rotation-invariant, primIndex = k*K+j (GLOBAL -> instance = prim/K).
+            std::vector<rt::RtSphere> spheresV;
+            spheresV.reserve((size_t)kInstanceCount * kPrimsPerInstance);
+            for (uint32_t k = 0; k < kInstanceCount; ++k) {
+                const Rt7Inst& inst = kInsts[k];
+                for (uint32_t j = 0; j < kPrimsPerInstance; ++j) {
+                    const FxVec3& c = kLocalC[j];
+                    FxVec3 w{inst.rot[0]*c.x + inst.rot[1]*c.y + inst.rot[2]*c.z + inst.t.x,
+                             inst.rot[3]*c.x + inst.rot[4]*c.y + inst.rot[5]*c.z + inst.t.y,
+                             inst.rot[6]*c.x + inst.rot[7]*c.y + inst.rot[8]*c.z + inst.t.z};
+                    spheresV.push_back(rt::RtSphere{w, kLocalR[j], k * kPrimsPerInstance + j});
+                }
+            }
+
+            rt::RtScene scene{};
+            scene.spheres = std::span<const rt::RtSphere>(spheresV);
+            scene.lightDir = rt::RtNormalize(FxVec3{F(4,10), F(8,10), F(-3,10)});
+            scene.background = rt::PackRGBA8(34, 40, 56, 255);
+            rt::RtCamera cam{};   // the pinned RT2 camera
+            cam.eye     = FxVec3{F(0,1), F(2,1), F(-9,1)};
+            cam.right   = FxVec3{kOne, 0, 0};
+            cam.up      = FxVec3{0, kOne, 0};
+            cam.forward = FxVec3{0, 0, kOne};
+            cam.halfW   = F(7, 10);
+            cam.halfH   = F(7, 10);
+
+            // === CPU reference: the image + the EXPECTED winning-instance map (primIndex / K) ===
+            std::vector<uint32_t> cpuImage(kPixels, 0), cpuInst(kPixels, 0xFFFFFFFFu);
+            uint32_t cpuHits = 0;
+            for (uint32_t py = 0; py < kRtH; ++py) for (uint32_t px = 0; px < kRtW; ++px) {
+                rt::RtRay ray = rt::PrimaryRay(cam, px, py, kRtW, kRtH);
+                rt::RtHit hit = rt::TraceClosest(ray, scene);
+                const size_t idx = (size_t)py * kRtW + px;
+                cpuImage[idx] = rt::ShadeHitInt(hit, scene);
+                if (hit.primIndex != rt::kRtMiss) {
+                    ++cpuHits;
+                    cpuInst[idx] = hit.primIndex / kPrimsPerInstance;
+                }
+            }
+            uint32_t cpuPerInst[3] = {0, 0, 0};
+            for (size_t i = 0; i < kPixels; ++i)
+                if (cpuInst[i] != 0xFFFFFFFFu) ++cpuPerInst[cpuInst[i]];
+
+            auto writeBmpFrom = [&](const std::vector<uint32_t>& img) {
+                std::vector<uint8_t> bgra(kPixels*4, 0);
+                for (size_t p=0;p<kPixels;++p){uint32_t c=img[p];
+                    bgra[p*4+0]=(uint8_t)((c>>16)&0xFF); bgra[p*4+1]=(uint8_t)((c>>8)&0xFF);
+                    bgra[p*4+2]=(uint8_t)(c&0xFF); bgra[p*4+3]=(uint8_t)((c>>24)&0xFF);}
+                return WriteBMP(rt7InstancedShotPath, bgra, kRtW, kRtH);
+            };
+
+            if (!device->SupportsHardwareRayQuery()) {
+                std::printf("rt7-instanced: rhi hw ray query INACTIVE (hwRayQuery:false) -> CPU fallback\n");
+                bool ok = writeBmpFrom(cpuImage);
+                device->WaitIdle();
+                return ok ? 0 : 1;
+            }
+
+            // === ONE BLAS (the local 4-sphere cluster) x THREE TLAS instances with transforms ===
+            auto fxf = [](fx v) -> float { return (float)v / (float)(int)kOne; };
+            std::vector<rhi::AccelGeometry> geoms(kPrimsPerInstance);
+            for (uint32_t j = 0; j < kPrimsPerInstance; ++j) {
+                float cx=fxf(kLocalC[j].x), cy=fxf(kLocalC[j].y), cz=fxf(kLocalC[j].z), rr=fxf(kLocalR[j]);
+                geoms[j].kind = rhi::AccelGeometry::Kind::AabbProcedural;
+                geoms[j].lo = math::Vec3(cx-rr, cy-rr, cz-rr);
+                geoms[j].hi = math::Vec3(cx+rr, cy+rr, cz+rr);
+            }
+            rhi::BlasDesc bd{}; bd.geoms = std::span<const rhi::AccelGeometry>(geoms);
+            auto blas = device->CreateBlas(bd);
+            if (!blas) { std::fprintf(stderr, "FATAL: rt7-instanced CreateBlas returned null with HW RT on\n");
+                device->WaitIdle(); return 1; }
+
+            std::vector<rhi::TlasInstance> instances(kInstanceCount);
+            for (uint32_t k = 0; k < kInstanceCount; ++k) {
+                const Rt7Inst& inst = kInsts[k];
+                instances[k].blas = blas.get();
+                instances[k].instanceId = k;             // instanceCustomIndex -> CandidateInstanceID()
+                float* m = instances[k].transform;       // row-major 3x4
+                for (int r = 0; r < 3; ++r) {
+                    m[r*4+0] = (float)inst.rot[r*3+0];
+                    m[r*4+1] = (float)inst.rot[r*3+1];
+                    m[r*4+2] = (float)inst.rot[r*3+2];
+                }
+                m[3] = fxf(inst.t.x); m[7] = fxf(inst.t.y); m[11] = fxf(inst.t.z);
+            }
+            rhi::TlasDesc td{}; td.instances = std::span<const rhi::TlasInstance>(instances);
+            auto tlas = device->CreateTlas(td);
+            if (!tlas) { std::fprintf(stderr, "FATAL: rt7-instanced CreateTlas returned null with HW RT on\n");
+                device->WaitIdle(); return 1; }
+
+            // === HW dispatch (rt_instanced.comp): the world-sphere SSBO indexed [inst*K + localPrim] ===
+            struct GpuSphere { int32_t cx, cy, cz, radius; uint32_t primIndex, _p0, _p1, _p2; };
+            static_assert(sizeof(GpuSphere) == 32, "GpuSphere std430");
+            struct GpuParams {
+                int32_t eye[4]; int32_t right[4]; int32_t up[4]; int32_t forward[4];
+                int32_t light[4]; int32_t plane[4]; uint32_t counts[4];
+            };
+            static_assert(sizeof(GpuParams) == 28 * 4, "GpuParams std430");
+
+            std::vector<GpuSphere> gPrims(spheresV.size());
+            for (size_t i = 0; i < spheresV.size(); ++i) {
+                const rt::RtSphere& s = spheresV[i];
+                gPrims[i] = GpuSphere{s.center.x, s.center.y, s.center.z, s.radius, s.primIndex, 0,0,0};
+            }
+            GpuParams params{};
+            params.eye[0]=cam.eye.x; params.eye[1]=cam.eye.y; params.eye[2]=cam.eye.z;
+            params.right[0]=cam.right.x; params.right[1]=cam.right.y; params.right[2]=cam.right.z;
+            params.up[0]=cam.up.x; params.up[1]=cam.up.y; params.up[2]=cam.up.z;
+            params.forward[0]=cam.forward.x; params.forward[1]=cam.forward.y; params.forward[2]=cam.forward.z;
+            params.light[0]=scene.lightDir.x; params.light[1]=scene.lightDir.y; params.light[2]=scene.lightDir.z;
+            params.plane[0]=cam.halfW; params.plane[1]=cam.halfH;
+            params.plane[2]=(int32_t)kRtW; params.plane[3]=(int32_t)kRtH;
+            params.counts[0]=kPrimsPerInstance; params.counts[1]=kInstanceCount;
+            params.counts[2]=scene.background; params.counts[3]=0;
+
+            auto makeStorage = [&](const void* data, size_t bytes) {
+                rhi::BufferDesc d; d.size = bytes; d.initialData = data; d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            const uint32_t kGroupsX = (kRtW + 7u) / 8u, kGroupsY = (kRtH + 7u) / 8u;
+
+            auto hwCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/rt_instanced.comp.hlsl.spv");
+            auto hwCs = device->CreateShaderModule({std::span<const uint32_t>(hwCsWords)});
+            rhi::ComputePipelineDesc hwDesc;
+            hwDesc.compute = hwCs.get(); hwDesc.storageBufferCount = 4; hwDesc.threadsPerGroupX = 64;
+            hwDesc.accelStructureBinding = 4;   // the TLAS slot the kernel RayQueries
+            auto hwCompute = device->CreateComputePipeline(hwDesc);
+
+            auto runHw = [&](std::vector<uint32_t>& outImage, std::vector<uint32_t>& outInst) {
+                auto pb  = makeStorage(gPrims.data(), gPrims.size()*sizeof(GpuSphere));
+                auto prb = makeStorage(&params, sizeof(GpuParams));
+                std::vector<uint32_t> z(kPixels, 0);
+                auto ib  = makeStorage(z.data(), z.size()*sizeof(uint32_t));
+                auto nb  = makeStorage(z.data(), z.size()*sizeof(uint32_t));
+                render::RenderGraph g;
+                render::RgResource sw = g.ImportSwapchain("swapchain");
+                g.AddPass("rt_instanced_hw", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd){
+                    cmd.BindComputePipeline(*hwCompute);
+                    cmd.BindStorageBuffer(*pb,0);  cmd.BindStorageBuffer(*prb,1);
+                    cmd.BindStorageBuffer(*ib,2);  cmd.BindStorageBuffer(*nb,3);
+                    cmd.BindAccelStructure(*tlas, 4);
+                    cmd.DispatchCompute(kGroupsX, kGroupsY, 1);
+                    cmd.ComputeToVertexBarrier();
+                    cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                });
+                g.Execute(*device); device->WaitIdle();
+                outImage.assign(kPixels, 0);
+                device->ReadBuffer(*ib, outImage.data(), outImage.size()*sizeof(uint32_t), 0);
+                outInst.assign(kPixels, 0);
+                device->ReadBuffer(*nb, outInst.data(), outInst.size()*sizeof(uint32_t), 0);
+            };
+
+            std::vector<uint32_t> hwImage, hwInst;
+            runHw(hwImage, hwInst);
+
+            // PROOF (a): HW multi-instance trace == CPU reference, image byte-equal.
+            if (std::memcmp(hwImage.data(), cpuImage.data(), kPixels*sizeof(uint32_t)) != 0) {
+                size_t firstDiff = kPixels;
+                for (size_t p=0;p<kPixels;++p) if (hwImage[p]!=cpuImage[p]) { firstDiff=p; break; }
+                std::fprintf(stderr, "FATAL: rt7-instanced HW image != CPU (firstDiff:%zu hw=%08x cpu=%08x)"
+                             " — instance transform / candidate-mapping bug\n", firstDiff,
+                             firstDiff<kPixels?hwImage[firstDiff]:0, firstDiff<kPixels?cpuImage[firstDiff]:0);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("rt7-instanced: {rays:%zu, instances:%u, primsPerInstance:%u} HW==CPU image "
+                        "BYTE-EQUAL (%u hits)\n", kPixels, kInstanceCount, kPrimsPerInstance, cpuHits);
+
+            // PROOF (b): the winning INSTANCE id per pixel == primIndex/K, byte-equal; per-instance hit
+            // counts all nonzero (rays hitting cluster k report instance k).
+            if (std::memcmp(hwInst.data(), cpuInst.data(), kPixels*sizeof(uint32_t)) != 0) {
+                size_t firstDiff = kPixels;
+                for (size_t p=0;p<kPixels;++p) if (hwInst[p]!=cpuInst[p]) { firstDiff=p; break; }
+                std::fprintf(stderr, "FATAL: rt7-instanced HW instance-id map != expected (firstDiff:%zu "
+                             "hw=%08x cpu=%08x)\n", firstDiff,
+                             firstDiff<kPixels?hwInst[firstDiff]:0, firstDiff<kPixels?cpuInst[firstDiff]:0);
+                device->WaitIdle(); return 1;
+            }
+            if (cpuPerInst[0] == 0 || cpuPerInst[1] == 0 || cpuPerInst[2] == 0) {
+                std::fprintf(stderr, "FATAL: rt7-instanced an instance has ZERO hit pixels (inst0:%u "
+                             "inst1:%u inst2:%u) — scene/camera bug\n",
+                             cpuPerInst[0], cpuPerInst[1], cpuPerInst[2]);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("rt7-instanced: instance-id map BYTE-EQUAL (per-instance hit pixels inst0:%u "
+                        "inst1:%u inst2:%u)\n", cpuPerInst[0], cpuPerInst[1], cpuPerInst[2]);
+
+            // PROOF (c): determinism — two HW runs byte-identical (image + instance map).
+            {
+                std::vector<uint32_t> hwImage2, hwInst2;
+                runHw(hwImage2, hwInst2);
+                if (std::memcmp(hwImage.data(), hwImage2.data(), kPixels*sizeof(uint32_t)) != 0 ||
+                    std::memcmp(hwInst.data(), hwInst2.data(), kPixels*sizeof(uint32_t)) != 0) {
+                    std::fprintf(stderr, "FATAL: rt7-instanced nondeterministic (two HW runs differ)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("rt7-instanced determinism: HW two runs BYTE-IDENTICAL\n");
+            }
+            std::printf("rt7-instanced: rhi hw ray query ACTIVE (hwRayQuery:true)\n");
+
+            bool ok = writeBmpFrom(hwImage);
+            if (ok) std::printf("wrote %s (%ux%u) — REAL multi-instance TLAS HW ray query (%u CPU hits)\n",
+                                rt7InstancedShotPath, kRtW, kRtH, cpuHits);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", rt7InstancedShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

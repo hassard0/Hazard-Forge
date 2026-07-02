@@ -594,6 +594,13 @@ hf_compile_shaders(
     # MSL) -> NOT in the Metal hf_gen_msl list; on Metal --rt2-query runs the CPU rtrace::RenderScene
     # (byte-identical by construction). The Vulkan side carries the HW==SW-GPU==CPU memcmp proof.
     "shaders/rt_query.comp.hlsl:csrq"
+    # Hardware Ray Tracing Slice RT7 (Track-R R9): rt_instanced.comp is the REAL MULTI-INSTANCE TLAS kernel
+    # — the rt_query.comp candidate-drain contract over a TLAS of N transformed instances of ONE BLAS; each
+    # candidate maps TWO-LEVEL (CandidateInstanceID x CandidatePrimitiveIndex) into a host-pretransformed
+    # world-space sphere SSBO, so the fx math never touches the driver's float instance transform. Like
+    # rt_query.comp it is VULKAN-SPIR-V-ONLY (RayQuery + int64) -> NOT in the Metal hf_gen_msl list; the
+    # Metal twin is the hand-authored shaders/rt_instanced.metal (instance_acceleration_structure).
+    "shaders/rt_instanced.comp.hlsl:csrq"
     # Hardware Ray Tracing Slice 3 (Slice RT3, FLAGSHIP #28): rt_shadow.comp is the DETERMINISTIC RT HARD
     # SHADOWS kernel — ONE thread per pixel runs the rt_query.comp PRIMARY RayQuery body VERBATIM (closest
     # hit), then casts a SECOND RayQuery (the SHADOW ray from hit.pos + normal*kRtShadowEps toward the light)

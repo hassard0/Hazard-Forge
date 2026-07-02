@@ -28,8 +28,9 @@ public:
     MetalAccelStructure() = default;
     ~MetalAccelStructure() override = default;  // ARC releases as_ / the retained buffers + child handles.
 
-    // The built acceleration structure (a primitive AS for a BLAS, an instance AS for a true TLAS, or —
-    // in the S1 degenerate simplification — the single child BLAS's primitive AS shared through).
+    // The built acceleration structure (a primitive AS for a BLAS; for a TLAS: a TRUE instance AS when
+    // built from N >= 2 instances — Slice RT7 — or, in the S1 degenerate 1-instance simplification, the
+    // single child BLAS's primitive AS shared through).
     id<MTLAccelerationStructure> Handle() const { return as_; }
 
     // The child BLAS handles a TLAS references (empty for a BLAS). The dispatch must `useResource:` each

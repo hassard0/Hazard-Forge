@@ -188,6 +188,86 @@ int main() {
         check(primMismatch == 0, "RT2 closest-prim shade matches the brute-force reference per pixel");
     }
 
-    if (g_fail == 0) std::printf("rt_query_test: all RT2 CPU invariants PASS\n");
+    // ================= Slice RT7 — the instanced-scene CPU-reference digests =================
+    // The RT7 showcases (--rt7-instanced-shot Vulkan / --rt7-instanced Metal) prove HW == THIS CPU
+    // reference byte-equal; this section pins the reference itself: the SAME pinned scene — ONE 4-sphere
+    // cluster instanced THREE times (identity / rotY+90 / rotZ+90, exact integer transforms) — is host-
+    // pretransformed into world spheres, traced by the frozen rtrace:: math, and the image + the
+    // per-pixel winning-instance map are digested (FNV-1a 64). The digests are PINNED (MSVC + clang agree
+    // — pure integer math), so any drift in the shared scene definition or the frozen math fails here
+    // without a GPU. Also checks: instance = primIndex/K is consistent, and every instance is hit.
+    {
+        const uint32_t kPrimsPerInstance = 4;
+        const FxVec3 kLocalC[4] = {
+            FxVec3{0, 0, 0}, FxVec3{F(3,2), 0, 0}, FxVec3{0, F(3,2), 0}, FxVec3{0, 0, F(3,2)}};
+        const fx kLocalR[4] = {F(3,4), F(1,2), F(1,2), F(1,2)};
+        struct Rt7Inst { int rot[9]; FxVec3 t; };
+        const uint32_t kInstanceCount = 3;
+        const Rt7Inst kInsts[3] = {
+            {{1,0,0,  0,1,0,  0,0,1}, FxVec3{F(-3,1), F(0,1), F(2,1)}},   // k0: identity
+            {{0,0,1,  0,1,0, -1,0,0}, FxVec3{F(0,1),  F(1,2), F(9,2)}},   // k1: rotY +90
+            {{0,-1,0, 1,0,0,  0,0,1}, FxVec3{F(3,1),  F(0,1), F(2,1)}},   // k2: rotZ +90
+        };
+
+        std::vector<rt::RtSphere> spheresV;
+        for (uint32_t k = 0; k < kInstanceCount; ++k) {
+            const Rt7Inst& inst = kInsts[k];
+            for (uint32_t j = 0; j < kPrimsPerInstance; ++j) {
+                const FxVec3& c = kLocalC[j];
+                FxVec3 w{inst.rot[0]*c.x + inst.rot[1]*c.y + inst.rot[2]*c.z + inst.t.x,
+                         inst.rot[3]*c.x + inst.rot[4]*c.y + inst.rot[5]*c.z + inst.t.y,
+                         inst.rot[6]*c.x + inst.rot[7]*c.y + inst.rot[8]*c.z + inst.t.z};
+                spheresV.push_back(rt::RtSphere{w, kLocalR[j], k * kPrimsPerInstance + j});
+            }
+        }
+        rt::RtScene scene{};
+        scene.spheres = std::span<const rt::RtSphere>(spheresV);
+        scene.lightDir = rt::RtNormalize(FxVec3{F(4,10), F(8,10), F(-3,10)});
+        scene.background = rt::PackRGBA8(34, 40, 56, 255);
+        rt::RtCamera cam{};
+        cam.eye = FxVec3{F(0,1), F(2,1), F(-9,1)};
+        cam.right = FxVec3{kOne, 0, 0}; cam.up = FxVec3{0, kOne, 0}; cam.forward = FxVec3{0, 0, kOne};
+        cam.halfW = F(7, 10); cam.halfH = F(7, 10);
+
+        std::vector<uint32_t> img(kPixels, 0), inst(kPixels, 0xFFFFFFFFu);
+        uint32_t perInst[3] = {0, 0, 0};
+        for (uint32_t py = 0; py < H; ++py) for (uint32_t px = 0; px < W; ++px) {
+            rt::RtRay ray = rt::PrimaryRay(cam, px, py, W, H);
+            rt::RtHit hit = rt::TraceClosest(ray, scene);
+            const size_t idx = (size_t)py * W + px;
+            img[idx] = rt::ShadeHitInt(hit, scene);
+            if (hit.primIndex != rt::kRtMiss) {
+                inst[idx] = hit.primIndex / kPrimsPerInstance;
+                ++perInst[inst[idx]];
+            }
+        }
+
+        // FNV-1a 64 over the little-endian words (deterministic, compiler-independent).
+        auto fnv1a64 = [](const std::vector<uint32_t>& v) -> uint64_t {
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (uint32_t w32 : v)
+                for (int b = 0; b < 4; ++b) {
+                    h ^= (uint64_t)((w32 >> (8 * b)) & 0xFFu);
+                    h *= 0x100000001b3ull;
+                }
+            return h;
+        };
+        const uint64_t imgDigest  = fnv1a64(img);
+        const uint64_t instDigest = fnv1a64(inst);
+        std::printf("rt7 instanced CPU-reference digests: image 0x%016llx instMap 0x%016llx "
+                    "(perInst %u/%u/%u)\n",
+                    (unsigned long long)imgDigest, (unsigned long long)instDigest,
+                    perInst[0], perInst[1], perInst[2]);
+
+        // PINNED (MSVC 19.x x64 + clang++ x64 agree — pure-integer Q16.16 path).
+        const uint64_t kRt7ImageDigest   = 0x4bff69aafcf23871ull;
+        const uint64_t kRt7InstMapDigest = 0x70112b520d270e6bull;
+        check(imgDigest == kRt7ImageDigest, "RT7 instanced CPU image digest matches the pinned value");
+        check(instDigest == kRt7InstMapDigest, "RT7 instanced instance-map digest matches the pinned value");
+        check(perInst[0] > 0 && perInst[1] > 0 && perInst[2] > 0,
+              "RT7 instanced: every instance is hit by at least one pixel");
+    }
+
+    if (g_fail == 0) std::printf("rt_query_test: all RT2 + RT7 CPU invariants PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

@@ -26,6 +26,18 @@
 // can promote it on the Mac if instance_acceleration_structure compiles cleanly). The TLAS object still
 // retains the child BLAS handle + exposes it via ChildHandles() so BindAccelStructure's useResource:
 // discipline is fully exercised.
+//
+// ===== Slice RT7 (Track-R R9): the REAL MULTI-INSTANCE TLAS. =====
+// CreateTlas now BRANCHES on the instance count: a 1-instance TlasDesc keeps the S1 degenerate path above
+// BYTE-FOR-BYTE (every pre-RT7 caller — rt2-query-rhi/rt3/rt4/rt6 — passes exactly one identity instance,
+// so their goldens are untouched, and the returned handle stays a primitive AS the existing
+// primitive_acceleration_structure kernels bind unchanged). N >= 2 instances build the TRUE
+// MTLInstanceAccelerationStructureDescriptor path: one MTLAccelerationStructureUserIDInstanceDescriptor
+// per TlasInstance (row-major transform[12] -> the column-major MTLPackedFloat4x3, mask 0xFF,
+// userID = instanceId — matching the Vulkan VkAccelerationStructureInstanceKHR::instanceCustomIndex
+// semantics, vulkan_accel.cpp:177-192) over the deduped child-BLAS array. The result is an INSTANCE AS:
+// it binds to an `instance_acceleration_structure` kernel (shaders/rt_instanced.metal) — NOT to the
+// primitive_acceleration_structure kernels the 1-instance path serves.
 #include "rhi_metal/metal_accel.h"
 #include "rhi_metal/metal_device.h"
 #include "rhi_metal/metal_buffer.h"
@@ -95,10 +107,92 @@ std::unique_ptr<IAccelStructure> MetalDevice::CreateBlas(const BlasDesc& desc) {
     return out;
 }
 
-// --- CreateTlas: the S1 degenerate single-BLAS "TLAS == its single BLAS" (see file header) ----------
+// --- CreateTlas: 1 instance -> the S1 degenerate single-BLAS "TLAS == its single BLAS";
+//     N >= 2 instances -> the RT7 REAL instance acceleration structure (see file header) ----------------
 std::unique_ptr<IAccelStructure> MetalDevice::CreateTlas(const TlasDesc& desc) {
     if (!supportsRaytracing_) return nullptr;
     if (desc.instances.empty()) return nullptr;
+
+    // ===== RT7: N >= 2 instances -> the TRUE two-level instance AS =====
+    if (desc.instances.size() >= 2) {
+        // 1) One MTLAccelerationStructureUserIDInstanceDescriptor per TlasInstance. The child BLAS handles
+        //    are DEDUPED (in first-appearance order) into the instancedAccelerationStructures array;
+        //    accelerationStructureIndex points each instance at its BLAS. The row-major 3x4 transform[12]
+        //    (rhi.h TlasInstance, row r = transform[r*4 .. r*4+3]) transposes into the COLUMN-major
+        //    MTLPackedFloat4x3 (columns[c] = {transform[0*4+c], transform[1*4+c], transform[2*4+c]};
+        //    columns[3] = the translation). userID = instanceId (the Vulkan instanceCustomIndex twin,
+        //    surfaced to the kernel via get_candidate_user_instance_id()); mask = 0xFF (matches the
+        //    Vulkan inst.mask and the kernels' all-pass 0xFF query mask).
+        std::vector<id<MTLAccelerationStructure>> children;
+        std::vector<MTLAccelerationStructureUserIDInstanceDescriptor> idescs;
+        idescs.reserve(desc.instances.size());
+        for (const TlasInstance& ti : desc.instances) {
+            if (!ti.blas) continue;
+            id<MTLAccelerationStructure> h = static_cast<MetalAccelStructure*>(ti.blas)->Handle();
+            if (!h) continue;
+            uint32_t childIdx = 0;
+            while (childIdx < children.size() && children[childIdx] != h) ++childIdx;
+            if (childIdx == children.size()) children.push_back(h);
+
+            MTLAccelerationStructureUserIDInstanceDescriptor d{};
+            for (int c = 0; c < 4; ++c)
+                d.transformationMatrix.columns[c] = MTLPackedFloat3Make(
+                    ti.transform[0 * 4 + c], ti.transform[1 * 4 + c], ti.transform[2 * 4 + c]);
+            d.options = MTLAccelerationStructureInstanceOptionNone;
+            d.mask = 0xFFu;
+            d.intersectionFunctionTableOffset = 0;
+            d.accelerationStructureIndex = childIdx;
+            d.userID = ti.instanceId;
+            idescs.push_back(d);
+        }
+        if (idescs.empty()) return nullptr;
+
+        // 2) Upload the instance descriptors to a shared buffer (the CreateBlas bbox-upload idiom).
+        id<MTLBuffer> instBuf = [device_
+            newBufferWithBytes:idescs.data()
+                        length:idescs.size() * sizeof(MTLAccelerationStructureUserIDInstanceDescriptor)
+                       options:MTLResourceStorageModeShared];
+        if (!instBuf) return nullptr;
+
+        // 3) The instance-AS descriptor over the child BLAS array + the descriptor buffer.
+        NSMutableArray<id<MTLAccelerationStructure>>* childArray =
+            [NSMutableArray arrayWithCapacity:children.size()];
+        for (id<MTLAccelerationStructure> c : children) [childArray addObject:c];
+
+        MTLInstanceAccelerationStructureDescriptor* asDesc =
+            [MTLInstanceAccelerationStructureDescriptor descriptor];
+        asDesc.instancedAccelerationStructures = childArray;
+        asDesc.instanceCount = (NSUInteger)idescs.size();
+        asDesc.instanceDescriptorBuffer = instBuf;
+        asDesc.instanceDescriptorBufferOffset = 0;
+        asDesc.instanceDescriptorStride = sizeof(MTLAccelerationStructureUserIDInstanceDescriptor);
+        asDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeUserID;
+
+        // 4) Size + allocate + synchronous build (LIFTED from CreateBlas steps 3-5 above).
+        MTLAccelerationStructureSizes sizes = [device_ accelerationStructureSizesWithDescriptor:asDesc];
+        id<MTLAccelerationStructure> accel =
+            [device_ newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+        id<MTLBuffer> scratch = [device_ newBufferWithLength:sizes.buildScratchBufferSize
+                                                     options:MTLResourceStorageModePrivate];
+        if (!accel || !scratch) return nullptr;
+        {
+            id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+            id<MTLAccelerationStructureCommandEncoder> enc = [cb accelerationStructureCommandEncoder];
+            [enc buildAccelerationStructure:accel descriptor:asDesc scratchBuffer:scratch scratchBufferOffset:0];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.error) return nullptr;  // tlas build failed
+        }
+
+        // 5) The TLAS retains its instance-descriptor buffer AND every child BLAS handle (so they outlive
+        //    it; BindAccelStructure useResource:'s the TLAS + each child for the GPU traversal).
+        auto out = std::make_unique<MetalAccelStructure>();
+        out->SetHandle(accel);
+        out->RetainBuffer(instBuf);
+        for (id<MTLAccelerationStructure> c : children) out->AddChild(c);
+        return out;
+    }
 
     // S1 SIMPLIFICATION: a 1-instance identity TLAS shares the single child BLAS's primitive-AS handle, so
     // the existing primitive_acceleration_structure rt_query.metal kernel binds UNCHANGED. We still build a
