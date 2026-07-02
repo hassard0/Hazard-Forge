@@ -1385,6 +1385,25 @@ hf_add_pure_test(ai_render_test)
 # ground (NO constraints/collision/render — later CL slices). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(cloth_test)
 
+# Slice HR1 — DETERMINISTIC STRAND/HAIR SIMULATION CORE (engine/sim/hair.h, Track-S S2 of
+# docs/SUPERIORITY_ROADMAP.md): Q16.16 PBD rods — strands as 1D constraint chains with BENDING stiffness
+# (the bending-as-distance i..i+2 constraint with a k_bend fractional projection, the exact integer
+# scheme), root-pinned, gravity-driven, strand<->strand collision (the CL7 pair-grid mold with the
+# stretch+bend 1-ring exclusion = same-strand verts >= 3 apart collide) — bit-identical + lockstep/
+# rollback-replayable (UE5's Groom is float/non-deterministic). ~80% mold-reuse of cloth.h (READ-ONLY:
+# ClothParticle/IntegrateParticle/SolveDistanceConstraint/BuildSelfCandidates/SolveSelfCollision/
+# ClothDigest); the step uses the FL7 velocity re-encode discipline (v = (pos-prev)/dt, damped). Pins
+# InitStrands/BuildHairConstraints/the exclusion set, the SolveBendConstraint exact integer scheme
+# (kBend==kOne == SolveDistanceConstraint BIT-EXACT; kBend==0.5 hand-checked; kBend==0 exact no-op),
+# determinism (two runs byte-identical + net::DigestBytes-over-pos + HairDigest PINNED, identical MSVC +
+# clang), the physics (vertical hang analytic band + exact tip pin; stiff-vs-limp droop from a
+# direction-clamped horizontal root — the honest saturating numbers; strand<->strand separation >= 2r -
+# slack with the without-collision negative control), identity-at-zero (kBend=0 + radius=0 == the
+# hand-composed pure stretch chain BIT-EXACT), the pinned stretch residual, and lockstep/rollback
+# (replica == authority; rollback corrects a real root-drag misprediction). PURE CPU on both backends
+# (the CF1/FR8 precedent — NO new shader, NO new RHI). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(hair_test)
+
 # Deterministic GPU Fluid Slice 1 (Slice FL1, the BEACHHEAD of FLAGSHIP #9): the Q16.16 fixed-point
 # fluid PARTICLE POOL INTEGRATOR + dam-break block core (engine/sim/fluid.h) the GPU
 # shaders/fluid_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
