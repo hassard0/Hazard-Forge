@@ -53,6 +53,39 @@ std::string PercentDecodeUri(const char* uri);
 std::vector<uint8_t> ReadUriBytesRelativeTo(const char* gltfPath, const char* uri);
 
 // ---------------------------------------------------------------------------------------------------
+// PURE alpha-mode resolution (Slice SC1b — alpha-mask cutouts). Maps a glTF material's alphaMode +
+// alphaCutoff onto the engine's single alpha-TEST material model:
+//   OPAQUE (0) -> {masked=false, cutoff=0}   (no test; cutoff 0 also never discards in the shader)
+//   MASK   (1) -> {masked=true,  cutoff=authored alphaCutoff}   (spec default 0.5)
+//   BLEND  (2) -> {masked=true,  cutoff=0.5}   DOCUMENTED v1 APPROXIMATION: true alpha blending
+//                 needs a sorted transparent pass / OIT (the engine has --oit but wiring it into the
+//                 hero path is out of scope); a 0.5 alpha test keeps blend-authored foliage/decals
+//                 from rendering as opaque cards, which is the visible SC1 artifact.
+// `alphaMode` uses the cgltf_alpha_mode numbering (0=opaque, 1=mask, 2=blend); anything else is
+// treated as opaque. Pure; unit-tested in gltf_uri_image_test.
+struct AlphaMaskInfo {
+    bool  masked = false;
+    float cutoff = 0.0f;
+};
+AlphaMaskInfo ResolveAlphaMode(int alphaMode, float alphaCutoff);
+
+// ---------------------------------------------------------------------------------------------------
+// PURE deterministic RGBA8 mip-chain generation (Slice SC1b — texture mipmaps). The full mip count
+// for a w x h image (floor(log2(max(w,h,1))) + 1; a 1x1 image has 1 level).
+uint32_t FullMipCount(uint32_t width, uint32_t height);
+
+// Build mip levels 1..FullMipCount-1 from the tightly-packed RGBA8 level 0 (level i is
+// max(1, width>>i) x max(1, height>>i)). Each destination texel is the integer-rounded average of
+// the (clamped) 2x2 source block — pure int arithmetic, so the chain is BIT-IDENTICAL on every
+// platform/backend (the CPU chain feeds rhi::TextureDesc::mipData on BOTH Vulkan and Metal, unlike
+// a GPU blit whose filtering is vendor-defined). Odd source dimensions clamp the +1 sample to the
+// edge (each destination still averages exactly 4 samples). Returns an empty vector for a 1x1
+// image (no chain). NOTE: byte-space averaging (no sRGB linearization, no normal renormalization) —
+// the standard fast path; documented v1 fidelity tradeoff.
+std::vector<std::vector<uint8_t>> BuildRgba8MipChain(const uint8_t* mip0,
+                                                     uint32_t width, uint32_t height);
+
+// ---------------------------------------------------------------------------------------------------
 // Pure scene-graph hierarchy composition (no device, no cgltf) — factored out so it can be unit
 // tested in isolation. A SceneNode is a plain node: a local transform (already resolved from a
 // glTF node's `matrix` or its TRS) plus child indices.
@@ -206,6 +239,13 @@ struct PbrMaterial {
     float metallicFactor = 1.0f;
     float roughnessFactor = 1.0f;
     float emissiveFactor[3] = {0.0f, 0.0f, 0.0f};
+    // Slice SC1b: glTF alphaMode resolved via ResolveAlphaMode. When alphaMasked the draw should use
+    // an alpha-testing pipeline (e.g. lit_cutout.vert + lit_pbr_cutout.frag) with alphaCutoff packed
+    // into the per-draw material push constant .w (the #38 packing convention: x=metallic,
+    // y=roughness, z=albedo tint, w=alpha cutoff; 0 = no test). Opaque draws ignore both fields, so
+    // every pre-SC1b consumer is unchanged.
+    bool  alphaMasked = false;
+    float alphaCutoff = 0.0f;
 };
 
 // One renderable: a (non-owning) mesh + material + the node's composed world transform. The same
@@ -237,10 +277,24 @@ struct GltfScene {
     math::Mat4 FitTransform(float targetSize, float groundY) const;
 };
 
+// Optional scene-import behaviours (Slice SC1b). The default-constructed value reproduces the
+// pre-SC1b behaviour EXACTLY (mip-0-only texture uploads), so every existing caller/golden is
+// byte-identical; hero paths opt in explicitly.
+struct GltfLoadOptions {
+    // Generate full deterministic CPU RGBA8 mip chains (BuildRgba8MipChain) for every decoded
+    // image texture and upload them via the existing rhi::TextureDesc::mipData path (trilinear
+    // sampling comes from the default samplers, which already carry full-LOD linear mip filtering
+    // in both backends; 1-mip textures keep sampling exactly as before). 1x1 fallback textures are
+    // unaffected (no chain exists).
+    bool generateMipmaps = false;
+};
+
 // Walk the default scene's node hierarchy depth-first, composing world = parent*local for each node,
 // and emit one SceneInstance per primitive of every mesh-referencing node. glTF materials are decoded
 // once and shared; the same (mesh,primitive) geometry is uploaded once and shared across instances.
 // Throws std::runtime_error on parse/load/validation failure or missing POSITION.
 GltfScene LoadGltfScene(rhi::IRHIDevice& device, const char* path);
+// Same, with explicit options (SC1b). LoadGltfScene(device, path) == LoadGltfScene(device, path, {}).
+GltfScene LoadGltfScene(rhi::IRHIDevice& device, const char* path, const GltfLoadOptions& opts);
 
 } // namespace hf::asset

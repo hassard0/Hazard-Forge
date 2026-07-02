@@ -98,6 +98,11 @@ hf_compile_shaders(
     # StructuredBuffer (set 3, bindings 13/14/15). frame_data.hlsli untouched.
     "shaders/lit_manylight.frag.hlsl:ps"
     "shaders/lit_pbr.frag.hlsl:ps"
+    # Alpha-mask cutouts (Slice SC1b): a lit.vert copy that forwards the push-constant material.w
+    # alpha cutoff as a location-6 varying + a lit_pbr.frag copy that discards below it. Separate
+    # NEW files — the golden-locked lit.vert/lit_pbr.frag pipelines are byte-for-byte untouched.
+    "shaders/lit_cutout.vert.hlsl:vs"
+    "shaders/lit_pbr_cutout.frag.hlsl:ps"
     "shaders/lit_pbr_ibl.frag.hlsl:ps"
     # Substrate-lite layered materials (issue #11, SB1): a copy of lit_pbr_ibl.frag + an additive
     # clearcoat BRDF lobe gated by FrameData.substrateParams. clearcoat=0 == lit_pbr_ibl byte-identical.

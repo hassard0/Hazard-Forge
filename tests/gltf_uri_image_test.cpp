@@ -20,6 +20,7 @@
 #include "cgltf/cgltf.h"       // declarations only (no CGLTF_IMPLEMENTATION — it lives in hf_core)
 #include "stb/stb_image.h"     // declarations only (no STB_IMAGE_IMPLEMENTATION — same TU rule)
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -116,6 +117,65 @@ int main() {
             if (px) stbi_image_free(px);
         }
         cgltf_free(data);
+    }
+
+    // ---- Slice SC1b: alphaMode/alphaCutoff parsing + the PURE ResolveAlphaMode mapping ----------
+    // Pure pins first (cgltf numbering: 0=OPAQUE, 1=MASK, 2=BLEND).
+    {
+        AlphaMaskInfo op = ResolveAlphaMode(0, 0.5f);
+        check(!op.masked && op.cutoff == 0.0f, "alpha: OPAQUE -> {masked=false, cutoff=0}");
+        AlphaMaskInfo mk = ResolveAlphaMode(1, 0.42f);
+        check(mk.masked && mk.cutoff == 0.42f, "alpha: MASK -> {masked=true, cutoff=authored}");
+        AlphaMaskInfo bl = ResolveAlphaMode(2, 0.9f);
+        check(bl.masked && bl.cutoff == 0.5f,
+              "alpha: BLEND -> {masked=true, cutoff=0.5} (documented v1 MASK approximation)");
+        AlphaMaskInfo uk = ResolveAlphaMode(99, 0.3f);
+        check(!uk.masked && uk.cutoff == 0.0f, "alpha: unknown mode -> opaque");
+    }
+    // Then the cgltf field contract: a materials-only fixture .gltf with all three modes parses to
+    // the alpha_mode/alpha_cutoff values DecodeMaterial reads (MASK cutoff authored 0.42; the
+    // cutoff-less MASK material gets cgltf's spec default 0.5).
+    const fs::path alphaGltfPath = dir / "alpha_modes.gltf";
+    {
+        const char* json =
+            "{\"asset\":{\"version\":\"2.0\"},\"materials\":["
+            "{\"name\":\"op\"},"
+            "{\"name\":\"mk\",\"alphaMode\":\"MASK\",\"alphaCutoff\":0.42},"
+            "{\"name\":\"mkDefault\",\"alphaMode\":\"MASK\"},"
+            "{\"name\":\"bl\",\"alphaMode\":\"BLEND\"}]}";
+        std::ofstream f(alphaGltfPath, std::ios::binary);
+        f << json;
+        check(f.good(), "fixture: alpha_modes.gltf written");
+    }
+    {
+        const std::string p = alphaGltfPath.string();
+        cgltf_options aopt{};
+        cgltf_data* ad = nullptr;
+        cgltf_result ares = cgltf_parse_file(&aopt, p.c_str(), &ad);
+        check(ares == cgltf_result_success && ad && ad->materials_count == 4,
+              "cgltf: alpha fixture parses with 4 materials");
+        if (ares == cgltf_result_success && ad && ad->materials_count == 4) {
+            check(ad->materials[0].alpha_mode == cgltf_alpha_mode_opaque,
+                  "cgltf: unstated alphaMode parses OPAQUE");
+            check(ad->materials[1].alpha_mode == cgltf_alpha_mode_mask &&
+                      std::fabs(ad->materials[1].alpha_cutoff - 0.42f) < 1e-6f,
+                  "cgltf: MASK + authored alphaCutoff 0.42");
+            check(ad->materials[2].alpha_mode == cgltf_alpha_mode_mask &&
+                      ad->materials[2].alpha_cutoff == 0.5f,
+                  "cgltf: MASK without alphaCutoff defaults to the spec 0.5");
+            check(ad->materials[3].alpha_mode == cgltf_alpha_mode_blend,
+                  "cgltf: BLEND parses");
+            // End-to-end mapping (the exact expression DecodeMaterial evaluates).
+            AlphaMaskInfo m1 = ResolveAlphaMode((int)ad->materials[1].alpha_mode,
+                                                ad->materials[1].alpha_cutoff);
+            check(m1.masked && std::fabs(m1.cutoff - 0.42f) < 1e-6f,
+                  "alpha: parsed MASK material resolves to {true, 0.42}");
+            AlphaMaskInfo m3 = ResolveAlphaMode((int)ad->materials[3].alpha_mode,
+                                                ad->materials[3].alpha_cutoff);
+            check(m3.masked && m3.cutoff == 0.5f,
+                  "alpha: parsed BLEND material resolves to {true, 0.5}");
+        }
+        if (ad) cgltf_free(ad);
     }
 
     // ---- 3. Fallback contract: non-file URIs and missing files return empty (never throw) -------

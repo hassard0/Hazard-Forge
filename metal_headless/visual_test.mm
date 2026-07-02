@@ -1450,10 +1450,15 @@ static int RunSceneShowcase(const char* outPath) {
 // images are EXTERNAL JPG/PNG file URIs (the SC1 loader seam) — and renders a fixed INTERIOR atrium
 // camera looking down the nave in the asset's native meters (no auto-fit): directional sun + the
 // existing shadow path + full PBR with the real textures, sky through the open roof, standard post.
-// Prints the same {meshes, materials, textures, triangles, drawCalls, shaded} stat line. FLOAT-class
-// golden. Fails loudly with a fetch hint when the asset is absent (it is fetched, never committed).
-// Documented fidelity gaps (same as Vulkan): alphaMode MASK/BLEND not honoured (opaque-only
-// pipeline), mip-0-only texture uploads, KHR_materials_* extensions ignored. -----------------------
+// Prints the same {meshes, materials, textures, triangles, drawCalls, shaded, maskedMaterials} stat
+// line. FLOAT-class golden. Fails loudly with a fetch hint when the asset is absent (it is fetched,
+// never committed). Slice SC1b (same as Vulkan): alphaMode MASK honoured via the lit_cutout.vert +
+// lit_pbr_cutout.frag pipeline (cutoff in material.w; BLEND approximated as MASK@0.5 — documented
+// v1) + full deterministic CPU mip chains on every decoded texture (GltfLoadOptions::
+// generateMipmaps -> the existing TextureDesc::mipData N-mip path; the Metal default sampler
+// already filters mips linearly). Remaining gaps: the depth-only shadow pass does not alpha-test
+// (masked foliage casts its full-quad shadow); KHR_materials_* extensions ignored; byte-space mip
+// averaging (no sRGB linearization, no normal renormalization). ------------------------------------
 static int RunSc1HeroShowcase(const char* outPath) {
     using math::Mat4; using math::Vec3;
     const uint32_t W = 1280, H = 720;
@@ -1492,6 +1497,14 @@ static int RunSc1HeroShowcase(const char* outPath) {
     pbrDesc.pushConstantSize = sizeof(float) * 20;
     auto pbrPipeline = device->CreateGraphicsPipeline(pbrDesc);
 
+    // SC1b: alpha-mask (cutout) pipeline — lit_cutout.vert + lit_pbr_cutout.frag (same layout/state
+    // as the opaque PBR pipeline; only the location-6 cutoff varying + fragment discard differ).
+    auto cutVs = loadMSL("lit_cutout.vert.gen.metal", "cutout_vertex");
+    auto cutFs = loadMSL("lit_pbr_cutout.frag.gen.metal", "pbr_cutout_fragment");
+    rhi::GraphicsPipelineDesc cutDesc = pbrDesc;
+    cutDesc.vertex = cutVs.get(); cutDesc.fragment = cutFs.get();
+    auto cutoutPipeline = device->CreateGraphicsPipeline(cutDesc);
+
     // Static depth-only shadow pipeline.
     auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
     rhi::GraphicsPipelineDesc shDesc;
@@ -1527,7 +1540,11 @@ static int RunSc1HeroShowcase(const char* outPath) {
     hf::asset::GltfScene sponza;
     const auto loadT0 = std::chrono::steady_clock::now();
     try {
-        sponza = hf::asset::LoadGltfScene(*device, HF_SPONZA_MODEL_PATH);
+        // SC1b: full deterministic CPU mip chains (identical bytes to the Vulkan path — the chain
+        // is pure-integer CPU code feeding the shared TextureDesc::mipData upload).
+        hf::asset::GltfLoadOptions loadOpts;
+        loadOpts.generateMipmaps = true;
+        sponza = hf::asset::LoadGltfScene(*device, HF_SPONZA_MODEL_PATH, loadOpts);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FATAL: --sc1-hero-shot could not load '%s': %s\n",
                      HF_SPONZA_MODEL_PATH, e.what());
@@ -1547,10 +1564,14 @@ static int RunSc1HeroShowcase(const char* outPath) {
         triangles += inst.mesh->indexCount() / 3ull;
     const unsigned shaded = (unsigned)sponza.instances.size();
     const unsigned drawCalls = shaded * 2u + 2u;   // shadow + scene passes + sky + post
+    // SC1b: how many deduped materials are alpha-masked (glTF MASK, or BLEND->MASK@0.5).
+    unsigned maskedMaterials = 0;
+    for (const auto& m : sponza.materialStorage)
+        if (m->alphaMasked) ++maskedMaterials;
     std::printf("[sc1] hero stats: meshes=%zu materials=%zu textures=%zu triangles=%llu "
-                "drawCalls=%u shaded=%u\n",
+                "drawCalls=%u shaded=%u maskedMaterials=%u\n",
                 sponza.meshStorage.size(), sponza.materialStorage.size(),
-                sponza.textureCount, triangles, drawCalls, shaded);
+                sponza.textureCount, triangles, drawCalls, shaded, maskedMaterials);
     std::printf("[sc1] sponza load: %.2fs\n", loadSec);
 
     // Fixed interior camera + sun — IDENTICAL constants to the Vulkan path (FlipProjY excepted).
@@ -1612,20 +1633,29 @@ static int RunSc1HeroShowcase(const char* outPath) {
             cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
             cmd.BindPipeline(*skyPipe);
             cmd.Draw(3);
-            cmd.BindPipeline(*pbrPipeline);
-            for (const auto& inst : sponza.instances) {
+            // SC1b: OPAQUE instances through the unchanged PBR pipeline first, then the
+            // alpha-MASKED instances through the cutout pipeline (cutoff in material.w; z=0 keeps
+            // the untinted sentinel). Same split + order as the Vulkan path.
+            auto drawInstance = [&](const hf::asset::SceneInstance& inst) {
                 const hf::asset::PbrMaterial& m = *inst.material;
                 float pc[20];
                 for (int k = 0; k < 16; ++k) pc[k] = inst.worldTransform.m[k];
                 pc[16] = m.metallicFactor; pc[17] = m.roughnessFactor;
-                pc[18] = 0.0f; pc[19] = 0.0f;
+                pc[18] = 0.0f;
+                pc[19] = m.alphaMasked ? m.alphaCutoff : 0.0f;
                 cmd.PushConstants(pc, sizeof(pc));
                 cmd.BindMaterialPBR(*m.baseColor, *m.metalRough, *m.normalMap,
                                     *m.emissive, *m.occlusion);
                 cmd.BindVertexBuffer(inst.mesh->vertices());
                 cmd.BindIndexBuffer(inst.mesh->indices());
                 cmd.DrawIndexed(inst.mesh->indexCount());
-            }
+            };
+            cmd.BindPipeline(*pbrPipeline);
+            for (const auto& inst : sponza.instances)
+                if (!inst.material->alphaMasked) drawInstance(inst);
+            cmd.BindPipeline(*cutoutPipeline);
+            for (const auto& inst : sponza.instances)
+                if (inst.material->alphaMasked) drawInstance(inst);
             cmd.EndRenderPass();
         });
 

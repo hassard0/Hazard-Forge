@@ -255,6 +255,11 @@ target_compile_definitions(draco_gltf_load_test PRIVATE
 # cgltf + stb_image IMPLEMENTATIONS live in hf_core's gltf_loader.cpp (declarations only here).
 # Pure CPU (hf_core), no RHI/device, ASan-eligible.
 hf_add_pure_test(gltf_uri_image_test)
+# Slice SC1b (alpha-mask cutouts + texture mipmaps): the PURE deterministic RGBA8 mip chain
+# (hf::asset::BuildRgba8MipChain / FullMipCount) that feeds rhi::TextureDesc::mipData on BOTH
+# backends — pinned integer-rounded averages, odd-dim edge clamps, chain shape, determinism.
+# (The alphaMode/alphaCutoff parsing + ResolveAlphaMode pins live in gltf_uri_image_test.)
+hf_add_pure_test(gltf_mipchain_test)
 # Binary FBX mesh importer (issue #15 ask #2 — support FBX alongside glTF/OBJ): the SELF-CONTAINED,
 # clean-room engine/asset/fbx_loader.h loads the assimp BSD test cube assets/models/box.fbx (FBX v7400,
 # "Kaydara FBX Binary" node-tree) to correct geometry: 24 verts / 12 triangles, each axis 2 distinct

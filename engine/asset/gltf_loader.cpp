@@ -95,6 +95,66 @@ std::vector<uint8_t> ReadUriBytesRelativeTo(const char* gltfPath, const char* ur
     return out;
 }
 
+// ---- PURE alpha-mode resolution (Slice SC1b) — see the header contract. ----
+AlphaMaskInfo ResolveAlphaMode(int alphaMode, float alphaCutoff) {
+    AlphaMaskInfo out;
+    if (alphaMode == 1) {              // cgltf_alpha_mode_mask
+        out.masked = true;
+        out.cutoff = alphaCutoff;      // cgltf defaults this to the spec's 0.5
+    } else if (alphaMode == 2) {       // cgltf_alpha_mode_blend
+        out.masked = true;             // v1: BLEND approximated as MASK at the spec-default 0.5
+        out.cutoff = 0.5f;             // (documented; proper OIT wiring is out of scope for SC1b)
+    }
+    return out;                        // opaque / unknown: {false, 0}
+}
+
+// ---- PURE deterministic RGBA8 mip chain (Slice SC1b) — see the header contract. ----
+uint32_t FullMipCount(uint32_t width, uint32_t height) {
+    uint32_t m = width > height ? width : height;
+    if (m == 0) m = 1;
+    uint32_t levels = 1;
+    while (m > 1) { m >>= 1; ++levels; }
+    return levels;
+}
+
+std::vector<std::vector<uint8_t>> BuildRgba8MipChain(const uint8_t* mip0,
+                                                     uint32_t width, uint32_t height) {
+    std::vector<std::vector<uint8_t>> chain;
+    if (!mip0 || width == 0 || height == 0) return chain;
+    const uint32_t levels = FullMipCount(width, height);
+    if (levels <= 1) return chain;   // 1x1: no chain
+    chain.reserve(levels - 1);
+
+    const uint8_t* prev = mip0;
+    uint32_t pw = width, ph = height;
+    for (uint32_t lvl = 1; lvl < levels; ++lvl) {
+        const uint32_t mw = (width >> lvl) ? (width >> lvl) : 1u;
+        const uint32_t mh = (height >> lvl) ? (height >> lvl) : 1u;
+        std::vector<uint8_t> dst((size_t)mw * mh * 4);
+        for (uint32_t y = 0; y < mh; ++y) {
+            // Clamp the 2x2 source block to the previous level's edge (odd dims duplicate the edge
+            // texel, keeping every destination texel an exact 4-sample integer average).
+            const uint32_t sy0 = (2u * y     < ph) ? 2u * y     : ph - 1u;
+            const uint32_t sy1 = (2u * y + 1 < ph) ? 2u * y + 1 : ph - 1u;
+            for (uint32_t x = 0; x < mw; ++x) {
+                const uint32_t sx0 = (2u * x     < pw) ? 2u * x     : pw - 1u;
+                const uint32_t sx1 = (2u * x + 1 < pw) ? 2u * x + 1 : pw - 1u;
+                const uint8_t* p00 = prev + ((size_t)sy0 * pw + sx0) * 4;
+                const uint8_t* p10 = prev + ((size_t)sy0 * pw + sx1) * 4;
+                const uint8_t* p01 = prev + ((size_t)sy1 * pw + sx0) * 4;
+                const uint8_t* p11 = prev + ((size_t)sy1 * pw + sx1) * 4;
+                uint8_t* d = dst.data() + ((size_t)y * mw + x) * 4;
+                for (int c = 0; c < 4; ++c)
+                    d[c] = (uint8_t)(((uint32_t)p00[c] + p10[c] + p01[c] + p11[c] + 2u) >> 2);
+            }
+        }
+        chain.push_back(std::move(dst));
+        prev = chain.back().data();
+        pw = mw; ph = mh;
+    }
+    return chain;
+}
+
 // Build the engine's CPU vertex/index arrays from a glTF primitive (DEVICE-FREE — issue #36 seam).
 //
 //  * recentre — when true, the geometry is recentred so its bbox centre sits at the origin (the
@@ -338,8 +398,13 @@ std::unique_ptr<rhi::ITexture> MakeSolidTexture(rhi::IRHIDevice& device,
 // .gltf's directory — Slice SC1) into an RGBA8 rhi::ITexture. Returns nullptr if the image is absent
 // or cannot be reached/decoded; callers substitute a sensible fallback. `label` names the map in
 // diagnostics; `gltfPath` is the source .gltf/.glb path external URIs resolve against.
+// `genMips` (Slice SC1b, default false == the pre-SC1b path verbatim): build the full deterministic
+// CPU RGBA8 mip chain (BuildRgba8MipChain) and upload it through the EXISTING
+// rhi::TextureDesc::mipData N-mip path (Slice R); both backends' default samplers already filter
+// linearly across mips, and a 1-mip texture samples exactly as before.
 std::unique_ptr<rhi::ITexture> DecodeImage(rhi::IRHIDevice& device, const cgltf_image* image,
-                                           const char* label, const char* gltfPath) {
+                                           const char* label, const char* gltfPath,
+                                           bool genMips = false) {
     if (!image) return nullptr;
 
     const stbi_uc* srcBytes = nullptr;
@@ -390,6 +455,19 @@ std::unique_ptr<rhi::ITexture> DecodeImage(rhi::IRHIDevice& device, const cgltf_
     td.format = rhi::Format::RGBA8_UNorm;
     td.data = pixels;
     td.dataSize = static_cast<uint64_t>(w) * h * 4;
+
+    // Slice SC1b: full deterministic CPU mip chain -> the existing N-mip upload path. The chain and
+    // the pointer table must outlive CreateTexture (they are read during the staged upload).
+    std::vector<std::vector<uint8_t>> mipChain;
+    std::vector<const void*> mipPtrs;
+    if (genMips && (w > 1 || h > 1)) {
+        mipChain = BuildRgba8MipChain(pixels, td.width, td.height);
+        mipPtrs.reserve(mipChain.size() + 1);
+        mipPtrs.push_back(pixels);                          // level 0 = the stbi decode
+        for (const auto& m : mipChain) mipPtrs.push_back(m.data());
+        td.mipLevels = static_cast<uint32_t>(mipPtrs.size());
+        td.mipData = mipPtrs.data();
+    }
     auto tex = device.CreateTexture(td);
 
     stbi_image_free(pixels);
@@ -399,8 +477,9 @@ std::unique_ptr<rhi::ITexture> DecodeImage(rhi::IRHIDevice& device, const cgltf_
 // Decode the material's base-color image into an RGBA8 texture; white fallback on any failure.
 std::unique_ptr<rhi::ITexture> LoadBaseColorTexture(rhi::IRHIDevice& device,
                                                     const cgltf_image* image,
-                                                    const char* gltfPath) {
-    auto tex = DecodeImage(device, image, "base-color", gltfPath);
+                                                    const char* gltfPath,
+                                                    bool genMips = false) {
+    auto tex = DecodeImage(device, image, "base-color", gltfPath, genMips);
     return tex ? std::move(tex) : MakeWhiteTexture(device);
 }
 
@@ -464,9 +543,11 @@ cgltf_data* OpenGltf(const char* path) {
 // Every texture is non-null (neutral 1x1 fallbacks per absent map, identical semantics to
 // LoadPbrGltfModel). A null `mat` yields a sensible default (white base, neutral metalRough,
 // flat normal, black emissive, white occlusion, metallic 0 / roughness 1).
-// `gltfPath` is the source file path external image URIs resolve against (SC1).
+// `gltfPath` is the source file path external image URIs resolve against (SC1). `opts` (SC1b):
+// generateMipmaps builds deterministic CPU mip chains for every decoded map (fallback 1x1s have no
+// chain); alphaMode/alphaCutoff are ALWAYS read (pure data — opaque consumers ignore the fields).
 PbrMaterial DecodeMaterial(rhi::IRHIDevice& device, const cgltf_material* mat,
-                           const char* gltfPath) {
+                           const char* gltfPath, const GltfLoadOptions& opts = {}) {
     float metallic = mat ? 1.0f : 0.0f;   // default material: dielectric (metallic 0)
     float roughness = 1.0f;
     float emissiveF[3] = {0.0f, 0.0f, 0.0f};
@@ -490,19 +571,26 @@ PbrMaterial DecodeMaterial(rhi::IRHIDevice& device, const cgltf_material* mat,
         for (int k = 0; k < 3; ++k) emissiveF[k] = mat->emissive_factor[k];
     }
 
+    const bool genMips = opts.generateMipmaps;
     PbrMaterial out;
-    out.baseColor = LoadBaseColorTexture(device, baseImg, gltfPath);
-    out.metalRough = DecodeImage(device, mrImg, "metallic-roughness", gltfPath);
+    out.baseColor = LoadBaseColorTexture(device, baseImg, gltfPath, genMips);
+    out.metalRough = DecodeImage(device, mrImg, "metallic-roughness", gltfPath, genMips);
     if (!out.metalRough) out.metalRough = MakeSolidTexture(device, 255, 255, 0, 255);
-    out.normalMap = DecodeImage(device, normalImg, "normal", gltfPath);
+    out.normalMap = DecodeImage(device, normalImg, "normal", gltfPath, genMips);
     if (!out.normalMap) out.normalMap = MakeSolidTexture(device, 128, 128, 255, 255);
-    out.emissive = DecodeImage(device, emissiveImg, "emissive", gltfPath);
+    out.emissive = DecodeImage(device, emissiveImg, "emissive", gltfPath, genMips);
     if (!out.emissive) out.emissive = MakeSolidTexture(device, 0, 0, 0, 255);
-    out.occlusion = DecodeImage(device, occlusionImg, "occlusion", gltfPath);
+    out.occlusion = DecodeImage(device, occlusionImg, "occlusion", gltfPath, genMips);
     if (!out.occlusion) out.occlusion = MakeWhiteTexture(device);
     out.metallicFactor = metallic;
     out.roughnessFactor = roughness;
     for (int k = 0; k < 3; ++k) out.emissiveFactor[k] = emissiveF[k];
+    // Slice SC1b: resolve glTF alphaMode -> the engine's alpha-test model (pure helper; see header).
+    if (mat) {
+        const AlphaMaskInfo am = ResolveAlphaMode((int)mat->alpha_mode, mat->alpha_cutoff);
+        out.alphaMasked = am.masked;
+        out.alphaCutoff = am.cutoff;
+    }
     return out;
 }
 
@@ -1016,6 +1104,10 @@ math::Mat4 GltfScene::FitTransform(float targetSize, float groundY) const {
 }
 
 GltfScene LoadGltfScene(rhi::IRHIDevice& device, const char* path) {
+    return LoadGltfScene(device, path, GltfLoadOptions{});   // pre-SC1b behaviour verbatim
+}
+
+GltfScene LoadGltfScene(rhi::IRHIDevice& device, const char* path, const GltfLoadOptions& opts) {
     cgltf_data* data = OpenGltf(path);
     struct Guard { cgltf_data* d; ~Guard() { if (d) cgltf_free(d); } } guard{data};
 
@@ -1029,7 +1121,7 @@ GltfScene LoadGltfScene(rhi::IRHIDevice& device, const char* path) {
         if (!mat) {
             if (!defaultMaterial) {
                 out.materialStorage.push_back(
-                    std::make_unique<PbrMaterial>(DecodeMaterial(device, nullptr, path)));
+                    std::make_unique<PbrMaterial>(DecodeMaterial(device, nullptr, path, opts)));
                 defaultMaterial = out.materialStorage.back().get();
             }
             return defaultMaterial;
@@ -1038,12 +1130,12 @@ GltfScene LoadGltfScene(rhi::IRHIDevice& device, const char* path) {
         if (idx < 0 || (cgltf_size)idx >= data->materials_count) {
             // Foreign pointer (shouldn't happen); decode standalone, owned but un-cached.
             out.materialStorage.push_back(
-                std::make_unique<PbrMaterial>(DecodeMaterial(device, mat, path)));
+                std::make_unique<PbrMaterial>(DecodeMaterial(device, mat, path, opts)));
             return out.materialStorage.back().get();
         }
         if (!materialByIndex[idx]) {
             out.materialStorage.push_back(
-                std::make_unique<PbrMaterial>(DecodeMaterial(device, mat, path)));
+                std::make_unique<PbrMaterial>(DecodeMaterial(device, mat, path, opts)));
             materialByIndex[idx] = out.materialStorage.back().get();
         }
         return materialByIndex[idx];

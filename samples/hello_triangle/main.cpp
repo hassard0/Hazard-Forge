@@ -109087,11 +109087,19 @@ int main(int argc, char** argv) {
         // shadow path + full PBR with the real textures, sky through the open roof, then the standard
         // post pass. Prints the {meshes, materials, textures, triangles, drawCalls, shaded} stat line
         // (the scale proof) and the load time. FLOAT-class golden (the established render class).
-        // Documented fidelity gaps (honesty over green): alphaMode MASK/BLEND is NOT honoured (the
-        // lit-PBR pipeline is opaque-only, so foliage/chain cutout quads render as opaque cards),
-        // textures upload mip-0 only (no mip chain -> distant-texel aliasing), KHR_materials_specular
-        // /_ior/_transmission extension parameters are ignored (core metallic-roughness only), and
-        // base-color decode is UNORM (the same convention every existing glTF shot uses). ------------
+        // Slice SC1b closed the two big SC1 gaps: (1) alphaMode MASK is now honoured — masked
+        // materials draw through the lit_cutout.vert + lit_pbr_cutout.frag pipeline (alpha cutoff in
+        // push-constant material.w per the #38 packing; `discard` below it), so foliage/trim cutout
+        // quads read as proper silhouettes instead of opaque speckled cards (BLEND is approximated
+        // as MASK@0.5 — documented v1; the engine's OIT is not wired into the hero path); (2) every
+        // decoded texture now uploads a FULL deterministic CPU-box-filtered mip chain
+        // (GltfLoadOptions::generateMipmaps -> BuildRgba8MipChain -> the existing TextureDesc::
+        // mipData N-mip path), so distant floor/curtain texels stop aliasing.
+        // Remaining documented fidelity gaps (honesty over green): the depth-only SHADOW pass does
+        // not alpha-test, so masked foliage still casts its full-quad shadow; KHR_materials_specular
+        // /_ior/_transmission extension parameters are ignored (core metallic-roughness only); and
+        // base-color decode is UNORM (the same convention every existing glTF shot uses), with mips
+        // averaged in byte space (no sRGB linearization) and normal-map mips not renormalized. ------
         if (sc1HeroShotPath) {
             using math::Mat4; using math::Vec3;
             uint32_t w = window.FramebufferWidth();
@@ -109129,6 +109137,18 @@ int main(int argc, char** argv) {
             pbrDesc.pbrMaterial = true;
             pbrDesc.pushConstantSize = sizeof(float) * 20;  // mat4 model + float4 material
             auto pbrPipeline = device->CreateGraphicsPipeline(pbrDesc);
+
+            // SC1b: alpha-mask (cutout) pipeline — the lit_cutout.vert + lit_pbr_cutout.frag pair
+            // (same layout/state as the opaque PBR pipeline; the ONLY differences are the location-6
+            // alpha-cutoff varying and the fragment `discard`). Masked-material draws select this.
+            auto cutVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_cutout.vert.hlsl.spv");
+            auto cutFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_pbr_cutout.frag.hlsl.spv");
+            auto cutVs = device->CreateShaderModule({std::span<const uint32_t>(cutVsWords)});
+            auto cutFs = device->CreateShaderModule({std::span<const uint32_t>(cutFsWords)});
+            rhi::GraphicsPipelineDesc cutDesc = pbrDesc;
+            cutDesc.vertex = cutVs.get();
+            cutDesc.fragment = cutFs.get();
+            auto cutoutPipeline = device->CreateGraphicsPipeline(cutDesc);
 
             // Depth-only shadow pipeline (every imported primitive casts).
             auto shadowVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
@@ -109177,7 +109197,11 @@ int main(int argc, char** argv) {
             hf::asset::GltfScene sponza;
             const auto loadT0 = std::chrono::steady_clock::now();
             try {
-                sponza = hf::asset::LoadGltfScene(*device, HF_SPONZA_MODEL_PATH);
+                // SC1b: full deterministic CPU mip chains for every decoded texture (the hero path
+                // opts in; the default-options overload keeps every other caller mip-0-only).
+                hf::asset::GltfLoadOptions loadOpts;
+                loadOpts.generateMipmaps = true;
+                sponza = hf::asset::LoadGltfScene(*device, HF_SPONZA_MODEL_PATH, loadOpts);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "FATAL: --sc1-hero-shot could not load '%s': %s\n",
                              HF_SPONZA_MODEL_PATH, e.what());
@@ -109201,10 +109225,14 @@ int main(int argc, char** argv) {
                 triangles += inst.mesh->indexCount() / 3ull;
             const unsigned shaded = (unsigned)sponza.instances.size();
             const unsigned drawCalls = shaded * 2u + 2u;   // shadow + scene passes + sky + post
+            // SC1b: how many deduped materials are alpha-masked (glTF MASK, or BLEND->MASK@0.5).
+            unsigned maskedMaterials = 0;
+            for (const auto& m : sponza.materialStorage)
+                if (m->alphaMasked) ++maskedMaterials;
             std::printf("[sc1] hero stats: meshes=%zu materials=%zu textures=%zu triangles=%llu "
-                        "drawCalls=%u shaded=%u\n",
+                        "drawCalls=%u shaded=%u maskedMaterials=%u\n",
                         sponza.meshStorage.size(), sponza.materialStorage.size(),
-                        sponza.textureCount, triangles, drawCalls, shaded);
+                        sponza.textureCount, triangles, drawCalls, shaded, maskedMaterials);
             std::printf("[sc1] sponza load: %.2fs; world AABB min(%.2f %.2f %.2f) max(%.2f %.2f %.2f)\n",
                         loadSec, sponza.bbMin[0], sponza.bbMin[1], sponza.bbMin[2],
                         sponza.bbMax[0], sponza.bbMax[1], sponza.bbMax[2]);
@@ -109275,21 +109303,32 @@ int main(int argc, char** argv) {
                     cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
                     cmd.BindPipeline(*skyPipe);
                     cmd.Draw(3);
-                    // The hero scene (full PBR): every instance at its authored world transform.
-                    cmd.BindPipeline(*pbrPipeline);
-                    for (const auto& inst : sponza.instances) {
+                    // The hero scene (full PBR), instance order preserved within each class. SC1b:
+                    // OPAQUE instances first through the unchanged PBR pipeline, then the
+                    // alpha-MASKED instances through the cutout pipeline with the material's cutoff
+                    // in push-constant material.w (the #38 packing; z=0 keeps the untinted
+                    // sentinel). Draw order between the classes is irrelevant for correctness —
+                    // cutouts write depth like opaque geometry (discard only removes texels).
+                    auto drawInstance = [&](const hf::asset::SceneInstance& inst) {
                         const hf::asset::PbrMaterial& m = *inst.material;
                         float pc[20];
                         for (int k = 0; k < 16; ++k) pc[k] = inst.worldTransform.m[k];
                         pc[16] = m.metallicFactor; pc[17] = m.roughnessFactor;
-                        pc[18] = 0.0f; pc[19] = 0.0f;
+                        pc[18] = 0.0f;
+                        pc[19] = m.alphaMasked ? m.alphaCutoff : 0.0f;
                         cmd.PushConstants(pc, sizeof(pc));
                         cmd.BindMaterialPBR(*m.baseColor, *m.metalRough, *m.normalMap,
                                             *m.emissive, *m.occlusion);
                         cmd.BindVertexBuffer(inst.mesh->vertices());
                         cmd.BindIndexBuffer(inst.mesh->indices());
                         cmd.DrawIndexed(inst.mesh->indexCount());
-                    }
+                    };
+                    cmd.BindPipeline(*pbrPipeline);
+                    for (const auto& inst : sponza.instances)
+                        if (!inst.material->alphaMasked) drawInstance(inst);
+                    cmd.BindPipeline(*cutoutPipeline);
+                    for (const auto& inst : sponza.instances)
+                        if (inst.material->alphaMasked) drawInstance(inst);
                     cmd.EndRenderPass();
                 });
 

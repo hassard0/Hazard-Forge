@@ -100,6 +100,11 @@ hf_gen_msl(lit_manylight.frag  lit_manylight.frag.hlsl  frag manylight_fragment)
 hf_gen_msl(lit_clustered_cl.frag  lit_clustered_cl.frag.hlsl  frag clustered_lights_fragment)
 # Full-PBR fragment shader (Slice P): reuses lit.vert; samples the 5-texture glTF material set.
 hf_gen_msl(lit_pbr.frag lit_pbr.frag.hlsl frag pbr_fragment)
+# Alpha-mask cutouts (Slice SC1b): the cutout vertex/fragment pair (lit.vert + lit_pbr.frag copies
+# with the location-6 alpha-cutoff varying + discard). NEW files, NEW gen commands — every existing
+# shader's gen command line (and so its MSL and golden) is byte-for-byte unchanged.
+hf_gen_msl(lit_cutout.vert     lit_cutout.vert.hlsl     vert cutout_vertex)
+hf_gen_msl(lit_pbr_cutout.frag lit_pbr_cutout.frag.hlsl frag pbr_cutout_fragment)
 # Data-driven material graph (Slice AV): the COMMITTED build-time-generated fragment shader
 # (shaders/generated/mat_showcase.frag.hlsl, codegen'd from assets/materials/showcase.mat.json on the
 # Windows build). It #includes ../pbr_core.hlsli and reuses lit.vert + the existing PBR material set,
