@@ -1404,6 +1404,28 @@ hf_add_pure_test(cloth_test)
 # (the CF1/FR8 precedent — NO new shader, NO new RHI). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(hair_test)
 
+# Slice SB1 — DETERMINISTIC VOLUMETRIC SOFT BODY CORE (engine/sim/softbody.h, Track-S S3 of
+# docs/SUPERIORITY_ROADMAP.md): Q16.16 PBD volumetric lattice — an NxNxN particle cube with STRETCH
+# (axis edges) + SHEAR (both face diagonals) + per-cell VOLUME preservation (the v1 isotropic
+# centroid-scale projection against a signed-6-tet integer cell volume, the documented exact scheme)
+# that SQUASHES on impact and RECOVERS its shape — bit-identical + lockstep/rollback-replayable (UE5
+# has no deterministic soft body; Chaos Flesh is float/experimental). ~80% mold-reuse of cloth.h
+# (READ-ONLY: ClothParticle/IntegrateParticle/SolveDistanceConstraint/CollidePlane/ClothDigest); the
+# step uses the HR1/FL7 velocity re-encode discipline (v = (pos-prev)/dt, damped). Pins InitLattice/
+# BuildSoftConstraints (counts + hand-enumerated edges + the host-snapped diagonal rest), the
+# CellVolume exact integer scheme (unit cube == kOne, translation- AND shear-invariant, half-height ==
+# kOne/2), the SolveVolumeConstraint clamped centroid-scale hand-check (kVol==0 exact no-op, kOne/2
+# half projection, pinned corner holds, at-rest no drift), determinism (two runs byte-identical +
+# net::DigestBytes-over-pos + SoftBodyDigest PINNED, identical MSVC + clang), the physics (the
+# hard-impact drop SQUASHES to 75% of rest height then RECOVERS to within 1/16 unit — the shape-memory
+# proof; VOLUME is LOAD-BEARING: kVol==kOne recovers to 0.26% volume error while kVol==0 folds cells
+# and stays crushed at 7.5% lost, both pinned; the settled body is at REST), identity-at-zero (kVol=0
+# == the hand-composed pure stretch+shear lattice BIT-EXACT; damp==kOne == the raw re-encode), the
+# pinned honest residuals, and lockstep/rollback (replica == authority; rollback corrects a real
+# impulse misprediction). PURE CPU on both backends (the CF1/FR8/HR1 precedent — NO new shader, NO new
+# RHI). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(softbody_test)
+
 # Deterministic GPU Fluid Slice 1 (Slice FL1, the BEACHHEAD of FLAGSHIP #9): the Q16.16 fixed-point
 # fluid PARTICLE POOL INTEGRATOR + dam-break block core (engine/sim/fluid.h) the GPU
 # shaders/fluid_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
