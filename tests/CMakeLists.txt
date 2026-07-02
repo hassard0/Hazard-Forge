@@ -414,6 +414,12 @@ hf_add_pure_test(point_shadow_test)
 # BuildClusters consistency (offsets == prefix sum, sum(count) == lightIndices.size()). Pure C++
 # (render/clustered.h, header-only), ASan-eligible.
 hf_add_pure_test(clustered_test)
+# Slice ML1 — MANY-LIGHT RENDERING (Track-S S7): the 128-PcgHash-light field + its render::clustered
+# assignment (render/manylight.h::BuildShowcaseAssignment — the SAME call the --manylight-shot
+# showcases make), pinning the FNV-1a-64 assignment digest + maxPerCluster + totalAssignments,
+# plus run-stability (two builds byte-identical) and the 1024-light capacity path. Existing
+# clustered_test assertions untouched. Pure C++ (header-only), ASan-eligible.
+hf_add_pure_test(manylight_test)
 # Slice CL — Clustered Light Culling (Forward+): SphereAABBIntersect (inside/touching/outside),
 # ClusterViewAABB frustum tiling, AssignLights correctness + the no-false-negative brute-force parity
 # (the render-invariance safety property), real-culling reduction (maxPerCluster<totalLights), and

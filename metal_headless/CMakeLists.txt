@@ -88,6 +88,11 @@ hf_gen_msl(lit_point.frag  lit_point.frag.hlsl  frag point_fragment)
 # point lights from three fragment-stage storage buffers (space3 -> flat Metal fragment buffers).
 # Reuses lit.vert. Same HLSL->SPIR-V->MSL toolchain.
 hf_gen_msl(lit_clustered.frag  lit_clustered.frag.hlsl  frag clustered_fragment)
+# Many-light lit fragment (Slice ML1, Track-S S7): the SSBO-backed path past the
+# HF_MAX_POINT_LIGHTS=8 FrameData cap — the AG clustered lookup over a runtime-sized light
+# StructuredBuffer (set-3 bindings 13/14/15 -> flat Metal fragment buffers 13/14/15 via
+# --msl-decoration-binding). Reuses lit.vert. Same HLSL->SPIR-V->MSL toolchain.
+hf_gen_msl(lit_manylight.frag  lit_manylight.frag.hlsl  frag manylight_fragment)
 # Clustered LIGHT-CULLING lit fragment (Slice CL): windowed hard-radius point lights from this pixel's
 # cluster's fixed-slot ordered list (the SAME ClusterList layout the cluster_assign compute fills on
 # Vulkan; on Metal the list is assigned CPU-side via render/cluster.h). Reuses lit.vert. Shared

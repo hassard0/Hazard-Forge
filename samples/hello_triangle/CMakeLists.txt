@@ -93,6 +93,10 @@ hf_compile_shaders(
     # Clustered / Forward+ lit fragment (Slice AG): per-fragment cluster index + iterate that
     # cluster's point lights from three fragment-stage storage buffers (set 3).
     "shaders/lit_clustered.frag.hlsl:ps"
+    # Many-light lit fragment (Slice ML1, Track-S S7): the SSBO-backed path past the
+    # HF_MAX_POINT_LIGHTS=8 FrameData cap — the AG clustered lookup over a runtime-sized light
+    # StructuredBuffer (set 3, bindings 13/14/15). frame_data.hlsli untouched.
+    "shaders/lit_manylight.frag.hlsl:ps"
     "shaders/lit_pbr.frag.hlsl:ps"
     "shaders/lit_pbr_ibl.frag.hlsl:ps"
     # Substrate-lite layered materials (issue #11, SB1): a copy of lit_pbr_ibl.frag + an additive
