@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "ecs/ecs.h"
+#include "editor/edit_history.h"       // Slice ED5: the deterministic undo/redo command stack.
 #include "editor/editor_panel_data.h"  // EditorState + the panel-data model (pure).
 #include "scene/scene_io.h"
 
@@ -56,8 +57,14 @@ struct EditorUIProbe {
 // viewport region the rendered scene shows through. EditorState (the selected entity) is defined in
 // editor_panel_data.h. Inspector widget edits mutate `registry` through edit_ops (see the ED1 note
 // above). `probe`, when non-null, receives this frame's widget rects (headless input synthesis).
+//
+// Slice ED5 (deterministic undo/redo): when `history` is non-null every inspector edit is applied
+// through the RECORDED wrappers (edit_history.h — same ops, plus a before/after command on the
+// stack) and the panel handles Ctrl+Z (Undo) / Ctrl+Y (Redo) while no text field is being edited.
+// With the default (nullptr) the panel behaves EXACTLY as before ED5 — raw ops, no key handling —
+// so existing callers compile + render byte-identically (the static --editor-shot golden).
 void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resources,
                    EditorState& state, uint32_t fbWidth, uint32_t fbHeight,
-                   EditorUIProbe* probe = nullptr);
+                   EditorUIProbe* probe = nullptr, EditHistory* history = nullptr);
 
 }  // namespace hf::editor

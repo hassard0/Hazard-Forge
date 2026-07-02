@@ -81,7 +81,30 @@ bool DragRow3(const char* label, float v[3], float speed, UiRect* r0, UiRect* r1
 
 void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resources,
                    EditorState& state, uint32_t fbWidth, uint32_t fbHeight,
-                   EditorUIProbe* probe) {
+                   EditorUIProbe* probe, EditHistory* history) {
+    // --- Slice ED5: the edit write paths, RECORDED when a history is wired (the recorded wrappers
+    // capture before/after around the SAME raw op; with a null history the raw op runs directly, so
+    // pre-ED5 callers behave byte-identically). All inspector edits below route through these. ---
+    auto applyTransform = [&](int entity, const TransformEdit& e) {
+        if (history) RecordedApplyTransformEdit(*history, registry, entity, e);
+        else ApplyTransformEdit(registry, entity, e);
+    };
+    auto applyMaterial = [&](int entity, const MaterialEdit& e) {
+        if (history) RecordedApplyMaterialEdit(*history, registry, entity, e);
+        else ApplyMaterialEdit(registry, entity, e);
+    };
+    // --- Slice ED5: Ctrl+Z undo / Ctrl+Y redo (history mode only; suppressed while a text field is
+    // active so ImGui's own InputText Ctrl+Z stays local to the field). Key handling only — zero
+    // visual chrome, so the static shots are untouched. ---
+    if (history) {
+        const ImGuiIO& io = ImGui::GetIO();
+        if (io.KeyCtrl && !io.WantTextInput) {
+            const EditTargets targets{&registry, nullptr};
+            if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) Undo(*history, targets);
+            if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) Redo(*history, targets);
+        }
+    }
+
     // --- Panel DATA (pure, ImGui-free, unit-tested): hierarchy rows + inspector + stats. ---
     const PanelData data = BuildPanelData(registry, resources, state);
     const DockLayout layout = DefaultDockLayout();
@@ -174,7 +197,7 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                     TransformEdit e;
                     e.setPosition = true;
                     e.position = {pos[0], pos[1], pos[2]};
-                    ApplyTransformEdit(registry, in.index, e);
+                    applyTransform(in.index, e);
                 }
                 float eul[3] = {in.eulerRadians.x, in.eulerRadians.y, in.eulerRadians.z};
                 if (DragRow3("Euler", eul, 0.01f, probe ? &probe->eulerX : nullptr,
@@ -182,7 +205,7 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                     TransformEdit e;
                     e.setEuler = true;
                     e.euler = {eul[0], eul[1], eul[2]};
-                    ApplyTransformEdit(registry, in.index, e);
+                    applyTransform(in.index, e);
                 }
                 float scl[3] = {in.scale.x, in.scale.y, in.scale.z};
                 if (DragRow3("Scale", scl, 0.01f, probe ? &probe->scaleX : nullptr,
@@ -190,7 +213,7 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                     TransformEdit e;
                     e.setScale = true;
                     e.scale = {scl[0], scl[1], scl[2]};
-                    ApplyTransformEdit(registry, in.index, e);
+                    applyTransform(in.index, e);
                 }
             }
             ImGui::Separator();
@@ -206,7 +229,7 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                     MaterialEdit e;
                     e.setMetallic = true;
                     e.metallic = metallic;
-                    ApplyMaterialEdit(registry, in.index, e);
+                    applyMaterial(in.index, e);
                 }
                 if (probe) CaptureItemRect(&probe->metallic);
                 ImGui::SameLine(0.0f, style.ItemInnerSpacing.x);
@@ -218,7 +241,7 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                     MaterialEdit e;
                     e.setRoughness = true;
                     e.roughness = roughness;
-                    ApplyMaterialEdit(registry, in.index, e);
+                    applyMaterial(in.index, e);
                 }
                 if (probe) CaptureItemRect(&probe->roughness);
                 ImGui::SameLine(0.0f, style.ItemInnerSpacing.x);
@@ -238,7 +261,7 @@ void BuildEditorUI(ecs::Registry& registry, const scene::SceneResources& resourc
                             MaterialEdit e;
                             e.setBaseColor = true;
                             e.baseColor = tex;
-                            ApplyMaterialEdit(registry, in.index, e);
+                            applyMaterial(in.index, e);
                         }
                     }
                     ImGui::EndCombo();

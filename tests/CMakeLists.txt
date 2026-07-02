@@ -408,6 +408,14 @@ hf_add_pure_test(editor_panels_test)
 # --editor-edit-shot capture golden-verifies the rendered EDITED scene; this pins the ops behind it.
 # Pure C++ (hf_core), no RHI/backend/ImGui symbols, ASan-eligible.
 hf_add_pure_test(editor_edit_test)
+# Slice ED5 — deterministic undo/redo command stack (editor/edit_history.h): recorded commands over
+# the pure edit ops (scene transform/material + the flow-family enrollment), undo K / redo K restore
+# BYTE-IDENTICAL DumpScene state, the interleave truncates the redo tail (pinned), the serialized
+# edit session round-trips digest-identically and REPLAYS byte-identically on a fresh scene, and the
+# fixed hand-authored history serializes to a PINNED cross-compiler FNV-1a-64 digest (MSVC == clang;
+# the artifact is hand-LE, layout-free). Pure C++ (hf_core), no RHI/backend/ImGui symbols,
+# ASan-eligible.
+hf_add_pure_test(edit_history_test)
 # Cascaded shadow maps (Slice AD): frustum-split scheme (N increasing splits in (near,far]) +
 # per-cascade ortho fit (all 8 slice corners land inside the cascade clip volume). Pure C++
 # (render/csm.h, header-only), ASan-eligible.

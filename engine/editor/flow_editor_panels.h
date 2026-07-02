@@ -51,10 +51,17 @@ struct FlowEditorUIProbe {
 // defaults (nullptr) the panel renders EXACTLY as before ED2 — no edit affordance draws, so the static
 // --flow-editor-shot golden is byte-identical (existing 5-arg callers compile + render unchanged).
 // `probe`, when non-null, receives this frame's widget rects (headless input synthesis).
+//
+// Slice ED5 (deterministic undo/redo — the FLOW-family enrollment proof): when `history` is non-null
+// (edit mode only) the palette / connect / delete edits apply through the RECORDED wrappers
+// (edit_history.h RecordedAddFlowNode/RecordedConnectFlow/RecordedDeleteFlowNode — same ops, plus a
+// reversible command on the stack). With the default (nullptr) the raw ops run exactly as before ED5.
+// Undo/Redo key handling stays with the OWNER of the history (the caller drives Undo/Redo with an
+// EditTargets naming this graph); the panel only records.
 void BuildFlowEditorUI(const flow::Graph& graph, const FlowGraphView& view,
                        uint32_t fbWidth, uint32_t fbHeight, const FlowLayout& layout = FlowLayout{},
                        flow::Graph* editGraph = nullptr, FlowEditorState* editState = nullptr,
-                       FlowEditorUIProbe* probe = nullptr);
+                       FlowEditorUIProbe* probe = nullptr, EditHistory* history = nullptr);
 
 // Issue #24 — LIVE EXECUTION FEEDBACK editor: the SAME node-graph editor as BuildFlowEditorUI PLUS each
 // node's LIVE evaluated value (the flow VM output, values[node.id] from FlowLiveValues) drawn as a distinct

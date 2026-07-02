@@ -134,6 +134,7 @@
 #include "editor/gizmo.h"
 #include "editor/introspect.h"
 #include "editor/edit_ops.h"  // Slice BX: pure-CPU editor live-edit ops (ApplyTransformEdit/Material).
+#include "editor/edit_history.h"  // Slice ED5: deterministic undo/redo command stack over the edit ops.
 #include "editor/flow_editor_data.h"  // Issue #24: pure flow-graph node-editor view (ImGui-free, golden).
 #include "editor/flow_edit_ops.h"     // Issue #24: deterministic graph edit ops (Add/Connect/Delete).
 #include "flow/flow.h"                // Issue #24: the deterministic flow VM the node editor drives.
@@ -776,6 +777,13 @@ int main(int argc, char** argv) {
     // hand-called twin (bit-compare) with the expected post-edit view digests, and that two full passes
     // are byte-identical. No capture/present — the ImGui frames are CPU-built. Implies --editor.
     bool ed2DryRun = false;
+    // Slice ED5 (deterministic undo/redo): after the ED1 typed edits, inject Ctrl+Z / Ctrl+Y through
+    // the REAL editor key handling and assert the ECS floats reverted / re-applied EXACTLY (bitwise),
+    // the undone scene dump is BYTE-IDENTICAL to the pre-edit baseline, the redone dump to the
+    // post-edit dump, the recorded history round-trips Serialize->Deserialize digest-identically, and
+    // ReplayHistory on a fresh baseline scene reproduces the edited dump byte-for-byte (the edit
+    // session as a replayable artifact). Two full passes byte-identical. Implies --editor.
+    bool ed5DryRun = false;
     // Issue #24 (Blueprint-class visual scripting, editor half): render the deterministic flow-graph
     // node editor over a fixed showcase flow::Graph (FlowGraphView -> BuildFlowEditorUI), write a BMP,
     // print a `flow-editor: {...}` line. Implies --editor (the ImGui overlay path).
@@ -3101,6 +3109,15 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--ed2-dry-run") == 0) {
             editor = true;
             ed2DryRun = true;
+        }
+        // Slice ED5 (deterministic undo/redo command stack): --ed5-dry-run. A SEPARATE `if` (the
+        // else-if ladder is at MSVC's C1061 limit). Headless synthetic-input proof that the recorded
+        // command stack undoes/redoes the ED1 typed edits bit-exactly through the REAL Ctrl+Z/Ctrl+Y
+        // key handling, and that the serialized edit session replays byte-identically on a fresh
+        // scene. Prints `ed5-dry-run: ...` proof lines; exit 0/1. Implies --editor.
+        if (std::strcmp(argv[i], "--ed5-dry-run") == 0) {
+            editor = true;
+            ed5DryRun = true;
         }
         // Issue #5: the TIME-CHANNEL deliverable (--sky-animated-shot <out.bmp>). A SEPARATE `if` (not
         // chained onto the else-if ladder above) because that ladder is already at MSVC's block-nesting
@@ -12673,6 +12690,12 @@ int main(int argc, char** argv) {
             };
             buildDefaultEditScene(editReg);
 
+            // === Slice ED5: the fly editor's deterministic undo/redo command stack. A completed
+            // gizmo drag records ONE Transform command (before captured at grab, after at release);
+            // Ctrl+Z / Ctrl+Y in the live loop's key handling undo/redo through the SAME edit ops. ===
+            editor::EditHistory flyHistory;
+            const editor::EditTargets flyTargets{&editReg, nullptr};
+
             // World AABB of an entity: its mesh object-space bounds transformed by its Transform and
             // re-fit to an axis-aligned box (8-corner transform -> min/max). Used for ray picking.
             auto worldAabb = [](const scene::Transform& xf, const scene::MeshBounds& b) {
@@ -12729,6 +12752,8 @@ int main(int argc, char** argv) {
             // --- Drag state for the gizmo (the per-frame prevRay/curRay manipulation). ---
             int   dragAxis = editor::kAxisNone;   // grabbed gizmo axis while left-dragging (-1 = none)
             math::Ray dragPrevRay{};              // last frame's cursor ray (seeded on grab -> no jump)
+            editor::XformState dragBeforeXf{};    // ED5: the transform captured at gizmo grab (undo payload)
+            int   dragEntityIndex = -1;           // ED5: the view index a drag command will target
 
             // Cursor ray for an input snapshot: framebuffer px -> NDC -> world ray. (The px->NDC map is
             // editor::PixelToNdc, shared with the unit test.) Only meaningful while NOT mouse-looking.
@@ -12756,6 +12781,10 @@ int main(int argc, char** argv) {
                             if (axis != editor::kAxisNone) {
                                 dragAxis = axis;
                                 dragPrevRay = ray;   // seed: first drag frame is a no-op (no jump)
+                                // ED5: capture the pre-drag transform — the undo payload of the ONE
+                                // command this drag becomes at release.
+                                dragBeforeXf = editor::CaptureXform(xf);
+                                dragEntityIndex = sel.index;
                                 return dragAxis;
                             }
                         }
@@ -12779,7 +12808,23 @@ int main(int argc, char** argv) {
                     dragPrevRay = ray;
                     return dragAxis;
                 }
-                if (!leftDown) dragAxis = editor::kAxisNone;  // release ends the drag
+                if (!leftDown) {
+                    // Release ends the drag. ED5: the completed manipulation becomes ONE recorded
+                    // Transform command (before at grab -> after at release; a no-move drag records
+                    // nothing — RecordTransformState skips bitwise-identical payloads).
+                    if (dragAxis != editor::kAxisNone && dragEntityIndex >= 0) {
+                        std::vector<ecs::Entity> ents; std::vector<editor::PickAabb> boxes;
+                        snapshotPickList(ents, boxes);
+                        if (dragEntityIndex < (int)ents.size()) {
+                            const scene::Transform& cur =
+                                editReg.get<scene::TransformC>(ents[dragEntityIndex]).t;
+                            editor::RecordTransformState(flyHistory, dragEntityIndex, dragBeforeXf,
+                                                         editor::CaptureXform(cur));
+                        }
+                        dragEntityIndex = -1;
+                    }
+                    dragAxis = editor::kAxisNone;
+                }
                 return dragAxis;
             };
 
@@ -12930,9 +12975,10 @@ int main(int argc, char** argv) {
             // cursor stays visible for LEFT-click picking + gizmo drag (Slice AM). ESC quits.
             std::printf("--fly: WASD move, RIGHT-drag look, Space/E up, Ctrl/Q down, Shift sprint, "
                         "wheel speed, ESC quit | LEFT-click pick, LEFT-drag gizmo, P play/pause, O "
-                        "step, G/R/T gizmo mode, Ctrl+S save\n");
+                        "step, G/R/T gizmo mode, Ctrl+S save, Ctrl+Z undo, Ctrl+Y redo\n");
 
             bool prevP = false, prevO = false, prevCtrlS = false, prevLeft = false, prevRight = false;
+            bool prevCtrlZ = false, prevCtrlY = false;   // ED5: undo/redo edge triggers
             int savedCount = 0;
             int liveSteps = 0;
 
@@ -12977,6 +13023,23 @@ int main(int argc, char** argv) {
                         std::printf("[editor] saved fly_scene_edit.json (%zu bytes)\n", json.size()); }
                 }
                 prevCtrlS = nowCtrlS;
+                // --- ED5: Ctrl+Z undo / Ctrl+Y redo of the recorded gizmo-drag commands (edge-
+                // triggered; the commands re-apply their before/after payloads through the SAME
+                // deterministic edit ops, so undo N + redo N restores bit-identical state). ---
+                bool nowCtrlZ = in.Down(runtime::Key::Ctrl) && in.Down(runtime::Key::Z);
+                if (nowCtrlZ && !prevCtrlZ) {
+                    if (editor::Undo(flyHistory, flyTargets))
+                        std::printf("[editor] undo (%zu applied / %zu recorded)\n",
+                                    flyHistory.cursor, flyHistory.commands.size());
+                }
+                prevCtrlZ = nowCtrlZ;
+                bool nowCtrlY = in.Down(runtime::Key::Ctrl) && in.Down(runtime::Key::Y);
+                if (nowCtrlY && !prevCtrlY) {
+                    if (editor::Redo(flyHistory, flyTargets))
+                        std::printf("[editor] redo (%zu applied / %zu recorded)\n",
+                                    flyHistory.cursor, flyHistory.commands.size());
+                }
+                prevCtrlY = nowCtrlY;
 
                 // --- LEFT-click pick + LEFT-drag gizmo (only while NOT mouse-looking on the right). ---
                 int activeAxis = editor::kAxisNone;
@@ -110602,6 +110665,239 @@ int main(int argc, char** argv) {
                         deterministic ? "yes" : "NO", a.transcript.size());
             const bool ok = flowOk && seqOk && widgetOk && deterministic;
             std::printf("ed2-dry-run: %s\n", ok ? "PASS" : "FAIL");
+            teardownEditor();
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Slice ED5: DETERMINISTIC UNDO/REDO COMMAND STACK dry-run — the ED1 typed-edit sequence
+        // re-run with an EditHistory wired into BuildEditorUI (every inspector edit lands on the
+        // recorded command stack), then driven BACK and FORTH through the REAL Ctrl+Z / Ctrl+Y key
+        // handling with synthetic io events, and finally exported as a REPLAYABLE SESSION ARTIFACT.
+        //
+        // PROOFS (all must hold; exit 1 otherwise):
+        //   (a) EDITS RECORD: the two ED1 typed edits (Position-X 4.625, Metallic 0.875) reach the
+        //       ECS exactly AND the history holds exactly 2 commands.
+        //   (b) UNDO IS BIT-EXACT: two Ctrl+Z through the editor's key handling revert BOTH floats
+        //       EXACTLY (==) to their pre-edit values and the scene's DumpScene is BYTE-IDENTICAL to
+        //       the pre-edit baseline dump.
+        //   (c) REDO IS BIT-EXACT: two Ctrl+Y re-apply both typed values exactly and the dump is
+        //       BYTE-IDENTICAL to the post-edit dump.
+        //   (d) THE SESSION IS AN ARTIFACT: SerializeHistory -> DeserializeHistory round-trips with
+        //       an IDENTICAL DigestHistory, and ReplayHistory of the deserialized session onto a
+        //       FRESH registry loaded from the baseline reproduces the post-edit dump byte-for-byte.
+        //   (e) DETERMINISTIC: a second full pass (fresh registry from the baseline) yields a
+        //       byte-identical transcript (all floats, digests, and dumps folded in).
+        if (ed5DryRun) {
+            const uint32_t dw = window.FramebufferWidth();
+            const uint32_t dh = window.FramebufferHeight();
+            ImGuiIO& io = ImGui::GetIO();
+
+            const int   kRow       = 1;          // hierarchy row to select ("sphere #1", the ED1 target)
+            const float kPosX      = 4.625f;     // typed Position-X (exact in float)
+            const char* kPosXText  = "4.625";
+            const float kMetallic  = 0.875f;     // typed Metallic (exact in float)
+            const char* kMetalText = "0.875";
+
+            // The pre-edit baseline (pass B reloads from this, so both passes start identically; it
+            // is also the undo byte-identity reference and the replay starting state).
+            const std::string baseline = scene::DumpScene(registry, resources);
+
+            struct Ed5Pass {
+                bool rowsOk = false, selOk = false;
+                float posBefore = 0, metBefore = 0;   // pre-edit ECS floats
+                float posAfter = 0, metAfter = 0;     // post-edit (must == typed)
+                float posUndo = 0, metUndo = 0;       // post-undo (must == pre-edit, bitwise)
+                float posRedo = 0, metRedo = 0;       // post-redo (must == typed again)
+                std::size_t cmdCount = 0;             // recorded commands (pinned: 2)
+                bool undoDumpMatch = false;           // undone dump == baseline (byte-identical)
+                bool redoDumpMatch = false;           // redone dump == post-edit dump (byte-identical)
+                bool serializeOk = false;             // Serialize -> Deserialize succeeded
+                uint64_t digLive = 0, digRT = 0;      // live vs round-tripped history digest
+                bool replayMatch = false;             // replayed fresh scene dump == post-edit dump
+                std::string postDump;                 // the post-edit dump (the redo/replay reference)
+                std::string transcript;               // everything folded -> the determinism compare
+            };
+
+            auto runPass = [&](ecs::Registry& reg) -> Ed5Pass {
+                Ed5Pass r;
+                editor::EditorState st;          // fresh UI selection state per pass
+                editor::EditorUIProbe probe;
+                editor::EditHistory hist;        // THE COMMAND STACK under test
+                // One CPU-only ImGui frame with the history wired (the ONLY difference vs ED1).
+                auto uiFrame = [&](editor::EditorUIProbe* p) {
+                    io.DisplaySize = ImVec2((float)dw, (float)dh);
+                    ImGui::NewFrame();
+                    editor::BuildEditorUI(reg, resources, st, dw, dh, p, &hist);
+                    ImGui::Render();
+                };
+                // The ED1 synthetic-input helpers, verbatim, over this pass's uiFrame.
+                auto clickAt = [&](const editor::UiRect& rc, bool ctrl) {
+                    io.AddMousePosEvent(rc.cx(), rc.cy());
+                    uiFrame(nullptr);
+                    if (ctrl) io.AddKeyEvent(ImGuiMod_Ctrl, true);
+                    io.AddMouseButtonEvent(0, true);
+                    uiFrame(nullptr);
+                    io.AddMouseButtonEvent(0, false);
+                    uiFrame(nullptr);
+                    if (ctrl) { io.AddKeyEvent(ImGuiMod_Ctrl, false); uiFrame(nullptr); }
+                };
+                auto typeIntoField = [&](const editor::UiRect& rc, const char* text) {
+                    clickAt(rc, /*ctrl=*/true);
+                    for (const char* c = text; *c; ++c)
+                        io.AddInputCharacter((unsigned int)(unsigned char)*c);
+                    uiFrame(nullptr);
+                    uiFrame(nullptr);   // flush any trickled remainder before the commit key
+                    io.AddKeyEvent(ImGuiKey_Enter, true);
+                    uiFrame(nullptr);
+                    io.AddKeyEvent(ImGuiKey_Enter, false);
+                    uiFrame(nullptr);
+                };
+                auto idle = [&](int frames) {
+                    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+                    for (int f = 0; f < frames; ++f) uiFrame(nullptr);
+                };
+                // Ctrl+<key> press through the REAL editor key handling (Ctrl down a frame first so
+                // io.KeyCtrl is level-true on the frame the key edge fires).
+                auto pressCtrl = [&](ImGuiKey key) {
+                    io.AddKeyEvent(ImGuiMod_Ctrl, true);
+                    uiFrame(nullptr);
+                    io.AddKeyEvent(key, true);
+                    uiFrame(nullptr);   // <- the undo/redo fires on this frame
+                    io.AddKeyEvent(key, false);
+                    uiFrame(nullptr);
+                    io.AddKeyEvent(ImGuiMod_Ctrl, false);
+                    uiFrame(nullptr);
+                };
+                auto ecsPosX = [&]() {
+                    return reg.get<scene::TransformC>(editor::EntityAtViewIndex(reg, kRow))
+                        .t.position.x;
+                };
+                auto ecsMet = [&]() {
+                    return reg.get<scene::MaterialC>(editor::EntityAtViewIndex(reg, kRow)).metallic;
+                };
+
+                idle(2);
+                uiFrame(&probe);
+                r.rowsOk = (int)probe.hierarchyRows.size() > kRow &&
+                           probe.hierarchyRows[kRow].valid && probe.posX.valid &&
+                           probe.metallic.valid;
+                if (!r.rowsOk) return r;
+                r.posBefore = ecsPosX();
+                r.metBefore = ecsMet();
+                // 1. The ED1 edit sequence, recorded: select row -> type Position-X -> type Metallic.
+                clickAt(probe.hierarchyRows[kRow], /*ctrl=*/false);
+                r.selOk = (st.selectedEntity == kRow);
+                idle(4);
+                uiFrame(&probe);
+                typeIntoField(probe.posX, kPosXText);
+                idle(4);
+                typeIntoField(probe.metallic, kMetalText);
+                idle(24);
+                r.posAfter = ecsPosX();
+                r.metAfter = ecsMet();
+                r.cmdCount = hist.commands.size();
+                r.postDump = scene::DumpScene(reg, resources);
+                // 2. UNDO x2 via the REAL Ctrl+Z handling (metallic first, then position — LIFO).
+                pressCtrl(ImGuiKey_Z);
+                pressCtrl(ImGuiKey_Z);
+                idle(2);
+                r.posUndo = ecsPosX();
+                r.metUndo = ecsMet();
+                r.undoDumpMatch = (scene::DumpScene(reg, resources) == baseline);
+                // 3. REDO x2 via the REAL Ctrl+Y handling.
+                pressCtrl(ImGuiKey_Y);
+                pressCtrl(ImGuiKey_Y);
+                idle(2);
+                r.posRedo = ecsPosX();
+                r.metRedo = ecsMet();
+                r.redoDumpMatch = (scene::DumpScene(reg, resources) == r.postDump);
+                // 4. The session artifact: serialize (NAMED encoding via the scene's resources ->
+                // pointer-free, PROCESS-PORTABLE bytes) -> deserialize -> digest equal; replay the
+                // deserialized session on a FRESH registry loaded from the baseline.
+                const std::vector<uint8_t> bytes = editor::SerializeHistory(hist, &resources);
+                editor::EditHistory rt;
+                r.serializeOk = editor::DeserializeHistory(bytes.data(), bytes.size(), rt,
+                                                           &resources);
+                r.digLive = editor::DigestHistory(hist, &resources);
+                r.digRT = editor::DigestHistory(rt, &resources);
+                if (r.serializeOk) {
+                    ecs::Registry fresh;
+                    std::string tmpScene = std::string(std::tmpnam(nullptr)) + ".json";
+                    { std::ofstream f(tmpScene, std::ios::binary); f << baseline; }
+                    scene::LoadScene(fresh, resources, tmpScene.c_str());
+                    std::remove(tmpScene.c_str());
+                    editor::ReplayHistory(rt, editor::EditTargets{&fresh, nullptr});
+                    r.replayMatch = (scene::DumpScene(fresh, resources) == r.postDump);
+                }
+                // The pass transcript (floats as exact bit patterns + digests + dump size + flags).
+                auto bits = [](float f) {
+                    uint32_t u;
+                    std::memcpy(&u, &f, sizeof(u));
+                    return u;
+                };
+                char tb[512];
+                std::snprintf(tb, sizeof(tb),
+                              "cmds=%zu pos %08x->%08x undo %08x redo %08x | met %08x->%08x undo "
+                              "%08x redo %08x | dumps u%d r%d | art ok%d dig %016llx %016llx rep%d "
+                              "| post %zu bytes",
+                              r.cmdCount, bits(r.posBefore), bits(r.posAfter), bits(r.posUndo),
+                              bits(r.posRedo), bits(r.metBefore), bits(r.metAfter), bits(r.metUndo),
+                              bits(r.metRedo), (int)r.undoDumpMatch, (int)r.redoDumpMatch,
+                              (int)r.serializeOk, (unsigned long long)r.digLive,
+                              (unsigned long long)r.digRT, (int)r.replayMatch, r.postDump.size());
+                r.transcript = tb;
+                return r;
+            };
+
+            // Pass A on the live registry; pass B on a fresh registry reloaded from the baseline.
+            Ed5Pass a = runPass(registry);
+            ecs::Registry regB;
+            {
+                std::string tmpScene = std::string(std::tmpnam(nullptr)) + ".json";
+                { std::ofstream f(tmpScene, std::ios::binary); f << baseline; }
+                scene::LoadScene(regB, resources, tmpScene.c_str());
+                std::remove(tmpScene.c_str());
+            }
+            Ed5Pass b = runPass(regB);
+
+            // (a) The edits reached the ECS AND recorded exactly two commands.
+            const bool editOk = a.rowsOk && a.selOk && a.posAfter == kPosX &&
+                                a.metAfter == kMetallic && a.posBefore != kPosX &&
+                                a.metBefore != kMetallic && a.cmdCount == 2u;
+            // (b) Undo reverted both floats bitwise-exactly + the dump matches the baseline bytes.
+            const bool undoOk = a.posUndo == a.posBefore && a.metUndo == a.metBefore &&
+                                a.undoDumpMatch;
+            // (c) Redo re-applied both typed values + the dump matches the post-edit bytes.
+            const bool redoOk = a.posRedo == kPosX && a.metRedo == kMetallic && a.redoDumpMatch;
+            // (d) The serialized session round-trips digest-identically and replays byte-identically.
+            const bool artifactOk = a.serializeOk && a.digLive == a.digRT && a.digLive != 0 &&
+                                    a.replayMatch;
+            // (e) Two full passes byte-identical.
+            const bool deterministic = !a.transcript.empty() && a.transcript == b.transcript;
+
+            std::printf("ed5-dry-run: typed edits recorded: posX %g -> %g, metallic %g -> %g, "
+                        "commands=%zu (expected 2)\n",
+                        a.posBefore, a.posAfter, a.metBefore, a.metAfter, a.cmdCount);
+            std::printf("ed5-dry-run: Ctrl+Z x2 -> posX %g metallic %g exact-revert=%s "
+                        "baseline-dump-byte-identical=%s\n",
+                        a.posUndo, a.metUndo,
+                        (a.posUndo == a.posBefore && a.metUndo == a.metBefore) ? "yes" : "NO",
+                        a.undoDumpMatch ? "yes" : "NO");
+            std::printf("ed5-dry-run: Ctrl+Y x2 -> posX %g metallic %g exact-reapply=%s "
+                        "postedit-dump-byte-identical=%s\n",
+                        a.posRedo, a.metRedo,
+                        (a.posRedo == kPosX && a.metRedo == kMetallic) ? "yes" : "NO",
+                        a.redoDumpMatch ? "yes" : "NO");
+            std::printf("ed5-dry-run: session artifact: serialize/deserialize=%s digest "
+                        "0x%016llx==0x%016llx %s | replay-on-fresh-scene byte-identical=%s\n",
+                        a.serializeOk ? "yes" : "NO", (unsigned long long)a.digLive,
+                        (unsigned long long)a.digRT, a.digLive == a.digRT ? "equal" : "DIFFER",
+                        a.replayMatch ? "yes" : "NO");
+            std::printf("ed5-dry-run: two passes byte-identical=%s (transcript %zu bytes)\n",
+                        deterministic ? "yes" : "NO", a.transcript.size());
+            const bool ok = editOk && undoOk && redoOk && artifactOk && deterministic;
+            std::printf("ed5-dry-run: %s\n", ok ? "PASS" : "FAIL");
             teardownEditor();
             device->WaitIdle();
             return ok ? 0 : 1;

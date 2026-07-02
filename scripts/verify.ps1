@@ -856,6 +856,21 @@ Write-Host '--- editor ED2: interactive authoring panels dry-run ---'
 if (-not `$ed2Ok) { Write-Host 'ED2 authoring-panels dry-run FAILED'; exit 30 }
 Write-Host 'editor ED2: authoring-panels dry-run PASS'
 
+# --- Slice ED5: deterministic undo/redo command-stack dry-run. The ED1 typed edits are re-run with
+# the RECORDED command stack (edit_history.h) wired into BuildEditorUI, then Ctrl+Z / Ctrl+Y are
+# injected through the REAL editor key handling and must prove: the ECS floats revert / re-apply
+# EXACTLY (bitwise), the undone scene dump is BYTE-IDENTICAL to the pre-edit baseline and the redone
+# dump to the post-edit dump, the serialized edit session round-trips Serialize->Deserialize with an
+# identical DigestHistory, ReplayHistory on a fresh baseline scene reproduces the edited dump
+# byte-for-byte (the edit session as a portable replayable artifact), and two full passes are
+# byte-identical. ---
+Write-Host '--- editor ED5: deterministic undo/redo command-stack dry-run ---'
+`$ed5 = & `$lmExe --ed5-dry-run 2>&1
+`$ed5 | ForEach-Object { Write-Host `$_ }
+`$ed5Ok = (`$LASTEXITCODE -eq 0) -and (`$ed5 | Select-String -SimpleMatch 'ed5-dry-run: PASS')
+if (-not `$ed5Ok) { Write-Host 'ED5 undo/redo command-stack dry-run FAILED'; exit 41 }
+Write-Host 'editor ED5: undo/redo command-stack dry-run PASS'
+
 exit 0
 "@
 

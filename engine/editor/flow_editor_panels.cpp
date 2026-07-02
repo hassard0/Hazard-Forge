@@ -52,9 +52,25 @@ void CaptureItemRect(UiRect* slot) {
 void BuildFlowEditorUI(const flow::Graph& graph, const FlowGraphView& view,
                        uint32_t fbWidth, uint32_t fbHeight, const FlowLayout& layout,
                        flow::Graph* editGraph, FlowEditorState* editState,
-                       FlowEditorUIProbe* probe) {
+                       FlowEditorUIProbe* probe, EditHistory* history) {
     const float fbW = static_cast<float>(fbWidth);
     const float fbH = static_cast<float>(fbHeight);
+
+    // --- Slice ED5: the graph write paths, RECORDED when a history is wired (edit_history.h — same
+    // raw ops, plus a reversible command on the stack; a null history runs the raw op directly, so
+    // pre-ED5 callers behave byte-identically). The three edit affordances below route through these.
+    auto doAddNode = [&](flow::Graph& g, uint32_t kind) {
+        if (history) RecordedAddFlowNode(*history, g, kind, /*constArg=*/0);
+        else AddFlowNode(g, kind, /*constArg=*/0);
+    };
+    auto doConnect = [&](flow::Graph& g, flow::NodeId from, flow::NodeId to, uint32_t slot) {
+        if (history) RecordedConnectFlow(*history, g, from, to, slot);
+        else ConnectFlow(g, from, to, slot);
+    };
+    auto doDelete = [&](flow::Graph& g, flow::NodeId victim) {
+        if (history) RecordedDeleteFlowNode(*history, g, victim);
+        else DeleteFlowNode(g, victim);
+    };
 
     // --- Menu bar (fixed; renders fine without input). Reserve its height for the tiling below. ---
     float menuH = 0.0f;
@@ -90,7 +106,7 @@ void BuildFlowEditorUI(const flow::Graph& graph, const FlowGraphView& view,
             ImGui::PushStyleColor(ImGuiCol_Header, KindColor(k));
             // Selectable as a button-like palette entry; fires on click release (edit mode adds a node).
             if (ImGui::Selectable(KindLabel(k), false)) {
-                if (editGraph) AddFlowNode(*editGraph, k, /*constArg=*/0);
+                if (editGraph) doAddNode(*editGraph, k);
             }
             if (probe) {
                 UiRect r;
@@ -202,9 +218,9 @@ void BuildFlowEditorUI(const flow::Graph& graph, const FlowGraphView& view,
                             const ImVec2 c = P(nv.x, nv.y + static_cast<int>(slot + 1u) * layout.boxH / 4);
                             if (m.x >= c.x - 8.0f && m.x < c.x + 8.0f &&
                                 m.y >= c.y - 8.0f && m.y < c.y + 8.0f) {
-                                ConnectFlow(*editGraph,
-                                            static_cast<flow::NodeId>(editState->selectedNode),
-                                            nv.id, slot);
+                                doConnect(*editGraph,
+                                          static_cast<flow::NodeId>(editState->selectedNode),
+                                          nv.id, slot);
                                 consumed = true;
                             }
                         }
@@ -228,7 +244,7 @@ void BuildFlowEditorUI(const flow::Graph& graph, const FlowGraphView& view,
             // Delete affordance: the Delete key on the canvas selection (no visual chrome -> the static
             // golden is untouched; the dry-run synthesizes the key event).
             if (editState->selectedNode >= 0 && ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
-                DeleteFlowNode(*editGraph, static_cast<flow::NodeId>(editState->selectedNode));
+                doDelete(*editGraph, static_cast<flow::NodeId>(editState->selectedNode));
                 editState->selectedNode = -1;   // ids shifted -> the selection is void
             }
         }
