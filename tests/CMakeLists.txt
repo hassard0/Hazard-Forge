@@ -1508,6 +1508,25 @@ hf_add_pure_test(grain_test)
 # ASan-eligible. particles.h #includes fpx.h + grain.h read-only.
 hf_add_pure_test(particles_test)
 
+# Slice PA1 (Track-S S11 of docs/SUPERIORITY_ROADMAP.md): PARTICLE-SYSTEM AUTHORING VIA THE FLOW VM
+# (engine/sim/particle_author.h, namespace hf::sim::pauthor) — the flow VM (engine/flow/flow.h StepGraph)
+# DRIVES the deterministic particle system (engine/sim/particles.h StepParticles): a flow graph's per-tick
+# output registers overwrite bound emitter/force-field parameters (ParamBinding/ResolveBindings/
+# StepAuthoredEffect — reg IS the Q16.16 value; kParamSpawnPerTick reg IS the raw count), so particle effects
+# are AUTHORED as graphs via the editor edit-ops (AddFlowNode/ConnectFlow), not hand-written C++ structs —
+# Niagara-class emitter graphs, bit-exact + lockstep-replayable (UE5's Niagara is float/non-deterministic).
+# Pins: (b) ZERO bindings == StepParticles(baseCfg) BIT-IDENTICAL (the identity control); (c) the edit-ops-
+# built pulsing-fountain fixture — SerializeGraph digest pinned (authored, not hardcoded), the PULSE (spawn
+# == kBurstSpawn exactly on ticks t%6==5), the OSCILLATION (emitter X an exact period-16 triangle hitting
+# +-1.0), the RAMP (vortex strength == (t+1)*kRampStep exactly; late tangential speed > early, both pinned),
+# the alive-count trace digest + final composed-state digest pinned; (d) BINDING EXACTNESS (a kConst register
+# IS the parameter bit-for-bit — 123456 -> origin.y -> the spawned particle's pos.y); (e) lockstep (replica
+# re-derives graph state + pool bit-for-bit from inputs only), rollback corrects a real misprediction, and
+# the snapshot-completeness control (omit the flow GraphState -> DIVERGES — graph state IS sim state). Pure
+# C++ (hf_core), ASan-eligible. particle_author.h #includes particles.h + flow.h + editor/flow_edit_ops.h
+# read-only (all byte-untouched).
+hf_add_pure_test(particle_author_test)
+
 # Deterministic PCG Slice 1 (Slice PCG1, the BEACHHEAD of FLAGSHIP #22): the seeded hash-PRNG primitive
 # (engine/pcg/pcg.h, namespace hf::pcg) every later PCG slice consumes — a deterministic seeded integer
 # hash-PRNG in Q16.16, pure int32 (MSL-native). Reuses the ParticleHash avalanche SHAPE + the EmitDir no-trig

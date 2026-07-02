@@ -104,6 +104,7 @@
 #include "sim/fluid.h"              // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp + the Vulkan --fluid-integrate-shot
 #include "sim/grain.h"              // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp + the Vulkan --grain-integrate-shot
 #include "sim/particles.h"          // Slice PT1: deterministic GPU particles Q16.16 emitter + integrator (FxParticle/ParticlePool/EmitParticle/IntegrateParticles/RecycleDead/StepEmitIntegrate, free-list) — shared verbatim with particles_integrate.comp + the Vulkan --pt1-emit-shot; the Metal --pt1-emit runs the CPU StepEmitIntegrate (int64 integrator -> Vulkan-only shader)
+#include "sim/particle_author.h"    // Slice PA1: PARTICLE AUTHORING VIA THE FLOW VM (AuthoredEffect/ParamBinding/StepAuthoredEffect/MakePulsingFountainEffect — a flow graph's per-tick output registers drive the emitter/force-field params; the --pa1-fountain pulsing fountain, authored via the flow edit-ops; PURE CPU, byte-identical to the Vulkan --pa1-fountain-shot by construction)
 #include "pcg/pcg.h"                // Slice PCG1: deterministic PCG seeded hash-PRNG primitive (PcgHash/PcgRand01/PcgRandRange/PcgUnitDir/PcgStream) Q16.16 pure-int32 — reuses particles.h ParticleHash + EmitDir; the Metal --pcg1-hash runs the IDENTICAL pure-integer point-plot the Vulkan --pcg1-hash-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "wfc/wfc_render.h"          // Slice WFC-S6: WFC LIT 3D render bridge (WfcToRenderInstances / WfcRenderStyle / TileOf / WfcTileKinds) — the ONE float crossing of FLAGSHIP #29; the Metal --wfc6-render runs the IDENTICAL tileset/seed/grid/style/camera the Vulkan --wfc6-render-shot runs (instance set byte-identical BY CONSTRUCTION)
 #include "econ/econ_render.h"        // Slice ECON-S6: ECON LIT 3D render bridge (EconToRenderInstances / EconRenderStyle / EconBarItems) — the ONE float crossing of FLAGSHIP #30; the Metal --econ6-render runs the IDENTICAL showcase state/script/style/camera the Vulkan --econ6-render-shot runs (instance set byte-identical BY CONSTRUCTION)
@@ -31326,6 +31327,102 @@ static int RunPt5LockstepShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
     std::printf("OK wrote %s (%ux%u) — particle lockstep+rollback converged state (%u alive)\n",
                 outPath, imgW, imgH, kAlive);
+    return 0;
+}
+
+// ===== Slice PA1 — PARTICLE AUTHORING VIA THE FLOW VM showcase (--pa1-fountain) (Track-S S11). PURE CPU —
+// NO GPU dispatch, NO new shader, NO new RHI; both Vulkan-Windows (--pa1-fountain-shot) and Metal-Mac run the
+// IDENTICAL CPU composition (engine/sim/particle_author.h::StepAuthoredEffect: flow::StepGraph ->
+// ResolveBindings -> particles::StepParticles) so the mid-burst pool golden is bit-identical cross-backend BY
+// CONSTRUCTION. The PULSING FOUNTAIN asset (MakePulsingFountainEffect — built EXCLUSIVELY via the flow
+// edit-ops AddFlowNode/ConnectFlow: 24 nodes, 3 bindings — spawn pulse 1->12 every 6 ticks, emitter-X
+// period-16 triangle sweep [-1,+1], vortex-strength ramp +1/32 per tick) stepped kShowcaseSteps=128 ticks;
+// asserts the PINNED edit-ops graph digest (authored, not hardcoded) + the exact burst-tick count + the
+// PINNED final composed-state digest (pool + flow GraphState — the same pins tests/particle_author_test.cpp
+// carries, MSVC==clang). Integer strict-zero side-view viz (the PT5 transform). New golden
+// tests/golden/metal/pa1_fountain.png. THE SCENE BELOW IS BYTE-IDENTICAL to the Vulkan --pa1-fountain-shot.
+static int RunPa1FountainShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace pt = hf::sim::particles;
+    namespace pa = hf::sim::pauthor;
+    namespace vg = render::vg;
+
+    // ===== THE PA1 SCENE — the FIXED authored asset (MUST match the Vulkan --pa1-fountain-shot). =====
+    const pa::fx kDt = pa::kOne / 60;
+    pa::AuthoredEffect effect = pa::MakePulsingFountainEffect();
+
+    // PROOF (1) THE AUTHORING PIN: the edit-ops-built graph's SerializeGraph digest == the pinned value.
+    const uint64_t graphDigest = pa::DigestAuthoredGraph(effect.graph);
+    if (graphDigest != 0xca55eabb27042ba8ull)
+        return fail("pa1-fountain: graph digest != pinned (the edit-ops-built asset drifted)");
+    std::printf("pa1-fountain: edit-ops graph digest==pinned (authored, not hardcoded)\n");
+
+    // Run the authored effect kShowcaseSteps ticks (the input channel idle — the pure authored pulse).
+    pt::ParticlePool pool = pt::InitParticlePool(pa::kShowcaseCapacity);
+    const std::vector<hf::flow::Reg> noInput = {0};
+    uint32_t burstTicks = 0;
+    for (uint32_t t = 0; t < pa::kShowcaseSteps; ++t) {
+        pa::ResolvedParams rp;
+        pa::StepAuthoredEffect(effect, pool, kDt, pool.tick, noInput, &rp);
+        if (rp.cfg.ratePerTick == (pa::fx)pa::kBurstSpawn) ++burstTicks;
+    }
+    const uint32_t alive = pt::CountAlive(pool);
+    const uint64_t finalDigest = pa::DigestAuthored(pool, effect.state);
+
+    // PROOF (2) THE PULSE: the burst rate resolved on exactly the expected ticks (t%6==5 -> 21 of 128).
+    if (burstTicks != pa::kShowcaseSteps / (uint32_t)pa::kPulsePeriod)
+        return fail("pa1-fountain: burst-tick count != expected (the pulse structure broke)");
+    std::printf("pa1-fountain pulse: %u burst ticks over %u steps (every %d ticks, exactly)\n",
+                burstTicks, pa::kShowcaseSteps, pa::kPulsePeriod);
+
+    // PROOF (3) THE COMPOSED-STATE PIN: pool + flow GraphState digest == the test's pinned value.
+    if (finalDigest != 0x745c02a3574c687full)
+        return fail("pa1-fountain: final composed digest != pinned (pool/graph-state drift)");
+    if (alive == 0) return fail("pa1-fountain: no alive particles at capture (degenerate)");
+
+    std::printf("pa1-fountain: {nodes:%u, bindings:%u, alive:%u, steps:%u, digest:0x%016llx}\n",
+                (unsigned)effect.graph.nodes.size(), (unsigned)effect.bindings.size(), alive,
+                pa::kShowcaseSteps, (unsigned long long)finalDigest);
+
+    // --- Golden: the mid-burst pool side-view (IDENTICAL to the Vulkan --pa1-fountain-shot by
+    // construction — the PT5 integer transform: ground line + hashColor(seed) dots; no spheres). ---
+    const int kPxPerUnit = 40;
+    const uint32_t imgW = 240, imgH = 240;
+    const int originPxX = (int)imgW / 2;
+    const int originPxY = 140;
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int32_t wpx, int32_t wpy, int& ix, int& iy) {
+        ix = originPxX + (int)(((int64_t)wpx * kPxPerUnit) >> pt::kFrac);
+        iy = originPxY - (int)(((int64_t)wpy * kPxPerUnit) >> pt::kFrac);  // y up
+    };
+    auto putPx = [&](int ix, int iy, uint8_t r, uint8_t gg, uint8_t b) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = b; dst[1] = gg; dst[2] = r; dst[3] = 255;
+    };
+    {
+        int gx0, gy0; worldToPx(0, effect.groundY, gx0, gy0);
+        for (int x = 0; x < (int)imgW; ++x) putPx(x, gy0, 90, 80, 60);
+    }
+    int particlePx = 0;
+    for (uint32_t i = 0; i < pa::kShowcaseCapacity; ++i) {
+        const pt::FxParticle& p = pool.particles[(size_t)i];
+        if (!(p.flags & pt::kFlagAlive)) continue;
+        int cx, cy; worldToPx(p.pos.x, p.pos.y, cx, cy);
+        Vec3 col = vg::hashColor(p.seed);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                putPx(cx + dx, cy + dy, (uint8_t)(col.x * 255.0f + 0.5f),
+                      (uint8_t)(col.y * 255.0f + 0.5f), (uint8_t)(col.z * 255.0f + 0.5f));
+                ++particlePx;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — flow-authored pulsing fountain mid-burst (%d particle px)\n",
+                outPath, imgW, imgH, particlePx);
     return 0;
 }
 
@@ -78188,6 +78285,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pt5-lockstep") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pt5_lockstep.png";
             try { return RunPt5LockstepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pa1-fountain <out.png>: render the PARTICLE AUTHORING VIA THE FLOW VM showcase (Slice PA1,
+        // Track-S S11). PURE CPU: the flow VM's per-tick output registers drive the particle emitter/force-
+        // field params (particle_author.h::StepAuthoredEffect over the edit-ops-built pulsing-fountain
+        // asset — spawn pulse 1->12 every 6 ticks, emitter-X triangle sweep, vortex-strength ramp), asserts
+        // the pinned edit-ops graph digest + burst-tick count + the pinned final composed-state digest
+        // (pool + flow GraphState), and CPU-colors the mid-burst side-view golden — IDENTICAL to the Vulkan
+        // --pa1-fountain-shot by construction. New golden tests/golden/metal/pa1_fountain.png. NO GPU
+        // compute, NO new shader, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--pa1-fountain") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pa1_fountain.png";
+            try { return RunPa1FountainShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --grain-neighbors <out.png>: render the Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH

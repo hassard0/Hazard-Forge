@@ -80,6 +80,7 @@
 #include "sim/fluid.h"          // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp
 #include "sim/grain.h"          // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp
 #include "sim/particles.h"      // Slice PT1: deterministic GPU particles Q16.16 emitter + integrator (FxParticle/ParticlePool/EmitParticle/IntegrateParticles/RecycleDead/StepEmitIntegrate, free-list) — shared verbatim with particles_integrate.comp
+#include "sim/particle_author.h" // Slice PA1: PARTICLE AUTHORING VIA THE FLOW VM (AuthoredEffect/ParamBinding/StepAuthoredEffect/MakePulsingFountainEffect — a flow graph's per-tick output registers drive the emitter/force-field params; the --pa1-fountain-shot pulsing fountain, authored via the flow edit-ops)
 #include "pcg/pcg.h"            // Slice PCG1: deterministic PCG seeded hash-PRNG primitive (PcgHash/PcgRand01/PcgRandRange/PcgUnitDir/PcgStream) Q16.16 pure-int32 — reuses particles.h ParticleHash + EmitDir; the Vulkan --pcg1-hash-shot pure-integer point-plot (strict-zero cross-backend)
 #include "wfc/wfc_render.h"     // Slice WFC-S6: WFC LIT 3D render bridge (WfcToRenderInstances / WfcRenderStyle / TileOf / WfcTileKinds) — the ONE float crossing of FLAGSHIP #29; turns a collapsed integer tilemap (wfc::Generate, bit-exact) into per-tile cube transforms for the --wfc6-render-shot money-shot. wfc.h stays self-contained.
 #include "econ/econ_render.h"    // Slice ECON-S6: ECON LIT 3D render bridge (EconToRenderInstances / EconRenderStyle / EconBarItems) — the ONE float crossing of FLAGSHIP #30; turns the bit-exact integer ledger (econ::EconState after the fixed showcase script) into per-(entity,item) bar transforms for the --econ6-render-shot economy-skyline money-shot. econ.h stays self-contained.
@@ -601,6 +602,7 @@ int main(int argc, char** argv) {
     const char* grainFrictionShotPath = nullptr; // --grain-friction-shot <out.bmp> (Slice GR4: Deterministic GPU Granular/Sand TANGENTIAL COULOMB FRICTION — the angle-of-repose money-shot, the SIGNATURE slice of FLAGSHIP #10. A 5x5x5 staggered grain block dropped onto FLAT ground (NO collider sphere — friction alone holds the heap) is settled into a self-supporting CONE by StepGrainFrictionSteps K steps x iters JACOBI iterations, EACH adding a TANGENTIAL friction sub-pass (grain_friction Δp_i = Σ −share·corr where corr is the tangential relative displacement Δx_t clamped to the Coulomb cone fxmul(μ,pen)) after the GR3 NORMAL push (grain_contact_dp -> apply): {grain_contact_dp -> apply -> grain_friction -> apply}×iters -> vel -> grain_collide. The K-step loop is HOST-driven over MULTI-THREAD per-grain passes; GPU==CPU grain array bit-exact vs grain.h::StepGrainFrictionSteps (memcmp). The HONEST slope-stability metric (MeasureGrainRepose {height,baseRadius,slope}): the repose angle is EMERGENT + deterministic + two-run byte-identical, slope clearly > the μ=0 frictionless control, within a μ-implied band — NOT an exact degree. int64 -> grain_friction Vulkan-only; Metal --grain-friction runs the CPU StepGrainFriction. REUSES grain_contact_apply + grain_collide (GR3). NO lockstep (GR5), NO float render (GR6), NO new RHI)
     const char* grainLockstepShotPath = nullptr; // --grain-lockstep-shot <out.bmp> (Slice GR5: Deterministic GPU Granular/Sand LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #10 — PURE-CPU harness over the GR1-GR4 granular sim WITH friction (the FL5/CL5/FPX5 twin): a 5x5x5 staggered grain block (the GR4 friction scene, μ=0.8) fed a scripted wind/push command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-grain-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* gr7PolyShotPath = nullptr; // --gr7-poly-shot <out.bmp> (Slice GR7: POLYDISPERSE GRANULAR MATERIAL, the Track-R R6 refinement closing FLAGSHIP #10's documented "monodisperse grains" caveat — PURE-CPU on BOTH backends (the GR5/CL7 Track-R precedent; NO GPU dispatch, NO new shader, NO new RHI): a staggered 5x5x5 MIXED-SIZE pour (2/3 small r=0.25 + 1/3 big r=0.5 assigned by the deterministic index hash seed 7, EXACT r^3 inverse masses via PolyInvMass — big grains 8x heavier so gravel shoves sand ~8x further, the physical asymmetry) settles K=280 steps x iters=4 via StepGrainPolySteps (the GR4 friction step with the broadphase contract made structural: hSearch widened to >= 2*maxRadius, the largest pair sum) onto a STATIC ROUGH BED of 1089 boundary grains (the honest scene finding: the family has NO grain-floor tangential friction, so a bare-floor pour never rests — the rough bed arrests sliders via GR4 grain-grain friction, zero new physics). Proofs: IDENTITY-AT-UNIFORM (all radii equal -> StepGrainPoly BIT-IDENTICAL to the mono GR4 StepGrainFriction), determinism (two runs byte-identical), rest (every dynamic grain < 0.5 u/s at the settle step) + the pinned honest Jacobi residual. Integer strict-zero side-view golden (bed dim gray, small grains sand 5px, big grains orange 9px — color-coded by SIZE CLASS); stat line = grains/sizes/steps/digest/minPairResidual; identical to the Metal --gr7-poly by construction)
+    const char* pa1FountainShotPath = nullptr; // --pa1-fountain-shot <out.bmp> (Slice PA1: PARTICLE AUTHORING VIA THE FLOW VM — Track-S S11: the flow VM (engine/flow/flow.h StepGraph) DRIVES the deterministic particle system (engine/sim/particles.h StepParticles) through ParamBindings (engine/sim/particle_author.h): the PULSING FOUNTAIN showcase asset (MakePulsingFountainEffect — authored EXCLUSIVELY via the editor edit-ops AddFlowNode/ConnectFlow, 24 nodes / 3 bindings: a self-resetting cycle counter pulses the spawn count 1->12 every 6 ticks, a period-16 triangle wave sweeps the emitter X across [-1,+1], a kCounter ramps the vortex strength +1/32 per tick) stepped kShowcaseSteps=128 ticks pure-CPU; asserts the pinned graph digest (authored, not hardcoded) + the pinned final composed-state digest (pool + flow GraphState); integer strict-zero side-view viz (the PT5 style); NO GPU dispatch, NO new shader, NO new RHI)
     const char* pt5LockstepShotPath = nullptr; // --pt5-lockstep-shot <out.bmp> (Slice PT5: Deterministic GPU Particles LOCKSTEP + ROLLBACK proof, the NETCODE HEADLINE of FLAGSHIP #19 — PURE-CPU harness over the bit-exact PT4 StepParticles (the GR5/FL5/CL5/FPX5 twin): the PT4 fountain scene (emitter + vortex field + ground + 2 spheres, capacity 240, T 240) fed a scripted ParticleCommand stream (a kCmdGust shoves the spray sideways + a kCmdBurst puff); authority==replica BIT-EXACT inputs-only (ParticleStatesEqual over particles+freeList+spawnCursor+tick) + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged) + snapshot-completeness control (omit freeList/spawnCursor -> diverges); converged-pool side-view golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* fluidNeighborsShotPath = nullptr; // --fluid-neighbors-shot <out.bmp> (Slice FL2: Deterministic GPU Fluid GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #9 — the FL1 1000-particle dam-break block bucketed into a uniform spatial-hash grid (BuildCellTable) + a per-particle 27-cell-stencil candidate NEIGHBOR LIST (BuildNeighborList) via PURE-INT32 count->scan->emit (fluid_cell_{count,scan,emit} + fluid_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-particle neighbor-count heat viz; NO density/kernel (FL3), NO radial r<h cull)
     const char* fluidDensityShotPath = nullptr; // --fluid-density-shot <out.bmp> (Slice FL3, the MAKE-OR-BREAK of FLAGSHIP #9: Deterministic GPU Fluid PBF DENSITY + λ — the FL1 dam-break block (settled) -> BuildNeighborList (FL2) -> BuildKernelTable (host-snapped Q16.16 poly6/spiky LUT) -> ComputeDensity (ρ_i = W[0] + Σ W[bin(r²)] over neighbours, int64 r²) -> ComputeLambda (λ_i = −C_i/(Σ|∇C_i|²+ε), C_i = ρ_i/ρ0−1, unilateral clamp) by fluid_density.comp + fluid_lambda.comp (ONE thread per particle, int64 -> Vulkan-only; Metal runs the CPU reference). GPU==CPU ρ+λ bit-exact, per-particle density heat viz; the only genuinely fluid-specific slice. NO PBF position solve (FL4))
@@ -1457,6 +1459,20 @@ int main(int argc, char** argv) {
         // nested-block parse limit (the GR5/FPX5/CL5/FL5 lesson).
         if (std::strcmp(argv[i], "--pt5-lockstep-shot") == 0 && i + 1 < argc) {
             pt5LockstepShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice PA1: --pa1-fountain-shot <out.bmp> — PARTICLE AUTHORING VIA THE FLOW VM (Track-S S11). The flow
+        // VM's per-tick output registers DRIVE the particle emitter/force-field params (engine/sim/
+        // particle_author.h): the PULSING-FOUNTAIN asset — authored EXCLUSIVELY via the flow edit-ops
+        // (AddFlowNode/ConnectFlow; the pinned graph digest is the "authored, not hardcoded" proof) — pulses the
+        // spawn count (12-burst every 6 ticks), sweeps the emitter X (a period-16 triangle in [-1,+1]) and ramps
+        // the vortex strength (+1/32 per tick), all bit-exact + lockstep-replayable (UE5 Niagara graphs are
+        // float/non-deterministic). PURE CPU (the underlying PT passes keep their GPU/CPU split untouched); the
+        // Metal --pa1-fountain runs the IDENTICAL code -> byte-identical golden BY CONSTRUCTION. STANDALONE
+        // branch (not in the --shot else-if chain) to avoid MSVC's nested-block parse limit C1061 (the PT5 lesson).
+        if (std::strcmp(argv[i], "--pa1-fountain-shot") == 0 && i + 1 < argc) {
+            pa1FountainShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -41593,6 +41609,120 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — particle lockstep+rollback converged state (%d particle px)\n",
                                 pt5LockstepShotPath, imgW, imgH, particlePx);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", pt5LockstepShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Slice PA1 — PARTICLE AUTHORING VIA THE FLOW VM showcase (--pa1-fountain-shot <out.bmp>, Track-S
+        // S11). The flow VM's per-tick output registers DRIVE the particle emitter/force-field params
+        // (engine/sim/particle_author.h::StepAuthoredEffect — StepGraph -> ResolveBindings -> StepParticles):
+        // the PULSING FOUNTAIN asset (MakePulsingFountainEffect, built EXCLUSIVELY via the flow edit-ops
+        // AddFlowNode/ConnectFlow — 24 nodes, 3 bindings: spawn pulse 1->12 every 6 ticks, emitter-X period-16
+        // triangle sweep [-1,+1], vortex-strength ramp +1/32 per tick) stepped kShowcaseSteps=128 pure-CPU
+        // ticks and captured MID-BURST (the last burst tick 125 is 3 ticks old — the puff visibly in flight).
+        // Asserts the PINNED edit-ops graph digest (authored, not hardcoded) + the PINNED final composed-state
+        // digest (pool + flow GraphState — the same pins tests/particle_author_test.cpp carries, MSVC==clang)
+        // + the exact burst-tick count. Integer strict-zero side-view viz (the PT5 transform: ground line +
+        // hashColor(seed) dots); the Metal --pa1-fountain runs THIS IDENTICAL CPU code -> byte-identical
+        // golden BY CONSTRUCTION. NO GPU dispatch, NO new shader, NO new RHI. (STANDALONE branch — C1061.)
+        if (pa1FountainShotPath) {
+            using math::Vec3;
+            namespace pt = hf::sim::particles;
+            namespace pa = hf::sim::pauthor;
+            namespace vg = render::vg;
+
+            // ===== THE PA1 SCENE — the FIXED authored asset (MUST match the Metal --pa1-fountain and
+            // tests/particle_author_test.cpp: the same asset + same steps -> the SAME pinned digests). =====
+            const pa::fx kDt = pa::kOne / 60;
+            pa::AuthoredEffect effect = pa::MakePulsingFountainEffect();
+
+            // PROOF (1) THE AUTHORING PIN: the graph was BUILT via the flow edit-ops (AddFlowNode/ConnectFlow);
+            // its SerializeGraph digest must equal the test's pinned value (authored, not hardcoded).
+            const uint64_t graphDigest = pa::DigestAuthoredGraph(effect.graph);
+            if (graphDigest != 0xca55eabb27042ba8ull) {
+                std::fprintf(stderr, "FATAL: pa1-fountain graph digest 0x%016llx != pinned 0xca55eabb27042ba8 "
+                             "(the edit-ops-built asset drifted)\n", (unsigned long long)graphDigest);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("pa1-fountain: edit-ops graph digest==pinned (authored, not hardcoded)\n");
+
+            // Run the authored effect kShowcaseSteps ticks (the input channel idle — the pure authored pulse).
+            pt::ParticlePool pool = pt::InitParticlePool(pa::kShowcaseCapacity);
+            const std::vector<hf::flow::Reg> noInput = {0};
+            uint32_t burstTicks = 0;
+            for (uint32_t t = 0; t < pa::kShowcaseSteps; ++t) {
+                pa::ResolvedParams rp;
+                pa::StepAuthoredEffect(effect, pool, kDt, pool.tick, noInput, &rp);
+                if (rp.cfg.ratePerTick == (pa::fx)pa::kBurstSpawn) ++burstTicks;
+            }
+            const uint32_t alive = pt::CountAlive(pool);
+            const uint64_t finalDigest = pa::DigestAuthored(pool, effect.state);
+
+            // PROOF (2) THE PULSE: the burst rate resolved on exactly the expected ticks (t%6==5 -> 21 of 128).
+            if (burstTicks != pa::kShowcaseSteps / (uint32_t)pa::kPulsePeriod) {
+                std::fprintf(stderr, "FATAL: pa1-fountain burst ticks %u != expected %u (the pulse structure "
+                             "broke)\n", burstTicks, pa::kShowcaseSteps / (uint32_t)pa::kPulsePeriod);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("pa1-fountain pulse: %u burst ticks over %u steps (every %d ticks, exactly)\n",
+                        burstTicks, pa::kShowcaseSteps, pa::kPulsePeriod);
+
+            // PROOF (3) THE COMPOSED-STATE PIN: pool + flow GraphState digest == the test's pinned value.
+            if (finalDigest != 0x745c02a3574c687full) {
+                std::fprintf(stderr, "FATAL: pa1-fountain final composed digest 0x%016llx != pinned "
+                             "0x745c02a3574c687f (pool/graph-state drift)\n", (unsigned long long)finalDigest);
+                device->WaitIdle(); return 1;
+            }
+            if (alive == 0) {
+                std::fprintf(stderr, "FATAL: pa1-fountain: no alive particles at capture (degenerate)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            std::printf("pa1-fountain: {nodes:%u, bindings:%u, alive:%u, steps:%u, digest:0x%016llx}\n",
+                        (unsigned)effect.graph.nodes.size(), (unsigned)effect.bindings.size(), alive,
+                        pa::kShowcaseSteps, (unsigned long long)finalDigest);
+
+            // --- Golden: the mid-burst pool side-view (the PT5 integer transform — ground line + hashColor
+            // (seed) dots; no spheres in this scene). originPxY 140 keeps the whole fountain (mouth y=3 ->
+            // py 20, ground y=-2 -> py 220) in frame. ---
+            const int kPxPerUnit = 40;
+            const uint32_t imgW = 240, imgH = 240;
+            const int originPxX = (int)imgW / 2;
+            const int originPxY = 140;
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto worldToPx = [&](int32_t wpx, int32_t wpy, int& ix, int& iy) {
+                ix = originPxX + (int)(((int64_t)wpx * kPxPerUnit) >> pt::kFrac);
+                iy = originPxY - (int)(((int64_t)wpy * kPxPerUnit) >> pt::kFrac);  // y up
+            };
+            auto putPx = [&](int ix, int iy, uint8_t r, uint8_t gg, uint8_t b) {
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = b; dst[1] = gg; dst[2] = r; dst[3] = 255;
+            };
+            {
+                int gx0, gy0; worldToPx(0, effect.groundY, gx0, gy0);
+                for (int x = 0; x < (int)imgW; ++x) putPx(x, gy0, 90, 80, 60);
+            }
+            int particlePx = 0;
+            for (uint32_t i = 0; i < pa::kShowcaseCapacity; ++i) {
+                const pt::FxParticle& p = pool.particles[(size_t)i];
+                if (!(p.flags & pt::kFlagAlive)) continue;
+                int cx, cy; worldToPx(p.pos.x, p.pos.y, cx, cy);
+                Vec3 col = vg::hashColor(p.seed);
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        putPx(cx + dx, cy + dy, (uint8_t)(col.x * 255.0f + 0.5f),
+                              (uint8_t)(col.y * 255.0f + 0.5f), (uint8_t)(col.z * 255.0f + 0.5f));
+                        ++particlePx;
+                    }
+            }
+            bool ok = WriteBMP(pa1FountainShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — flow-authored pulsing fountain mid-burst (%d particle px)\n",
+                                pa1FountainShotPath, imgW, imgH, particlePx);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", pa1FountainShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
