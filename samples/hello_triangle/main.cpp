@@ -657,6 +657,7 @@ int main(int argc, char** argv) {
     const char* mm1LocomotionShotPath = nullptr; // --mm1-locomotion-shot <out.bmp> (Slice MM1: DETERMINISTIC MOTION MATCHING, Track-S S4 of docs/SUPERIORITY_ROADMAP.md / the long-queued flagship #33 — UE5's motion matching is float/non-replayable; ours is a pure integer function of (database, input stream). A Q16.16 pose FEATURE DATABASE (engine/anim/motion_match.h: root velocity + future trajectory offsets at +10/+20/+30 frames + left/right foot positions/velocities, quantized ONCE at database build — the one documented float->integer boundary; the fixture clips use exact binary-fraction keys so the sampling is EXACT cross-compiler) + an integer weighted-L1 brute-force nearest-neighbor search with the strict (cost, index) tie-break + the search-interval controller (advance -> search every N=10 ticks -> HARD switch, the documented v1 transition — popping is honest) driven by a scripted stick: zero velocity [0,60), forward 1.5 u/s [60,150), zero [150,240). The character's root integrates the selected frame's root-velocity feature (root-motion drive). PROOFS: two runs BYTE-IDENTICAL; the selection story — idle holds under zero velocity, the switch to WALK lands EXACTLY at search tick 60, back to IDLE exactly at 150, switches == 2. Stat line: dbFrames/searches/switches/steps/trace digest. Integer strict-zero top-down path trace + per-tick selection timeline strip (idle=amber, walk=cyan, switches=gold), CPU-colored -> identical both backends BY CONSTRUCTION. PURE CPU: NO GPU dispatch, NO new shader, NO new RHI; engine/anim/ existing headers byte-UNTOUCHED (motion_match.h is additive). STANDALONE branch (C1061))
     const char* cf1CoupleShotPath = nullptr;     // --cf1-couple-shot <out.bmp> (Slice CF1: Deterministic Cloth<->Fluid Coupling — the WET-CLOTH CORE, Track-S S1 of docs/SUPERIORITY_ROADMAP.md, the FOURTH material-interaction pairing (rigid<->fluid CP, rigid<->grain CG, grain<->fluid GF shipped). PURE CPU (the GF5 --cgf-lockstep convention: NO GPU dispatch, NO new shader, NO new RHI): a 4x4x4 fluid block (64 particles) falls onto a corner-pinned 9x9 cloth HAMMOCK; couple_cf.h::StepClothFluidSteps composes fluid::StepFluidVisc + cloth::StepClothSelf AS-IS -> the shared-grid cross-query -> K Jacobi cross-pool vert-sphere CONTACT projections -> the TWO-WAY XSPH-style DRAG (v=(pos-prev)/dt both pools, prev re-encode). PROOFS: (1) two coupled runs BYTE-IDENTICAL both pools; (2) THE BARRIER — without coupling the fluid passes straight through (below-plane count == all), with coupling it is CAUGHT (porosity may leak a few, reported honestly); (3) THE TWO-WAY SAG — the cloth's mean dynamic-vert Y drops under the fluid load vs a dry control run through the SAME coupled entry (empty fluid pool — the fair-baseline lesson: the drag's velocity re-encode also damps the cloth). Stat line: verts/particles/steps/ClothDigest/FluidDigest/caught/sag. Integer side-view golden CPU-colored -> identical both backends BY CONSTRUCTION (the strict zero-differing-pixel bar); Metal --cf1-couple-shot runs the IDENTICAL CPU harness. rho0 = the probe MAX density (no PBF startup burst — the scene lesson); kernel h == coupling h == 2x spacing. cloth.h/fluid.h byte-UNTOUCHED (couple_cf.h is the additive sibling))
     const char* cp7FloatShotPath = nullptr;      // --cp7-float-shot <out.bmp> (Slice CP7: SUBMERGED-VOLUME BUOYANCY + SEALED CONTAINMENT, Track-R R5 of docs/SUPERIORITY_ROADMAP.md — closes the two documented CP caveats: (1) linear buoyancy -> the ARCHIMEDES spherical-cap submerged-volume force V(d)=(pi/3)d^2(3r-d) in pure Q16.16 (couple.h::SphereCapVolume, exact int64 triple product), fluid surface = the deterministic pool 90th-percentile quantile (couple.h::FluidSurfaceY, value-space bisection — the local max-y estimator was REJECTED: it reads a body-riding splash plume as "surface" and rockets the body), body mass from density (BodyFromDensity: invMass = 1/(rho_b*V) -> a body settles where V(d)/V == rho_b/rho_f, the floating condition); (2) leaking static-wall containment -> the hard basin-AABB seal (ClampToBasin after every StepCoupleV2 tick -> ZERO particles outside BY CONSTRUCTION; the OLD StepCouple under a hard drop leaks 343 outside / 277 escaped — the pinned negative control in couple_test). THE SCENE: the ARCHIMEDES LINEUP — THREE spheres of density 0.25/0.5/0.9 (r=1.5) dropped into one sealed 17x7 basin float at visibly different settled depths (measured window-mean d = 0.975/1.496/2.462 wu vs analytic 0.979/1.500/2.411 — the honest 0.15-wu bands; rho>=1 sinks, pinned in couple_test). StepCoupleV2 = CP4's locked order with the buoyancy exchange swapped to ONCE-per-step Archimedes (the GF4 lesson) + FL7 XSPH pool viscosity (calms the slosh) + the seal; params.legacy delegates VERBATIM to the frozen CP4 StepCouple (the identity, pinned). PURE CPU on BOTH backends (the CF1/FR8/HR1 precedent: NO GPU dispatch, NO new shader, NO new RHI — CP2's GPU path serves the OLD model untouched); integer side-view golden CPU-colored -> identical both backends BY CONSTRUCTION (the strict zero-differing-pixel bar). Stat line: bodies/particles/steps/CoupleDigest/depths. STANDALONE branch (C1061))
+    const char* cl8RideShotPath = nullptr;       // --cl8-ride-shot <out.bmp> (Slice CL8: DYNAMIC COLLIDERS + COULOMB FRICTION for the deterministic cloth, the Track-R R3 remainder closing the CL4/CL7 documented "no dynamic colliders, no friction" caveats — a DynamicSphere (the CL4 SphereCollider + the body's vel/angVel, the fpx::FxBody sphere convention via DynamicSphereFromBody) is projected against per tick at its CURRENT pose (the CL4 CollideParticleSphere math VERBATIM), and the contact gets position-level COULOMB FRICTION (the GR4 tangential clamp: the vert's step displacement RELATIVE to the body surface velocity v_surf = vel + angVel x r is split normal/tangential and the tangential slip is cancelled up to fmax = mu*pen — static-stick below the cone, kinetic-slide above) made persistent by the FL7/HR1 velocity RE-ENCODE (vel = (pos-prev)/dt, outward-normal component clamped to the surface's own — the launch clamp) — so a free draped sheet RIDES the moving body (mean-X ride ratio 0.945 at mu=0.8 vs 0.02 at mu=0, the friction-is-load-bearing contrast) and swirls with a spinning one; ONE-WAY v1 (body -> cloth; the body is kinematic/scripted — documented). PURE CPU on BOTH backends (the CF1/HR1/SB1 convention: NO GPU dispatch, NO new shader, NO new RHI — the int64-backed math would be Vulkan-only anyway; cross-backend bit-identical BY CONSTRUCTION); integer strict-zero side-view golden, CPU-colored. Stat line: verts/steps/mu/digest/rideRatio. STANDALONE branch (C1061))
     const char* fpxSolveShotPath = nullptr; // --fpx-solve-shot <out.bmp> (Slice FPX3: Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver, the MAKE-OR-BREAK of FLAGSHIP #6 — a cluster falls + collides into a settled PILE over the FPX2 pairs, GPU==CPU body array bit-exact, single-thread serial Gauss-Seidel)
     const char* fpxOrientShotPath = nullptr; // --fpx-orient-shot <out.bmp> (Slice FPX4: Deterministic Fixed-Point Physics integer QUATERNION ORIENTATION integrator — a 6x6 grid of free-spinning bodies integrated K=120 fixed Q16.16 quaternion steps by one GPU thread per body, GPU==CPU body array bit-exact, orientation-gizmo grid viz)
     const char* fpxRenderShotPath = nullptr; // --fpx-render-shot <out.bmp> (Slice FPX6: Deterministic Fixed-Point Physics LIT 3D RENDER — the bit-exact fpx sim run to a settled PILE, each FxBody -> a float FxBodyTransform, rendered as lit 3D instanced spheres through the EXISTING instanced lit pipeline; FLOAT visresolve-bar, Metal-baked golden; completes flagship #6)
@@ -1679,6 +1680,20 @@ int main(int argc, char** argv) {
         // limit C1061, like the other coupling shots.
         if (std::strcmp(argv[i], "--cp7-float-shot") == 0 && i + 1 < argc) {
             cp7FloatShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CL8: --cl8-ride-shot <out.bmp> — DYNAMIC COLLIDERS + COULOMB FRICTION for the
+        // deterministic cloth (Track-R R3 remainder: closes the CL4/CL7 documented "no dynamic
+        // colliders, no friction" caveats). A free draped sheet RIDES a horizontally-moving sphere
+        // (cloth.h::StepClothDynamicSteps — the CL4-mold projection vs the CURRENT body pose + the
+        // GR4-mold Coulomb tangential clamp + the FL7/HR1 velocity re-encode). PURE CPU on BOTH
+        // backends (the CF1/HR1/SB1 convention): NO GPU dispatch, NO new shader, NO new RHI; the
+        // integer side-view golden is CPU-colored -> identical both backends BY CONSTRUCTION.
+        // STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's nested-block parse
+        // limit C1061, like the other cloth shots.
+        if (std::strcmp(argv[i], "--cl8-ride-shot") == 0 && i + 1 < argc) {
+            cl8RideShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -42450,6 +42465,199 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — hr1 settled strand fan (%d strands, %d verts)\n",
                                 hr1HairShotPath, imgW, imgH, hs.S, kVertCount);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", hr1HairShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DYNAMIC COLLIDERS + COULOMB FRICTION for the deterministic cloth (--cl8-ride-shot
+        // <out.bmp>, Slice CL8, the Track-R R3 remainder of docs/SUPERIORITY_ROADMAP.md — closes the
+        // CL4/CL7 documented "no dynamic colliders, no friction" caveats). PURE CPU (the CF1/HR1/SB1
+        // convention): both Vulkan-Windows and Metal-Mac run the IDENTICAL CPU harness
+        // (cloth.h::StepClothDynamicSteps — the CL4-mold projection vs the body's CURRENT pose + the
+        // GR4-mold Coulomb tangential clamp + the FL7/HR1 velocity re-encode) so the mid-ride golden is
+        // bit-identical cross-backend BY CONSTRUCTION. The scene (== the cloth_test CL8 conventions): a
+        // free 9x9 sheet settles onto a radius-1.5 sphere (120 ticks, mu=0.8), then the body moves +X at
+        // 1.5 u/s for 45 ticks — the sheet RIDES it (mean-X ride ratio ~0.945). PROOFS: (1) two runs
+        // BYTE-IDENTICAL (cloth AND body); (2) the friction contrast — the mu=0 control (SAME settle)
+        // is left behind (ratio ~0.02): friction is load-bearing. NO GPU dispatch, NO new shader, NO
+        // new RHI; cloth.h CL1-CL7 byte-UNTOUCHED (CL8 is append-only). STANDALONE branch (C1061). ---
+        if (cl8RideShotPath) {
+            using math::Vec3;
+            namespace cloth = hf::sim::cloth;
+            const cloth::fx kOne = cloth::kOne;
+            const auto FromInt = [](int v) { return (cloth::fx)(v << cloth::kFrac); };
+
+            // The ride scene (== the Metal --cl8-ride-shot config, == the cloth_test CL8 conventions):
+            // a free (NO pins) 9x9 half-unit-spacing sheet laid HORIZONTAL just above the sphere top.
+            cloth::ClothGrid grid;
+            grid.W = 9; grid.H = 9; grid.spacing = kOne / 2;
+            grid.origin = cloth::FxVec3{0, FromInt(20), 0};
+            std::vector<cloth::ClothParticle> init = cloth::InitGrid(grid);
+            const std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, init);
+            const cloth::ClothAdjacency excl = cloth::BuildClothAdjacency(init.size(), es);
+            const cloth::fx yTop = FromInt(4) + kOne / 2 + kOne / 8;      // 4.625 (sphere top = 4.5)
+            for (int r = 0; r < grid.H; ++r)
+                for (int c = 0; c < grid.W; ++c) {
+                    cloth::ClothParticle& p = init[(size_t)cloth::ParticleIndex(grid, r, c)];
+                    p.pos = cloth::FxVec3{(cloth::fx)((c - 4) * (int)(kOne / 2)), yTop,
+                                          (cloth::fx)((r - 4) * (int)(kOne / 2))};
+                    p.prev = p.pos;
+                    p.vel = cloth::FxVec3{0, 0, 0};
+                    p.invMass = kOne;                    // ALL dynamic — a free cloth can ride
+                    p.flags = 0;
+                }
+            cloth::DynamicSphere body0;
+            body0.center = cloth::FxVec3{0, FromInt(3), 0};
+            body0.radius = kOne + kOne / 2;              // 1.5
+            const cloth::FxVec3 kGrav{0, FromInt(-10), 0};
+            const cloth::fx kDt = kOne / 60, kGroundY = 0;
+            const cloth::fx kMu = (cloth::fx)((int64_t)4 * kOne / 5);     // 0.8 (52428)
+            const int kIters = 8, kSettle = 120, kRide = 45;
+            const std::vector<cloth::SphereCollider> noStatics;
+            const int kVertCount = grid.W * grid.H;
+
+            // Settle SHARED at mu=0.8 (the fair start — a frictionless settle slides off the sphere
+            // before the ride even begins), then ride 45 ticks at 1.5 u/s at the tested mu.
+            const auto run = [&](cloth::fx mu, std::vector<cloth::ClothParticle>& out,
+                                 cloth::DynamicSphere& bOut, cloth::fx& rideRatio, int& contacts) {
+                out = init;
+                bOut = body0;
+                cloth::StepClothDynamicSteps(grid, out, es, excl, noStatics, bOut, kMu, kGrav, kDt,
+                                             kGroundY, kIters, 0, 0, kSettle);
+                const cloth::fx meanX0 = cloth::MeanDynamicX(out);
+                const cloth::fx bodyX0 = bOut.center.x;
+                bOut.vel = cloth::FxVec3{kOne + kOne / 2, 0, 0};
+                contacts = cloth::StepClothDynamicSteps(grid, out, es, excl, noStatics, bOut, mu,
+                                                        kGrav, kDt, kGroundY, kIters, 0, 0, kRide);
+                rideRatio = cloth::fxdiv(cloth::MeanDynamicX(out) - meanX0, bOut.center.x - bodyX0);
+            };
+
+            std::vector<cloth::ClothParticle> a, b, ctrl;
+            cloth::DynamicSphere ba, bb, bc;
+            cloth::fx ratioA = 0, ratioB = 0, ratioCtrl = 0;
+            int contactsA = 0, contactsB = 0, contactsCtrl = 0;
+            run(kMu, a, ba, ratioA, contactsA);
+
+            // PROOF (1) determinism: two runs byte-identical (cloth AND body).
+            run(kMu, b, bb, ratioB, contactsB);
+            if (a.size() != b.size() ||
+                std::memcmp(a.data(), b.data(), a.size() * sizeof(cloth::ClothParticle)) != 0 ||
+                std::memcmp(&ba, &bb, sizeof(cloth::DynamicSphere)) != 0) {
+                std::fprintf(stderr, "FATAL: cl8-ride two runs differ (nondeterministic — a float "
+                             "crept into the fixed-point friction path?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cl8-ride determinism: two runs BYTE-IDENTICAL (cloth AND body)\n");
+
+            // PROOF (2) THE RIDE + the friction contrast: mu=0.8 carries the sheet mid-ride
+            // (ratio ~0.945, still in contact); the mu=0 control (SAME settle) is left behind
+            // (ratio ~0.02, the body slides out from under it) — friction is LOAD-BEARING.
+            run(0, ctrl, bc, ratioCtrl, contactsCtrl);
+            if (!(ratioA > (cloth::fx)(3 * kOne / 4)) || !(ratioA > ratioCtrl + kOne / 2) ||
+                contactsA <= 0) {
+                std::fprintf(stderr, "FATAL: cl8-ride the cloth did NOT ride the body (ratio %d vs "
+                             "mu=0 %d, contacts %d)\n", ratioA, ratioCtrl, contactsA);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cl8-ride friction contrast: rideRatio mu=0.8 -> %d, mu=0 -> %d of kOne=%d "
+                        "(%d riding contacts; the mu=0 body slid out from under the sheet)\n",
+                        ratioA, ratioCtrl, kOne, contactsA);
+
+            const uint64_t kDigest = cloth::ClothDigest(a);
+            std::printf("cl8-ride: {verts:%d, steps:%d, mu:%d, digest:0x%016llx, rideRatio:%d}\n",
+                        kVertCount, kSettle + kRide, kMu, (unsigned long long)kDigest, ratioA);
+
+            // --- Golden: the integer side-view (X-Y) of the MID-RIDE state (CPU-colored -> identical
+            // both backends BY CONSTRUCTION; the strict zero-differing-pixel bar). The sphere a slate
+            // disc at its FINAL pose, a dim dotted line marking its START x, the riding sheet a warm ->
+            // cyan row ramp (depth), the ground a dark strip. ---
+            const int kPxPerUnit = 32, kImgMargin = 18;
+            const int kWorldLoX = -3, kWorldW = 8;       // X in [-3, 5]
+            const int kWorldLoY = -1, kWorldH = 7;       // Y in [-1, 6]
+            const uint32_t imgW = (uint32_t)(kImgMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kImgMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto setPx = [&](int ix, int iy, const Vec3& col) {
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            };
+            auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+                const int64_t loX = (int64_t)kWorldLoX << cloth::kFrac;
+                const int64_t loY = (int64_t)kWorldLoY << cloth::kFrac;
+                cx = kImgMargin + (int)(((int64_t)wxFx - loX) * kPxPerUnit >> cloth::kFrac);
+                cy = (int)imgH - kImgMargin - (int)(((int64_t)wyFx - loY) * kPxPerUnit >> cloth::kFrac);
+            };
+            // The ground strip (y = 0, 2 px).
+            {
+                int gx, gy; toPx(0, 0, gx, gy);
+                for (int ix = 0; ix < (int)imgW; ++ix)
+                    for (int dy = 0; dy < 2; ++dy) setPx(ix, gy + dy, Vec3{0.16f, 0.17f, 0.20f});
+            }
+            // The body's START x (a dim dotted vertical at x = 0 — the motion evidence).
+            {
+                int sx, syTop, syBot, tmp;
+                toPx(0, FromInt(6), sx, syTop);
+                toPx(0, 0, tmp, syBot);
+                for (int iy = syTop; iy <= syBot; iy += 3) setPx(sx, iy, Vec3{0.42f, 0.36f, 0.20f});
+            }
+            // The sphere: a filled integer disc at its FINAL (mid-ride) pose + a gold center dot.
+            {
+                int cx, cy; toPx(ba.center.x, ba.center.y, cx, cy);
+                const int rpx = (int)(((int64_t)ba.radius * kPxPerUnit) >> cloth::kFrac);
+                for (int dy = -rpx; dy <= rpx; ++dy)
+                    for (int dx = -rpx; dx <= rpx; ++dx) {
+                        if (dx * dx + dy * dy > rpx * rpx) continue;
+                        setPx(cx + dx, cy + dy, Vec3{0.30f, 0.42f, 0.62f});
+                    }
+                for (int dy = -2; dy <= 2; ++dy)
+                    for (int dx = -2; dx <= 2; ++dx)
+                        setPx(cx + dx, cy + dy, Vec3{0.95f, 0.80f, 0.40f});
+            }
+            // The riding sheet: structural EDGES first (integer Bresenham, dimmed) so the sheet reads
+            // as a draped NET, then the verts in the warm (near rows) -> cyan (far rows) depth ramp.
+            auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+                int adx = x1 - x0; if (adx < 0) adx = -adx;
+                int ady = y1 - y0; if (ady < 0) ady = -ady;
+                const int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+                int err = adx - ady;
+                for (;;) {
+                    setPx(x0, y0, col);
+                    if (x0 == x1 && y0 == y1) break;
+                    const int e2 = 2 * err;
+                    if (e2 > -ady) { err -= ady; x0 += sx; }
+                    if (e2 < adx)  { err += adx; y0 += sy; }
+                }
+            };
+            auto rowCol = [&](int r, float dim) {
+                const float t = (float)r / (float)(grid.H - 1);
+                return Vec3{(0.85f + (0.22f - 0.85f) * t) * dim,
+                            (0.55f + (0.64f - 0.55f) * t) * dim,
+                            (0.25f + (0.97f - 0.25f) * t) * dim};
+            };
+            for (const cloth::Constraint& e : es) {
+                if (e.kind != cloth::kConstraintStructural) continue;
+                int x0, y0, x1, y1;
+                toPx(a[(size_t)e.i].pos.x, a[(size_t)e.i].pos.y, x0, y0);
+                toPx(a[(size_t)e.j].pos.x, a[(size_t)e.j].pos.y, x1, y1);
+                drawLine(x0, y0, x1, y1, rowCol((int)(e.i / (uint32_t)grid.W), 0.55f));
+            }
+            for (int i = 0; i < kVertCount; ++i) {
+                const Vec3 col = rowCol(i / grid.W, 1.0f);
+                int cx, cy; toPx(a[(size_t)i].pos.x, a[(size_t)i].pos.y, cx, cy);
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) setPx(cx + dx, cy + dy, col);
+            }
+            bool ok = WriteBMP(cl8RideShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — cl8 mid-ride cloth on the moving body (%d verts, "
+                                "%d contacts)\n", cl8RideShotPath, imgW, imgH, kVertCount, contactsA);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cl8RideShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

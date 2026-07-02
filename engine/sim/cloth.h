@@ -1212,5 +1212,386 @@ inline uint64_t ClothDigest(const std::vector<ClothParticle>& particles) {
     return h;
 }
 
+// ===== Slice CL8 — Deterministic GPU Cloth: DYNAMIC COLLIDERS + COULOMB FRICTION (Track-R R3 remainder) ==
+// FLAGSHIP #8 shipped with two DOCUMENTED fidelity gaps CL7 left open: NO DYNAMIC (moving) colliders and
+// NO FRICTION — the cloth can drape over a STATIC sphere (CL4) but not ride a MOVING one, and every
+// contact is frictionless (the cloth slides off). CL8 closes both: a cloth draped over a MOVING/ROTATING
+// fpx-style body with position-level Coulomb friction — the cloth RIDES the body (a deterministic,
+// bit-identical-cross-platform riding cloth; UE5 Chaos Cloth's kinematic-collider friction is float /
+// non-deterministic). All APPEND-ONLY below CL7 (CL1-CL7 byte-unchanged). Three pieces:
+//   (1) THE DYNAMIC COLLIDER (DynamicSphere): the CL4 SphereCollider plus the body's MOTION state (linear
+//       vel + world-axis angVel — the fpx::FxBody sphere convention; DynamicSphereFromBody is the seam).
+//       The projection itself is the CL4 CollideParticleSphere math VERBATIM against the body's CURRENT
+//       pose (the pose is advanced by the caller / an fpx step each tick — CL8's step takes the body
+//       state per tick; AdvanceDynamicSphere is the v1 kinematic driver). The body's surface velocity at
+//       a contact point is v_surf = vel + angVel x r (r = point - center, the rigid-body kinematics
+//       identity) — pure integer via a LOCAL FxCross (the particles.h precedent: fpx.h lacks dot/cross;
+//       copied VERBATIM the convex.h int64 form, composed of fxmul only).
+//   (2) COULOMB FRICTION (the new physics — the GR4 SolveGrainFriction clamp, retargeted from a
+//       grain-grain pair to a vert-vs-kinematic-body contact): after the normal snap, the vert's step
+//       displacement RELATIVE to the body surface (dx_rel = (pos - prev) - v_surf*dt) is split into
+//       normal + tangential parts; the tangential slip is cancelled up to the Coulomb cone fmax =
+//       fxmul(mu, pen) (pen = the normal correction magnitude, the GR4 proxy): t <= fmax -> STATIC
+//       (cancel ALL slip, the cloth sticks/rides), t > fmax -> KINETIC (cancel fxdiv(fmax, t) of it, the
+//       clamped slide). The friction is applied POSITIONALLY (pos -= corr) and then made PERSISTENT via
+//       the FL7/HR1/couple_cf VELOCITY RE-ENCODE on the contacted vert: vel = (pos - prev)/dt (per-axis
+//       fxdiv), prev = pos - vel*dt — so a stuck vert's velocity BECOMES the body's surface velocity and
+//       next tick's integrate carries it along (the ride). ONE-WAY v1 (body -> cloth; documented): the
+//       cloth is light relative to the body, so the reaction on the body is neglected — the body's
+//       motion is authored/kinematic (or an fpx step), never modified here. Two-way is future work.
+//   (3) THE STEP (StepClothDynamic): the CL7 composition with the dynamic body at the CL4 composition
+//       point — StepClothCollide VERBATIM (integrate + constraints + ground + STATIC spheres), then the
+//       dynamic-sphere pass (CollideDynamicSphere), then the CL7 self pass iff thickness/selfIters on.
+//       Because CollideSpheres/CollideDynamicSphere are per-vert INDEPENDENT (no inter-vert coupling),
+//       "static list then dynamic sphere" is BIT-IDENTICAL to CL4/CL7 with the sphere APPENDED to the
+//       static list — which is the constructed IDENTITY: mu == 0 AND a body at rest (vel == angVel == 0)
+//       degenerates EXACTLY to StepClothSelf on the same sphere set + [body] (bit-checked in
+//       tests/cloth_test.cpp; at mu == 0 CollideParticleDynamicSphere returns BEFORE any friction /
+//       re-encode state is touched — the FL7 early-out lesson: re-encoding at mu=0 would NOT be
+//       byte-neutral).
+//
+// THE CPU/GPU CHOICE (the Track-R CF1/FR8/HR1 convention, documented): CL8 ships PURE CPU on BOTH
+// backends — the projection/friction math is int64-backed (FxLength/FxNormalize/fxdiv), which under the
+// house convention would make any GPU kernel DXC/Vulkan-only with a Metal CPU reference anyway; a
+// pure-CPU pass run IDENTICALLY on Vulkan-Windows and Metal-Mac is cross-backend bit-identical BY
+// CONSTRUCTION. NO new shader, NO new RHI; a GPU kernel is a future refinement, not CL8.
+//
+// HONEST CAVEATS: (a) this is POSITION-LEVEL PBD friction (the GR4 model), NOT an exact Coulomb force
+// law — the cone radius uses the CURRENT penetration depth as the normal-force proxy, so per-step stick
+// is bounded by mu*pen and a resting contact's pen is one gravity-step deep (~g*dt^2): a fast body drags
+// the cloth up to speed over MANY steps (an exponential catch-up, pinned honestly in the tests), not
+// instantly; (b) the friction pass runs ONCE per step at the CL4 composition point (the CL4 house order),
+// not per solver iteration — the constraint solve re-absorbs the push next step; (c) contacted verts'
+// velocity is re-encoded from their net displacement (the couple_cf fair-baseline note: this also damps
+// them relative to CL3's keep-integrated-velocity convention — any with/without comparison must hold mu,
+// not the re-encode, as the variable: the mu=0 control skips the re-encode entirely and is the CL4
+// baseline); (d) tunneling: a body moving more than ~its radius per step can pass a vert without contact
+// (velocities are bounded in the pinned scenes; CCD is future work).
+
+// kClothFrictionEps: the slip dead-band (the GR4 kGrainFrictionEps twin). Below it the tangential
+// relative displacement is fxdiv/FxNormalize truncation noise, NOT real slip — no friction is applied so
+// a resting contact accumulates no spurious drift. Pure integer; identical on every platform.
+inline constexpr fx kClothFrictionEps = 16;   // ~16 Q16.16 LSBs (a tiny fraction of a world unit)
+
+// ----- FxCross (LOCAL, VERBATIM the convex.h/particles.h int64 form — fpx.h lacks it) -------------------
+// a x b = (ay*bz - az*by, az*bx - ax*bz, ax*by - ay*bx), each fxmul an int64 product then >> kFrac. The
+// only CL8 use is angVel x r (the surface-velocity kinematics). NO new fixed-point primitive — the
+// dot/cross composed of fxmul, the particles.h precedent.
+inline FxVec3 FxCross(const FxVec3& a, const FxVec3& b) {
+    return FxVec3{
+        fxmul(a.y, b.z) - fxmul(a.z, b.y),
+        fxmul(a.z, b.x) - fxmul(a.x, b.z),
+        fxmul(a.x, b.y) - fxmul(a.y, b.x),
+    };
+}
+
+// ----- DynamicSphere: a MOVING/ROTATING sphere collider (the CL4 SphereCollider + the motion state) -----
+// The fpx sphere convention (pos + radius == fpx::FxBody's), extended with the body's linear velocity and
+// world-axis angular velocity — everything the friction needs to know how the SURFACE moves. 10 x int32,
+// no padding holes (memcmp-able — the lockstep snapshot carries it by value).
+struct DynamicSphere {
+    FxVec3 center;        // Q16.16 world-space sphere center (== fpx::FxBody::pos, the CURRENT pose)
+    fx     radius = 0;    // Q16.16 sphere radius (== fpx::FxBody::radius)
+    FxVec3 vel;           // Q16.16 linear velocity of the center (world units / second)
+    FxVec3 angVel;        // Q16.16 angular velocity (radians / second, world-axis omega — fpx::FxBody::angVel)
+};
+
+// DynamicSphereFromBody(b): the cloth-vs-FPX seam (the CL4 SphereFromBody twin, plus the motion state).
+// The caller refreshes this each tick from the fpx-stepped body — CL8 consumes the CURRENT body state.
+inline DynamicSphere DynamicSphereFromBody(const fpx::FxBody& b) {
+    return DynamicSphere{b.pos, b.radius, b.vel, b.angVel};
+}
+
+// AdvanceDynamicSphere(s, dt): the v1 KINEMATIC pose driver — center += vel*dt (component-wise fxmul).
+// angVel spins the surface in place (a sphere's contact geometry is orientation-invariant, so no
+// quaternion integrate is needed — only the surface-velocity kinematics see angVel). A caller driving the
+// body from a real fpx step uses DynamicSphereFromBody instead; this is the deterministic scripted mover
+// the tests/showcase/lockstep use (one-way v1: the cloth never pushes back — documented above).
+inline void AdvanceDynamicSphere(DynamicSphere& s, fx dt) {
+    s.center.x += fxmul(s.vel.x, dt);
+    s.center.y += fxmul(s.vel.y, dt);
+    s.center.z += fxmul(s.vel.z, dt);
+}
+
+// DynamicSphereSurfaceVelocity(s, p): the body's surface velocity at world point p — the rigid-body
+// kinematics identity v_surf = vel + angVel x (p - center). Pure integer (FxCross of fxmul). This is what
+// the vert's motion is measured RELATIVE to (a vert riding a spinning body is "at rest" in contact terms).
+inline FxVec3 DynamicSphereSurfaceVelocity(const DynamicSphere& s, const FxVec3& p) {
+    return FxAdd(s.vel, FxCross(s.angVel, FxSub(p, s.center)));
+}
+
+// ----- CollideParticleDynamicSphere: project ONE vert out of the MOVING sphere + Coulomb friction ------
+// The bit-exact CL8 core. Pinned -> untouched. The projection is the CL4 CollideParticleSphere math
+// VERBATIM against the CURRENT pose (int32 AABB reject -> FxLength -> snap to the surface along the
+// outward normal); mu == 0 (or dt == 0) RETURNS RIGHT AFTER THE SNAP — byte-for-byte the CL4 pass, the
+// constructed identity. With friction on (mu > 0), at the contact:
+//   pen    = radius - dist                      (the normal correction magnitude — the GR4 cone proxy)
+//   v_surf = vel + angVel x r                    (the body's surface velocity at the snapped contact)
+//   dx_rel = (pos - prev) - v_surf*dt            (the vert's step displacement RELATIVE to the surface)
+//   dx_t   = dx_rel - (dx_rel . n)*n             (tangential part; dot composed of fxmul, the GR4 idiom)
+//   t = |dx_t|; fmax = fxmul(mu, pen)            (the Coulomb cone)
+//   t <= eps  -> no friction (truncation noise, the dead-band)
+//   t <= fmax -> pos -= dx_t                     (STATIC: cancel ALL tangential slip — stick/ride)
+//   else      -> pos -= dx_t * fxdiv(fmax, t)    (KINETIC: clamp the slip to the cone — drag)
+//   then the ground clamp (friction can push a low vert below the floor), and the FL7/HR1 velocity
+//   RE-ENCODE on this contacted vert: vel = (pos - prev)/dt, prev = pos - vel*dt — the friction persists
+//   into next tick's integrate (this is what makes the cloth RIDE instead of being re-slammed by the
+//   CL3 keep-integrated-velocity convention). int64-backed (FxLength/FxNormalize/fxdiv), pure integer,
+//   fixed op order. Returns true iff this vert contacted (the coverage stat).
+inline bool CollideParticleDynamicSphere(ClothParticle& p, const DynamicSphere& s, fx mu, fx dt,
+                                         fx groundY) {
+    if (p.flags & kFlagPinned) return false;
+    // int32 AABB reject (the CL4 cheap common-case skip, VERBATIM).
+    const fx dx = p.pos.x - s.center.x;
+    const fx dy = p.pos.y - s.center.y;
+    const fx dz = p.pos.z - s.center.z;
+    const fx ax = dx < 0 ? -dx : dx;
+    const fx ay = dy < 0 ? -dy : dy;
+    const fx az = dz < 0 ? -dz : dz;
+    if (ax > s.radius || ay > s.radius || az > s.radius) return false;   // outside the AABB -> no overlap
+    const FxVec3 d = FxVec3{dx, dy, dz};
+    const fx dist = FxLength(d);
+    if (dist >= s.radius) return false;                                  // outside the sphere -> untouched
+    const fx pen = s.radius - dist;                                      // the normal correction magnitude
+    const FxVec3 n = FxNormalize(d);                                     // dist==0 -> {0,kOne,0} fallback
+    p.pos = FxAdd(s.center, FxScale(n, s.radius));                       // the CL4 snap (identical math)
+    if (mu == 0 || dt == 0) return true;    // the IDENTITY: mu=0 is EXACTLY the CL4 projection — return
+                                            // BEFORE any friction/re-encode state is touched (FL7 lesson)
+    // ---- Coulomb friction (the GR4 tangential clamp, vert vs the kinematic body surface) ----
+    const FxVec3 vSurf = DynamicSphereSurfaceVelocity(s, p.pos);         // at the snapped contact point
+    const FxVec3 dxVert = FxSub(p.pos, p.prev);                          // the vert's net step displacement
+    const FxVec3 dxRel = FxSub(dxVert, FxScale(vSurf, dt));              // relative to the moving surface
+    const fx dotN = fxmul(dxRel.x, n.x) + fxmul(dxRel.y, n.y) + fxmul(dxRel.z, n.z);
+    const FxVec3 dxT = FxSub(dxRel, FxScale(n, dotN));                   // the tangential slip
+    const fx t = FxLength(dxT);
+    if (t > kClothFrictionEps) {                                         // real slip (not the dead-band)
+        const fx fmax = fxmul(mu, pen);                                  // the Coulomb cone radius
+        FxVec3 corr;
+        if (t <= fmax) corr = dxT;                                       // STATIC: cancel ALL slip (stick)
+        else           corr = FxScale(dxT, fxdiv(fmax, t));              // KINETIC: clamp to the cone
+        p.pos = FxSub(p.pos, corr);
+        if (p.pos.y < groundY) p.pos.y = groundY;                        // friction cannot tunnel the floor
+    }
+    // The FL7/HR1 velocity RE-ENCODE on the contacted vert (vel = (pos - prev)/dt; prev = pos - vel*dt):
+    // a stuck vert's velocity BECOMES the surface velocity -> next tick's integrate carries it (the ride).
+    fx vx = fxdiv(p.pos.x - p.prev.x, dt);
+    fx vy = fxdiv(p.pos.y - p.prev.y, dt);
+    fx vz = fxdiv(p.pos.z - p.prev.z, dt);
+    // THE LAUNCH CLAMP (measured, documented): the normal SNAP is a positional constraint, not an
+    // impulse — re-encoding it verbatim would turn every plow-push into PERSISTENT outward velocity
+    // (each contact step re-encodes the push; the accumulating rebound LAUNCHES the cloth off the body
+    // after ~40 riding steps — observed before this clamp). So the re-encoded velocity's OUTWARD normal
+    // component is clamped to the surface's own normal velocity (vSurf . n — the rate the surface itself
+    // advances outward; a front-slope plow may push exactly as fast as the surface approaches, no
+    // faster). Approaching verts (vn < vsn) are untouched. The tangential (friction) part persists —
+    // that IS the ride.
+    const fx vn = fxmul(vx, n.x) + fxmul(vy, n.y) + fxmul(vz, n.z);
+    const fx vsn = fxmul(vSurf.x, n.x) + fxmul(vSurf.y, n.y) + fxmul(vSurf.z, n.z);
+    if (vn > vsn) {
+        const fx excess = vn - vsn;
+        vx -= fxmul(excess, n.x);
+        vy -= fxmul(excess, n.y);
+        vz -= fxmul(excess, n.z);
+    }
+    p.vel = FxVec3{vx, vy, vz};
+    p.prev = FxVec3{p.pos.x - fxmul(vx, dt), p.pos.y - fxmul(vy, dt), p.pos.z - fxmul(vz, dt)};
+    return true;
+}
+
+// ----- CollideDynamicSphere: the per-vert pass over the whole lattice (the CL4 CollideSpheres twin) ----
+// Per-vert INDEPENDENT (each vert vs the one read-only body — no inter-vert coupling), fixed index order,
+// deterministic. Returns the contact count (the coverage stat). Because it is per-vert independent, running
+// it AFTER CollideSpheres(staticSet) is bit-identical to CL4's CollideSpheres(staticSet + [body]) at mu=0
+// — the composition argument the StepClothDynamic identity rests on.
+inline int CollideDynamicSphere(std::vector<ClothParticle>& particles, const DynamicSphere& s,
+                                fx mu, fx dt, fx groundY) {
+    int contacts = 0;
+    const size_t n = particles.size();
+    for (size_t i = 0; i < n; ++i)
+        if (CollideParticleDynamicSphere(particles[i], s, mu, dt, groundY)) ++contacts;
+    return contacts;
+}
+
+// ----- StepClothDynamic: the composed DYNAMIC-COLLIDER step (CL7 composition + the moving body) --------
+// StepClothCollide VERBATIM (integrate + Gauss-Seidel constraints + ground + STATIC spheres), then the
+// dynamic-body pass at the CL4 composition point (CollideDynamicSphere against the body's CURRENT pose —
+// the caller advanced it this tick), then the CL7 self pass iff thickness > 0 AND selfIters > 0 (the
+// StepClothSelf tail VERBATIM). THE CONSTRUCTED IDENTITY (bit-checked): mu == 0 + a body at rest ==
+// StepClothSelf(spheres + [SphereCollider{body.center, body.radius}]) BYTE-IDENTICAL — per-vert
+// independence makes "static list then body" == "body appended to the list", and mu == 0 makes the
+// per-vert math EXACTLY CL4's. State shape unchanged (pos, prev, vel) -> the CL5 snapshot machinery
+// applies (the body pose joins the snapshot — see ClothDynState below). Returns the total sphere-contact
+// count this step (static + dynamic).
+inline int StepClothDynamic(const ClothGrid& grid, std::vector<ClothParticle>& particles,
+                            const std::vector<Constraint>& constraints, const ClothAdjacency& excl,
+                            const std::vector<SphereCollider>& spheres,
+                            const DynamicSphere& body, fx mu,
+                            const FxVec3& gravity, fx dt, fx groundY, int iters,
+                            fx thickness, int selfIters) {
+    int contacts = StepClothCollide(grid, particles, constraints, spheres,
+                                    gravity, dt, groundY, iters);
+    contacts += CollideDynamicSphere(particles, body, mu, dt, groundY);
+    if (thickness <= 0 || selfIters <= 0) return contacts;   // identity-at-zero (the CL7 off-switch)
+    const ClothSelfList list = BuildSelfCandidates(particles, excl, thickness);
+    for (int k = 0; k < selfIters; ++k)
+        SolveSelfCollision(particles, list, thickness, groundY);
+    return contacts;
+}
+
+// ----- StepClothDynamicSteps: run K composed steps, ADVANCING the body each tick (the showcase driver) --
+// Per tick: AdvanceDynamicSphere FIRST (the body's pose moves — the "project relative to the CURRENT
+// body pose each tick" contract), then StepClothDynamic against the advanced pose. The body state is
+// in-out (the caller reads the final pose). Returns the final step's contact count.
+inline int StepClothDynamicSteps(const ClothGrid& grid, std::vector<ClothParticle>& particles,
+                                 const std::vector<Constraint>& constraints, const ClothAdjacency& excl,
+                                 const std::vector<SphereCollider>& spheres,
+                                 DynamicSphere& body, fx mu,
+                                 const FxVec3& gravity, fx dt, fx groundY, int iters,
+                                 fx thickness, int selfIters, int steps) {
+    int contacts = 0;
+    for (int s = 0; s < steps; ++s) {
+        AdvanceDynamicSphere(body, dt);
+        contacts = StepClothDynamic(grid, particles, constraints, excl, spheres, body, mu,
+                                    gravity, dt, groundY, iters, thickness, selfIters);
+    }
+    return contacts;
+}
+
+// ----- CL8 LOCKSTEP: the CL5 harness with the BODY POSE IN THE SNAPSHOT ---------------------------------
+// The body's motion IS the command stream: kCmdBodyVel / kCmdBodyAngVel set the body's velocities (the
+// deterministic per-tick inputs a netcode layer would put on the wire), and the peer re-derives BOTH the
+// cloth AND the body pose bit-for-bit from the inputs alone. The snapshot is (cloth particles, body) —
+// the CL5 SnapshotCloth extended by the 10-int32 DynamicSphere (value copy, memcmp-able).
+
+inline constexpr uint32_t kCmdBodyVel    = 3u;  // body.vel    = arg (the scripted mover input)
+inline constexpr uint32_t kCmdBodyAngVel = 4u;  // body.angVel = arg (the scripted spin input)
+
+// ClothDynState: the full CL8 lockstep state — the cloth pool + the body pose. Value copy is the
+// snapshot (std::vector deep-copies; DynamicSphere is a flat POD).
+struct ClothDynState {
+    std::vector<ClothParticle> cloth;
+    DynamicSphere              body;
+};
+
+// ApplyClothDynCommand: body kinds route to the body; every other kind routes to the CL5
+// ApplyClothCommand VERBATIM (wind/pin/unpin on the cloth; unknown kinds no-op there, deterministic).
+inline void ApplyClothDynCommand(std::vector<ClothParticle>& cloth, DynamicSphere& body,
+                                 const ClothCommand& c) {
+    if (c.kind == kCmdBodyVel)         body.vel = c.arg;
+    else if (c.kind == kCmdBodyAngVel) body.angVel = c.arg;
+    else                               ApplyClothCommand(cloth, c);
+}
+
+// SimClothDynTick: (1) apply this tick's commands in ARRAY ORDER (the CL5 contract); (2) advance the
+// body's pose (the kinematic mover); (3) StepClothDynamic against the advanced pose. Pure integer,
+// fixed order -> bit-identical on every peer/platform. The CL5 SimClothTick twin over (cloth, body).
+inline void SimClothDynTick(const ClothGrid& grid, ClothDynState& st,
+                            const std::vector<Constraint>& constraints, const ClothAdjacency& excl,
+                            const std::vector<SphereCollider>& spheres,
+                            const std::vector<ClothCommand>& stream, uint32_t tick, fx mu,
+                            const FxVec3& gravity, fx dt, fx groundY, int iters,
+                            fx thickness, int selfIters) {
+    for (const ClothCommand& c : stream)
+        if (c.tick == tick) ApplyClothDynCommand(st.cloth, st.body, c);
+    AdvanceDynamicSphere(st.body, dt);
+    StepClothDynamic(grid, st.cloth, constraints, excl, spheres, st.body, mu,
+                     gravity, dt, groundY, iters, thickness, selfIters);
+}
+
+// RunClothDynLockstep: THE peer entry point (the CL5 RunClothLockstep twin over ClothDynState).
+// authority and replica fed the SAME init + stream (inputs ONLY) re-derive the SAME (cloth, body)
+// bit-for-bit — the lockstep proof memcmps BOTH pools.
+inline ClothDynState RunClothDynLockstep(const ClothGrid& grid, const ClothDynState& init,
+                                         const std::vector<Constraint>& constraints,
+                                         const ClothAdjacency& excl,
+                                         const std::vector<SphereCollider>& spheres,
+                                         const std::vector<ClothCommand>& stream, int ticks, fx mu,
+                                         const FxVec3& gravity, fx dt, fx groundY, int iters,
+                                         fx thickness, int selfIters) {
+    ClothDynState st = init;
+    for (int t = 0; t < ticks; ++t)
+        SimClothDynTick(grid, st, constraints, excl, spheres, stream, (uint32_t)t, mu,
+                        gravity, dt, groundY, iters, thickness, selfIters);
+    return st;
+}
+
+// RunClothDynRollback: the CL5 RunClothRollback twin with the BODY POSE IN THE SNAPSHOT — (1) advance
+// 0..mispredictTick with the authoritative stream; (2) snapshot (cloth, body) — a value copy; (2b)
+// speculate <= 3 ticks with the MISPREDICTED stream (a diverging body input); (3) restore the snapshot
+// (BOTH pools) + re-simulate with the correct stream. The proof asserts the result == RunClothDynLockstep
+// (rollback corrected the misprediction EXACTLY, cloth AND body).
+inline ClothDynState RunClothDynRollback(const ClothGrid& grid, const ClothDynState& init,
+                                         const std::vector<Constraint>& constraints,
+                                         const ClothAdjacency& excl,
+                                         const std::vector<SphereCollider>& spheres,
+                                         const std::vector<ClothCommand>& authStream,
+                                         const std::vector<ClothCommand>& mispredictStream,
+                                         int ticks, int mispredictTick, fx mu,
+                                         const FxVec3& gravity, fx dt, fx groundY, int iters,
+                                         fx thickness, int selfIters) {
+    ClothDynState st = init;
+    for (int t = 0; t < mispredictTick; ++t)
+        SimClothDynTick(grid, st, constraints, excl, spheres, authStream, (uint32_t)t, mu,
+                        gravity, dt, groundY, iters, thickness, selfIters);
+    const ClothDynState snap = st;                       // the rollback restore point (cloth + body)
+    int specTicks = ticks - mispredictTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimClothDynTick(grid, st, constraints, excl, spheres, mispredictStream,
+                        (uint32_t)(mispredictTick + s), mu, gravity, dt, groundY, iters,
+                        thickness, selfIters);
+    st = snap;                                           // ROLLBACK: restore BOTH pools
+    for (int t = mispredictTick; t < ticks; ++t)
+        SimClothDynTick(grid, st, constraints, excl, spheres, authStream, (uint32_t)t, mu,
+                        gravity, dt, groundY, iters, thickness, selfIters);
+    return st;
+}
+
+// ----- CL8 measurement helpers (deterministic integer stats for the ride/spin/penetration proofs) -------
+// MeanDynamicX(particles): the int64-truncated mean pos.x over NON-PINNED verts (0 if none). The ride
+// metric is DISPLACEMENT-based (mean-x delta over a window vs the body's delta) because the CL3
+// convention keeps non-contacted verts' integrated velocity — positions, not velocities, tell the truth.
+inline fx MeanDynamicX(const std::vector<ClothParticle>& particles) {
+    int64_t sum = 0, cnt = 0;
+    for (const ClothParticle& p : particles) {
+        if (p.flags & kFlagPinned) continue;
+        sum += (int64_t)p.pos.x;
+        ++cnt;
+    }
+    return cnt == 0 ? 0 : (fx)(sum / cnt);               // int64 truncating divide (deterministic)
+}
+
+// SwirlAboutY(before, after, center): the summed signed XZ cross of each dynamic vert's before/after
+// offset from `center` — Sum_i (rz0*rx1 - rx0*rz1), raw int64 (a Q32.32-scale area sum). POSITIVE when
+// the cloth rotated WITH a +Y angVel (right-hand about +Y carries +X toward -Z); ~0 for a stationary
+// cloth. The spin-proof metric. Arrays matched by index; a size mismatch returns 0 (bounds-checked).
+inline int64_t SwirlAboutY(const std::vector<ClothParticle>& before,
+                           const std::vector<ClothParticle>& after, const FxVec3& center) {
+    if (before.size() != after.size()) return 0;
+    int64_t s = 0;
+    for (size_t i = 0; i < before.size(); ++i) {
+        if (before[i].flags & kFlagPinned) continue;
+        const int64_t rx0 = (int64_t)(before[i].pos.x - center.x);
+        const int64_t rz0 = (int64_t)(before[i].pos.z - center.z);
+        const int64_t rx1 = (int64_t)(after[i].pos.x - center.x);
+        const int64_t rz1 = (int64_t)(after[i].pos.z - center.z);
+        s += rz0 * rx1 - rx0 * rz1;
+    }
+    return s;
+}
+
+// MinDistToCenter(particles, center): the minimum FxLength(pos - center) over ALL verts — the
+// no-penetration proof metric (>= radius - a pinned residual after the CL8 pass; the FxNormalize/FxScale
+// snap truncates a few LSBs short of radius, the kCollideEps reality, and the friction's tangential move
+// chords a hair inward — the tests pin the honest bound). INT32_MAX if empty (deterministic sentinel).
+inline fx MinDistToCenter(const std::vector<ClothParticle>& particles, const FxVec3& center) {
+    fx best = INT32_MAX;
+    for (const ClothParticle& p : particles) {
+        const fx len = FxLength(FxSub(p.pos, center));
+        if (len < best) best = len;
+    }
+    return best;
+}
+
 }  // namespace cloth
 }  // namespace hf::sim

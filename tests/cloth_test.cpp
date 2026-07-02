@@ -1135,6 +1135,368 @@ int main() {
               "CL7 snapshot: the CL5 round-trip holds over the self-colliding state BIT-EXACT");
     }
 
+    // ================================================================================================
+    // ===== Slice CL8 — DYNAMIC COLLIDERS + COULOMB FRICTION (the Track-R R3 remainder) ==============
+    // ================================================================================================
+
+    // --- CL8 (a) DynamicSphereFromBody: the cloth-vs-FPX seam copies pose + motion --------------------
+    {
+        fpx::FxBody b;
+        b.pos = cloth::FxVec3{FromInt(2), FromInt(3), FromInt(-1)};
+        b.radius = kOne + kOne / 2;
+        b.vel = cloth::FxVec3{FromInt(1), 0, FromInt(-2)};
+        b.angVel = cloth::FxVec3{0, FromInt(2), 0};
+        const cloth::DynamicSphere s = cloth::DynamicSphereFromBody(b);
+        check(std::memcmp(&s.center, &b.pos, sizeof(cloth::FxVec3)) == 0 && s.radius == b.radius &&
+              std::memcmp(&s.vel, &b.vel, sizeof(cloth::FxVec3)) == 0 &&
+              std::memcmp(&s.angVel, &b.angVel, sizeof(cloth::FxVec3)) == 0,
+              "CL8 seam: DynamicSphereFromBody copies pos/radius/vel/angVel");
+
+        // AdvanceDynamicSphere: center += vel*dt (component-wise fxmul), angVel/radius untouched.
+        cloth::DynamicSphere m = s;
+        const fx dt = kOne / 2;
+        cloth::AdvanceDynamicSphere(m, dt);
+        check(m.center.x == s.center.x + cloth::fxmul(s.vel.x, dt) &&
+              m.center.y == s.center.y &&
+              m.center.z == s.center.z + cloth::fxmul(s.vel.z, dt) &&
+              m.radius == s.radius,
+              "CL8 seam: AdvanceDynamicSphere == center += vel*dt exactly");
+
+        // Surface velocity: v_surf = vel + angVel x r. At r = (+radius, 0, 0) with angVel = 2 about +Y:
+        // omega x r = (wy*rz - 0, ..., -wy*rx) = (0, 0, -2*radius) -> +X surface point moves toward -Z.
+        const cloth::FxVec3 p = cloth::FxAdd(s.center, cloth::FxVec3{s.radius, 0, 0});
+        const cloth::FxVec3 vs = cloth::DynamicSphereSurfaceVelocity(s, p);
+        check(vs.x == s.vel.x && vs.y == s.vel.y &&
+              vs.z == s.vel.z - cloth::fxmul(FromInt(2), s.radius),
+              "CL8 seam: surface velocity == vel + angVel x r (the +X point moves -Z under +Y spin)");
+    }
+
+    // --- CL8 (b) THE FRICTION CONE (closed-form unit): static-stick below, kinetic-clamp above --------
+    {
+        // A single vert inside a STATIC unit sphere at the origin, straight below the top: dist = 0.875
+        // (exact), pen = 0.125, n = +Y exact, snap -> (0, 1, 0). prev offset in -X gives a pure-tangential
+        // slip of known magnitude; v_surf = 0 (static body) so dx_rel = pos - prev.
+        cloth::DynamicSphere s;
+        s.center = cloth::FxVec3{0, 0, 0};
+        s.radius = kOne;
+        const fx dt = kOne / 60;
+        const fx mu = kOne / 2;                          // cone fmax = mu*pen = 0.5*0.125 = 0.0625 = 4096
+        const fx pen = kOne - (kOne * 7 / 8);            // 8192 (0.125)
+        const fx fmax = cloth::fxmul(mu, pen);           // 4096
+
+        // KINETIC: slip 0.25 (16384) > fmax 4096 -> the correction is clamped to EXACTLY fmax.
+        cloth::ClothParticle pk;
+        pk.pos = cloth::FxVec3{0, kOne * 7 / 8, 0};
+        pk.prev = cloth::FxVec3{-(kOne / 4), kOne * 7 / 8, 0};
+        pk.vel = cloth::FxVec3{0, 0, 0};
+        pk.invMass = kOne;
+        const bool hitK = cloth::CollideParticleDynamicSphere(pk, s, mu, dt, FromInt(-100));
+        check(hitK, "CL8 cone: the kinetic vert contacted");
+        // snap -> (0, kOne, 0); dxT = (slip, 0, 0); corr = dxT * (fmax/t) -> x = 0 - fmax = -4096.
+        check(pk.pos.x == -fmax && pk.pos.y == kOne && pk.pos.z == 0,
+              "CL8 cone KINETIC: tangential correction clamped to EXACTLY mu*pen (the GR4 clamp)");
+        // The re-encode: vel = (pos - prev)/dt, prev = pos - vel*dt (the FL7/HR1 discipline).
+        check(pk.vel.x == cloth::fxdiv(-fmax - (-(kOne / 4)), dt) &&
+              pk.prev.x == pk.pos.x - cloth::fxmul(pk.vel.x, dt),
+              "CL8 cone: the contacted vert was velocity-RE-ENCODED (vel = (pos-prev)/dt)");
+
+        // STATIC: slip 0.03125 (2048) <= fmax 4096 -> ALL tangential slip cancelled (pos.x back to prev.x).
+        cloth::ClothParticle pssv;
+        pssv.pos = cloth::FxVec3{0, kOne * 7 / 8, 0};
+        pssv.prev = cloth::FxVec3{-(kOne / 32), kOne * 7 / 8, 0};
+        pssv.vel = cloth::FxVec3{0, 0, 0};
+        pssv.invMass = kOne;
+        const bool hitS = cloth::CollideParticleDynamicSphere(pssv, s, mu, dt, FromInt(-100));
+        check(hitS, "CL8 cone: the static vert contacted");
+        check(pssv.pos.x == -(kOne / 32) && pssv.pos.y == kOne,
+              "CL8 cone STATIC: all tangential slip cancelled (stick — pos.x returned to prev.x)");
+
+        // mu == 0: EXACTLY the CL4 projection — snap only, NO friction, NO re-encode (the identity core).
+        cloth::ClothParticle p0;
+        p0.pos = cloth::FxVec3{0, kOne * 7 / 8, 0};
+        p0.prev = cloth::FxVec3{-(kOne / 4), kOne * 7 / 8, 0};
+        p0.vel = cloth::FxVec3{FromInt(1), FromInt(-2), 0};
+        p0.invMass = kOne;
+        cloth::ClothParticle c4 = p0;
+        const cloth::SphereCollider sc{s.center, s.radius};
+        cloth::CollideParticleSphere(c4, sc);
+        cloth::CollideParticleDynamicSphere(p0, s, /*mu*/0, dt, FromInt(-100));
+        check(std::memcmp(&p0, &c4, sizeof(cloth::ClothParticle)) == 0,
+              "CL8 identity core: mu=0 CollideParticleDynamicSphere == CL4 CollideParticleSphere BYTE-EXACT");
+    }
+
+    // --- the CL8 DRAPE scene builder (shared by identity/ride/spin/lockstep) --------------------------
+    // A free (NO pins) 9x9 half-unit-spacing sheet laid HORIZONTAL, centered just above a radius-1.5
+    // sphere at (0, 3, 0) — it drapes over the body and, once the body moves/spins, rides it (mu high)
+    // or slides (mu = 0). Constraints/adjacency come from the InitGrid rest sheet (spacing preserved:
+    // the re-lay is an isometry — the flat sheet rotated into XZ).
+    const auto buildDrape = [](cloth::ClothGrid& grid, std::vector<cloth::ClothParticle>& ps,
+                               std::vector<cloth::Constraint>& es, cloth::ClothAdjacency& excl,
+                               cloth::DynamicSphere& body) {
+        grid.W = 9; grid.H = 9; grid.spacing = kOne / 2;
+        grid.origin = cloth::FxVec3{0, FromInt(20), 0};
+        ps = cloth::InitGrid(grid);
+        es = cloth::BuildConstraints(grid, ps);          // rest lengths from the flat sheet
+        excl = cloth::BuildClothAdjacency(ps.size(), es);
+        const fx yTop = FromInt(4) + kOne / 2 + kOne / 8;    // 4.625: just above the sphere top (4.5)
+        for (int r = 0; r < grid.H; ++r)
+            for (int c = 0; c < grid.W; ++c) {
+                cloth::ClothParticle& p = ps[(size_t)cloth::ParticleIndex(grid, r, c)];
+                p.pos = cloth::FxVec3{(fx)((c - 4) * (int)(kOne / 2)), yTop,
+                                      (fx)((r - 4) * (int)(kOne / 2))};
+                p.prev = p.pos;
+                p.vel = cloth::FxVec3{0, 0, 0};
+                p.invMass = kOne;                        // ALL dynamic — a free cloth can ride
+                p.flags = 0;
+            }
+        body.center = cloth::FxVec3{0, FromInt(3), 0};
+        body.radius = kOne + kOne / 2;                   // 1.5
+        body.vel = cloth::FxVec3{0, 0, 0};
+        body.angVel = cloth::FxVec3{0, 0, 0};
+    };
+    const cloth::FxVec3 kDynGrav{0, FromInt(-10), 0};
+    const fx kDynDt = kOne / 60;
+    const fx kDynGroundY = 0;
+    const int kDynIters = 8;
+    const fx kDynMu = (fx)((int64_t)4 * kOne / 5);       // 0.8 (52428 — host-snapped once)
+    const int kSettleSteps = 120, kRideSteps = 45, kSpinSteps = 45;
+
+    // --- CL8 (c) THE CONSTRUCTED IDENTITY: mu=0 + a body at REST == StepClothSelf(spheres + [body]) ----
+    {
+        cloth::ClothGrid grid;
+        std::vector<cloth::ClothParticle> init;
+        std::vector<cloth::Constraint> es;
+        cloth::ClothAdjacency excl;
+        cloth::DynamicSphere body;
+        buildDrape(grid, init, es, excl, body);
+        // A second STATIC sphere off to the side (so the static list is non-trivial in the identity).
+        const std::vector<cloth::SphereCollider> statics{
+            cloth::SphereCollider{cloth::FxVec3{FromInt(-3), FromInt(1), 0}, kOne}};
+        std::vector<cloth::SphereCollider> combined = statics;
+        combined.push_back(cloth::SphereCollider{body.center, body.radius});
+
+        // The dynamic path at mu=0, body at rest — WITH the CL7 self pass ON (the strongest identity:
+        // the dynamic pass sits at the CL4 composition point, BEFORE the self pass, exactly like CL7).
+        std::vector<cloth::ClothParticle> viaDyn = init;
+        cloth::DynamicSphere b = body;                   // vel/angVel zero -> Advance is an exact no-op
+        cloth::StepClothDynamicSteps(grid, viaDyn, es, excl, statics, b, /*mu*/0, kDynGrav, kDynDt,
+                                     kDynGroundY, kDynIters, /*thickness*/kOne / 2, /*selfIters*/2, 40);
+        std::vector<cloth::ClothParticle> viaCl7 = init;
+        cloth::StepClothSelfSteps(grid, viaCl7, es, excl, combined, kDynGrav, kDynDt, kDynGroundY,
+                                  kDynIters, kOne / 2, 2, 40);
+        check(viaDyn.size() == viaCl7.size() &&
+              std::memcmp(viaDyn.data(), viaCl7.data(),
+                          viaDyn.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL8 identity: mu=0 + static body == StepClothSelf(spheres + [body]) BIT-IDENTICAL (self ON)");
+        check(std::memcmp(&b, &body, sizeof(cloth::DynamicSphere)) == 0,
+              "CL8 identity: a rest body's pose is untouched by the K-step driver");
+    }
+
+    // --- CL8 (d) THE RIDE: a horizontally-moving sphere carries the cloth iff friction is on ----------
+    {
+        cloth::ClothGrid grid;
+        std::vector<cloth::ClothParticle> init;
+        std::vector<cloth::Constraint> es;
+        cloth::ClothAdjacency excl;
+        cloth::DynamicSphere body0;
+        buildDrape(grid, init, es, excl, body0);
+        const std::vector<cloth::SphereCollider> noStatics;
+
+        // Settle SHARED at mu=0.8 (both controls start from the SAME settled drape — a frictionless
+        // settle slides off the sphere before the ride even starts, so mu-during-settle would confound
+        // the contrast; the couple_cf fair-baseline lesson), then ride at the tested mu: the RIDE mu is
+        // the only variable. The mu=0 ride skips friction AND the re-encode entirely (the CL4 baseline).
+        const auto ride = [&](fx mu, std::vector<cloth::ClothParticle>& out, cloth::DynamicSphere& bOut,
+                              fx& rideRatio, int& contacts) {
+            out = init;
+            bOut = body0;
+            // (1) settle the drape on the resting body (always mu = 0.8 — the shared start).
+            const int settleContacts =
+                cloth::StepClothDynamicSteps(grid, out, es, excl, noStatics, bOut, kDynMu, kDynGrav,
+                                             kDynDt, kDynGroundY, kDynIters, 0, 0, kSettleSteps);
+            std::printf("CL8 ride: settled with %d contacts, minDist %d\n", settleContacts,
+                        cloth::MinDistToCenter(out, bOut.center));
+            // (2) the body moves +X at 1.5 u/s for 45 ticks (1.125 world units) — MID-RIDE (see the
+            // honest slip caveat pinned below: past ~50 riding ticks the pen-proxy grip loses the sheet).
+            const fx meanX0 = cloth::MeanDynamicX(out);
+            const fx bodyX0 = bOut.center.x;
+            bOut.vel = cloth::FxVec3{kOne + kOne / 2, 0, 0};
+            contacts = cloth::StepClothDynamicSteps(grid, out, es, excl, noStatics, bOut, mu, kDynGrav,
+                                                    kDynDt, kDynGroundY, kDynIters, 0, 0, kRideSteps);
+            const fx meanX1 = cloth::MeanDynamicX(out);
+            rideRatio = cloth::fxdiv(meanX1 - meanX0, bOut.center.x - bodyX0);
+        };
+
+        std::vector<cloth::ClothParticle> withMu, noMu;
+        cloth::DynamicSphere bMu, bNo;
+        fx ratioMu = 0, ratioNo = 0;
+        int contactsMu = 0, contactsNo = 0;
+        ride(kDynMu, withMu, bMu, ratioMu, contactsMu);
+        ride(0, noMu, bNo, ratioNo, contactsNo);
+        std::printf("CL8 ride: rideRatio mu=0.8 -> %d, mu=0 -> %d (kOne=%d; contacts %d vs %d; "
+                    "bodyX %d)\n", ratioMu, ratioNo, kOne, contactsMu, contactsNo, bMu.center.x);
+        check(bMu.center.x == cloth::fxmul(kOne + kOne / 2, kDynDt) * kRideSteps,
+              "CL8 ride: the body advanced EXACTLY vel*dt per tick (the kinematic driver)");
+        check(ratioMu > (fx)(3 * kOne / 4),
+              "CL8 ride: with mu=0.8 the cloth RIDES the body (mean-X delta > 3/4 of the body's)");
+        check(ratioNo < kOne / 16,
+              "CL8 ride: with mu=0 the body slides OUT FROM UNDER the cloth (ratio < 1/16)");
+        check(ratioMu > ratioNo + kOne / 2,
+              "CL8 ride: friction is LOAD-BEARING (mu=0.8 ride ratio beats mu=0 by > 1/2)");
+        check(contactsMu > 0, "CL8 ride: the riding cloth is in contact at the final step");
+
+        // (c-proof) NO PENETRATION: every vert stays >= radius - slack from the body center.
+        const fx minMu = cloth::MinDistToCenter(withMu, bMu.center);
+        const fx minNo = cloth::MinDistToCenter(noMu, bNo.center);
+        std::printf("CL8 ride: min dist-to-center mu=0.8 -> %d, mu=0 -> %d (radius %d)\n",
+                    minMu, minNo, bMu.radius);
+        check(minMu >= bMu.radius - kOne / 16 && minNo >= bNo.radius - kOne / 16,
+              "CL8 ride: no penetration (min vert-to-center >= radius - kOne/16, both runs)");
+        // The exact pins (verified identical MSVC + clang — the cross-compiler determinism gate):
+        // the riding sheet's closest vert sits 2 LSB under radius (the FxNormalize/FxScale snap
+        // truncation, the kCollideEps reality); the mu=0 sheet was left 1.13 units behind the body.
+        check(ratioMu == 61913 && ratioNo == 1280,
+              "CL8 ride pin: rideRatio mu=0.8 == 61913 (0.945*kOne), mu=0 == 1280 (0.02*kOne)");
+        check(contactsMu == 41, "CL8 ride pin: 41 contacts at the final riding step");
+        check(minMu == 98302 && minNo == 172633,
+              "CL8 ride pin: min dist-to-center == 98302 (r-2 LSB, riding) / 172633 (slid off, mu=0)");
+
+        // (d-proof) determinism + the pinned digests (MSVC == clang, the cross-compiler gate).
+        std::vector<cloth::ClothParticle> rerun;
+        cloth::DynamicSphere bRerun;
+        fx ratioRerun = 0;
+        int contactsRerun = 0;
+        ride(kDynMu, rerun, bRerun, ratioRerun, contactsRerun);
+        check(rerun.size() == withMu.size() &&
+              std::memcmp(rerun.data(), withMu.data(),
+                          rerun.size() * sizeof(cloth::ClothParticle)) == 0 &&
+              std::memcmp(&bRerun, &bMu, sizeof(cloth::DynamicSphere)) == 0,
+              "CL8 determinism: two ride runs BYTE-IDENTICAL (cloth AND body)");
+        std::printf("CL8 pin: ride digest mu=0.8 = 0x%016llx, mu=0 = 0x%016llx\n",
+                    (unsigned long long)cloth::ClothDigest(withMu),
+                    (unsigned long long)cloth::ClothDigest(noMu));
+        check(cloth::ClothDigest(withMu) == 0xbc5de9aa3b86f976ull,
+              "CL8 ride pin: mu=0.8 ride digest == the pinned value (MSVC == clang)");
+        check(cloth::ClothDigest(noMu) == 0xeff021b669689fbaull,
+              "CL8 ride pin: mu=0 slide digest == the pinned value (MSVC == clang)");
+    }
+
+    // --- CL8 (e) THE SPIN: a spinning sphere swirls the cloth iff friction is on ----------------------
+    {
+        cloth::ClothGrid grid;
+        std::vector<cloth::ClothParticle> init;
+        std::vector<cloth::Constraint> es;
+        cloth::ClothAdjacency excl;
+        cloth::DynamicSphere body0;
+        buildDrape(grid, init, es, excl, body0);
+        const std::vector<cloth::SphereCollider> noStatics;
+
+        // The shared mu=0.8 settle (the ride discipline), then spin at the tested mu. `omega` lets the
+        // no-spin drift control run the SAME mu=0 window with the body fully at rest.
+        const auto spin = [&](fx mu, fx omega, std::vector<cloth::ClothParticle>& out, int64_t& swirl) {
+            out = init;
+            cloth::DynamicSphere b = body0;
+            cloth::StepClothDynamicSteps(grid, out, es, excl, noStatics, b, kDynMu, kDynGrav, kDynDt,
+                                         kDynGroundY, kDynIters, 0, 0, kSettleSteps);
+            const std::vector<cloth::ClothParticle> settled = out;
+            b.angVel = cloth::FxVec3{0, omega, 0};           // omega rad/s about +Y, center at rest
+            cloth::StepClothDynamicSteps(grid, out, es, excl, noStatics, b, mu, kDynGrav, kDynDt,
+                                         kDynGroundY, kDynIters, 0, 0, kSpinSteps);
+            swirl = cloth::SwirlAboutY(settled, out, b.center);
+        };
+        std::vector<cloth::ClothParticle> withMu, noMu, noSpin;
+        int64_t swirlMu = 0, swirlNo = 0, swirlDrift = 0;
+        spin(kDynMu, FromInt(2), withMu, swirlMu);
+        spin(0, FromInt(2), noMu, swirlNo);
+        spin(0, 0, noSpin, swirlDrift);                      // the drift control: mu=0, NO spin at all
+        std::printf("CL8 spin: swirl mu=0.8 -> %lld, mu=0 -> %lld, mu=0 no-spin drift -> %lld\n",
+                    (long long)swirlMu, (long long)swirlNo, (long long)swirlDrift);
+        check(swirlMu > 0, "CL8 spin: with mu=0.8 the cloth ROTATES WITH the +Y spin (swirl > 0)");
+        const int64_t absNo = swirlNo < 0 ? -swirlNo : swirlNo;
+        check(swirlMu > absNo * 8,
+              "CL8 spin: friction is LOAD-BEARING (the mu=0.8 swirl dwarfs the mu=0 residual, > 8x)");
+        // The mu=0 residual is NOT rotation — it is the relax/slide drift of REMOVING friction (the
+        // cloth settled UNDER friction; without it the drape lets go). Proof: at mu=0 the friction
+        // branch (the ONLY place angVel enters the math) is skipped and the center is at rest, so a
+        // spinning body is BIT-IDENTICAL to a static one — the mu=0 spin run == the mu=0 NO-SPIN run
+        // byte-for-byte, i.e. the spin's contribution at mu=0 is EXACTLY zero.
+        check(noMu.size() == noSpin.size() &&
+              std::memcmp(noMu.data(), noSpin.data(), noMu.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL8 spin: at mu=0 the spin contributes EXACTLY nothing (spin run == no-spin run BIT-EXACT)");
+        // The exact pins (verified identical MSVC + clang): 45 spin ticks at 2 rad/s swirl the riding
+        // sheet by +7.04e11 raw cross-sum; the mu=0 window's residual is the friction-removal drift.
+        check(swirlMu == 703817621882ll && swirlNo == -44319629339ll,
+              "CL8 spin pin: swirl mu=0.8 == 703817621882, mu=0 == -44319629339 (the drift, not rotation)");
+        std::printf("CL8 pin: spin digest mu=0.8 = 0x%016llx\n",
+                    (unsigned long long)cloth::ClothDigest(withMu));
+        check(cloth::ClothDigest(withMu) == 0xabbdec597f7b054full,
+              "CL8 spin pin: mu=0.8 spin digest == the pinned value (MSVC == clang)");
+    }
+
+    // --- CL8 (f) LOCKSTEP + ROLLBACK: the body's motion AS the command stream -------------------------
+    {
+        cloth::ClothGrid grid;
+        std::vector<cloth::ClothParticle> initCloth;
+        std::vector<cloth::Constraint> es;
+        cloth::ClothAdjacency excl;
+        cloth::DynamicSphere body0;
+        buildDrape(grid, initCloth, es, excl, body0);
+        const std::vector<cloth::SphereCollider> noStatics;
+        const cloth::ClothDynState init{initCloth, body0};
+        const int ticks = 60;
+        // The authoritative inputs: the body starts moving at tick 10, spins at tick 30, plus a cloth
+        // wind gust at tick 20 (the CL5 vert commands compose with the body commands).
+        const std::vector<cloth::ClothCommand> authStream{
+            cloth::ClothCommand{10, cloth::kCmdBodyVel, 0, cloth::FxVec3{kOne, 0, 0}},
+            cloth::ClothCommand{20, cloth::kCmdWind, (uint32_t)cloth::ParticleIndex(grid, 4, 4),
+                                cloth::FxVec3{0, FromInt(1), FromInt(1)}},
+            cloth::ClothCommand{30, cloth::kCmdBodyAngVel, 0, cloth::FxVec3{0, FromInt(2), 0}},
+        };
+        // The misprediction: the peer guessed the WRONG body velocity at tick 30 (a -X turn, no spin).
+        const std::vector<cloth::ClothCommand> mispredictStream{
+            cloth::ClothCommand{10, cloth::kCmdBodyVel, 0, cloth::FxVec3{kOne, 0, 0}},
+            cloth::ClothCommand{20, cloth::kCmdWind, (uint32_t)cloth::ParticleIndex(grid, 4, 4),
+                                cloth::FxVec3{0, FromInt(1), FromInt(1)}},
+            cloth::ClothCommand{30, cloth::kCmdBodyVel, 0, cloth::FxVec3{-kOne, 0, 0}},
+        };
+
+        const cloth::ClothDynState authority =
+            cloth::RunClothDynLockstep(grid, init, es, excl, noStatics, authStream, ticks, kDynMu,
+                                       kDynGrav, kDynDt, kDynGroundY, kDynIters, 0, 0);
+        const cloth::ClothDynState replica =
+            cloth::RunClothDynLockstep(grid, init, es, excl, noStatics, authStream, ticks, kDynMu,
+                                       kDynGrav, kDynDt, kDynGroundY, kDynIters, 0, 0);
+        check(authority.cloth.size() == replica.cloth.size() &&
+              std::memcmp(authority.cloth.data(), replica.cloth.data(),
+                          authority.cloth.size() * sizeof(cloth::ClothParticle)) == 0 &&
+              std::memcmp(&authority.body, &replica.body, sizeof(cloth::DynamicSphere)) == 0,
+              "CL8 lockstep: replica == authority BIT-EXACT (cloth AND body pose, inputs-only re-sim)");
+
+        // A real divergence: the mispredicted stream lands on a DIFFERENT state.
+        const cloth::ClothDynState wrong =
+            cloth::RunClothDynLockstep(grid, init, es, excl, noStatics, mispredictStream, ticks, kDynMu,
+                                       kDynGrav, kDynDt, kDynGroundY, kDynIters, 0, 0);
+        check(std::memcmp(wrong.cloth.data(), authority.cloth.data(),
+                          authority.cloth.size() * sizeof(cloth::ClothParticle)) != 0,
+              "CL8 rollback: the misprediction actually diverges (control)");
+
+        // Rollback: speculate the wrong tick-30 input, restore the (cloth + BODY POSE) snapshot,
+        // re-simulate the authoritative stream -> EXACTLY the authority state.
+        const cloth::ClothDynState corrected =
+            cloth::RunClothDynRollback(grid, init, es, excl, noStatics, authStream, mispredictStream,
+                                       ticks, 30, kDynMu, kDynGrav, kDynDt, kDynGroundY, kDynIters, 0, 0);
+        check(corrected.cloth.size() == authority.cloth.size() &&
+              std::memcmp(corrected.cloth.data(), authority.cloth.data(),
+                          authority.cloth.size() * sizeof(cloth::ClothParticle)) == 0 &&
+              std::memcmp(&corrected.body, &authority.body, sizeof(cloth::DynamicSphere)) == 0,
+              "CL8 rollback: rollback corrects the misprediction to authority BIT-EXACT (cloth + body)");
+        std::printf("CL8 pin: lockstep authority digest = 0x%016llx (bodyX=%d)\n",
+                    (unsigned long long)cloth::ClothDigest(authority.cloth), authority.body.center.x);
+        check(cloth::ClothDigest(authority.cloth) == 0x05b60c6ab723e214ull &&
+              authority.body.center.x == 54600,
+              "CL8 lockstep pin: authority digest + final body pose == the pinned values (MSVC == clang)");
+    }
+
     if (g_fail == 0) std::printf("cloth_test: ALL PASS\n");
     else std::printf("cloth_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

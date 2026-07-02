@@ -34149,6 +34149,192 @@ static int RunHr1HairShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CL8 — DYNAMIC COLLIDERS + COULOMB FRICTION showcase (--cl8-ride-shot) =========================
+// The Track-R R3 remainder of docs/SUPERIORITY_ROADMAP.md — closes the CL4/CL7 documented "no dynamic
+// colliders, no friction" caveats: a free draped sheet RIDES a horizontally-moving sphere. PURE CPU (the
+// CF1/HR1/SB1 convention: NO GPU compute, NO new shader, NO new RHI): this harness runs the IDENTICAL
+// CPU code (engine/sim/cloth.h::StepClothDynamicSteps — the CL4-mold projection against the body's
+// CURRENT pose + the GR4-mold Coulomb tangential clamp [static-stick below fmax = mu*pen, kinetic-slide
+// above] + the FL7/HR1 velocity re-encode with the outward-normal launch clamp; ONE-WAY v1 body->cloth,
+// the body kinematic) on Metal-Mac that the Vulkan --cl8-ride-shot runs on Windows -> the mid-ride
+// golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). The
+// scene (== the cloth_test CL8 conventions): a free 9x9 sheet settles onto a radius-1.5 sphere (120
+// ticks, mu=0.8), then the body moves +X at 1.5 u/s for 45 ticks — the sheet rides (ratio ~0.945).
+// PROOFS: (1) two runs BYTE-IDENTICAL (cloth AND body); (2) the friction contrast (the mu=0 control on
+// the SAME settle is left behind, ratio ~0.02). Stat line: verts/steps/mu/digest/rideRatio. New golden
+// tests/golden/metal/cl8_ride.png (baked on the Mac by the controller); two runs DIFF 0.0000. cloth.h
+// CL1-CL7 byte-UNTOUCHED (CL8 is append-only).
+static int RunCl8RideShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace cloth = hf::sim::cloth;
+    const cloth::fx kOne = cloth::kOne;
+    const auto FromInt = [](int v) { return (cloth::fx)(v << cloth::kFrac); };
+
+    // The ride scene (== the Vulkan --cl8-ride-shot config, == the cloth_test CL8 conventions): a free
+    // (NO pins) 9x9 half-unit-spacing sheet laid HORIZONTAL just above the sphere top.
+    cloth::ClothGrid grid;
+    grid.W = 9; grid.H = 9; grid.spacing = kOne / 2;
+    grid.origin = cloth::FxVec3{0, FromInt(20), 0};
+    std::vector<cloth::ClothParticle> init = cloth::InitGrid(grid);
+    const std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, init);
+    const cloth::ClothAdjacency excl = cloth::BuildClothAdjacency(init.size(), es);
+    const cloth::fx yTop = FromInt(4) + kOne / 2 + kOne / 8;      // 4.625 (sphere top = 4.5)
+    for (int r = 0; r < grid.H; ++r)
+        for (int c = 0; c < grid.W; ++c) {
+            cloth::ClothParticle& p = init[(size_t)cloth::ParticleIndex(grid, r, c)];
+            p.pos = cloth::FxVec3{(cloth::fx)((c - 4) * (int)(kOne / 2)), yTop,
+                                  (cloth::fx)((r - 4) * (int)(kOne / 2))};
+            p.prev = p.pos;
+            p.vel = cloth::FxVec3{0, 0, 0};
+            p.invMass = kOne;                    // ALL dynamic — a free cloth can ride
+            p.flags = 0;
+        }
+    cloth::DynamicSphere body0;
+    body0.center = cloth::FxVec3{0, FromInt(3), 0};
+    body0.radius = kOne + kOne / 2;              // 1.5
+    const cloth::FxVec3 kGrav{0, FromInt(-10), 0};
+    const cloth::fx kDt = kOne / 60, kGroundY = 0;
+    const cloth::fx kMu = (cloth::fx)((int64_t)4 * kOne / 5);     // 0.8 (52428)
+    const int kIters = 8, kSettle = 120, kRide = 45;
+    const std::vector<cloth::SphereCollider> noStatics;
+    const int kVertCount = grid.W * grid.H;
+
+    // Settle SHARED at mu=0.8 (the fair start — a frictionless settle slides off the sphere before the
+    // ride even begins), then ride 45 ticks at 1.5 u/s at the tested mu.
+    const auto run = [&](cloth::fx mu, std::vector<cloth::ClothParticle>& out,
+                         cloth::DynamicSphere& bOut, cloth::fx& rideRatio, int& contacts) {
+        out = init;
+        bOut = body0;
+        cloth::StepClothDynamicSteps(grid, out, es, excl, noStatics, bOut, kMu, kGrav, kDt,
+                                     kGroundY, kIters, 0, 0, kSettle);
+        const cloth::fx meanX0 = cloth::MeanDynamicX(out);
+        const cloth::fx bodyX0 = bOut.center.x;
+        bOut.vel = cloth::FxVec3{kOne + kOne / 2, 0, 0};
+        contacts = cloth::StepClothDynamicSteps(grid, out, es, excl, noStatics, bOut, mu,
+                                                kGrav, kDt, kGroundY, kIters, 0, 0, kRide);
+        rideRatio = cloth::fxdiv(cloth::MeanDynamicX(out) - meanX0, bOut.center.x - bodyX0);
+    };
+
+    std::vector<cloth::ClothParticle> a, b, ctrl;
+    cloth::DynamicSphere ba, bb, bc;
+    cloth::fx ratioA = 0, ratioB = 0, ratioCtrl = 0;
+    int contactsA = 0, contactsB = 0, contactsCtrl = 0;
+    run(kMu, a, ba, ratioA, contactsA);
+
+    // PROOF (1) determinism: two runs byte-identical (cloth AND body).
+    run(kMu, b, bb, ratioB, contactsB);
+    if (a.size() != b.size() ||
+        std::memcmp(a.data(), b.data(), a.size() * sizeof(cloth::ClothParticle)) != 0 ||
+        std::memcmp(&ba, &bb, sizeof(cloth::DynamicSphere)) != 0)
+        return fail("cl8-ride: two runs differ (nondeterministic)");
+    std::printf("cl8-ride determinism: two runs BYTE-IDENTICAL (cloth AND body)\n");
+
+    // PROOF (2) THE RIDE + the friction contrast: mu=0.8 carries the sheet mid-ride (ratio ~0.945,
+    // still in contact); the mu=0 control (SAME settle) is left behind (ratio ~0.02) — friction is
+    // LOAD-BEARING.
+    run(0, ctrl, bc, ratioCtrl, contactsCtrl);
+    if (!(ratioA > (cloth::fx)(3 * kOne / 4)) || !(ratioA > ratioCtrl + kOne / 2) || contactsA <= 0)
+        return fail("cl8-ride: the cloth did NOT ride the body");
+    std::printf("cl8-ride friction contrast: rideRatio mu=0.8 -> %d, mu=0 -> %d of kOne=%d "
+                "(%d riding contacts; the mu=0 body slid out from under the sheet)\n",
+                ratioA, ratioCtrl, kOne, contactsA);
+
+    const uint64_t kDigest = cloth::ClothDigest(a);
+    std::printf("cl8-ride: {verts:%d, steps:%d, mu:%d, digest:0x%016llx, rideRatio:%d}\n",
+                kVertCount, kSettle + kRide, kMu, (unsigned long long)kDigest, ratioA);
+
+    // --- Golden: the integer side-view (X-Y) of the MID-RIDE state (IDENTICAL to the Vulkan
+    // --cl8-ride-shot BY CONSTRUCTION; the sphere a slate disc at its FINAL pose, a dim dotted line
+    // marking its START x, the riding sheet a warm -> cyan row ramp, the ground a dark strip). ---
+    const int kPxPerUnit = 32, kImgMargin = 18;
+    const int kWorldLoX = -3, kWorldW = 8;       // X in [-3, 5]
+    const int kWorldLoY = -1, kWorldH = 7;       // Y in [-1, 6]
+    const uint32_t imgW = (uint32_t)(kImgMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kImgMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto setPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int64_t loX = (int64_t)kWorldLoX << cloth::kFrac;
+        const int64_t loY = (int64_t)kWorldLoY << cloth::kFrac;
+        cx = kImgMargin + (int)(((int64_t)wxFx - loX) * kPxPerUnit >> cloth::kFrac);
+        cy = (int)imgH - kImgMargin - (int)(((int64_t)wyFx - loY) * kPxPerUnit >> cloth::kFrac);
+    };
+    // The ground strip (y = 0, 2 px).
+    {
+        int gx, gy; toPx(0, 0, gx, gy);
+        for (int ix = 0; ix < (int)imgW; ++ix)
+            for (int dy = 0; dy < 2; ++dy) setPx(ix, gy + dy, Vec3{0.16f, 0.17f, 0.20f});
+    }
+    // The body's START x (a dim dotted vertical at x = 0 — the motion evidence).
+    {
+        int sx, syTop, syBot, tmp;
+        toPx(0, FromInt(6), sx, syTop);
+        toPx(0, 0, tmp, syBot);
+        for (int iy = syTop; iy <= syBot; iy += 3) setPx(sx, iy, Vec3{0.42f, 0.36f, 0.20f});
+    }
+    // The sphere: a filled integer disc at its FINAL (mid-ride) pose + a gold center dot.
+    {
+        int cx, cy; toPx(ba.center.x, ba.center.y, cx, cy);
+        const int rpx = (int)(((int64_t)ba.radius * kPxPerUnit) >> cloth::kFrac);
+        for (int dy = -rpx; dy <= rpx; ++dy)
+            for (int dx = -rpx; dx <= rpx; ++dx) {
+                if (dx * dx + dy * dy > rpx * rpx) continue;
+                setPx(cx + dx, cy + dy, Vec3{0.30f, 0.42f, 0.62f});
+            }
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx)
+                setPx(cx + dx, cy + dy, Vec3{0.95f, 0.80f, 0.40f});
+    }
+    // The riding sheet: structural EDGES first (integer Bresenham, dimmed) so the sheet reads as a
+    // draped NET, then the verts in the warm (near rows) -> cyan (far rows) depth ramp.
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int adx = x1 - x0; if (adx < 0) adx = -adx;
+        int ady = y1 - y0; if (ady < 0) ady = -ady;
+        const int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+        int err = adx - ady;
+        for (;;) {
+            setPx(x0, y0, col);
+            if (x0 == x1 && y0 == y1) break;
+            const int e2 = 2 * err;
+            if (e2 > -ady) { err -= ady; x0 += sx; }
+            if (e2 < adx)  { err += adx; y0 += sy; }
+        }
+    };
+    auto rowCol = [&](int r, float dim) {
+        const float t = (float)r / (float)(grid.H - 1);
+        return Vec3{(0.85f + (0.22f - 0.85f) * t) * dim,
+                    (0.55f + (0.64f - 0.55f) * t) * dim,
+                    (0.25f + (0.97f - 0.25f) * t) * dim};
+    };
+    for (const cloth::Constraint& e : es) {
+        if (e.kind != cloth::kConstraintStructural) continue;
+        int x0, y0, x1, y1;
+        toPx(a[(size_t)e.i].pos.x, a[(size_t)e.i].pos.y, x0, y0);
+        toPx(a[(size_t)e.j].pos.x, a[(size_t)e.j].pos.y, x1, y1);
+        drawLine(x0, y0, x1, y1, rowCol((int)(e.i / (uint32_t)grid.W), 0.55f));
+    }
+    for (int i = 0; i < kVertCount; ++i) {
+        const Vec3 col = rowCol(i / grid.W, 1.0f);
+        int cx, cy; toPx(a[(size_t)i].pos.x, a[(size_t)i].pos.y, cx, cy);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) setPx(cx + dx, cy + dy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cl8 mid-ride cloth on the moving body (%d verts, %d contacts)\n",
+                outPath, imgW, imgH, kVertCount, contactsA);
+    return 0;
+}
+
 // ===== Slice SB1 — DETERMINISTIC VOLUMETRIC SOFT BODY CORE showcase (--sb1-soft-shot) ======================
 // Track-S S3 of docs/SUPERIORITY_ROADMAP.md — deformable VOLUMES (jelly/flesh/rubber), the material
 // family the engine lacked; UE5 has no deterministic soft body (Chaos Flesh is float/experimental).
@@ -78886,6 +79072,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--sb1-soft-shot") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_sb1_soft.png";
             try { return RunSb1SoftShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cl8-ride-shot <out.png>: render the DYNAMIC COLLIDERS + COULOMB FRICTION showcase (Slice
+        // CL8, the Track-R R3 remainder of docs/SUPERIORITY_ROADMAP.md — closes the CL4/CL7 documented
+        // "no dynamic colliders, no friction" caveats). PURE CPU (the CF1/HR1/SB1 convention): the
+        // harness runs the IDENTICAL CPU code (cloth.h::StepClothDynamicSteps — the CL4-mold projection
+        // against the body's CURRENT pose + the GR4-mold Coulomb tangential clamp + the FL7/HR1
+        // velocity re-encode with the outward-normal launch clamp) on Metal-Mac that the Vulkan
+        // --cl8-ride-shot runs on Windows -> the mid-ride golden is bit-identical cross-backend BY
+        // CONSTRUCTION. A free draped sheet RIDES the moving sphere (ratio ~0.945 vs ~0.02 at mu=0).
+        // New golden tests/golden/metal/cl8_ride.png; two runs DIFF 0.0000. NO GPU compute, NO new
+        // shader, NO new RHI; cloth.h CL1-CL7 byte-UNTOUCHED (CL8 is append-only).
+        if (argc > 1 && std::strcmp(argv[1], "--cl8-ride-shot") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cl8_ride.png";
+            try { return RunCl8RideShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --mm1-locomotion-shot <out.png>: render the DETERMINISTIC MOTION MATCHING showcase (Slice
