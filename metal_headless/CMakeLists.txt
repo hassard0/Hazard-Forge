@@ -1196,6 +1196,11 @@ add_executable(visual_test
     ${HF_ROOT}/engine/anim/state_machine.cpp
     # Impulse-based rigid-body world (Slice S): pure C++ physics core (no Metal/RHI deps).
     ${HF_ROOT}/engine/physics/world.cpp
+    # Deterministic 16-bit PCM WAV writer (Slice BB, pure C++): the --au1-graph showcase (Slice AU1,
+    # the procedural audio graph) writes its bit-identical cross-backend WAV through it. The header-only
+    # audio_graph.h/dsp.h need no TU; wav.cpp is the one audio source the encoder requires. MUST be
+    # listed here so the Metal --au1-graph link resolves EncodeWav/WriteWav (the #31 link-gap lesson).
+    ${HF_ROOT}/engine/audio/wav.cpp
     # Procedural terrain / heightmap (Slice BF): the SAME pure-C++ Height + BuildTerrain TU the
     # Windows engine compiles, so the generated terrain mesh is BIT-IDENTICAL across backends (the
     # cross-backend golden contract). No Metal/RHI deps. Drives the --terrain showcase.

@@ -25,6 +25,7 @@
 #include "audio/mixer.h"
 #include "audio/wav.h"
 #include "audio/dsp.h"   // Slice DSP6: procedural-phrase capstone (--dsp-song showcase)
+#include "audio/audio_graph.h"   // Slice AU1: deterministic procedural audio GRAPH + 3D spatialization (--au1-graph-shot showcase)
 #include "game/roll_game.h"
 #include "net/snapshot.h"            // Slice BQ: replication snapshot layer (pure CPU)
 #include "net/transport.h"           // Slice BU: simulated transport + client jitter-buffer/interp (pure CPU)
@@ -775,6 +776,7 @@ int main(int argc, char** argv) {
     bool pickTest = false;                   // --pick-test: headless pick demo, prints picked index
     const char* audioRenderPath = nullptr;   // --audio-render <out.wav> (Slice BB: deterministic audio)
     const char* dspSongPath = nullptr;       // --dsp-song <out.wav> (Slice DSP6: procedural-phrase capstone)
+    const char* au1GraphShotPath = nullptr;  // --au1-graph-shot <out.wav> (Slice AU1: procedural audio graph + 3D spatialization)
     const char* decalShotPath = nullptr;     // --decal-shot <out.bmp> (Slice BH: screen-space decals)
     const char* postStackShotPath = nullptr; // --poststack-shot <out.bmp> (Slice BN: data-driven post stack)
     const char* vfxShotPath = nullptr;       // --vfx-shot <out.bmp> (Slice CC: CPU particle/VFX emitter)
@@ -799,6 +801,16 @@ int main(int argc, char** argv) {
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--dsp-song") == 0) {
             dspSongPath = argv[i + 1];
+            break;
+        }
+    }
+    // Slice AU1: --au1-graph-shot <out.wav> — same small pre-scan idiom (the giant if/else chain below
+    // is at MSVC's C1061 block-nesting limit). Pure flag capture; the handler runs as a pre-device
+    // pure-CPU block (with --audio-render / --dsp-song), where the self-contained audio_graph.h meets
+    // wav.h.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--au1-graph-shot") == 0) {
+            au1GraphShotPath = argv[i + 1];
             break;
         }
     }
@@ -4632,6 +4644,27 @@ int main(int argc, char** argv) {
                     kSR, kFrames, notes.size(),
                     static_cast<unsigned long long>(audio::dsp::DigestBuffer(buffer)));
         std::printf("dsp-song: wrote %s\n", dspSongPath);
+        return 0;
+    }
+
+    // --au1-graph-shot <out.wav> (Slice AU1, Track-S S10): fully headless (no window/GPU). Render the
+    // FIXED ~2 s procedural-audio-graph scene — two 3D-SPATIALIZED emitters (a left-behind low square
+    // pulse + a right-front sine arpeggio, each osc->adsr->gain->kSpatial) mixed through a feedback
+    // delay tail to the kOut sink — via graph::RenderAu1Showcase (the SAME shared fixture the Metal
+    // --au1-graph runs, so the WAV bytes are IDENTICAL cross-backend BY CONSTRUCTION), and emit it as
+    // a deterministic WAV. Audio is pure integer CPU: byte-identical run-to-run, platform-to-platform,
+    // and backend-to-backend (the strongest golden in the suite — a bit-identical .wav).
+    if (au1GraphShotPath) {
+        std::vector<int16_t> buffer;
+        const audio::graph::Au1ShowcaseStats stats = audio::graph::RenderAu1Showcase(buffer);
+        if (!audio::WriteWav(au1GraphShotPath, 48000, 2, buffer)) {
+            std::fprintf(stderr, "FATAL: cannot write au1-graph output '%s'\n", au1GraphShotPath);
+            return 1;
+        }
+        std::printf("au1-graph: {nodes:%u, edges:%u, frames:%d, samples:%zu, digest:0x%016llx}\n",
+                    stats.nodes, stats.edges, stats.frames, buffer.size(),
+                    static_cast<unsigned long long>(stats.digest));
+        std::printf("au1-graph: wrote %s\n", au1GraphShotPath);
         return 0;
     }
 

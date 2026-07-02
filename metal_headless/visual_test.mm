@@ -119,6 +119,8 @@
 #include "sim/softbody.h"            // Slice SB1: deterministic volumetric soft body PBD lattice (Track-S S3) — SoftLattice/InitLattice/BuildSoftConstraints/BuildSoftCells/StepSoftBodySteps/SoftBodyDigest, the pure-CPU --sb1-soft-shot harness
 #include "sim/fract.h"               // Slice FR1: deterministic rigid-body fracture cell pre-fracture / Voronoi decomposition (FractField/FractSeed/ClassifyFractCells) — shared verbatim with fract_classify.comp + the Vulkan --fract-cells-shot
 #include "anim/ik.h"                 // Slice IK1: deterministic IK control-rig fixed-point ANGLE LUT (FxAcosLut/FxSinLut/FxCosLut/FxAtan2Lut) — shared verbatim with ik_angle.comp + the Vulkan --ik1-angle-shot
+#include "audio/audio_graph.h"       // Slice AU1: deterministic procedural audio GRAPH + 3D spatialization (Track-S S10) — graph::RenderAu1Showcase, the SAME shared fixture the Vulkan --au1-graph-shot renders; audio is pure integer CPU so the Metal --au1-graph WAV bytes are IDENTICAL cross-backend BY CONSTRUCTION
+#include "audio/wav.h"               // Slice AU1: the deterministic 44-byte PCM WAV encoder (wav.cpp added to this target) — the --au1-graph output path
 #include "sim/joint.h"               // Slice JT1: deterministic articulated-body ragdoll JOINT GRAPH + BALL-JOINT constraint (FxJoint/WorldAnchor/SolveBallJoint/StepJointWorld) — shared verbatim with joint_ball_solve.comp + the Vulkan --joint-ball-shot
 #include "sim/vehicle.h"             // Slice VH1: deterministic vehicle physics SUSPENSION SPRING JOINT (FxSpringJoint/SolveSpringJoint/SpringLength/StepSpringWorld) — shared verbatim with vehicle_spring_solve.comp + the Vulkan --vehicle-spring-shot (int64 solve -> Vulkan-only; Metal --vehicle-spring runs the CPU StepSpringWorld)
 #include "sim/active.h"              // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot (int64 solve -> Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld)
@@ -75214,6 +75216,26 @@ int main(int argc, char** argv) {
             } else {
                 std::fputs(text.c_str(), stdout);
             }
+            return 0;
+        }
+        // --au1-graph <out.wav> (Slice AU1, Track-S S10): render the FIXED ~2 s procedural-audio-graph
+        // scene — two 3D-SPATIALIZED emitters (a left-behind low square pulse + a right-front sine
+        // arpeggio) mixed through a feedback delay tail — via graph::RenderAu1Showcase (the SAME shared
+        // fixture the Vulkan --au1-graph-shot renders) and write the deterministic WAV. Pure integer
+        // CPU (no Metal device): the WAV bytes are IDENTICAL to the Vulkan/Windows side BY CONSTRUCTION
+        // (the strongest golden in the suite — a bit-identical .wav, cmp-able cross-backend).
+        if (argc > 2 && std::strcmp(argv[1], "--au1-graph") == 0) {
+            const char* out = argv[2];
+            std::vector<int16_t> buffer;
+            const hf::audio::graph::Au1ShowcaseStats stats = hf::audio::graph::RenderAu1Showcase(buffer);
+            if (!hf::audio::WriteWav(out, 48000, 2, buffer)) {
+                std::fprintf(stderr, "FATAL: cannot write au1-graph output '%s'\n", out);
+                return 1;
+            }
+            std::printf("au1-graph: {nodes:%u, edges:%u, frames:%d, samples:%zu, digest:0x%016llx}\n",
+                        stats.nodes, stats.edges, stats.frames, buffer.size(),
+                        static_cast<unsigned long long>(stats.digest));
+            std::printf("au1-graph: wrote %s\n", out);
             return 0;
         }
         // --agent-query <cmds.json> <out.json> (Slice DX2, FLAGSHIP #31): build the SAME default scene

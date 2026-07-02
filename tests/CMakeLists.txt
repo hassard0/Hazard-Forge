@@ -102,6 +102,18 @@ hf_add_pure_test(audio_test)
 # pinned hash IN the test (NO image, NO render-bake) — the cross-platform proof is the SAME CPU test
 # producing the IDENTICAL hash on MSVC + Apple clang. Pure CPU (hf_core), no RHI/backend symbols, ASan.
 hf_add_pure_test(dsp_test)
+# Deterministic procedural AUDIO GRAPH + 3D SPATIALIZATION (Slice AU1, Track-S S10, the MetaSounds-class
+# layer): engine/audio/audio_graph.h — a flow.h-discipline node graph (EdgeMask-gated canonical Kahn
+# TopoOrder, "own-id == no edge" sentinel, deterministic cycle rejection) over the dsp.h integer
+# primitives (kOsc/kGain/kMix/kDelay/kAdsr/kPan/kSpatial/kOut), block-rendered with per-node state
+# carried across RenderBlock calls. Asserts determinism + the PINNED showcase-chain digest + one-buffer
+# == N-blocks, diamond once-only evaluation, cycle -> ok=false, disconnected-input-reads-silence, the
+# EXACT pinned delay echo cascade (truncating Q15 feedback decays to exact silence at echo 14), mix hard
+# clamp, gain identity-at-kQ15One, the pinned integer spatialization coefficients (hard-right/center/
+# inverse-square distance gains) + spatialized-render digest, BYTE-IDENTICAL composition with the
+# EXISTING mixer.h Render path, and the pinned AU1 showcase-scene digest (the --au1-graph-shot WAV
+# source). Pure CPU (hf_core), integer end to end, ASan-eligible.
+hf_add_pure_test(audio_graph_test)
 # Generic deterministic SESSION core (Slice NS1, flagship #24 NETCODE beachhead): engine/net/session.h
 # — a header-only, transport-agnostic, templated Session<World,Input> that drives N ticks of a caller-
 # supplied deterministic Step from a per-tick InputRing and exposes an FNV-1a-64 DigestBytes state
