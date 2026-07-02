@@ -707,6 +707,7 @@ int main(int argc, char** argv) {
     const char* navRegionShotPath = nullptr; // --nav-region-shot <out.bmp> (Slice NAV3: Deterministic GPU Navmesh INTEGER WATERSHED REGION GENERATION, the 3rd slice + MAKE-OR-BREAK of FLAGSHIP #7 — partition the NAV2 walkable distance field into REGIONS via a single-thread level-descending fixed-order integer watershed (nav_region.comp); GPU==CPU region[] bit-exact, hash-colored region partition viz)
     const char* navPolymeshShotPath = nullptr; // --nav-polymesh-shot <out.bmp> (Slice NAV4: Deterministic GPU Navmesh CONTOUR TRACE + INTEGER POLYGONIZATION, the 4th slice of FLAGSHIP #7 — trace each NAV3 region's boundary into an integer contour (nav_contour.comp: trace+Douglas-Peucker), triangulate it (nav_polygonize.comp: ear-clip + adjacency); GPU==CPU contour verts + poly indices + adjacency bit-exact; region fill + contour edges + poly edges viz)
     const char* navPathShotPath = nullptr; // --nav-path-shot <out.bmp> (Slice NAV5: Deterministic GPU Navmesh INTEGER A* PATHFINDING, the 5th slice + HEADLINE of FLAGSHIP #7 — run integer A* (Manhattan cost+heuristic over poly centroids, lowest-id tie-break) over the NAV4 poly adjacency graph (nav_astar.comp, [numthreads(1,1,1)] single-thread) -> a deterministic CORRIDOR; GPU==CPU corridor+cost+start/goal bit-exact, navmesh faint + corridor polyline bright viz)
+    const char* nav7MLShotPath = nullptr; // --nav7-ml-shot <out.bmp> (Slice NAV7, Track-R R8: MULTI-LAYER NAVMESH — overhangs/bridges/stacked walkable surfaces, closing the flagship-#7 "one-surface-per-column" caveat. PURE CPU (NO GPU dispatch, NO new shader, NO new RHI) — both backends run the IDENTICAL header-only integer ML pipeline (navmesh.h NAV7: FilterWalkableSpansML keeps EVERY walkable span top as a SURFACE/layer in a flat array + per-column CSR -> BuildSurfaceAdjacencyML per-layer max-step 4-neighbour CSR graph, NO same-column edges -> BuildDistanceFieldML the NAV2 chamfer over the surface graph -> FindPathML the NAV5 A* generalized to CSR) over the bridge-over-tunnel scene (MakeBridgeTunnelSpans: ground + two embankment ramps + a thin deck slab whose columns carry TWO surfaces: tunnel floor layer 0 + deck layer 1) -> the golden is bit-identical BY CONSTRUCTION (pure-integer top-down viz, strict-zero). THE MONEY SHOT: the UNDER path (cyan, through the tunnel, layer 0 only) and the OVER path (orange, up the ramps + across the deck) CROSS in (x,z) but never share a surface — impossible in the single-layer NAV1-6 navmesh. Proofs: extraction pins (48 two-surface columns, 1072 surfaces vs the single-layer 1024) + both paths pinned (30/cost 29 under, 28/cost 27 over, 12 deck surfaces) + the crossing (1 shared column, 0 shared surfaces) + two-run determinism + the FNV digest pin. Stat line = surfaces/mlCols/underLen/overLen/digest.)
     const char* navRenderShotPath = nullptr; // --nav-render-shot <out.bmp> (Slice NAV6: Deterministic GPU Navmesh LIT 3D RENDER CAPSTONE, the 6th + FINAL slice COMPLETING FLAGSHIP #7 — run the deterministic NAV1-NAV5 pipeline to a navmesh + A* corridor, convert the bit-exact integer polys + corridor to FLOAT via navmesh.h::PolyMeshToRenderMesh/PathToWorldPolyline, render a lit ground + translucent per-region navmesh overlay + bright corridor line from a fixed 3/4 camera; FLOAT visresolve-bar, REUSES lit/alpha-blend/debug-line pipelines, NO new shader/RHI)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
@@ -4104,6 +4105,15 @@ int main(int argc, char** argv) {
     // new shader/RHI; sleeping hulls tinted cool slate). Its OWN loop (the standalone-loop pattern).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--ps7-hullsleep-shot") == 0) { ps7HullSleepShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice NAV7: --nav7-ml-shot <out.bmp> (MULTI-LAYER NAVMESH, Track-R R8 — the flagship-#7
+    // one-surface-per-column caveat closure: FilterWalkableSpansML/BuildSurfaceAdjacencyML/
+    // BuildDistanceFieldML/FindPathML over the bridge-over-tunnel scene; a path UNDER the bridge + a
+    // path OVER it cross in (x,z) but never share a surface; PURE CPU, NO new shader/RHI, pure-integer
+    // strict-zero viz). Its OWN loop (the standalone-loop pattern).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--nav7-ml-shot") == 0) { nav7MLShotPath = argv[i + 1]; break; }
     }
 
     // Slice RT1: --rt1-trace-shot <out.bmp> (Hardware Ray Tracing THE DETERMINISTIC Q16.16 SW REFERENCE
@@ -55034,6 +55044,200 @@ int main(int argc, char** argv) {
                                 (unsigned long long)digest, sm.asleepCount, spatialIslands.islandCount,
                                 candidatePairs);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ps7HullSleepShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Slice NAV7 (Track-R R8): MULTI-LAYER NAVMESH — overhangs / bridges / stacked walkable
+        // surfaces (--nav7-ml-shot <out.bmp>). PURE CPU — NO GPU dispatch, NO new shader, NO new RHI;
+        // both backends run the IDENTICAL header-only integer ML pipeline (engine/nav/navmesh.h NAV7)
+        // over the bridge-over-tunnel scene -> the pure-integer top-down golden is bit-identical
+        // cross-backend BY CONSTRUCTION (strict-zero). THE MONEY SHOT: the UNDER path (cyan, tunnel,
+        // layer 0 only) and the OVER path (orange, ramps + deck, layer 1 across the deck) CROSS in
+        // (x,z) but never share a SURFACE — impossible in the single-layer NAV1-6 navmesh.
+        if (nav7MLShotPath) {
+            namespace nav = hf::nav;
+
+            // The deterministic 32x32 bridge-over-tunnel scene (== the nav_test NAV7 config).
+            const int kW = 32, kH = 32;
+            nav::Heightfield hf;
+            hf.w = kW; hf.h = kH;
+            hf.bminX = 0; hf.bminY = 0; hf.bminZ = 0;
+            hf.bmaxX = kW; hf.bmaxY = 64; hf.bmaxZ = kH;
+            hf.cs = 1; hf.ch = 1;
+            nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+            std::vector<std::vector<nav::Span>> merged;
+            const nav::BridgeSceneLayout L = nav::MakeBridgeTunnelSpans(hf, merged);
+
+            // The ML pipeline (extraction -> CSR adjacency -> anchors -> chamfer -> two A* paths).
+            auto runML = [&](std::vector<nav::MLSurface>& surf, std::vector<uint32_t>& off,
+                             std::vector<uint32_t>& cnt, std::vector<uint32_t>& nOff,
+                             std::vector<uint32_t>& nCnt, std::vector<uint32_t>& nList,
+                             std::vector<int32_t>& cx, std::vector<int32_t>& cz,
+                             std::vector<uint32_t>& dist, std::vector<uint32_t>& corU,
+                             std::vector<uint32_t>& corO, int32_t& costU, int32_t& costO) {
+                nav::FilterWalkableSpansML(hf, cfg, merged, surf, off, cnt);
+                nav::BuildSurfaceAdjacencyML(hf, cfg, surf, off, cnt, nOff, nCnt, nList);
+                nav::SurfaceAnchorsML(hf, surf, cx, cz);
+                nav::BuildDistanceFieldML(hf, cfg, surf, off, cnt, dist);
+                const uint32_t sU = off[(size_t)hf.columnId(16, 1)];    // tunnel run: ground->ground in z
+                const uint32_t gU = off[(size_t)hf.columnId(16, 30)];
+                const uint32_t sO = off[(size_t)hf.columnId(2, 16)];    // bridge run: ground->ground in x
+                const uint32_t gO = off[(size_t)hf.columnId(29, 16)];
+                costU = nav::FindPathML(nOff, nCnt, nList, cx, cz, sU, gU, corU);
+                costO = nav::FindPathML(nOff, nCnt, nList, cx, cz, sO, gO, corO);
+            };
+            std::vector<nav::MLSurface> surf;
+            std::vector<uint32_t> off, cnt, nOff, nCnt, nList, dist, corU, corO;
+            std::vector<int32_t> scx, scz;
+            int32_t costU = 0, costO = 0;
+            runML(surf, off, cnt, nOff, nCnt, nList, scx, scz, dist, corU, corO, costU, costO);
+
+            // PROOF (1) EXTRACTION: the pinned multi-layer census vs the single-layer collapse.
+            uint32_t mlCols = 0u;
+            for (uint32_t c : cnt) if (c > 1u) ++mlCols;
+            std::vector<std::vector<nav::Span>> slMerged = merged;
+            std::vector<uint32_t> slWalkable; std::vector<int32_t> slSurfaceY;
+            nav::FilterWalkableSpans(hf, cfg, slMerged, slWalkable, slSurfaceY);
+            uint32_t slCount = 0u;
+            for (uint32_t w2 : slWalkable) slCount += w2;
+            if (mlCols != 48u || surf.size() != 1072u || slCount != 1024u) {
+                std::fprintf(stderr, "FATAL: nav7-ml extraction census off (mlCols=%u surfaces=%zu sl=%u)\n",
+                             mlCols, surf.size(), slCount);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("nav7-ml: {surfaces:%u, mlCols:%u} vs single-layer %u — the deck columns carry "
+                        "BOTH the tunnel floor (layer 0) and the deck (layer 1)\n",
+                        (unsigned)surf.size(), mlCols, slCount);
+
+            // PROOF (2) THE TWO PATHS: under (layer 0 only, through the tunnel band) + over (uses the deck).
+            bool underLayer0 = corU.size() == 30u && costU == 29;
+            bool underCrossesBand = false;
+            for (uint32_t id : corU) {
+                if (surf[(size_t)id].layer != 0u) underLayer0 = false;
+                const int z = (int)(surf[(size_t)id].col / (uint32_t)kW);
+                if (z >= L.bandZ0 && z <= L.bandZ1) underCrossesBand = true;
+            }
+            uint32_t deckUsed = 0u;
+            for (uint32_t id : corO) if (surf[(size_t)id].layer == 1u) ++deckUsed;
+            const bool overOk = corO.size() == 28u && costO == 27 && deckUsed == 12u;
+            if (!underLayer0 || !underCrossesBand || !overOk) {
+                std::fprintf(stderr, "FATAL: nav7-ml paths off (under=%zu/%d band=%d over=%zu/%d deck=%u)\n",
+                             corU.size(), costU, (int)underCrossesBand, corO.size(), costO, deckUsed);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("nav7-ml paths: UNDER %u polys cost %d (layer 0 only, THROUGH the tunnel) + OVER "
+                        "%u polys cost %d (%u deck surfaces)\n",
+                        (unsigned)corU.size(), costU, (unsigned)corO.size(), costO, deckUsed);
+
+            // PROOF (3) THE CROSSING: shared (x,z) columns but NEVER a shared surface (the overhang proof).
+            uint32_t sharedCols = 0u;
+            bool sharedSurface = false;
+            for (uint32_t a : corU)
+                for (uint32_t b : corO) {
+                    if (a == b) sharedSurface = true;
+                    if (surf[(size_t)a].col == surf[(size_t)b].col) ++sharedCols;
+                }
+            if (sharedCols != 1u || sharedSurface) {
+                std::fprintf(stderr, "FATAL: nav7-ml crossing proof off (sharedCols=%u sharedSurface=%d)\n",
+                             sharedCols, (int)sharedSurface);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("nav7-ml crossing: the paths CROSS in exactly 1 (x,z) column and share 0 surfaces "
+                        "— impossible in the single-layer navmesh\n");
+
+            // PROOF (4) DETERMINISM: the full ML pipeline twice -> byte-identical everything.
+            {
+                std::vector<nav::MLSurface> s2;
+                std::vector<uint32_t> o2, c2, no2, nc2, nl2, d2, cu2, co2;
+                std::vector<int32_t> x2, z2;
+                int32_t ku2 = 0, ko2 = 0;
+                runML(s2, o2, c2, no2, nc2, nl2, x2, z2, d2, cu2, co2, ku2, ko2);
+                const bool same = s2.size() == surf.size() &&
+                    std::memcmp(s2.data(), surf.data(), surf.size() * sizeof(nav::MLSurface)) == 0 &&
+                    nl2 == nList && d2 == dist && cu2 == corU && co2 == corO &&
+                    ku2 == costU && ko2 == costO;
+                if (!same) {
+                    std::fprintf(stderr, "FATAL: nav7-ml two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("nav7-ml determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // --- Golden: the PURE-INTEGER top-down viz (strict-zero cross-backend BY CONSTRUCTION).
+            // Column fills: open ground dark green, embankment ramps warm (brighter with height), the
+            // two-surface deck/tunnel columns violet; the UNDER path cyan, the OVER path orange (drawn
+            // last so the crossing reads bridge-on-top), start/goal dots green/red. ---
+            const int kCell = 16;
+            const uint32_t imgW = (uint32_t)(kW * kCell), imgH = (uint32_t)(kH * kCell);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto putPx = [&](int x, int y, uint8_t r, uint8_t g2, uint8_t b2) {
+                if (x < 0 || y < 0 || x >= (int)imgW || y >= (int)imgH) return;
+                uint8_t* dst = &bgra[((size_t)y * imgW + x) * 4];
+                dst[0] = b2; dst[1] = g2; dst[2] = r; dst[3] = 255;
+            };
+            for (int cz = 0; cz < kH; ++cz)
+                for (int cx = 0; cx < kW; ++cx) {
+                    const size_t c = (size_t)hf.columnId(cx, cz);
+                    uint8_t r = 26, g = 42, b = 30;                       // open ground (dark green)
+                    if (cnt[c] > 1u) { r = 58; g = 44; b = 110; }          // deck over tunnel (violet)
+                    else if (cnt[c] == 1u && surf[(size_t)off[c]].y > 0) { // embankment ramp (warm, by height)
+                        const int y = surf[(size_t)off[c]].y;
+                        r = (uint8_t)(60 + y * 22); g = (uint8_t)(48 + y * 14); b = 34;
+                    }
+                    for (int dy = 0; dy < kCell; ++dy)
+                        for (int dx = 0; dx < kCell; ++dx)
+                            putPx(cx * kCell + dx, cz * kCell + dy, r, g, b);
+                }
+            // A corridor polyline between column CENTERS (pure-integer Bresenham, 3px thick).
+            auto drawSeg = [&](int px0, int py0, int px1, int py1, uint8_t r, uint8_t g2, uint8_t b2) {
+                int dx = px1 - px0, dy = py1 - py0;
+                int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+                int steps = adx > ady ? adx : ady;
+                if (steps == 0) { putPx(px0, py0, r, g2, b2); return; }
+                for (int s = 0; s <= steps; ++s) {
+                    const int px = px0 + (dx * s + (dx < 0 ? -steps / 2 : steps / 2)) / steps;
+                    const int py = py0 + (dy * s + (dy < 0 ? -steps / 2 : steps / 2)) / steps;
+                    for (int oy = -1; oy <= 1; ++oy)
+                        for (int ox = -1; ox <= 1; ++ox)
+                            putPx(px + ox, py + oy, r, g2, b2);
+                }
+            };
+            auto drawCorridor = [&](const std::vector<uint32_t>& cor, uint8_t r, uint8_t g2, uint8_t b2) {
+                for (size_t i = 0; i + 1 < cor.size(); ++i) {
+                    const uint32_t a = cor[i], b = cor[i + 1];
+                    drawSeg(scx[a] * kCell + kCell / 2, scz[a] * kCell + kCell / 2,
+                            scx[b] * kCell + kCell / 2, scz[b] * kCell + kCell / 2, r, g2, b2);
+                }
+            };
+            auto markDot = [&](uint32_t sid, uint8_t r, uint8_t g2, uint8_t b2) {
+                const int px = scx[sid] * kCell + kCell / 2, py = scz[sid] * kCell + kCell / 2;
+                for (int dy = -3; dy <= 3; ++dy)
+                    for (int dx = -3; dx <= 3; ++dx)
+                        if (dx * dx + dy * dy <= 9) putPx(px + dx, py + dy, r, g2, b2);
+            };
+            drawCorridor(corU, 40, 220, 235);    // UNDER (cyan, through the tunnel)
+            drawCorridor(corO, 250, 150, 40);    // OVER (orange, drawn last: bridge on top)
+            if (!corU.empty()) { markDot(corU.front(), 40, 230, 60); markDot(corU.back(), 235, 40, 40); }
+            if (!corO.empty()) { markDot(corO.front(), 40, 230, 60); markDot(corO.back(), 235, 40, 40); }
+
+            // The cross-compiler/cross-backend digest (== the nav_test NAV7 pin, 0x14cf524e6e089c37).
+            uint64_t digest = nav::Fnv1a64ML(surf.data(), surf.size() * sizeof(nav::MLSurface));
+            digest = nav::Fnv1a64ML(dist.data(), dist.size() * sizeof(uint32_t), digest);
+            digest = nav::Fnv1a64ML(corU.data(), corU.size() * sizeof(uint32_t), digest);
+            digest = nav::Fnv1a64ML(corO.data(), corO.size() * sizeof(uint32_t), digest);
+            digest = nav::Fnv1a64ML(&costU, sizeof(costU), digest);
+            digest = nav::Fnv1a64ML(&costO, sizeof(costO), digest);
+
+            bool ok = WriteBMP(nav7MLShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — nav7 multi-layer navmesh {surfaces:%u, mlCols:%u, "
+                                "underLen:%u, overLen:%u, digest:0x%016llx}\n",
+                                nav7MLShotPath, imgW, imgH, (unsigned)surf.size(), mlCols,
+                                (unsigned)corU.size(), (unsigned)corO.size(), (unsigned long long)digest);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", nav7MLShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

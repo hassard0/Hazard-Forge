@@ -1274,4 +1274,376 @@ inline void PathToWorldPolyline(const std::vector<uint32_t>& corridor,
     }
 }
 
+// =================================================================================================
+// Slice NAV7 — MULTI-LAYER NAVMESH: overhangs / bridges / stacked walkable surfaces (Track-R R8 of
+// docs/SUPERIORITY_ROADMAP.md — closes the flagship-#7 "one-surface-per-column" caveat). Additive
+// over NAV1-NAV6 (their functions stay byte-identical above). PURE CPU v1 (no GPU pass, no shader —
+// the NAV5 A* was single-thread [numthreads(1,1,1)] anyway; a GPU ML pipeline is a deferred
+// refinement). Pure integer on every path (NO float, NO <cmath>; int64 only inside the FNV digest
+// helper, which is NOT on the nav build path).
+//
+// WHAT THIS CLOSES: NAV2's FilterWalkableSpans collapses each column to ONE walkable surface
+// (surfaceY[col] = the TOPMOST walkable span top), so a bridge over a tunnel loses the tunnel floor —
+// the columns under the deck contribute only the deck. NAV7 keeps EVERY walkable span top as a
+// SURFACE (a layer): the flat surface array + per-column CSR (count/offset — the NAV1 colCount/
+// colOffset convention, NO std::map) lets an agent path UNDER the bridge and OVER it as distinct,
+// never-connected surfaces of the SAME (x,z) columns.
+//
+// THE LOCKED ML CONTRACTS (every ordering decision pinned — the NAV3/NAV5 determinism discipline):
+//   * Surface order: ascending column id (z*w+x row-major), then ascending surface y within a column
+//     (merged spans are ymin-ascending + non-overlapping, so a plain walk emits ascending tops).
+//     surface index = colOffsetML[col] + layer, layer 0 = the LOWEST walkable surface of the column.
+//   * Connectivity: surface a (column A) ~ surface b (adjacent column B) iff |a.y - b.y| <=
+//     walkableClimb (IsConnectedML — the NAV2 IsConnected max-step test per-LAYER; the walkable[]
+//     gates are implied: only walkable spans become surfaces). Two surfaces of the SAME column are
+//     NEVER connected (no teleport through floors).
+//   * Distance field: the NAV2 two-sweep integer chamfer generalized to the surface array — the
+//     sweep ORDER over surfaces (ascending index forward, descending backward) IS the NAV2 row-major
+//     sweep order because the surface array is column-id-ordered; a surface relaxes against EVERY
+//     connected surface in the 8 neighbour columns (W/NW/N/NE forward, E/SE/S/SW backward, the NAV2
+//     weights 2/3). Border-column surfaces seed 0 (the NAV2 border rule).
+//   * A*: FindPathML = the NAV5 FindPath body VERBATIM with the fixed-3 poly nbr[] generalized to a
+//     CSR adjacency (nbrOffset/nbrCount/nbrList); frontier = the same linear min-scan, f = g+h,
+//     tie-break LOWEST node index; neighbour relax order = the CSR list order (pinned by
+//     BuildSurfaceAdjacencyML: neighbour columns in the NAV3 fixed order up/down/left/right, then
+//     ascending layer within a column). Cost + heuristic = ManhattanDist on the (x,z) anchors —
+//     vertical distance is NOT costed (documented; matches NAV5's planar-centroid metric).
+//
+// THE IDENTITY-AT-CONFIG PROOF (the append-only equivalence): on a SINGLE-LAYER field (every column
+// <= 1 walkable surface) FilterWalkableSpansML emits exactly the FilterWalkableSpans walkable set
+// (colCountML[col] == walkable[col], surface y == surfaceY[col]) and BuildDistanceFieldML's per-
+// surface distance bit-equals BuildDistanceField's per-column distance — same seeds, same sweep
+// order, same relax; FindPathML on a <=3-degree CSR graph bit-equals FindPath on the same graph
+// (nav_test pins all three). NOTE (honesty): the NAV1-6 SHOWCASE field is NOT strictly single-layer —
+// the box-step columns already carry a walkable ground span UNDER the box top that NAV2 collapses
+// away (the very caveat NAV7 closes) — so the strict bit-identity proof runs on a truly-single-layer
+// field, plus a topmost-layer correspondence proof on the full showcase field.
+//
+// DOCUMENTED GAPS (deferred, NOT closed here): hole-carving, polygon merge (triangles-as-polys),
+// inter-region portals (the rest of Track-R R8), a GPU ML pipeline, and ML watershed/contour/
+// polymesh (NAV7 paths on the surface GRID graph directly, not on an ML polymesh).
+// =================================================================================================
+
+// ----- MLSurface: one walkable surface (a layer) of a column --------------------------------------
+// col = the flat column id (z*w+x), y = the surface top voxel-y (the span's ymax), layer = the
+// 0-based ordinal among the column's WALKABLE surfaces, bottom-up (a cramped span gets NO layer).
+// 12 bytes, no padding holes (memcmp-able — the Span discipline).
+struct MLSurface {
+    uint32_t col;
+    int32_t  y;
+    uint32_t layer;
+};
+
+// ----- FilterWalkableSpansML: EVERY walkable span top becomes a surface (the ML extraction) --------
+// The NAV2 FilterWalkableSpans clearance rule applied per-SPAN without the topmost collapse: for each
+// column (ascending col id), walk its merged spans BOTTOM to TOP (ascending ymin); a span's top is a
+// walkable SURFACE iff the clearance to the next solid span above (gap = above.ymin - this.ymax - 1),
+// or to the heightfield top ((bmaxY-1) - this.ymax) for the topmost span, is >= walkableHeight —
+// the IDENTICAL integer test FilterWalkableSpans applies. Emits surfaces in the LOCKED order
+// (ascending col, then ascending y) into the flat array + the per-column CSR (colOffsetML = exclusive
+// prefix sum, colCountML = per-column surface count — the NAV1 colOffset/colCount convention).
+// Takes the merged spans CONST (unlike FilterWalkableSpans it does NOT stamp span.area — the ML
+// extraction is a pure read; the single-layer path keeps sole ownership of the area mutation).
+inline void FilterWalkableSpansML(const Heightfield& hf, const WalkableConfig& cfg,
+                                  const std::vector<std::vector<Span>>& mergedSpansPerColumn,
+                                  std::vector<MLSurface>& surfaces,
+                                  std::vector<uint32_t>& colOffsetML,
+                                  std::vector<uint32_t>& colCountML) {
+    const size_t nCols = (size_t)hf.columnCount();
+    surfaces.clear();
+    colOffsetML.assign(nCols, 0u);
+    colCountML.assign(nCols, 0u);
+    const int32_t fieldTop = hf.bmaxY - 1;   // inclusive top voxel-y (the NAV2 rule)
+
+    for (size_t c = 0; c < nCols; ++c) {
+        colOffsetML[c] = (uint32_t)surfaces.size();
+        const std::vector<Span>& spans = mergedSpansPerColumn[c];
+        uint32_t layer = 0u;
+        for (size_t i = 0; i < spans.size(); ++i) {
+            int32_t clearance;
+            if (i + 1 < spans.size()) {
+                clearance = (int32_t)spans[i + 1].ymin - (int32_t)spans[i].ymax - 1;   // gap to above
+            } else {
+                clearance = fieldTop - (int32_t)spans[i].ymax;                          // to field top
+            }
+            if (clearance >= cfg.walkableHeight) {
+                surfaces.push_back(MLSurface{(uint32_t)c, (int32_t)spans[i].ymax, layer});
+                ++layer;
+            }
+        }
+        colCountML[c] = layer;
+    }
+}
+
+// ----- IsConnectedML: the per-layer max-step connectivity predicate --------------------------------
+// Two surfaces in ADJACENT columns connect iff |ya - yb| <= walkableClimb (the NAV2 IsConnected test
+// per-layer; both are walkable by construction — only walkable spans become surfaces). Same-column
+// surfaces are NEVER connected (the caller never asks; the adjacency/chamfer only cross columns).
+inline bool IsConnectedML(int32_t ya, int32_t yb, int32_t climb) {
+    int32_t d = ya - yb;
+    if (d < 0) d = -d;
+    return d <= climb;
+}
+
+// ----- SurfaceAnchorsML: the per-surface integer (x,z) anchors (the A* cost anchors) ---------------
+// cx[i]/cz[i] = surface i's column coords (col % w, col / w) — the FindPathML Manhattan anchors (the
+// NAV5 centroid-anchor role; vertical distance is NOT costed, documented above).
+inline void SurfaceAnchorsML(const Heightfield& hf, const std::vector<MLSurface>& surfaces,
+                             std::vector<int32_t>& cx, std::vector<int32_t>& cz) {
+    const size_t nS = surfaces.size();
+    cx.assign(nS, 0); cz.assign(nS, 0);
+    for (size_t i = 0; i < nS; ++i) {
+        cx[i] = (int32_t)(surfaces[i].col % (uint32_t)hf.w);
+        cz[i] = (int32_t)(surfaces[i].col / (uint32_t)hf.w);
+    }
+}
+
+// ----- BuildSurfaceAdjacencyML: the deterministic CSR surface graph (the A* edges) -----------------
+// For each surface s (ascending index), append the connected surfaces of the 4 neighbour columns in
+// the NAV3 FIXED order up (z-1), down (z+1), left (x-1), right (x+1); within a neighbour column,
+// ascending layer. nbrOffset = exclusive prefix sum, nbrCount = per-surface edge count (CSR — the
+// count/offset convention). Deterministic by the pinned orders; pure integer.
+inline void BuildSurfaceAdjacencyML(const Heightfield& hf, const WalkableConfig& cfg,
+                                    const std::vector<MLSurface>& surfaces,
+                                    const std::vector<uint32_t>& colOffsetML,
+                                    const std::vector<uint32_t>& colCountML,
+                                    std::vector<uint32_t>& nbrOffset,
+                                    std::vector<uint32_t>& nbrCount,
+                                    std::vector<uint32_t>& nbrList) {
+    const int w = hf.w, h = hf.h;
+    const size_t nS = surfaces.size();
+    nbrOffset.assign(nS, 0u);
+    nbrCount.assign(nS, 0u);
+    nbrList.clear();
+    const int32_t climb = cfg.walkableClimb;
+
+    for (size_t s = 0; s < nS; ++s) {
+        nbrOffset[s] = (uint32_t)nbrList.size();
+        const int x = (int)(surfaces[s].col % (uint32_t)w);
+        const int z = (int)(surfaces[s].col / (uint32_t)w);
+        const int32_t y = surfaces[s].y;
+        // The NAV3 fixed neighbour-column order: up (z-1), down (z+1), left (x-1), right (x+1).
+        const int nbr[4][2] = {{x, z - 1}, {x, z + 1}, {x - 1, z}, {x + 1, z}};
+        for (int k = 0; k < 4; ++k) {
+            const int nx = nbr[k][0], nz = nbr[k][1];
+            if (nx < 0 || nz < 0 || nx >= w || nz >= h) continue;
+            const size_t nc = (size_t)(nz * w + nx);
+            const uint32_t base = colOffsetML[nc], cnt = colCountML[nc];
+            for (uint32_t l = 0; l < cnt; ++l) {                      // ascending layer (pinned)
+                if (IsConnectedML(y, surfaces[(size_t)(base + l)].y, climb))
+                    nbrList.push_back(base + l);
+            }
+        }
+        nbrCount[s] = (uint32_t)nbrList.size() - nbrOffset[s];
+    }
+}
+
+// ----- BuildDistanceFieldML: the NAV2 two-sweep integer chamfer over the SURFACE graph -------------
+// dist[i] = the integer chamfer distance of surface i to the nearest boundary, GEODESIC over the
+// per-layer connectivity. Seed: border-column surfaces = 0, interior = kDistInf (non-walkable columns
+// simply have no surfaces — the NAV2 non-walkable-cell seed has no ML node to carry). Two sweeps over
+// the surface ARRAY (its order IS row-major column order): FORWARD ascending index relaxing against
+// the connected surfaces of the W/NW/N/NE columns, BACKWARD descending against E/SE/S/SW (the NAV2
+// weights: cardinal 2, diagonal 3). Multiple connected candidates in one neighbour column all relax
+// (min wins — deterministic, order-free). Residual kDistInf clamps to 0 (the NAV2 isolated-island
+// rule). On a single-layer field this is BIT-IDENTICAL to BuildDistanceField per column (same seeds,
+// same visitation order, same relax — nav_test pins it). Pure integer, single-thread serial.
+inline void BuildDistanceFieldML(const Heightfield& hf, const WalkableConfig& cfg,
+                                 const std::vector<MLSurface>& surfaces,
+                                 const std::vector<uint32_t>& colOffsetML,
+                                 const std::vector<uint32_t>& colCountML,
+                                 std::vector<uint32_t>& dist) {
+    const int w = hf.w, h = hf.h;
+    const size_t nS = surfaces.size();
+    dist.assign(nS, 0u);
+    const int32_t climb = cfg.walkableClimb;
+
+    // Seed: border-column surfaces = 0, interior surfaces = kDistInf (the NAV2 border rule).
+    for (size_t s = 0; s < nS; ++s) {
+        const int x = (int)(surfaces[s].col % (uint32_t)w);
+        const int z = (int)(surfaces[s].col / (uint32_t)w);
+        const bool border = (x == 0 || z == 0 || x == w - 1 || z == h - 1);
+        dist[s] = border ? 0u : kDistInf;
+    }
+
+    const uint32_t kCard = 2u, kDiag = 3u;
+    // Relax surface s against every CONNECTED surface of neighbour column (nx,nz) with weight wgt.
+    auto relax = [&](size_t s, int nx, int nz, uint32_t wgt) {
+        if (nx < 0 || nz < 0 || nx >= w || nz >= h) return;
+        const size_t nc = (size_t)(nz * w + nx);
+        const uint32_t base = colOffsetML[nc], cnt = colCountML[nc];
+        for (uint32_t l = 0; l < cnt; ++l) {
+            const size_t t = (size_t)(base + l);
+            if (!IsConnectedML(surfaces[s].y, surfaces[t].y, climb)) continue;
+            const uint32_t cand = dist[t] + wgt;
+            if (cand < dist[s]) dist[s] = cand;
+        }
+    };
+
+    // FORWARD sweep (ascending surface index == the NAV2 TL->BR row-major order): W, NW, N, NE.
+    for (size_t s = 0; s < nS; ++s) {
+        if (dist[s] == 0u) continue;   // a seed (0) can only stay 0 (the NAV2 rule)
+        const int x = (int)(surfaces[s].col % (uint32_t)w);
+        const int z = (int)(surfaces[s].col / (uint32_t)w);
+        relax(s, x - 1, z,     kCard);   // W
+        relax(s, x - 1, z - 1, kDiag);   // NW
+        relax(s, x,     z - 1, kCard);   // N
+        relax(s, x + 1, z - 1, kDiag);   // NE
+    }
+    // BACKWARD sweep (descending == BR->TL): E, SE, S, SW.
+    for (size_t s = nS; s-- > 0;) {
+        if (dist[s] == 0u) continue;
+        const int x = (int)(surfaces[s].col % (uint32_t)w);
+        const int z = (int)(surfaces[s].col / (uint32_t)w);
+        relax(s, x + 1, z,     kCard);   // E
+        relax(s, x + 1, z + 1, kDiag);   // SE
+        relax(s, x,     z + 1, kCard);   // S
+        relax(s, x - 1, z + 1, kDiag);   // SW
+    }
+    // Residual sentinel (an isolated surface island) clamps to 0 (the NAV2 rule).
+    for (size_t s = 0; s < nS; ++s)
+        if (dist[s] == kDistInf) dist[s] = 0u;
+}
+
+// ----- FindPathML: the NAV5 integer A* generalized to a CSR node graph (the NAV7 headline) ---------
+// The FindPath body VERBATIM with the fixed-3 poly nbr[] replaced by the CSR adjacency
+// (nbrOffset/nbrCount/nbrList — for surfaces, BuildSurfaceAdjacencyML's pinned-order graph; the node
+// count is nbrCount.size(), and cx/cz are the per-node integer anchors, SurfaceAnchorsML for
+// surfaces). Frontier = the linear min-scan (lowest f = g + h, tie-break LOWEST node index); edge
+// cost + heuristic = ManhattanDist on the anchors (admissible + consistent -> optimal, the NAV5
+// contract); neighbour relax order = the CSR list order (pinned). Output: corridor = the node-id
+// sequence start->goal (empty if unreachable; {start} if start==goal); returns the total integer
+// g-cost at goal. On a <=3-degree graph this bit-equals FindPath (nav_test pins it). Pure int32,
+// single-thread serial -> bit-exact across compilers/platforms.
+inline int32_t FindPathML(const std::vector<uint32_t>& nbrOffset,
+                          const std::vector<uint32_t>& nbrCount,
+                          const std::vector<uint32_t>& nbrList,
+                          const std::vector<int32_t>& cx, const std::vector<int32_t>& cz,
+                          uint32_t start, uint32_t goal, std::vector<uint32_t>& corridor) {
+    corridor.clear();
+    const size_t nP = nbrCount.size();
+    if (nP == 0u || start >= (uint32_t)nP || goal >= (uint32_t)nP) return 0;
+    if (start == goal) { corridor.push_back(start); return 0; }
+
+    std::vector<int32_t>  g(nP, kPathInf);       // best-known cost from start.
+    std::vector<uint8_t>  open(nP, 0u);          // 1 = node is in the open set.
+    std::vector<uint8_t>  closed(nP, 0u);        // 1 = node already expanded.
+    std::vector<uint32_t> cameFrom(nP, kNoCameFrom);
+
+    g[start] = 0;
+    open[start] = 1u;
+
+    while (true) {
+        // Pop the open node with the lowest f = g + h, tie-break LOWEST node id (the linear min-scan).
+        uint32_t cur = kNoCameFrom;
+        int32_t bestF = kPathInf;
+        for (uint32_t p = 0; p < (uint32_t)nP; ++p) {
+            if (open[p] == 0u) continue;
+            const int32_t hh = ManhattanDist(cx[p], cz[p], cx[goal], cz[goal]);
+            const int32_t f = g[p] + hh;
+            if (cur == kNoCameFrom || f < bestF) { bestF = f; cur = p; }   // ascending scan -> tie keeps lowest id.
+        }
+        if (cur == kNoCameFrom) break;   // open empty -> goal unreachable.
+        if (cur == goal) break;          // goal popped -> done (consistent h -> optimal on pop).
+
+        open[cur] = 0u;
+        closed[cur] = 1u;
+
+        // Relax neighbours in the pinned CSR list order.
+        const uint32_t eBase = nbrOffset[(size_t)cur], eCnt = nbrCount[(size_t)cur];
+        for (uint32_t e = 0; e < eCnt; ++e) {
+            const uint32_t nb = nbrList[(size_t)(eBase + e)];
+            if (nb >= (uint32_t)nP) continue;
+            if (closed[nb] != 0u) continue;
+            const int32_t step = ManhattanDist(cx[cur], cz[cur], cx[nb], cz[nb]);
+            const int32_t tentative = g[cur] + step;
+            if (tentative < g[nb]) {
+                g[nb] = tentative;
+                cameFrom[nb] = cur;
+                open[nb] = 1u;
+            }
+        }
+    }
+
+    // Reconstruct: if the goal was reached, walk came_from goal->start then reverse (the NAV5 walk).
+    if (g[goal] >= kPathInf) return 0;   // unreachable -> empty corridor.
+    std::vector<uint32_t> rev;
+    uint32_t node = goal;
+    for (size_t guard = 0; guard <= nP; ++guard) {
+        rev.push_back(node);
+        if (node == start) break;
+        node = cameFrom[node];
+        if (node == kNoCameFrom) { rev.clear(); break; }   // broken chain -> no corridor.
+    }
+    if (rev.empty() || rev.back() != start) { corridor.clear(); return 0; }
+    for (size_t i = rev.size(); i-- > 0;) corridor.push_back(rev[i]);
+    return g[goal];
+}
+
+// ----- The NAV7 proof scene: a BRIDGE over a TUNNEL --------------------------------------------------
+// BridgeSceneLayout carries the integer layout MakeBridgeTunnelSpans builds (inclusive ranges) so the
+// tests/showcase pick start/goal columns deterministically.
+struct BridgeSceneLayout {
+    int32_t deckY;             // the bridge-deck surface y
+    int32_t bandZ0, bandZ1;    // the bridge z band (inclusive)
+    int32_t rampW0, rampW1;    // west ramp x range (inclusive), heights 1..deckY
+    int32_t deckX0, deckX1;    // deck x range (inclusive) — the TWO-surface (tunnel) columns
+    int32_t rampE0, rampE1;    // east ramp x range (inclusive), heights deckY..1
+};
+
+// MakeBridgeTunnelSpans(hf, out): per-column MERGED spans (the MergeColumnSpans output form —
+// sorted-by-ymin, non-overlapping) for the bridge-over-tunnel scene, built directly at the span level
+// (a spans-level scene builder; the NAV2/NAV3 test convention — the conservative NAV1 TriYSpan cannot
+// rasterize a thin elevated slab or a climbable ramp). Designed for the 32x32 showcase grid:
+//   * every column: a ground span {0,0};
+//   * the bridge z band (4 columns deep, centered): a west EMBANKMENT ramp (solid {0,y}, y stepping
+//     1..deckY one voxel per column — climbable at walkableClimb 1), the DECK (a thin slab
+//     {deckY,deckY} ABOVE the preserved ground span — the tunnel: clearance deckY-1 under it), and a
+//     mirrored east ramp (deckY..1);
+//   * everything integer, deterministic, order-free.
+// With walkableHeight 2 / climb 1: deck columns carry TWO surfaces (tunnel floor y=0 layer 0 + deck
+// y=deckY layer 1); ramp columns ONE surface (the embankment top); all other columns ONE (ground).
+inline BridgeSceneLayout MakeBridgeTunnelSpans(const Heightfield& hf,
+                                               std::vector<std::vector<Span>>& mergedPerColumn) {
+    BridgeSceneLayout L;
+    L.deckY  = 6;
+    L.bandZ0 = hf.h / 2 - 2;          L.bandZ1 = hf.h / 2 + 1;
+    L.rampW0 = hf.w / 8;              L.rampW1 = hf.w / 8 + L.deckY - 1;
+    L.rampE1 = hf.w - hf.w / 8 - 1;   L.rampE0 = L.rampE1 - (L.deckY - 1);
+    L.deckX0 = L.rampW1 + 1;          L.deckX1 = L.rampE0 - 1;
+
+    const size_t nCols = (size_t)hf.columnCount();
+    mergedPerColumn.assign(nCols, {});
+    for (int z = 0; z < hf.h; ++z)
+        for (int x = 0; x < hf.w; ++x) {
+            std::vector<Span>& spans = mergedPerColumn[(size_t)hf.columnId(x, z)];
+            const bool inBand = (z >= L.bandZ0 && z <= L.bandZ1);
+            if (inBand && x >= L.rampW0 && x <= L.rampW1) {
+                const uint32_t y = (uint32_t)(x - L.rampW0 + 1);            // west ramp: 1..deckY
+                spans.push_back(Span{0u, y, 1u});                           // solid embankment
+            } else if (inBand && x >= L.rampE0 && x <= L.rampE1) {
+                const uint32_t y = (uint32_t)(L.rampE1 - x + 1);            // east ramp: deckY..1
+                spans.push_back(Span{0u, y, 1u});
+            } else if (inBand && x >= L.deckX0 && x <= L.deckX1) {
+                spans.push_back(Span{0u, 0u, 1u});                          // tunnel floor (ground)
+                spans.push_back(Span{(uint32_t)L.deckY, (uint32_t)L.deckY, 1u});   // the deck slab
+            } else {
+                spans.push_back(Span{0u, 0u, 1u});                          // open ground
+            }
+        }
+    return L;
+}
+
+// ----- Fnv1a64ML: the FNV-1a 64 digest helper (the cross-compiler/cross-backend pin) ---------------
+// NOT on the nav build path (proof/stat-line plumbing only — the showcase/test digest convention).
+// Chainable: pass the previous digest as the seed to fold multiple buffers.
+inline uint64_t Fnv1a64ML(const void* data, size_t bytes, uint64_t h = 1469598103934665603ull) {
+    const unsigned char* p = (const unsigned char*)data;
+    for (size_t i = 0; i < bytes; ++i) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 }  // namespace hf::nav

@@ -744,6 +744,300 @@ int main() {
         check(emptyPts.empty(), "NAV6 PathToWorldPolyline: empty corridor -> 0 points (no-op)");
     }
 
+    // ================= NAV7: FilterWalkableSpansML — a bridge column -> TWO surfaces =================
+    {
+        // 3x3 grid; column (1,1) is a bridge column (ground {0,0} + deck {6,6}); the rest ground-only.
+        nav::Heightfield hf = MakeHf(3, 3);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged((size_t)hf.columnCount());
+        for (auto& m : merged) m.push_back(nav::Span{0u, 0u, 1u});
+        merged[(size_t)hf.columnId(1, 1)] = {nav::Span{0u, 0u, 1u}, nav::Span{6u, 6u, 1u}};
+        std::vector<nav::MLSurface> surf;
+        std::vector<uint32_t> off, cnt;
+        nav::FilterWalkableSpansML(hf, cfg, merged, surf, off, cnt);
+        // 9 ground surfaces + 1 extra deck surface = 10 total; column (1,1) has 2 layers.
+        check(surf.size() == 10u, "NAV7 ML: 3x3 bridge field -> 10 surfaces (9 ground + 1 deck)");
+        const size_t bcol = (size_t)hf.columnId(1, 1);
+        check(cnt[bcol] == 2u, "NAV7 ML: bridge column has 2 surfaces (tunnel floor + deck)");
+        const uint32_t b0 = off[bcol];
+        check(surf[b0].y == 0 && surf[b0].layer == 0u, "NAV7 ML: layer 0 = tunnel floor y=0");
+        check(surf[b0 + 1u].y == 6 && surf[b0 + 1u].layer == 1u, "NAV7 ML: layer 1 = deck y=6");
+        // The LOCKED order: ascending column, then ascending y (layer index == position in column).
+        bool ordered = true;
+        for (size_t i = 1; i < surf.size(); ++i) {
+            if (surf[i].col < surf[i - 1].col) ordered = false;
+            if (surf[i].col == surf[i - 1].col && surf[i].y <= surf[i - 1].y) ordered = false;
+        }
+        check(ordered, "NAV7 ML: surfaces in the LOCKED order (ascending col, then ascending y)");
+
+        // A cramped ground under a low lid -> ONLY the lid top is a surface (layer 0 = the lid).
+        merged[(size_t)hf.columnId(0, 0)] = {nav::Span{0u, 0u, 1u}, nav::Span{2u, 3u, 1u}};
+        // A fully-sealed column (lid at fieldTop) -> ZERO surfaces.
+        merged[(size_t)hf.columnId(2, 2)] = {nav::Span{0u, 0u, 1u}, nav::Span{2u, 63u, 1u}};
+        nav::FilterWalkableSpansML(hf, cfg, merged, surf, off, cnt);
+        const size_t ccol = (size_t)hf.columnId(0, 0);
+        check(cnt[ccol] == 1u && surf[off[ccol]].y == 3 && surf[off[ccol]].layer == 0u,
+              "NAV7 ML: cramped ground under a lid -> only the lid top is a surface (layer 0)");
+        check(cnt[(size_t)hf.columnId(2, 2)] == 0u, "NAV7 ML: fully-sealed column -> 0 surfaces");
+    }
+
+    // ================= NAV7: IDENTITY on a truly single-layer field (the append-only proof) ==========
+    {
+        // 16x16, every column EXACTLY ONE span (ground + a solid embankment plateau) except two
+        // fully-sealed columns (0 walkable surfaces) — a genuinely single-layer field. NOTE: the NAV1-6
+        // SHOWCASE field is NOT strictly single-layer (the box-step columns carry a walkable ground span
+        // under the box top — the very caveat NAV7 closes), so the strict bit-identity runs here.
+        nav::Heightfield hf = MakeHf(16, 16);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged((size_t)hf.columnCount());
+        for (int z = 0; z < hf.h; ++z)
+            for (int x = 0; x < hf.w; ++x) {
+                uint32_t y = 0u;
+                if (x >= 4 && x <= 11 && z >= 6 && z <= 9) {
+                    const int32_t step = x - 3;                 // embankment: heights 1..6 (capped)
+                    y = (uint32_t)(step > 6 ? 6 : step);
+                }
+                merged[(size_t)hf.columnId(x, z)] = {nav::Span{0u, y, 1u}};
+            }
+        merged[(size_t)hf.columnId(2, 2)]   = {nav::Span{0u, 0u, 1u}, nav::Span{2u, 63u, 1u}};
+        merged[(size_t)hf.columnId(13, 13)] = {nav::Span{0u, 0u, 1u}, nav::Span{2u, 63u, 1u}};
+
+        // Single-layer NAV2 pipeline (FilterWalkableSpans mutates a copy).
+        std::vector<std::vector<nav::Span>> slMerged = merged;
+        std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, slMerged, walkable, surfaceY);
+        std::vector<uint32_t> dist;
+        nav::BuildDistanceField(hf, cfg, walkable, surfaceY, dist);
+
+        // ML pipeline (const merged — no mutation).
+        std::vector<nav::MLSurface> surf;
+        std::vector<uint32_t> off, cnt;
+        nav::FilterWalkableSpansML(hf, cfg, merged, surf, off, cnt);
+        std::vector<uint32_t> distML;
+        nav::BuildDistanceFieldML(hf, cfg, surf, off, cnt, distML);
+
+        // IDENTITY (extraction): colCountML == walkable, surface y == surfaceY, per column.
+        bool walkableIdent = true, surfIdent = true;
+        for (size_t c = 0; c < walkable.size(); ++c) {
+            if (cnt[c] != walkable[c]) walkableIdent = false;             // 0/1 on a single-layer field
+            if (walkable[c] != 0u && surf[off[c]].y != surfaceY[c]) surfIdent = false;
+        }
+        check(walkableIdent, "NAV7 identity: colCountML == walkable[] (single-layer field, bit-check)");
+        check(surfIdent, "NAV7 identity: ML surface y == surfaceY[] (single-layer field, bit-check)");
+        // IDENTITY (distance field): the per-surface ML chamfer == the per-column NAV2 chamfer.
+        bool distIdent = true;
+        for (size_t c = 0; c < walkable.size(); ++c) {
+            if (walkable[c] != 0u) { if (distML[off[c]] != dist[c]) distIdent = false; }
+            else                   { if (dist[c] != 0u) distIdent = false; }   // no surface -> NAV2 dist 0
+        }
+        check(distIdent, "NAV7 identity: BuildDistanceFieldML == BuildDistanceField (bit-check)");
+    }
+
+    // ================= NAV7: topmost-layer correspondence on the FULL NAV1-6 showcase field ==========
+    {
+        // The showcase field (ground + box-step + ramp): the ML top layer must equal the single-layer
+        // result on EVERY column, and the box columns are genuinely multi-layer (the collapsed caveat).
+        nav::Heightfield hf = MakeHf(32, 32);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<nav::NavTri> tris = nav::MakeShowcaseTriangles(hf);
+        std::vector<uint32_t> rc, ro;
+        std::vector<nav::Span> rs;
+        nav::RasterizeTriangleSpans(hf, std::span<const nav::NavTri>(tris), rc, ro, rs);
+        std::vector<std::vector<nav::Span>> merged((size_t)hf.columnCount());
+        for (int c = 0; c < hf.columnCount(); ++c) {
+            std::vector<nav::Span> raw(rs.begin() + ro[(size_t)c], rs.begin() + ro[(size_t)c] + rc[(size_t)c]);
+            merged[(size_t)c] = nav::MergeColumnSpans(std::move(raw));
+        }
+        std::vector<std::vector<nav::Span>> slMerged = merged;
+        std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, slMerged, walkable, surfaceY);
+        std::vector<nav::MLSurface> surf;
+        std::vector<uint32_t> off, cnt;
+        nav::FilterWalkableSpansML(hf, cfg, merged, surf, off, cnt);
+        bool topIdent = true;
+        uint32_t mlCols = 0u;
+        for (size_t c = 0; c < walkable.size(); ++c) {
+            const bool hasMl = cnt[c] > 0u;
+            if (hasMl != (walkable[c] != 0u)) topIdent = false;
+            if (hasMl && surf[(size_t)(off[c] + cnt[c] - 1u)].y != surfaceY[c]) topIdent = false;
+            if (cnt[c] > 1u) ++mlCols;
+        }
+        check(topIdent, "NAV7 showcase: ML TOP layer == single-layer walkable/surfaceY on every column");
+        // The box-step columns (the quad [8,16]x[8,16] minus the one column the ramp span swallows)
+        // carry a walkable tunnel-floor layer UNDER the box top the single-layer filter collapses away.
+        check(mlCols == 80u, "NAV7 showcase: 80 multi-layer columns (the box-step underside)");
+    }
+
+    // ================= NAV7: FindPathML == FindPath (the A* identity on <=3-degree graphs) ===========
+    {
+        // The NAV5 unit graphs rebuilt in BOTH forms (poly nbr[3] and CSR); corridors + costs bit-equal.
+        auto csrOf = [](const std::vector<nav::Poly>& polys, std::vector<uint32_t>& o,
+                        std::vector<uint32_t>& n, std::vector<uint32_t>& l) {
+            o.assign(polys.size(), 0u); n.assign(polys.size(), 0u); l.clear();
+            for (size_t p = 0; p < polys.size(); ++p) {
+                o[p] = (uint32_t)l.size();
+                for (int e = 0; e < 3; ++e)
+                    if (polys[p].nbr[e] != nav::kNoNeighbour) l.push_back(polys[p].nbr[e]);
+                n[p] = (uint32_t)l.size() - o[p];
+            }
+        };
+        auto initPolys = [](std::vector<nav::Poly>& polys) {
+            for (auto& p : polys) { p.nbr[0] = nav::kNoNeighbour; p.nbr[1] = nav::kNoNeighbour; p.nbr[2] = nav::kNoNeighbour; }
+        };
+        auto link = [](std::vector<nav::Poly>& polys, uint32_t a, int ea, uint32_t b, int eb) {
+            polys[a].nbr[ea] = b; polys[b].nbr[eb] = a;
+        };
+        // (1) the line A-B-C-D; (2) the diamond with a cheaper branch; (3) the equal-cost tie.
+        for (int scenario = 0; scenario < 3; ++scenario) {
+            std::vector<nav::Poly> polys(4);
+            initPolys(polys);
+            std::vector<int32_t> cx, cz;
+            if (scenario == 0) {
+                link(polys, 0, 0, 1, 0); link(polys, 1, 1, 2, 0); link(polys, 2, 1, 3, 0);
+                cx = {0, 10, 20, 30}; cz = {0, 0, 0, 0};
+            } else {
+                link(polys, 0, 0, 1, 0); link(polys, 0, 1, 2, 0); link(polys, 1, 1, 3, 0); link(polys, 2, 1, 3, 1);
+                cx = {0, 5, 5, 10}; cz = (scenario == 1) ? std::vector<int32_t>{0, 0, 20, 0}
+                                                         : std::vector<int32_t>{0, 0, 0, 0};
+            }
+            std::vector<uint32_t> corridor;
+            const int32_t cost = nav::FindPath(polys, cx, cz, 0u, 3u, corridor);
+            std::vector<uint32_t> o, n, l, corridorML;
+            csrOf(polys, o, n, l);
+            const int32_t costML = nav::FindPathML(o, n, l, cx, cz, 0u, 3u, corridorML);
+            const bool same = (cost == costML) && (corridor == corridorML);
+            check(same, "NAV7 A* identity: FindPathML == FindPath (corridor + cost bit-equal)");
+        }
+        // start==goal and unreachable parity.
+        std::vector<nav::Poly> polys(4);
+        initPolys(polys);
+        link(polys, 0, 0, 1, 0); link(polys, 2, 0, 3, 0);   // two components
+        std::vector<int32_t> cx = {0, 10, 100, 110}, cz = {0, 0, 0, 0};
+        std::vector<uint32_t> o, n, l, corML;
+        csrOf(polys, o, n, l);
+        check(nav::FindPathML(o, n, l, cx, cz, 1u, 1u, corML) == 0 && corML.size() == 1u && corML[0] == 1u,
+              "NAV7 A* identity: start==goal -> single-node corridor, cost 0");
+        check(nav::FindPathML(o, n, l, cx, cz, 0u, 2u, corML) == 0 && corML.empty(),
+              "NAV7 A* identity: unreachable -> empty corridor, cost 0");
+    }
+
+    // ================= NAV7: the BRIDGE-OVER-TUNNEL proof (the overhang headline) ====================
+    {
+        nav::Heightfield hf = MakeHf(32, 32);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged;
+        const nav::BridgeSceneLayout L = nav::MakeBridgeTunnelSpans(hf, merged);
+        check(L.deckY == 6 && L.bandZ0 == 14 && L.bandZ1 == 17 && L.rampW0 == 4 && L.rampW1 == 9 &&
+              L.deckX0 == 10 && L.deckX1 == 21 && L.rampE0 == 22 && L.rampE1 == 27,
+              "NAV7 bridge: the pinned 32x32 scene layout");
+
+        // (a) EXTRACTION: pin the multi-layer column count + total surfaces vs the single-layer count.
+        std::vector<nav::MLSurface> surf;
+        std::vector<uint32_t> off, cnt;
+        nav::FilterWalkableSpansML(hf, cfg, merged, surf, off, cnt);
+        uint32_t mlCols = 0u;
+        for (uint32_t c2 : cnt) if (c2 > 1u) ++mlCols;
+        check(mlCols == 48u, "NAV7 bridge: 48 two-surface columns (12 deck cols x 4 band rows)");
+        check(surf.size() == 1072u, "NAV7 bridge: 1072 surfaces (1024 columns + 48 deck layers)");
+        std::vector<std::vector<nav::Span>> slMerged = merged;
+        std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, slMerged, walkable, surfaceY);
+        uint32_t slCount = 0u;
+        for (uint32_t w2 : walkable) slCount += w2;
+        check(slCount == 1024u, "NAV7 bridge: single-layer finds only 1024 surfaces (one per column)");
+        // The single-layer caveat demo: a deck column collapses to the DECK, losing the tunnel floor.
+        const size_t deckCol = (size_t)hf.columnId(16, 16);
+        check(walkable[deckCol] == 1u && surfaceY[deckCol] == 6,
+              "NAV7 bridge: single-layer keeps ONLY the deck (surfaceY=6) — the caveat NAV7 closes");
+        check(cnt[deckCol] == 2u && surf[off[deckCol]].y == 0 && surf[off[deckCol] + 1u].y == 6,
+              "NAV7 bridge: ML keeps BOTH (tunnel floor y=0 layer 0 + deck y=6 layer 1)");
+
+        // The surface graph + distance field (smoke: geodesic interior distances exist).
+        std::vector<uint32_t> nOff, nCnt, nList;
+        nav::BuildSurfaceAdjacencyML(hf, cfg, surf, off, cnt, nOff, nCnt, nList);
+        std::vector<int32_t> cx, cz;
+        nav::SurfaceAnchorsML(hf, surf, cx, cz);
+        std::vector<uint32_t> distML;
+        nav::BuildDistanceFieldML(hf, cfg, surf, off, cnt, distML);
+        uint32_t maxDistML = 0u;
+        for (uint32_t d : distML) if (d > maxDistML) maxDistML = d;
+        check(maxDistML > 0u, "NAV7 bridge: ML distance field has interior depth (smoke)");
+        // No same-column edges (no teleport through floors): every neighbour is a DIFFERENT column.
+        bool noTeleport = true;
+        for (size_t s = 0; s < surf.size(); ++s)
+            for (uint32_t e = 0; e < nCnt[s]; ++e)
+                if (surf[(size_t)nList[(size_t)(nOff[s] + e)]].col == surf[s].col) noTeleport = false;
+        check(noTeleport, "NAV7 bridge: NO same-column edges (no teleport through floors)");
+
+        // (b) the path UNDER the bridge (through the tunnel): layer-0 surfaces ONLY.
+        const uint32_t sU = off[(size_t)hf.columnId(16, 1)];    // ground (16,1), layer 0
+        const uint32_t gU = off[(size_t)hf.columnId(16, 30)];   // ground (16,30), layer 0
+        std::vector<uint32_t> corridorU;
+        const int32_t costU = nav::FindPathML(nOff, nCnt, nList, cx, cz, sU, gU, corridorU);
+        check(corridorU.size() == 30u, "NAV7 bridge: UNDER path corridor length 30 (straight tunnel run)");
+        check(costU == 29, "NAV7 bridge: UNDER path cost 29");
+        bool underLayer0 = !corridorU.empty();
+        bool underCrossesBand = false;
+        for (uint32_t id : corridorU) {
+            if (surf[(size_t)id].layer != 0u) underLayer0 = false;
+            const int z = (int)(surf[(size_t)id].col / 32u);
+            if (z >= L.bandZ0 && z <= L.bandZ1) underCrossesBand = true;
+        }
+        check(underLayer0, "NAV7 bridge: UNDER path uses NO bridge surface (layer 0 only)");
+        check(underCrossesBand, "NAV7 bridge: UNDER path genuinely passes THROUGH the tunnel band");
+
+        // (c) the path OVER the bridge (ground -> west ramp -> deck -> east ramp -> ground).
+        const uint32_t sO = off[(size_t)hf.columnId(2, 16)];
+        const uint32_t gO = off[(size_t)hf.columnId(29, 16)];
+        std::vector<uint32_t> corridorO;
+        const int32_t costO = nav::FindPathML(nOff, nCnt, nList, cx, cz, sO, gO, corridorO);
+        check(corridorO.size() == 28u, "NAV7 bridge: OVER path corridor length 28 (straight bridge run)");
+        check(costO == 27, "NAV7 bridge: OVER path cost 27");
+        uint32_t deckUsed = 0u;
+        for (uint32_t id : corridorO) if (surf[(size_t)id].layer == 1u) ++deckUsed;
+        check(deckUsed == 12u, "NAV7 bridge: OVER path uses the DECK (all 12 deck columns, layer 1)");
+
+        // (d) THE CROSSING PROOF: the two paths share (x,z) columns but NEVER a surface.
+        uint32_t sharedCols = 0u;
+        bool sharedSurface = false;
+        for (uint32_t a : corridorU)
+            for (uint32_t b : corridorO) {
+                if (a == b) sharedSurface = true;
+                if (surf[(size_t)a].col == surf[(size_t)b].col) ++sharedCols;
+            }
+        check(sharedCols == 1u, "NAV7 bridge: the paths CROSS in exactly one (x,z) column (16,16)");
+        check(!sharedSurface, "NAV7 bridge: the paths NEVER share a surface (the overhang proof)");
+
+        // Determinism: the full ML pipeline twice -> byte-identical everything.
+        std::vector<nav::MLSurface> surf2;
+        std::vector<uint32_t> off2, cnt2, nOff2, nCnt2, nList2, distML2, corU2, corO2;
+        nav::FilterWalkableSpansML(hf, cfg, merged, surf2, off2, cnt2);
+        nav::BuildSurfaceAdjacencyML(hf, cfg, surf2, off2, cnt2, nOff2, nCnt2, nList2);
+        nav::BuildDistanceFieldML(hf, cfg, surf2, off2, cnt2, distML2);
+        std::vector<int32_t> cx2, cz2;
+        nav::SurfaceAnchorsML(hf, surf2, cx2, cz2);
+        const int32_t costU2 = nav::FindPathML(nOff2, nCnt2, nList2, cx2, cz2, sU, gU, corU2);
+        const int32_t costO2 = nav::FindPathML(nOff2, nCnt2, nList2, cx2, cz2, sO, gO, corO2);
+        const bool det = surf2.size() == surf.size() &&
+            std::memcmp(surf2.data(), surf.data(), surf.size() * sizeof(nav::MLSurface)) == 0 &&
+            nList2 == nList && distML2 == distML &&
+            corU2 == corridorU && corO2 == corridorO && costU2 == costU && costO2 == costO;
+        check(det, "NAV7 determinism: two full ML pipeline runs BYTE-IDENTICAL");
+
+        // The cross-compiler/cross-backend digest pin (surfaces + dist + both corridors + costs).
+        uint64_t digest = nav::Fnv1a64ML(surf.data(), surf.size() * sizeof(nav::MLSurface));
+        digest = nav::Fnv1a64ML(distML.data(), distML.size() * sizeof(uint32_t), digest);
+        digest = nav::Fnv1a64ML(corridorU.data(), corridorU.size() * sizeof(uint32_t), digest);
+        digest = nav::Fnv1a64ML(corridorO.data(), corridorO.size() * sizeof(uint32_t), digest);
+        digest = nav::Fnv1a64ML(&costU, sizeof(costU), digest);
+        digest = nav::Fnv1a64ML(&costO, sizeof(costO), digest);
+        std::printf("NAV7 digest: 0x%016llx (surfaces:%u mlCols:%u under:%u over:%u)\n",
+                    (unsigned long long)digest, (unsigned)surf.size(), mlCols,
+                    (unsigned)corridorU.size(), (unsigned)corridorO.size());
+        check(digest == 0x14cf524e6e089c37ULL,
+              "NAV7 digest: pinned cross-compiler constant (MSVC == clang == every platform)");
+    }
+
     if (g_fail == 0) { std::printf("nav_test OK\n"); return 0; }
     std::printf("nav_test: %d failures\n", g_fail);
     return 1;
