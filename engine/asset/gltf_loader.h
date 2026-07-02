@@ -36,6 +36,30 @@ CpuPrimitive BuildPrimitiveCPU(const cgltf_primitive& prim, const char* path, bo
                                float* outBbMin = nullptr, float* outBbMax = nullptr);
 
 // ---------------------------------------------------------------------------------------------------
+// DEVICE-FREE full scene-graph import (Slice SC3 — Sponza through the virtual-geometry stack).
+//
+// The CPU-only twin of LoadGltfScene: the SAME default-scene DFS node walk (WalkHierarchy), the SAME
+// unique-(mesh,primitive) geometry dedup in the SAME first-reference order, the SAME composed world
+// transforms and world AABB — but geometry stays in CPU CpuPrimitive arrays (BuildPrimitiveCPU,
+// recentre=false) and NO RHI device / texture / material is touched. This is the seam the SC3
+// meshlet -> cluster-cull -> auto-LOD at-scale pipeline (engine/render/sc3_stack.h) consumes: pure
+// CPU, unit-testable without a GPU, and the showcase uploads exactly these arrays itself.
+// Instances appear in DFS order (one per primitive of every mesh-referencing node), each holding the
+// index of its deduped CpuPrimitive in `meshes` plus the node's composed world transform.
+// Throws std::runtime_error on parse/load/validation failure or missing POSITION (like LoadGltfScene).
+struct CpuScene {
+    std::vector<CpuPrimitive> meshes;   // unique (mesh,primitive) geometry, first-reference order
+    struct Instance {
+        uint32_t   meshIndex = 0;       // into CpuScene::meshes
+        math::Mat4 world = math::Mat4::Identity();
+    };
+    std::vector<Instance> instances;    // DFS order (matches LoadGltfScene's instance order)
+    float bbMin[3] = {0, 0, 0};         // world-space scene AABB (over all instances)
+    float bbMax[3] = {0, 0, 0};
+};
+CpuScene LoadGltfSceneCpu(const char* path);
+
+// ---------------------------------------------------------------------------------------------------
 // PURE external-image-URI resolution (Slice SC1 — real-Sponza hero bake). Multi-file .gltf assets
 // (e.g. the Khronos PBR Sponza) reference their images as file URIs relative to the .gltf's own
 // directory instead of embedding them in a .glb buffer_view. These two helpers are the device-free,

@@ -914,6 +914,22 @@ hf_add_pure_test(cluster_lod_test)
 # welded-cube feature fixtures. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(lod_gen_test)
 
+# SPONZA THROUGH THE VIRTUAL-GEOMETRY STACK (Slice SC3, GAP_CLOSING Tier 2): the pure-CPU composition
+# header render/sc3_stack.h (meshlet decomposition -> per-cluster frustum cull -> auto-QEM LOD) over
+# REAL glTF content via the device-free asset::LoadGltfSceneCpu seam. TWO TIERS: (1) ALWAYS-ON on the
+# committed DamagedHelmet.glb + CesiumMilkTruck.glb — per-mesh partition completeness, decomposition
+# digest determinism, enclosing-camera cull with ZERO soundness violations, look-away camera culls
+# everything, LOD monotonicity/validity/determinism + honest 50%/25% hit-miss; (2) SPONZA-GATED at
+# hero scale (103 meshes / 262k tris, the SC1 hero camera cull) — SKIPS GRACEFULLY with a clear
+# message when the fetched (gitignored) asset is absent, since no committed asset reaches hero scale;
+# the full Sponza proof also runs in the --sc3-stack-shot showcase goldens. Pure C++ (hf_core: the
+# cgltf implementation lives in gltf_loader.cpp), no RHI/device, ASan-eligible.
+hf_add_pure_test(sc3_stack_test)
+target_compile_definitions(sc3_stack_test PRIVATE
+  "HF_SC3_HELMET_GLB=\"${CMAKE_SOURCE_DIR}/assets/models/DamagedHelmet.glb\""
+  "HF_SC3_TRUCK_GLB=\"${CMAKE_SOURCE_DIR}/assets/models/CesiumMilkTruck.glb\""
+  "HF_SC3_SPONZA_GLTF=\"${CMAKE_SOURCE_DIR}/assets/reference/_downloaded/Sponza/Sponza.gltf\"")
+
 # Virtual-geometry VISIBILITY BUFFER (Slice DW): the CPU side of the (clusterID, triangleID) ID packing
 # (render/visbuffer.h). Pins PackVisId/UnpackVisId round-trip over the full valid range, kTriIdBits>=7,
 # packing injective (collision-free) over [0,survivorCount)x[0,128), kVisBackground never equals a valid

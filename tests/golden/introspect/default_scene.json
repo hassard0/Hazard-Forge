@@ -283,6 +283,7 @@
     { "flag": "--ibl-shot", "desc": "HDR image-based lighting (equirect skybox reflections)." },
     { "flag": "--scene-shot", "desc": "glTF scene-graph import (CesiumMilkTruck node hierarchy)." },
     { "flag": "--sc1-hero-shot", "desc": "THE REAL-SPONZA HERO BAKE (Slice SC1): the FETCHED Khronos PBR Sponza — a real multi-file .gltf hero scene (103 meshes / 25 materials / 69 external-URI textures / 262k triangles) through the full stack (external image URIs resolved + decoded, the shared descriptor pool GROWING past one pool's capacity) rendered from a fixed interior atrium camera: directional sun + shadow map + full PBR with the real textures. Requires assets/reference/fetch_reference_assets -Sponza first (the asset is fetched, never committed); fails loudly with that hint when absent. Alias --sc1-hero." },
+    { "flag": "--sc3-stack-shot", "desc": "SPONZA THROUGH THE VIRTUAL-GEOMETRY STACK (Slice SC3): the FETCHED Khronos PBR Sponza's REAL heterogeneous geometry (103 meshes / 262k triangles: thin curtains, foliage cards, high-valence trim) pushed through the whole virtual-geometry pipeline at real-content scale — meshlet decomposition over EVERY mesh (partition completeness: every triangle exactly once; honest degenerate/boundary/non-manifold outlier stats; a deterministic integer digest over the full decomposition), per-cluster frustum cull from the SC1 hero camera (with a soundness proof: no witness-visible cluster dropped), and automatic QEM LOD on the 10 largest meshes (50%/25% targets with honest hit/miss — boundary-dominated open meshes may legally stall above target). Renders the SURVIVING clusters only, each tinted by its deterministic per-record hash color (the established meshlet-viz look). Requires assets/reference/fetch_reference_assets -Sponza first (the asset is fetched, never committed); fails loudly with that hint when absent." },
     { "flag": "--bloom-shot", "desc": "HDR bloom post-process." },
     { "flag": "--ssao-shot", "desc": "Screen-space ambient occlusion." },
     { "flag": "--skinning-shot", "desc": "Skeletal animation (GPU skinning)." },
@@ -788,6 +789,6 @@
       { "op": "introspect", "capability": "observe", "args": [{ "name": "path", "type": "string?" }] },
       { "op": "query", "capability": "observe", "args": [{ "name": "select", "type": "string" }, { "name": "entity", "type": "int?" }, { "name": "fields", "type": "[string]?" }] }
     ],
-    "contentHash": "0e6b1b41cda7c5f8"
+    "contentHash": "da01fdc75e823888"
   }
 }

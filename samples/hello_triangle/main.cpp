@@ -66,6 +66,7 @@
 #include "render/cluster_cull.h"  // Slice DT: per-cluster frustum cull CPU mirror (BuildClusterInstances/CullClusterInstances)
 #include "render/cluster_lod.h"  // Slice DV: discrete cluster-LOD selection CPU mirror (BuildLodMeshes/SelectLod, squared form)
 #include "render/lod_gen.h"      // Slice LOD1: deterministic automatic LOD generation (integer QEM decimation; shared with --lod-gen-shot)
+#include "render/sc3_stack.h"    // Slice SC3: Sponza through the virtual-geometry stack (meshlet -> cluster-cull -> auto-LOD at real-content scale; pure CPU composition; shared with --sc3-stack-shot)
 #include "render/visbuffer.h"   // Slice DW: visibility-buffer ID packing + CPU coverage reference (PackVisId/UnpackVisId/SurvivorInteriorSamples)
 #include "render/visresolve.h"  // Slice DX: deferred material resolve CPU mirror (ResolveFlatShade/ResolvePixel/EncodeBGRA8)
 #include "render/swraster.h"    // Slice SW1: CPU-reference integer software rasterizer (SwVisBuffer/RasterClusters/PackSw) — shared verbatim with --swraster (Metal)
@@ -446,6 +447,11 @@ int main(int argc, char** argv) {
     // URIs — the first real multi-million-unit multi-material scene through the full stack) and
     // renders a fixed INTERIOR atrium camera, sun + shadows + full PBR with the real textures.
     const char* sc1HeroShotPath = nullptr;
+    // Slice SC3 (GAP_CLOSING Tier 2 — SPONZA THROUGH THE VIRTUAL-GEOMETRY STACK): --sc3-stack-shot
+    // <out.bmp> pushes the REAL Sponza's heterogeneous geometry through meshlet decomposition ->
+    // per-cluster frustum cull (SC1 hero camera) -> auto-LOD (top-10 meshes) and renders the
+    // SURVIVING clusters with the per-cluster hash-color viz (the at-scale full-stack proof).
+    const char* sc3StackShotPath = nullptr;
     const char* iblShotPath = nullptr;
     // Substrate-lite layered materials (issue #11, SB1): the HDR-IBL helmet scene rendered through
     // lit_substrate.frag (lit_pbr_ibl + an additive clearcoat lobe). Own parse loop below (MSVC C1061).
@@ -3277,6 +3283,17 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--sc1-hero-shot") == 0 || std::strcmp(argv[i], "--sc1-hero") == 0) {
             sc1HeroShotPath = (i + 1 < argc) ? argv[i + 1] : "sc1_hero.bmp";
+            break;
+        }
+    }
+
+    // Slice SC3 (GAP_CLOSING Tier 2 — SPONZA THROUGH THE VIRTUAL-GEOMETRY STACK): --sc3-stack-shot
+    // <out.bmp>. Parsed in its OWN loop (the big else-if ladder above is at the MSVC C1061
+    // nested-block limit). The model path is baked (HF_SPONZA_MODEL_PATH — the gitignored fetched
+    // asset), so only the output path is an argument.
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--sc3-stack-shot") == 0) {
+            sc3StackShotPath = (i + 1 < argc) ? argv[i + 1] : "sc3_stack.bmp";
             break;
         }
     }
@@ -109075,6 +109092,294 @@ int main(int argc, char** argv) {
             }
             device->WaitIdle();
             return ok ? 0 : 1;
+        }
+
+        // --- SPONZA THROUGH THE VIRTUAL-GEOMETRY STACK (--sc3-stack-shot <out.bmp>, Slice SC3,
+        // GAP_CLOSING Tier 2): the virtual-geometry machinery (DS meshlet decomposition, DT
+        // per-cluster frustum cull, LOD1 auto-QEM) had only ever run on synthetic sphere fixtures
+        // (<= 12k tris); this pushes the REAL Sponza (103 meshes / 262k tris of heterogeneous
+        // authored geometry) through the whole pipeline via the pure-CPU composition header
+        // engine/render/sc3_stack.h (meshlet.h / cluster_cull.h / lod_gen.h byte-untouched):
+        //   1. Sc3DecomposeAll over EVERY mesh — partition completeness (every triangle exactly
+        //      once) at scale + honest outlier stats (degenerate tris, boundary/non-manifold edges —
+        //      real content has them) + a deterministic integer digest over the full decomposition.
+        //   2. Sc3BuildAndCull from the SC1 HERO CAMERA — the (instance x cluster) cull over the
+        //      real scene; Sc3CheckCullSoundness proves NO witness-visible cluster was dropped.
+        //   3. Sc3BuildTopLods on the 10 largest meshes — 50%/25% QEM targets with honest hit/miss
+        //      (boundary-dominated open meshes may legally stall above target — reported, not hidden).
+        //   4. Render the SURVIVING clusters only, each tinted by the deterministic per-record
+        //      hashColor (the established meshlet-viz look), from the hero camera. Geometry is
+        //      loaded DEVICE-FREE (asset::LoadGltfSceneCpu) and the reordered per-mesh index buffers
+        //      uploaded directly — no textures/materials touched (the viz needs none). ------------
+        if (sc3StackShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace vg = render::vg;
+            namespace fr = render::frustum;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // FAIL LOUDLY if the fetched asset is absent (it is gitignored, never committed).
+            {
+                std::FILE* probe = std::fopen(HF_SPONZA_MODEL_PATH, "rb");
+                if (!probe) {
+                    std::fprintf(stderr,
+                        "FATAL: Sponza not found at '%s'.\n"
+                        "       Run assets/reference/fetch_reference_assets.ps1 -Sponza (or "
+                        "fetch_reference_assets.sh --sponza) first — the asset is fetched, not committed.\n",
+                        HF_SPONZA_MODEL_PATH);
+                    device->WaitIdle();
+                    return 1;
+                }
+                std::fclose(probe);
+            }
+
+            // Device-free CPU import (geometry + instance transforms only; no texture decode, so
+            // this loads far faster than the SC1 hero path).
+            hf::asset::CpuScene sponza;
+            const auto loadT0 = std::chrono::steady_clock::now();
+            try {
+                sponza = hf::asset::LoadGltfSceneCpu(HF_SPONZA_MODEL_PATH);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "FATAL: --sc3-stack-shot could not load '%s': %s\n",
+                             HF_SPONZA_MODEL_PATH, e.what());
+                device->WaitIdle();
+                return 1;
+            }
+            const double loadSec = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - loadT0).count();
+            if (sponza.instances.empty()) {
+                std::fprintf(stderr, "FATAL: --sc3-stack-shot loaded ZERO instances from '%s'\n",
+                             HF_SPONZA_MODEL_PATH);
+                device->WaitIdle();
+                return 1;
+            }
+            std::printf("[sc3] sponza cpu load: %.2fs (%zu meshes, %zu instances)\n",
+                        loadSec, sponza.meshes.size(), sponza.instances.size());
+
+            // Adapt to the SC3 input views.
+            std::vector<vg::Sc3Mesh> meshes;
+            meshes.reserve(sponza.meshes.size());
+            for (const auto& m : sponza.meshes)
+                meshes.push_back({std::span<const scene::Vertex>(m.verts.data(), m.verts.size()),
+                                  std::span<const uint32_t>(m.indices.data(), m.indices.size())});
+            std::vector<vg::Sc3Instance> instances;
+            instances.reserve(sponza.instances.size());
+            for (const auto& inst : sponza.instances)
+                instances.push_back({inst.meshIndex, inst.world});
+
+            // --- 1. The at-scale decomposition (+ the determinism proof: a second full run). ---
+            vg::Sc3Decomposition dec = vg::Sc3DecomposeAll(meshes);
+            vg::Sc3Decomposition dec2 = vg::Sc3DecomposeAll(meshes);
+            const bool deterministic = (dec.digest == dec2.digest);
+
+            // --- 2. Cluster cull from the SC1 HERO CAMERA (the deterministic pinned view). ---
+            const Vec3 eye{8.2f, 1.7f, 0.0f};
+            const Vec3 center{-9.5f, 3.4f, 0.0f};
+            Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+            Mat4 proj = Mat4::Perspective(1.22173048f, aspect, 0.1f, 100.0f);  // 70 deg vertical
+            Mat4 vp = proj * view;
+            fr::Frustum heroFrustum = fr::FromViewProj(vp);
+            vg::Sc3CullResult cull = vg::Sc3BuildAndCull(dec, instances, heroFrustum);
+            vg::Sc3Soundness sound = vg::Sc3CheckCullSoundness(meshes, dec, instances, cull,
+                                                               heroFrustum);
+
+            // --- 3. Auto-LOD on the 10 largest meshes (honest hit/miss + quality numbers). ---
+            const uint32_t kTopN = 10;
+            std::vector<vg::Sc3LodEntry> lods = vg::Sc3BuildTopLods(meshes, kTopN);
+            unsigned long long lodSum0 = 0, lodSum1 = 0, lodSum2 = 0;
+            uint32_t lodInvalid = 0, hit50 = 0, hit25 = 0;
+            for (const auto& e : lods) {
+                lodSum0 += e.triCount[0]; lodSum1 += e.triCount[1]; lodSum2 += e.triCount[2];
+                lodInvalid += e.invalidTris;
+                if (e.hit50) ++hit50;
+                if (e.hit25) ++hit25;
+            }
+
+            // --- The stat block (the at-scale proof lines; every number deterministic). ---
+            std::printf("[sc3] stack stats: meshes=%u clusters=%u maxTrisPerCluster=%u culled=%u "
+                        "survivors=%u lodTop%u=%llu->%llu->%llu digest=0x%016llx\n",
+                        (uint32_t)meshes.size(), dec.totalClusters, dec.maxTrisPerCluster,
+                        cull.culledCount, cull.survivorCount, (uint32_t)lods.size(),
+                        lodSum0, lodSum1, lodSum2, (unsigned long long)dec.digest);
+            if (dec.incompleteMeshes == 0 && dec.invalidMeshes == 0)
+                std::printf("[sc3] decomposition: COMPLETE (%u/%u meshes, every tri exactly once) "
+                            "totalTris=%llu totalClusterInstances=%u\n",
+                            (uint32_t)meshes.size(), (uint32_t)meshes.size(),
+                            (unsigned long long)dec.totalTris, cull.total);
+            else
+                std::printf("[sc3] decomposition: BROKEN (incomplete=%u invalid=%u of %u meshes)\n",
+                            dec.incompleteMeshes, dec.invalidMeshes, (uint32_t)meshes.size());
+            std::printf("[sc3] outliers: degenerateTris=%llu boundaryEdges=%llu "
+                        "nonManifoldEdges=%llu\n",
+                        (unsigned long long)dec.degenerateTris,
+                        (unsigned long long)dec.boundaryEdges,
+                        (unsigned long long)dec.nonManifoldEdges);
+            std::printf("[sc3] cull soundness: witnesses=%llu violations=%llu\n",
+                        (unsigned long long)sound.witnessClusters,
+                        (unsigned long long)sound.violations);
+            for (size_t li = 0; li < lods.size(); ++li) {
+                const auto& e = lods[li];
+                std::printf("[sc3] lod[%zu] mesh=%u raw=%u welded=%u lod1=%u (hit50=%d "
+                            "err=%.6f) lod2=%u (hit25=%d err=%.6f) invalid=%u\n",
+                            li, e.meshIndex, e.rawTris, e.triCount[0],
+                            e.triCount[1], (int)e.hit50, e.geometricError[1],
+                            e.triCount[2], (int)e.hit25, e.geometricError[2], e.invalidTris);
+            }
+            std::printf("[sc3] lod targets: hit50=%u/%u hit25=%u/%u (boundary-preserving QEM v1 — "
+                        "misses on boundary-dominated open meshes are the honest finding)\n",
+                        hit50, (uint32_t)lods.size(), hit25, (uint32_t)lods.size());
+            if (deterministic)
+                std::printf("[sc3] determinism: two decompositions IDENTICAL digests\n");
+            else
+                std::printf("[sc3] determinism: FAILED (0x%016llx != 0x%016llx)\n",
+                            (unsigned long long)dec.digest, (unsigned long long)dec2.digest);
+
+            // --- 4. Render the SURVIVING clusters (per-record hash color, the meshlet-viz look). ---
+            // Per-mesh vertex buffer + REORDERED index buffer (the DS decomposition output).
+            std::vector<std::unique_ptr<rhi::IBuffer>> vbufs(meshes.size()), ibufs(meshes.size());
+            for (size_t mi = 0; mi < meshes.size(); ++mi) {
+                if (dec.sets[mi].meshlets.empty()) continue;
+                rhi::BufferDesc vbd;
+                vbd.size = meshes[mi].verts.size() * sizeof(scene::Vertex);
+                vbd.initialData = meshes[mi].verts.data();
+                vbd.usage = rhi::BufferUsage::Vertex;
+                vbufs[mi] = device->CreateBuffer(vbd);
+                rhi::BufferDesc ibd;
+                ibd.size = dec.sets[mi].indices.size() * sizeof(uint32_t);
+                ibd.initialData = dec.sets[mi].indices.data();
+                ibd.usage = rhi::BufferUsage::Index;
+                ibufs[mi] = device->CreateBuffer(ibd);
+            }
+
+            // Meshlet-viz pipeline (per-cluster flat color; consumes pos(0)+normal(3)) + sky + post —
+            // EXACTLY the --meshlet-viz trio.
+            auto mvVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/meshlet_viz.vert.hlsl.spv");
+            auto mvFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/meshlet_viz.frag.hlsl.spv");
+            auto mvVs = device->CreateShaderModule({std::span<const uint32_t>(mvVsW)});
+            auto mvFs = device->CreateShaderModule({std::span<const uint32_t>(mvFsW)});
+            rhi::GraphicsPipelineDesc mvDesc;
+            mvDesc.vertex = mvVs.get(); mvDesc.fragment = mvFs.get();
+            rhi::VertexLayout mvLayout;
+            mvLayout.stride = sizeof(scene::Vertex);  // 56
+            mvLayout.attributes = {
+                {0, rhi::Format::RGB32_Float, 0},
+                {3, rhi::Format::RGB32_Float, 32},
+            };
+            mvDesc.vertexLayout = mvLayout;
+            mvDesc.colorFormat = device->Swapchain().ColorFormat();
+            mvDesc.depthTest = true; mvDesc.usesFrameUniforms = true;
+            mvDesc.pushConstantSize = sizeof(float) * 20;   // float4x4 model + float4 color
+            auto mvPipeline = device->CreateGraphicsPipeline(mvDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+
+            FrameData fd{};
+            {
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f;
+                fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z;
+                fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.22173048f);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("scene", {}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*mvPipeline);
+                    // The SURVIVING cluster-instances only, in source order — the cull APPLIED to the
+                    // real scene. firstInstance carries the global record index (color key + fetch).
+                    uint32_t boundMesh = 0xFFFFFFFFu;
+                    for (const render::mdi::MdiCommand& c : cull.survivors) {
+                        const uint32_t rec = c.firstInstance;
+                        const uint32_t meshIdx = cull.recordMesh[rec];
+                        if (!vbufs[meshIdx] || !ibufs[meshIdx]) continue;
+                        if (meshIdx != boundMesh) {
+                            cmd.BindVertexBuffer(*vbufs[meshIdx]);
+                            cmd.BindIndexBuffer(*ibufs[meshIdx]);
+                            boundMesh = meshIdx;
+                        }
+                        const Mat4& model = instances[cull.records[rec].instanceIndex].world;
+                        Vec3 col = vg::hashColor(rec);
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                        pc[16] = col.x; pc[17] = col.y; pc[18] = col.z; pc[19] = 1.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.DrawIndexed(c.indexCount, c.firstIndex, (int32_t)c.vertexOffset);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(sc3StackShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — %u/%u surviving cluster-instances drawn\n",
+                                    sc3StackShotPath, cw, ch2, cull.survivorCount, cull.total);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", sc3StackShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            const bool proofsOk = (dec.incompleteMeshes == 0) && (dec.invalidMeshes == 0) &&
+                                  (sound.violations == 0) && deterministic && (lodInvalid == 0) &&
+                                  (cull.survivorCount > 0) && (cull.survivorCount < cull.total);
+            if (!proofsOk)
+                std::fprintf(stderr, "FATAL: sc3 at-scale proofs failed (completeness/soundness/"
+                             "determinism/lod-validity/cull-subset)\n");
+            return (ok && proofsOk) ? 0 : 1;
         }
 
         // --- THE REAL-SPONZA HERO BAKE (--sc1-hero-shot <out.bmp>, Slice SC1, GAP_CLOSING Tier 2):

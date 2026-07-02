@@ -1212,4 +1212,77 @@ GltfScene LoadGltfScene(rhi::IRHIDevice& device, const char* path, const GltfLoa
     return out;
 }
 
+CpuScene LoadGltfSceneCpu(const char* path) {
+    cgltf_data* data = OpenGltf(path);
+    struct Guard { cgltf_data* d; ~Guard() { if (d) cgltf_free(d); } } guard{data};
+
+    CpuScene out;
+
+    // --- Cache for unique (meshIndex, primIndex) CPU geometry: built once, shared across instances —
+    // the SAME dedup + first-reference order as LoadGltfScene's getMeshPrims (device-free twin). ---
+    struct PrimEntry { uint32_t index; float bbMin[3]; float bbMax[3]; };
+    std::vector<std::vector<PrimEntry>> meshPrims(data->meshes_count);  // [meshIndex][primIndex]
+    auto getMeshPrims = [&](cgltf_size meshIdx) -> const std::vector<PrimEntry>& {
+        std::vector<PrimEntry>& prims = meshPrims[meshIdx];
+        if (!prims.empty() || data->meshes[meshIdx].primitives_count == 0) return prims;
+        const cgltf_mesh& mesh = data->meshes[meshIdx];
+        prims.reserve(mesh.primitives_count);
+        for (cgltf_size p = 0; p < mesh.primitives_count; ++p) {
+            const cgltf_primitive& prim = mesh.primitives[p];
+            PrimEntry e;
+            e.index = (uint32_t)out.meshes.size();
+            out.meshes.push_back(
+                BuildPrimitiveCPU(prim, path, /*recentre=*/false, e.bbMin, e.bbMax));
+            prims.push_back(e);
+        }
+        return prims;
+    };
+
+    // --- The SAME default-scene node hierarchy + DFS walk as LoadGltfScene. ---
+    const cgltf_scene* scene = data->scene ? data->scene
+                                           : (data->scenes_count > 0 ? &data->scenes[0] : nullptr);
+    if (!scene)
+        throw std::runtime_error(std::string("glTF has no scene: ") + path);
+
+    std::vector<SceneNode> nodes(data->nodes_count);
+    for (cgltf_size i = 0; i < data->nodes_count; ++i) {
+        nodes[i].local = NodeLocalTransform(data->nodes[i]);
+        for (cgltf_size c = 0; c < data->nodes[i].children_count; ++c) {
+            ptrdiff_t ci = data->nodes[i].children[c] - data->nodes;
+            if (ci >= 0 && (cgltf_size)ci < data->nodes_count) nodes[i].children.push_back((int)ci);
+        }
+    }
+    std::vector<int> roots;
+    roots.reserve(scene->nodes_count);
+    for (cgltf_size i = 0; i < scene->nodes_count; ++i) {
+        ptrdiff_t ni = scene->nodes[i] - data->nodes;
+        if (ni >= 0 && (cgltf_size)ni < data->nodes_count) roots.push_back((int)ni);
+    }
+
+    float bbMin[3] = { 1e30f,  1e30f,  1e30f};
+    float bbMax[3] = {-1e30f, -1e30f, -1e30f};
+    bool any = false;
+
+    WalkHierarchy(nodes, roots, [&](int nodeIdx, const math::Mat4& world) {
+        const cgltf_node& nd = data->nodes[nodeIdx];
+        if (!nd.mesh) return;
+        ptrdiff_t meshIdx = nd.mesh - data->meshes;
+        if (meshIdx < 0 || (cgltf_size)meshIdx >= data->meshes_count) return;
+        const std::vector<PrimEntry>& prims = getMeshPrims((cgltf_size)meshIdx);
+        for (const PrimEntry& e : prims) {
+            CpuScene::Instance inst;
+            inst.meshIndex = e.index;
+            inst.world = world;
+            out.instances.push_back(inst);
+            ExpandWorldAabb(world, e.bbMin, e.bbMax, bbMin, bbMax);
+            any = true;
+        }
+    });
+
+    if (any) {
+        for (int k = 0; k < 3; ++k) { out.bbMin[k] = bbMin[k]; out.bbMax[k] = bbMax[k]; }
+    }
+    return out;
+}
+
 } // namespace hf::asset
