@@ -404,6 +404,7 @@ $Goldens = @(
     @{ Name = 'flow_editor';     Flag = '--flow-editor-shot' }   # Issue #24 flow-graph node editor (view digest 0xaaf9beb70640a9b7; registration back-filled)
     @{ Name = 'seq_editor';      Flag = '--seq-editor-shot' }    # Issue #25 sequencer timeline editor (view digest 0xf7a649c83eba8e7f; registration back-filled)
     @{ Name = 'widget_editor';   Flag = '--widget-editor-shot' } # Issue #30 widget/UI editor (view digest 0xc208ea031ced1608; registration back-filled)
+    @{ Name = 'cl8_ride';        Flag = '--cl8-ride-shot' }      # CL8 cloth dynamic colliders + Coulomb friction (R3 remainder; the cloth rides the moving body, digest 0xbc5de9aa3b86f976)
 )
 
 $winResult = 'SKIP'
