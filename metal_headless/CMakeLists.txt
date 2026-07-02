@@ -1302,6 +1302,9 @@ target_compile_definitions(visual_test PRIVATE
     HF_FOX_MODEL_PATH="${HF_ROOT}/assets/models/Fox.glb"
     HF_HELMET_MODEL_PATH="${HF_ROOT}/assets/models/DamagedHelmet.glb"
     HF_TRUCK_MODEL_PATH="${HF_ROOT}/assets/models/CesiumMilkTruck.glb"
+    # Slice SC1: the FETCHED (gitignored) Khronos PBR Sponza hero scene; --sc1-hero-shot fails
+    # loudly with a fetch hint when absent.
+    HF_SPONZA_MODEL_PATH="${HF_ROOT}/assets/reference/_downloaded/Sponza/Sponza.gltf"
     HF_SCENE_PATH="${HF_ROOT}/assets/scenes/default.json"
     HF_ENV_PATH="${HF_ROOT}/assets/env/env.hdr"
 )

@@ -56,13 +56,8 @@ VulkanTexture::VulkanTexture(VulkanDevice& device, const TextureDesc& desc)
     // material set. The equirect env map is never bound as a material, so building the 2-texture
     // material set would just waste descriptors. ---
     if (desc.environment) {
-        VkDescriptorSetLayout envLayout = device_.environmentSetLayout();
-        VkDescriptorSetAllocateInfo edai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        edai.descriptorPool = device_.descriptorPool();
-        edai.descriptorSetCount = 1;
-        edai.pSetLayouts = &envLayout;
-        Check(vkAllocateDescriptorSets(device_.device(), &edai, &environmentSet_),
-              "vkAllocateDescriptorSets(env)");
+        environmentSet_ = device_.allocateDescriptorSet(device_.environmentSetLayout(),
+                                                        "vkAllocateDescriptorSets(env)");
 
         VkDescriptorImageInfo envImage{};
         envImage.imageView = view_;
@@ -86,13 +81,9 @@ VulkanTexture::VulkanTexture(VulkanDevice& device, const TextureDesc& desc)
         return;  // no material set for an env texture
     }
 
-    // Descriptor set: allocate from the device pool with the shared layout, then update.
-    VkDescriptorSetLayout layout = device_.texturedSetLayout();
-    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dai.descriptorPool = device_.descriptorPool();
-    dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &layout;
-    Check(vkAllocateDescriptorSets(device_.device(), &dai, &set_), "vkAllocateDescriptorSets");
+    // Descriptor set: allocate from the device's (growing) shared pool with the shared layout,
+    // then update.
+    set_ = device_.allocateDescriptorSet(device_.texturedSetLayout(), "vkAllocateDescriptorSets");
 
     // binding 0 = base-color sampled image (the view), binding 1 = base sampler. DXC emits the
     // Texture2D and SamplerState as two separate descriptors, not one combined. binding 3/4 =
@@ -169,9 +160,8 @@ void VulkanTexture::attachNormalMap(VkImageView normalView) {
 }
 
 VulkanTexture::~VulkanTexture() {
-    if (set_) vkFreeDescriptorSets(device_.device(), device_.descriptorPool(), 1, &set_);
-    if (environmentSet_)
-        vkFreeDescriptorSets(device_.device(), device_.descriptorPool(), 1, &environmentSet_);
+    device_.freeDescriptorSet(set_);
+    device_.freeDescriptorSet(environmentSet_);
     if (view_) vkDestroyImageView(device_.device(), view_, nullptr);
     if (image_) vmaDestroyImage(device_.allocator(), image_, alloc_);
 }

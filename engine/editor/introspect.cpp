@@ -81,6 +81,7 @@ const Showcase kShowcases[] = {
     {"--material-introspect","Dump a material graph as deterministic JSON (or DOT with --dot): nodes, params, typed ports, edges, resolved PBROutput."},
     {"--ibl-shot",          "HDR image-based lighting (equirect skybox reflections)."},
     {"--scene-shot",        "glTF scene-graph import (CesiumMilkTruck node hierarchy)."},
+    {"--sc1-hero-shot",     "THE REAL-SPONZA HERO BAKE (Slice SC1): the FETCHED Khronos PBR Sponza — a real multi-file .gltf hero scene (103 meshes / 25 materials / 69 external-URI textures / 262k triangles) through the full stack (external image URIs resolved + decoded, the shared descriptor pool GROWING past one pool's capacity) rendered from a fixed interior atrium camera: directional sun + shadow map + full PBR with the real textures. Requires assets/reference/fetch_reference_assets -Sponza first (the asset is fetched, never committed); fails loudly with that hint when absent. Alias --sc1-hero."},
     {"--bloom-shot",        "HDR bloom post-process."},
     {"--ssao-shot",         "Screen-space ambient occlusion."},
     {"--skinning-shot",     "Skeletal animation (GPU skinning)."},

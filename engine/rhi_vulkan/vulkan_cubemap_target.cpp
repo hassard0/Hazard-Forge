@@ -85,13 +85,8 @@ VulkanCubemapTarget::VulkanCubemapTarget(VulkanDevice& device, uint32_t size, Fo
     //     binds at the env slot via BindCubemapProbe — mirrors VulkanRenderTarget::environmentSet but
     //     for a CUBE view. Allocated up front (the cube is always sampled). ---
     {
-        VkDescriptorSetLayout layout = device_.environmentSetLayout();
-        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        dai.descriptorPool = device_.descriptorPool();
-        dai.descriptorSetCount = 1;
-        dai.pSetLayouts = &layout;
-        Check(vkAllocateDescriptorSets(device_.device(), &dai, &environmentSet_),
-              "vkAllocateDescriptorSets(cube env)");
+        environmentSet_ = device_.allocateDescriptorSet(device_.environmentSetLayout(),
+                                                        "vkAllocateDescriptorSets(cube env)");
 
         VkDescriptorImageInfo imageInfo{};
         imageInfo.imageView = cubeView_;
@@ -117,8 +112,7 @@ VulkanCubemapTarget::VulkanCubemapTarget(VulkanDevice& device, uint32_t size, Fo
 }
 
 VulkanCubemapTarget::~VulkanCubemapTarget() {
-    if (environmentSet_)
-        vkFreeDescriptorSets(device_.device(), device_.descriptorPool(), 1, &environmentSet_);
+    device_.freeDescriptorSet(environmentSet_);
     if (cubeView_) vkDestroyImageView(device_.device(), cubeView_, nullptr);
     for (VkImageView v : faceViews_)
         if (v) vkDestroyImageView(device_.device(), v, nullptr);

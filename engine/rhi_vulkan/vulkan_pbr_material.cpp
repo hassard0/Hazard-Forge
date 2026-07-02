@@ -8,14 +8,10 @@ namespace hf::rhi::vk {
 VulkanPbrMaterial::VulkanPbrMaterial(VulkanDevice& device, ITexture& base, ITexture& metalRough,
                                      ITexture& normalMap, ITexture& emissive, ITexture& occlusion)
     : device_(device) {
-    // Allocate one set from the wider full-PBR layout (set 1 for the lit-PBR pipeline).
-    VkDescriptorSetLayout layout = device_.pbrMaterialSetLayout();
-    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dai.descriptorPool = device_.descriptorPool();
-    dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &layout;
-    Check(vkAllocateDescriptorSets(device_.device(), &dai, &set_),
-          "vkAllocateDescriptorSets(pbr-material)");
+    // Allocate one set from the wider full-PBR layout (set 1 for the lit-PBR pipeline), via the
+    // device's growing shared pool (SC1: a Sponza-class scene needs >1 pool of material sets).
+    set_ = device_.allocateDescriptorSet(device_.pbrMaterialSetLayout(),
+                                         "vkAllocateDescriptorSets(pbr-material)");
 
     // Five (image, sampler) pairs at the chosen bindings (matching the layout + the generated MSL):
     //   base 0/1, normal 3/4, metalRough 5/6, emissive 7/8, occlusion 9/10.
@@ -50,7 +46,7 @@ VulkanPbrMaterial::VulkanPbrMaterial(VulkanDevice& device, ITexture& base, IText
 }
 
 VulkanPbrMaterial::~VulkanPbrMaterial() {
-    if (set_) vkFreeDescriptorSets(device_.device(), device_.descriptorPool(), 1, &set_);
+    device_.freeDescriptorSet(set_);
 }
 
 } // namespace hf::rhi::vk

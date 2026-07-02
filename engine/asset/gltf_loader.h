@@ -36,6 +36,23 @@ CpuPrimitive BuildPrimitiveCPU(const cgltf_primitive& prim, const char* path, bo
                                float* outBbMin = nullptr, float* outBbMax = nullptr);
 
 // ---------------------------------------------------------------------------------------------------
+// PURE external-image-URI resolution (Slice SC1 — real-Sponza hero bake). Multi-file .gltf assets
+// (e.g. the Khronos PBR Sponza) reference their images as file URIs relative to the .gltf's own
+// directory instead of embedding them in a .glb buffer_view. These two helpers are the device-free,
+// unit-testable seam the image decode path uses to reach those bytes.
+
+// Percent-decode a URI component: every %XX (two hex digits) becomes the byte 0xXX (glTF permits
+// e.g. "my%20texture.png" for "my texture.png"). A malformed escape (truncated or non-hex) is copied
+// through verbatim rather than dropped. Pure; no filesystem access.
+std::string PercentDecodeUri(const char* uri);
+
+// Resolve a RELATIVE file URI against the directory containing `gltfPath` (the .gltf/.glb file) and
+// read the whole file's bytes. Returns an empty vector when the URI is not a plain relative file
+// reference (data: URIs — cgltf materialises embedded-buffer data: URIs itself; scheme'd URIs like
+// http:// are unsupported) or the file cannot be opened/read; callers fall back gracefully.
+std::vector<uint8_t> ReadUriBytesRelativeTo(const char* gltfPath, const char* uri);
+
+// ---------------------------------------------------------------------------------------------------
 // Pure scene-graph hierarchy composition (no device, no cgltf) — factored out so it can be unit
 // tested in isolation. A SceneNode is a plain node: a local transform (already resolved from a
 // glTF node's `matrix` or its TRS) plus child indices.
@@ -209,6 +226,9 @@ struct GltfScene {
     std::vector<SceneInstance> instances;
     float bbMin[3] = {0, 0, 0};   // world-space scene AABB (over all instances)
     float bbMax[3] = {0, 0, 0};
+    // Number of texture definitions in the source glTF (data->textures_count) — a load-proof stat
+    // for hero scenes (Slice SC1). 0 for scenes without textures.
+    size_t textureCount = 0;
 
     // A uniform-scale + translate that fits the whole scene to a cube of side `targetSize` and sets
     // it down so its min-Y rests at `groundY` and its XZ centre is at the origin. Pure: does NOT

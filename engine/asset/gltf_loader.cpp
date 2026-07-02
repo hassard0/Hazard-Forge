@@ -9,10 +9,11 @@
 #define CGLTF_IMPLEMENTATION
 #include "cgltf/cgltf.h"
 
-// stb_image: decode the embedded base-color image (PNG/JPEG) bytes -> RGBA8.
+// stb_image: decode the base-color image (PNG/JPEG) bytes -> RGBA8.
 // STB_IMAGE_IMPLEMENTATION is defined in exactly this one TU.
 #define STB_IMAGE_IMPLEMENTATION
-#define STBI_NO_STDIO   // we only ever decode from memory (embedded glb buffer_view)
+#define STBI_NO_STDIO   // we only ever decode from memory (embedded buffer_view OR file bytes we
+                        // read ourselves via ReadUriBytesRelativeTo — SC1 external-URI images)
 #include "stb/stb_image.h"
 
 #include <cmath>
@@ -36,6 +37,63 @@ const cgltf_accessor* FindAttr(const cgltf_primitive& prim, cgltf_attribute_type
 }
 
 } // namespace
+
+// ====================== Pure external-image-URI resolution (Slice SC1) ==========================
+
+std::string PercentDecodeUri(const char* uri) {
+    std::string out;
+    if (!uri) return out;
+    const size_t n = std::strlen(uri);
+    out.reserve(n);
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        if (uri[i] == '%' && i + 2 < n) {
+            int hi = hex(uri[i + 1]), lo = hex(uri[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(uri[i]);   // malformed escape (or ordinary char): copy through verbatim
+    }
+    return out;
+}
+
+std::vector<uint8_t> ReadUriBytesRelativeTo(const char* gltfPath, const char* uri) {
+    std::vector<uint8_t> out;
+    if (!gltfPath || !uri || !*uri) return out;
+    // Only plain relative file references are supported. data: URIs never reach here for buffers
+    // (cgltf materialises them), and an image data: URI / scheme'd URI (http://...) is not a file.
+    if (std::strncmp(uri, "data:", 5) == 0) return out;
+    if (std::strstr(uri, "://") != nullptr) return out;
+
+    // Directory of the .gltf file (everything up to and including the last path separator).
+    std::string dir(gltfPath);
+    const size_t slash = dir.find_last_of("/\\");
+    dir = (slash == std::string::npos) ? std::string() : dir.substr(0, slash + 1);
+
+    // Percent-decode the URI (glTF allows %XX escapes, e.g. %20 for a space; the Sponza image names
+    // are plain digits so this is a straight copy for the hero asset) and resolve against the dir.
+    const std::string full = dir + PercentDecodeUri(uri);
+
+    std::FILE* f = std::fopen(full.c_str(), "rb");
+    if (!f) return out;
+    std::fseek(f, 0, SEEK_END);
+    const long len = std::ftell(f);
+    if (len <= 0) { std::fclose(f); return out; }
+    std::fseek(f, 0, SEEK_SET);
+    out.resize(static_cast<size_t>(len));
+    const size_t got = std::fread(out.data(), 1, out.size(), f);
+    std::fclose(f);
+    if (got != out.size()) out.clear();
+    return out;
+}
 
 // Build the engine's CPU vertex/index arrays from a glTF primitive (DEVICE-FREE — issue #36 seam).
 //
@@ -276,18 +334,21 @@ std::unique_ptr<rhi::ITexture> MakeSolidTexture(rhi::IRHIDevice& device,
     return device.CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
 }
 
-// Decode a glTF image (embedded glb buffer_view, or external/data: URI) into an RGBA8 rhi::ITexture.
-// Returns nullptr if the image is absent or cannot be reached/decoded; callers substitute a sensible
-// fallback. `label` names the map in diagnostics.
+// Decode a glTF image (embedded glb buffer_view, or an external file URI resolved relative to the
+// .gltf's directory — Slice SC1) into an RGBA8 rhi::ITexture. Returns nullptr if the image is absent
+// or cannot be reached/decoded; callers substitute a sensible fallback. `label` names the map in
+// diagnostics; `gltfPath` is the source .gltf/.glb path external URIs resolve against.
 std::unique_ptr<rhi::ITexture> DecodeImage(rhi::IRHIDevice& device, const cgltf_image* image,
-                                           const char* label) {
+                                           const char* label, const char* gltfPath) {
     if (!image) return nullptr;
 
     const stbi_uc* srcBytes = nullptr;
     int srcLen = 0;
+    std::vector<uint8_t> uriBytes;   // external-URI file bytes; must outlive the stbi decode below
 
     if (image->buffer_view) {
-        // .glb: the image bytes live inside a buffer_view of an embedded buffer.
+        // .glb: the image bytes live inside a buffer_view of an embedded buffer. (This branch is
+        // byte-for-byte the pre-SC1 behaviour — the embedded goldens are untouched.)
         const cgltf_buffer_view* bv = image->buffer_view;
         if (!bv->buffer || !bv->buffer->data) {
             std::fprintf(stderr, "[gltf] %s image buffer_view has no data; using fallback\n", label);
@@ -296,13 +357,19 @@ std::unique_ptr<rhi::ITexture> DecodeImage(rhi::IRHIDevice& device, const cgltf_
         srcBytes = static_cast<const stbi_uc*>(bv->buffer->data) + bv->offset;
         srcLen = static_cast<int>(bv->size);
     } else if (image->uri) {
-        // External or data: URI. cgltf_load_buffers decodes data: URIs into a synthesized
-        // buffer; if the loader didn't materialise it into a buffer_view we can't reach the
-        // bytes here, so fall back gracefully (the showcase assets are embedded glb).
-        std::fprintf(stderr,
-            "[gltf] %s image is a URI ('%s') without an embedded buffer_view; using fallback\n",
-            label, image->uri);
-        return nullptr;
+        // External file URI (multi-file .gltf, e.g. the Khronos PBR Sponza): resolve relative to
+        // the .gltf's directory, read the file bytes, and feed the SAME stbi decode the embedded
+        // path uses. data: image URIs and scheme'd URIs are not files -> fall back gracefully.
+        uriBytes = ReadUriBytesRelativeTo(gltfPath, image->uri);
+        if (uriBytes.empty()) {
+            std::fprintf(stderr,
+                "[gltf] %s image URI ('%s') could not be read relative to '%s' "
+                "(data:/scheme'd URI, or missing file); using fallback\n",
+                label, image->uri, gltfPath ? gltfPath : "(null)");
+            return nullptr;
+        }
+        srcBytes = static_cast<const stbi_uc*>(uriBytes.data());
+        srcLen = static_cast<int>(uriBytes.size());
     } else {
         return nullptr;
     }
@@ -331,8 +398,9 @@ std::unique_ptr<rhi::ITexture> DecodeImage(rhi::IRHIDevice& device, const cgltf_
 
 // Decode the material's base-color image into an RGBA8 texture; white fallback on any failure.
 std::unique_ptr<rhi::ITexture> LoadBaseColorTexture(rhi::IRHIDevice& device,
-                                                    const cgltf_image* image) {
-    auto tex = DecodeImage(device, image, "base-color");
+                                                    const cgltf_image* image,
+                                                    const char* gltfPath) {
+    auto tex = DecodeImage(device, image, "base-color", gltfPath);
     return tex ? std::move(tex) : MakeWhiteTexture(device);
 }
 
@@ -396,7 +464,9 @@ cgltf_data* OpenGltf(const char* path) {
 // Every texture is non-null (neutral 1x1 fallbacks per absent map, identical semantics to
 // LoadPbrGltfModel). A null `mat` yields a sensible default (white base, neutral metalRough,
 // flat normal, black emissive, white occlusion, metallic 0 / roughness 1).
-PbrMaterial DecodeMaterial(rhi::IRHIDevice& device, const cgltf_material* mat) {
+// `gltfPath` is the source file path external image URIs resolve against (SC1).
+PbrMaterial DecodeMaterial(rhi::IRHIDevice& device, const cgltf_material* mat,
+                           const char* gltfPath) {
     float metallic = mat ? 1.0f : 0.0f;   // default material: dielectric (metallic 0)
     float roughness = 1.0f;
     float emissiveF[3] = {0.0f, 0.0f, 0.0f};
@@ -421,14 +491,14 @@ PbrMaterial DecodeMaterial(rhi::IRHIDevice& device, const cgltf_material* mat) {
     }
 
     PbrMaterial out;
-    out.baseColor = LoadBaseColorTexture(device, baseImg);
-    out.metalRough = DecodeImage(device, mrImg, "metallic-roughness");
+    out.baseColor = LoadBaseColorTexture(device, baseImg, gltfPath);
+    out.metalRough = DecodeImage(device, mrImg, "metallic-roughness", gltfPath);
     if (!out.metalRough) out.metalRough = MakeSolidTexture(device, 255, 255, 0, 255);
-    out.normalMap = DecodeImage(device, normalImg, "normal");
+    out.normalMap = DecodeImage(device, normalImg, "normal", gltfPath);
     if (!out.normalMap) out.normalMap = MakeSolidTexture(device, 128, 128, 255, 255);
-    out.emissive = DecodeImage(device, emissiveImg, "emissive");
+    out.emissive = DecodeImage(device, emissiveImg, "emissive", gltfPath);
     if (!out.emissive) out.emissive = MakeSolidTexture(device, 0, 0, 0, 255);
-    out.occlusion = DecodeImage(device, occlusionImg, "occlusion");
+    out.occlusion = DecodeImage(device, occlusionImg, "occlusion", gltfPath);
     if (!out.occlusion) out.occlusion = MakeWhiteTexture(device);
     out.metallicFactor = metallic;
     out.roughnessFactor = roughness;
@@ -462,7 +532,7 @@ GltfModel LoadGltfModel(rhi::IRHIDevice& device, const char* path) {
         if (pbr.base_color_texture.texture && pbr.base_color_texture.texture->image)
             baseImg = pbr.base_color_texture.texture->image;
     }
-    auto baseColor = LoadBaseColorTexture(device, baseImg);
+    auto baseColor = LoadBaseColorTexture(device, baseImg, path);
     return GltfModel(std::move(mesh), std::move(baseColor), metallic, roughness);
 }
 
@@ -505,14 +575,14 @@ PbrModel LoadPbrGltfModel(rhi::IRHIDevice& device, const char* path) {
     //   normal     -> (128,128,255)    decodes to (0,0,1): no TBN perturbation
     //   emissive   -> black            (adds nothing)
     //   occlusion  -> white            R=1: no ambient occlusion
-    auto baseColor = LoadBaseColorTexture(device, baseImg);
-    auto metalRough = DecodeImage(device, mrImg, "metallic-roughness");
+    auto baseColor = LoadBaseColorTexture(device, baseImg, path);
+    auto metalRough = DecodeImage(device, mrImg, "metallic-roughness", path);
     if (!metalRough) metalRough = MakeSolidTexture(device, 255, 255, 0, 255);
-    auto normalMap = DecodeImage(device, normalImg, "normal");
+    auto normalMap = DecodeImage(device, normalImg, "normal", path);
     if (!normalMap) normalMap = MakeSolidTexture(device, 128, 128, 255, 255);
-    auto emissive = DecodeImage(device, emissiveImg, "emissive");
+    auto emissive = DecodeImage(device, emissiveImg, "emissive", path);
     if (!emissive) emissive = MakeSolidTexture(device, 0, 0, 0, 255);
-    auto occlusion = DecodeImage(device, occlusionImg, "occlusion");
+    auto occlusion = DecodeImage(device, occlusionImg, "occlusion", path);
     if (!occlusion) occlusion = MakeWhiteTexture(device);
 
     return PbrModel(std::move(mesh), std::move(baseColor), std::move(metalRough),
@@ -845,7 +915,7 @@ SkinnedModel LoadSkinnedGltfModel(rhi::IRHIDevice& device, const char* path) {
         if (pbr.base_color_texture.texture && pbr.base_color_texture.texture->image)
             baseImg = pbr.base_color_texture.texture->image;
     }
-    auto baseColor = LoadBaseColorTexture(device, baseImg);
+    auto baseColor = LoadBaseColorTexture(device, baseImg, path);
 
     return SkinnedModel(std::move(mesh), std::move(baseColor), metallic, roughness,
                         std::move(sb.skeleton), std::move(animations), bbMin, bbMax);
@@ -950,6 +1020,7 @@ GltfScene LoadGltfScene(rhi::IRHIDevice& device, const char* path) {
     struct Guard { cgltf_data* d; ~Guard() { if (d) cgltf_free(d); } } guard{data};
 
     GltfScene out;
+    out.textureCount = data->textures_count;   // load-proof stat (Slice SC1 hero bake)
 
     // --- Decode + dedup materials. Cache by cgltf_material* (and one shared default for null). ---
     std::vector<const PbrMaterial*> materialByIndex(data->materials_count, nullptr);
@@ -958,7 +1029,7 @@ GltfScene LoadGltfScene(rhi::IRHIDevice& device, const char* path) {
         if (!mat) {
             if (!defaultMaterial) {
                 out.materialStorage.push_back(
-                    std::make_unique<PbrMaterial>(DecodeMaterial(device, nullptr)));
+                    std::make_unique<PbrMaterial>(DecodeMaterial(device, nullptr, path)));
                 defaultMaterial = out.materialStorage.back().get();
             }
             return defaultMaterial;
@@ -967,12 +1038,12 @@ GltfScene LoadGltfScene(rhi::IRHIDevice& device, const char* path) {
         if (idx < 0 || (cgltf_size)idx >= data->materials_count) {
             // Foreign pointer (shouldn't happen); decode standalone, owned but un-cached.
             out.materialStorage.push_back(
-                std::make_unique<PbrMaterial>(DecodeMaterial(device, mat)));
+                std::make_unique<PbrMaterial>(DecodeMaterial(device, mat, path)));
             return out.materialStorage.back().get();
         }
         if (!materialByIndex[idx]) {
             out.materialStorage.push_back(
-                std::make_unique<PbrMaterial>(DecodeMaterial(device, mat)));
+                std::make_unique<PbrMaterial>(DecodeMaterial(device, mat, path)));
             materialByIndex[idx] = out.materialStorage.back().get();
         }
         return materialByIndex[idx];

@@ -282,6 +282,7 @@
     { "flag": "--material-introspect", "desc": "Dump a material graph as deterministic JSON (or DOT with --dot): nodes, params, typed ports, edges, resolved PBROutput." },
     { "flag": "--ibl-shot", "desc": "HDR image-based lighting (equirect skybox reflections)." },
     { "flag": "--scene-shot", "desc": "glTF scene-graph import (CesiumMilkTruck node hierarchy)." },
+    { "flag": "--sc1-hero-shot", "desc": "THE REAL-SPONZA HERO BAKE (Slice SC1): the FETCHED Khronos PBR Sponza — a real multi-file .gltf hero scene (103 meshes / 25 materials / 69 external-URI textures / 262k triangles) through the full stack (external image URIs resolved + decoded, the shared descriptor pool GROWING past one pool's capacity) rendered from a fixed interior atrium camera: directional sun + shadow map + full PBR with the real textures. Requires assets/reference/fetch_reference_assets -Sponza first (the asset is fetched, never committed); fails loudly with that hint when absent. Alias --sc1-hero." },
     { "flag": "--bloom-shot", "desc": "HDR bloom post-process." },
     { "flag": "--ssao-shot", "desc": "Screen-space ambient occlusion." },
     { "flag": "--skinning-shot", "desc": "Skeletal animation (GPU skinning)." },
@@ -787,6 +788,6 @@
       { "op": "introspect", "capability": "observe", "args": [{ "name": "path", "type": "string?" }] },
       { "op": "query", "capability": "observe", "args": [{ "name": "select", "type": "string" }, { "name": "entity", "type": "int?" }, { "name": "fields", "type": "[string]?" }] }
     ],
-    "contentHash": "ee3ac9b87f008476"
+    "contentHash": "0e6b1b41cda7c5f8"
   }
 }

@@ -2078,6 +2078,11 @@ target_compile_definitions(hello_triangle PRIVATE
 # multiple meshes/materials; the wheels mesh is placed at two positions via two parent transforms).
 target_compile_definitions(hello_triangle PRIVATE
   "HF_TRUCK_MODEL_PATH=\"${CMAKE_SOURCE_DIR}/assets/models/CesiumMilkTruck.glb\"")
+# Slice SC1 — absolute path to the FETCHED (gitignored, NEVER committed) Khronos PBR Sponza hero
+# scene (multi-file .gltf + external JPG/PNG image URIs). --sc1-hero-shot fails loudly with a
+# "run fetch_reference_assets -Sponza first" message when it is absent.
+target_compile_definitions(hello_triangle PRIVATE
+  "HF_SPONZA_MODEL_PATH=\"${CMAKE_SOURCE_DIR}/assets/reference/_downloaded/Sponza/Sponza.gltf\"")
 # Absolute path to the default data-driven scene description (repo asset).
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SCENE_PATH=\"${CMAKE_SOURCE_DIR}/assets/scenes/default.json\"")

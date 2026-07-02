@@ -246,6 +246,15 @@ hf_add_pure_test(draco_test)
 hf_add_pure_test(draco_gltf_load_test)
 target_compile_definitions(draco_gltf_load_test PRIVATE
   "HF_BOX_DRACO_GLTF=\"${CMAKE_SOURCE_DIR}/assets/models/BoxDraco/Box.gltf\"")
+# EXTERNAL-image-URI loader seam (Slice SC1 — the real-Sponza hero bake): multi-file .gltf assets
+# reference images as file URIs relative to the .gltf's directory. Tests the pure helpers
+# (hf::asset::PercentDecodeUri + ReadUriBytesRelativeTo) end-to-end over a SELF-CREATED temp fixture
+# (a 2x2 png whose filename contains a space + a minimal .gltf with the %20-escaped uri, parsed by the
+# REAL cgltf): resolved bytes == the embedded-equivalent png bytes, the shared stbi_load_from_memory
+# decode yields the authored pixels, and data:/scheme'd/missing URIs fall back empty (never throw).
+# cgltf + stb_image IMPLEMENTATIONS live in hf_core's gltf_loader.cpp (declarations only here).
+# Pure CPU (hf_core), no RHI/device, ASan-eligible.
+hf_add_pure_test(gltf_uri_image_test)
 # Binary FBX mesh importer (issue #15 ask #2 — support FBX alongside glTF/OBJ): the SELF-CONTAINED,
 # clean-room engine/asset/fbx_loader.h loads the assimp BSD test cube assets/models/box.fbx (FBX v7400,
 # "Kaydara FBX Binary" node-tree) to correct geometry: 24 verts / 12 triangles, each axis 2 distinct

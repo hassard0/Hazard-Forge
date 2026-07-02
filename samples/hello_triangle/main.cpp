@@ -441,6 +441,11 @@ int main(int argc, char** argv) {
     // loads + renders through the engine. Two args: model path, then output BMP path.
     const char* referenceModelPath = nullptr;
     const char* referenceShotPath = nullptr;
+    // Slice SC1 (GAP_CLOSING Tier 2 — the REAL-SPONZA HERO BAKE): --sc1-hero-shot <out.bmp> (alias
+    // --sc1-hero) loads the FETCHED Khronos PBR Sponza (multi-file .gltf + external JPG/PNG image
+    // URIs — the first real multi-million-unit multi-material scene through the full stack) and
+    // renders a fixed INTERIOR atrium camera, sun + shadows + full PBR with the real textures.
+    const char* sc1HeroShotPath = nullptr;
     const char* iblShotPath = nullptr;
     // Substrate-lite layered materials (issue #11, SB1): the HDR-IBL helmet scene rendered through
     // lit_substrate.frag (lit_pbr_ibl + an additive clearcoat lobe). Own parse loop below (MSVC C1061).
@@ -3261,6 +3266,17 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--reference-shot") == 0) {
             referenceModelPath = argv[i + 1];
             referenceShotPath = argv[i + 2];
+            break;
+        }
+    }
+
+    // Slice SC1 (GAP_CLOSING Tier 2 — THE REAL-SPONZA HERO BAKE): --sc1-hero-shot <out.bmp> (alias
+    // --sc1-hero). Parsed in its OWN loop (the big else-if ladder above is at the MSVC C1061
+    // nested-block limit). The model path is baked (HF_SPONZA_MODEL_PATH — the gitignored fetched
+    // asset), so only the output path is an argument.
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--sc1-hero-shot") == 0 || std::strcmp(argv[i], "--sc1-hero") == 0) {
+            sc1HeroShotPath = (i + 1 < argc) ? argv[i + 1] : "sc1_hero.bmp";
             break;
         }
     }
@@ -109054,6 +109070,248 @@ int main(int argc, char** argv) {
                 ok = WriteBMP(pbrShotPath, px, cw, ch2);
                 if (ok) std::printf("wrote %s (%ux%u)\n", pbrShotPath, cw, ch2);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", pbrShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- THE REAL-SPONZA HERO BAKE (--sc1-hero-shot <out.bmp>, Slice SC1, GAP_CLOSING Tier 2):
+        // the first REAL multi-material hero scene through the full stack (every prior glTF shot is a
+        // small fixture). Loads the FETCHED (gitignored — assets/reference/fetch_reference_assets.ps1
+        // -Sponza) Khronos PBR Sponza: a multi-file .gltf whose ~70 images are EXTERNAL JPG/PNG file
+        // URIs (the SC1 loader seam) and whose ~100 material descriptor sets exceed one Vulkan
+        // descriptor pool (the SC1 growing-pool seam). Renders a fixed INTERIOR atrium camera looking
+        // down the nave in the asset's native meters (no auto-fit): directional sun + the existing
+        // shadow path + full PBR with the real textures, sky through the open roof, then the standard
+        // post pass. Prints the {meshes, materials, textures, triangles, drawCalls, shaded} stat line
+        // (the scale proof) and the load time. FLOAT-class golden (the established render class).
+        // Documented fidelity gaps (honesty over green): alphaMode MASK/BLEND is NOT honoured (the
+        // lit-PBR pipeline is opaque-only, so foliage/chain cutout quads render as opaque cards),
+        // textures upload mip-0 only (no mip chain -> distant-texel aliasing), KHR_materials_specular
+        // /_ior/_transmission extension parameters are ignored (core metallic-roughness only), and
+        // base-color decode is UNORM (the same convention every existing glTF shot uses). ------------
+        if (sc1HeroShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // FAIL LOUDLY if the fetched asset is absent (it is gitignored, never committed).
+            {
+                std::FILE* probe = std::fopen(HF_SPONZA_MODEL_PATH, "rb");
+                if (!probe) {
+                    std::fprintf(stderr,
+                        "FATAL: Sponza not found at '%s'.\n"
+                        "       Run assets/reference/fetch_reference_assets.ps1 -Sponza (or "
+                        "fetch_reference_assets.sh --sponza) first — the asset is fetched, not committed.\n",
+                        HF_SPONZA_MODEL_PATH);
+                    device->WaitIdle();
+                    return 1;
+                }
+                std::fclose(probe);
+            }
+
+            // Lit-PBR pipeline (shared lit.vert + full-PBR fragment; 5-texture material set).
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto pbrFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_pbr.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto pbrFs = device->CreateShaderModule({std::span<const uint32_t>(pbrFsWords)});
+            rhi::GraphicsPipelineDesc pbrDesc;
+            pbrDesc.vertex = litVs.get();
+            pbrDesc.fragment = pbrFs.get();
+            pbrDesc.vertexLayout = scene::MeshVertexLayout();
+            pbrDesc.colorFormat = device->Swapchain().ColorFormat();
+            pbrDesc.depthTest = true;
+            pbrDesc.usesFrameUniforms = true;
+            pbrDesc.usesTexture = true;
+            pbrDesc.pbrMaterial = true;
+            pbrDesc.pushConstantSize = sizeof(float) * 20;  // mat4 model + float4 material
+            auto pbrPipeline = device->CreateGraphicsPipeline(pbrDesc);
+
+            // Depth-only shadow pipeline (every imported primitive casts).
+            auto shadowVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto shadowVs = device->CreateShaderModule({std::span<const uint32_t>(shadowVsW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc shDesc;
+            shDesc.vertex = shadowVs.get();
+            shDesc.fragment = shadowFs.get();
+            shDesc.vertexLayout = scene::MeshVertexLayout();
+            shDesc.depthTest = true;
+            shDesc.depthOnly = true;
+            shDesc.usesFrameUniforms = true;
+            shDesc.pushConstantSize = sizeof(float) * 16;
+            auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+            // Sky (visible through the open atrium roof) + post.
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // Import the hero scene (node hierarchy -> instances + deduped materials). External image
+            // URIs are resolved + decoded by the SC1 loader seam; the growing descriptor pool absorbs
+            // the ~100+ material sets. The load time is reported (70 JPG decodes dominate).
+            hf::asset::GltfScene sponza;
+            const auto loadT0 = std::chrono::steady_clock::now();
+            try {
+                sponza = hf::asset::LoadGltfScene(*device, HF_SPONZA_MODEL_PATH);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "FATAL: --sc1-hero-shot could not load '%s': %s\n",
+                             HF_SPONZA_MODEL_PATH, e.what());
+                device->WaitIdle();
+                return 1;
+            }
+            const double loadSec = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - loadT0).count();
+            if (sponza.instances.empty()) {
+                std::fprintf(stderr, "FATAL: --sc1-hero-shot loaded ZERO instances from '%s'\n",
+                             HF_SPONZA_MODEL_PATH);
+                device->WaitIdle();
+                return 1;
+            }
+
+            // The stat line: the SCALE proof. triangles = sum of indexCount/3 over the instance list;
+            // drawCalls = every draw issued this frame (shadow-pass casters + scene-pass instances +
+            // sky + post fullscreen triangles); shaded = the full-PBR-shaded instance draws.
+            unsigned long long triangles = 0;
+            for (const auto& inst : sponza.instances)
+                triangles += inst.mesh->indexCount() / 3ull;
+            const unsigned shaded = (unsigned)sponza.instances.size();
+            const unsigned drawCalls = shaded * 2u + 2u;   // shadow + scene passes + sky + post
+            std::printf("[sc1] hero stats: meshes=%zu materials=%zu textures=%zu triangles=%llu "
+                        "drawCalls=%u shaded=%u\n",
+                        sponza.meshStorage.size(), sponza.materialStorage.size(),
+                        sponza.textureCount, triangles, drawCalls, shaded);
+            std::printf("[sc1] sponza load: %.2fs; world AABB min(%.2f %.2f %.2f) max(%.2f %.2f %.2f)\n",
+                        loadSec, sponza.bbMin[0], sponza.bbMin[1], sponza.bbMin[2],
+                        sponza.bbMax[0], sponza.bbMax[1], sponza.bbMax[2]);
+
+            // Fixed interior camera, native meters (NO auto-fit — the honest scale). The Khronos
+            // Sponza nave runs along X (~ -9.5..+9.5), the atrium floor at y~0, the upper gallery
+            // ~y 4..7. Stand at the east end of the atrium at eye height looking WEST down the nave,
+            // slightly upward so the columns, the upper-gallery arches and the red curtains frame the
+            // shot and the sun-lit floor stripe reads.
+            const Vec3 eye{8.2f, 1.7f, 0.0f};
+            const Vec3 center{-9.5f, 3.4f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.22173048f, aspect, 0.1f, 100.0f);  // 70 deg vertical
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                // Steep late-morning sun through the open roof, tilted so the light stripe falls
+                // across the nave floor and the column shadows rake.
+                Vec3 lightDir = math::normalize(Vec3{-0.25f, -1.0f, 0.45f});
+                fd.lightDir[0] = lightDir.x; fd.lightDir[1] = lightDir.y; fd.lightDir[2] = lightDir.z;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.96f; fd.lightColor[2] = 0.88f;
+                fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                // Shadow frustum: an ortho box covering the whole building (world AABB ~30m x 12.5m
+                // x 18m, half-diagonal ~18.6m about (-0.5, 5.2, -0.3)).
+                Vec3 sc{-0.5f, 5.2f, -0.3f};
+                Vec3 lightEye = sc - lightDir * 30.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-17.0f, 17.0f, -17.0f, 17.0f, 1.0f, 60.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.22173048f);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*shadowPipeline);
+                    for (const auto& inst : sponza.instances) {
+                        cmd.PushConstants(inst.worldTransform.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(inst.mesh->vertices());
+                        cmd.BindIndexBuffer(inst.mesh->indices());
+                        cmd.DrawIndexed(inst.mesh->indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    // The hero scene (full PBR): every instance at its authored world transform.
+                    cmd.BindPipeline(*pbrPipeline);
+                    for (const auto& inst : sponza.instances) {
+                        const hf::asset::PbrMaterial& m = *inst.material;
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = inst.worldTransform.m[k];
+                        pc[16] = m.metallicFactor; pc[17] = m.roughnessFactor;
+                        pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterialPBR(*m.baseColor, *m.metalRough, *m.normalMap,
+                                            *m.emissive, *m.occlusion);
+                        cmd.BindVertexBuffer(inst.mesh->vertices());
+                        cmd.BindIndexBuffer(inst.mesh->indices());
+                        cmd.DrawIndexed(inst.mesh->indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(sc1HeroShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u)\n", sc1HeroShotPath, cw, ch2);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", sc1HeroShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

@@ -100,13 +100,8 @@ VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uin
     // BindTexture(*this). Same two-write pattern as VulkanTexture: binding 0 sampled image, binding 1
     // sampler. For an integer image the sampler at binding 1 is a harmless unused descriptor (the
     // resolve frag texel-fetches binding 0 only).
-    VkDescriptorSetLayout layout = device_.materialSetLayout();
-    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dai.descriptorPool = device_.descriptorPool();
-    dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &layout;
-    Check(vkAllocateDescriptorSets(device_.device(), &dai, &set_),
-          "vkAllocateDescriptorSets(rt)");
+    set_ = device_.allocateDescriptorSet(device_.materialSetLayout(),
+                                         "vkAllocateDescriptorSets(rt)");
 
     VkDescriptorImageInfo imageInfo{};
     imageInfo.imageView = colorView_;
@@ -177,13 +172,8 @@ VkDescriptorSet VulkanRenderTarget::environmentSet() {
     // image (binding 11) + the env sampler (binding 12), so a baked probe atlas RT binds at the env
     // slot just like an HDR env texture. Reuses the existing env set layout + sampler — no new layout.
     if (environmentSet_ != VK_NULL_HANDLE) return environmentSet_;
-    VkDescriptorSetLayout layout = device_.environmentSetLayout();
-    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dai.descriptorPool = device_.descriptorPool();
-    dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &layout;
-    Check(vkAllocateDescriptorSets(device_.device(), &dai, &environmentSet_),
-          "vkAllocateDescriptorSets(rt env)");
+    environmentSet_ = device_.allocateDescriptorSet(device_.environmentSetLayout(),
+                                                    "vkAllocateDescriptorSets(rt env)");
 
     VkDescriptorImageInfo imageInfo{};
     imageInfo.imageView = colorView_;
@@ -209,9 +199,8 @@ VkDescriptorSet VulkanRenderTarget::environmentSet() {
 }
 
 VulkanRenderTarget::~VulkanRenderTarget() {
-    if (environmentSet_)
-        vkFreeDescriptorSets(device_.device(), device_.descriptorPool(), 1, &environmentSet_);
-    if (set_) vkFreeDescriptorSets(device_.device(), device_.descriptorPool(), 1, &set_);
+    device_.freeDescriptorSet(environmentSet_);
+    device_.freeDescriptorSet(set_);
     if (colorView_) vkDestroyImageView(device_.device(), colorView_, nullptr);
     if (depthView_) vkDestroyImageView(device_.device(), depthView_, nullptr);
     if (colorImage_) vmaDestroyImage(device_.allocator(), colorImage_, colorAlloc_);

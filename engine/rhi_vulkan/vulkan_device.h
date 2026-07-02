@@ -177,6 +177,16 @@ public:
     VkDescriptorSet allocateAccelGraphicsSet(VkAccelerationStructureKHR tlas, uint32_t slot);
     void freeAccelGraphicsSet(VkDescriptorSet set);
 
+    // Slice SC1 — GROWING shared-pool descriptor-set allocation (the standard vkguide pattern).
+    // Allocates one set of `layout` from the CURRENT shared pool; on VK_ERROR_OUT_OF_POOL_MEMORY /
+    // VK_ERROR_FRAGMENTED_POOL a NEW pool of the same shape is created (appended to descriptorPools_)
+    // and the allocation retried, so a real multi-material scene (the Sponza's ~100 material sets)
+    // can exceed one pool's maxSets without failing. Small scenes never grow — behaviour identical.
+    // `what` labels diagnostics. Every set's owning pool is recorded so freeDescriptorSet returns it
+    // to the pool it actually came from (sets from different pools must not be cross-freed).
+    VkDescriptorSet allocateDescriptorSet(VkDescriptorSetLayout layout, const char* what);
+    void freeDescriptorSet(VkDescriptorSet set);
+
     // Return (building + caching on first use) the descriptor set for a full-PBR material — the
     // wider set 1 pointing at the five textures' views. Keyed on the base-texture pointer (a
     // material binds a fixed 5-texture set), so the command-buffer BindMaterialPBR path re-binds an
@@ -247,7 +257,15 @@ private:
     VkDescriptorSetLayout accelGraphicsSetLayout_ = VK_NULL_HANDLE; // dedicated set for RT-graphics accel (Issue #34)
     uint32_t              accelGraphicsSlot_ = 0;                  // the accel binding slot baked into the layout
     VkDescriptorPool      accelDescriptorPool_ = VK_NULL_HANDLE;   // tiny pool for RT-graphics accel sets (fix-rhi-binding13)
-    VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;
+    VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;     // the CURRENT shared pool (== descriptorPools_.back())
+
+    // Slice SC1 — the growing shared-pool list. Every shared pool ever created (the initial one plus
+    // any growth pools), destroyed together at teardown; descriptorPool_ is always the most recent.
+    // descriptorSetPool_ maps each live allocated set to its owning pool so freeDescriptorSet frees
+    // to the right pool (VUID: a set must be freed to the pool it was allocated from).
+    VkDescriptorPool createSharedDescriptorPool();
+    std::vector<VkDescriptorPool> descriptorPools_;
+    std::map<VkDescriptorSet, VkDescriptorPool> descriptorSetPool_;
 
     // 1x1 flat tangent-space normal map (RGBA 128,128,255,255 -> (0,0,1) after decode), used as the
     // default normal map when a material has none, so the lit shader's TBN perturbation is a no-op.

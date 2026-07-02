@@ -10,6 +10,7 @@
 #include "rhi_vulkan/vulkan_cubemap_target.h"
 #include "rhi_vulkan/vulkan_pbr_material.h"
 #include "rhi_vulkan/vulkan_bindless.h"
+#include <cstdio>
 #include <cstring>
 
 #define VMA_IMPLEMENTATION
@@ -622,28 +623,10 @@ void VulkanDevice::CreateTextureResources() {
               "vkCreateDescriptorSetLayout(pbr)");
     }
 
-    // Pool: allow individual set frees (VulkanTexture frees its set in its dtor). Includes
-    // a UNIFORM_BUFFER capacity for the per-frame UBO sets (set 0).
-    // SAMPLED_IMAGE/SAMPLER counts cover material sets (set 1) plus the per-frame sets' shadow-map
-    // image + sampler bindings (set 0, bindings 1+2): +kFramesInFlight each.
-    // Each material set now binds TWO sampled images + TWO samplers (base-color + normal map), so
-    // double the per-set image/sampler capacity vs. the old single-texture material set.
-    VkDescriptorPoolSize poolSizes[3]{};
-    poolSizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    poolSizes[0].descriptorCount = 512 + kFramesInFlight;  // +full-PBR + (base,normal) material-pair sets
-    poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-    poolSizes[1].descriptorCount = 512 + kFramesInFlight;  // +full-PBR + (base,normal) material-pair sets
-    poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[2].descriptorCount = kFramesInFlight + 16;  // margin
-    VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    // Was 64. Bumped to 128 to cover the per-(base,normal) material-pair sets (one immutable set per
-    // distinct pairing) on top of the existing per-texture / per-frame / per-joint / PBR sets.
-    pci.maxSets = 128;
-    pci.poolSizeCount = 3;
-    pci.pPoolSizes = poolSizes;
-    Check(vkCreateDescriptorPool(device_, &pci, nullptr, &descriptorPool_),
-          "vkCreateDescriptorPool");
+    // Pool: allow individual set frees (VulkanTexture frees its set in its dtor). One pool of the
+    // standard shape is created up front; allocateDescriptorSet GROWS the pool list on exhaustion
+    // (Slice SC1 — a real multi-material scene like the Sponza needs more sets than one pool holds).
+    descriptorPool_ = createSharedDescriptorPool();
 
     // --- Per-frame set layout (set 0): binding 0 = uniform buffer (vertex+fragment), binding 1 =
     // shadow-map sampled image (fragment), binding 2 = shadow sampler (fragment). The shadow
@@ -687,12 +670,7 @@ void VulkanDevice::CreateTextureResources() {
               "vmaCreateBuffer(ubo)");
         uboMapped_[i] = info.pMappedData;
 
-        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        dai.descriptorPool = descriptorPool_;
-        dai.descriptorSetCount = 1;
-        dai.pSetLayouts = &frameSetLayout_;
-        Check(vkAllocateDescriptorSets(device_, &dai, &frameSet_[i]),
-              "vkAllocateDescriptorSets(frame)");
+        frameSet_[i] = allocateDescriptorSet(frameSetLayout_, "vkAllocateDescriptorSets(frame)");
 
         VkDescriptorBufferInfo bufInfo{uboBuffer_[i], 0, VK_WHOLE_SIZE};
         VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -734,12 +712,7 @@ void VulkanDevice::CreateTextureResources() {
               "vmaCreateBuffer(joint)");
         jointMapped_[i] = info.pMappedData;
 
-        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        dai.descriptorPool = descriptorPool_;
-        dai.descriptorSetCount = 1;
-        dai.pSetLayouts = &jointSetLayout_;
-        Check(vkAllocateDescriptorSets(device_, &dai, &jointSet_[i]),
-              "vkAllocateDescriptorSets(joint)");
+        jointSet_[i] = allocateDescriptorSet(jointSetLayout_, "vkAllocateDescriptorSets(joint)");
 
         VkDescriptorBufferInfo bufInfo{jointBuffer_[i], 0, VK_WHOLE_SIZE};
         VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -750,6 +723,66 @@ void VulkanDevice::CreateTextureResources() {
         write.pBufferInfo = &bufInfo;
         vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
     }
+}
+
+VkDescriptorPool VulkanDevice::createSharedDescriptorPool() {
+    // The standard shared-pool shape (kept identical to the historical single pool so small scenes
+    // behave exactly as before growth existed):
+    //   * FREE_DESCRIPTOR_SET_BIT — VulkanTexture / render targets free their sets in their dtors.
+    //   * UNIFORM_BUFFER capacity for the per-frame UBO sets (set 0) + margin.
+    //   * SAMPLED_IMAGE/SAMPLER counts cover material sets (set 1: 2-texture pairs and 5-texture
+    //     full-PBR) plus the per-frame sets' shadow-map image + sampler bindings (set 0, bindings
+    //     1+2): +kFramesInFlight each.
+    //   * maxSets 128 (was 64; bumped for the per-(base,normal) material-pair sets). A scene needing
+    //     more sets (the Sponza's ~100 materials x 5 textures) grows into ADDITIONAL pools of this
+    //     same shape via allocateDescriptorSet rather than failing OUT_OF_POOL_MEMORY.
+    VkDescriptorPoolSize poolSizes[3]{};
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    poolSizes[0].descriptorCount = 512 + kFramesInFlight;  // +full-PBR + (base,normal) material-pair sets
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    poolSizes[1].descriptorCount = 512 + kFramesInFlight;  // +full-PBR + (base,normal) material-pair sets
+    poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSizes[2].descriptorCount = kFramesInFlight + 16;  // margin
+    VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pci.maxSets = 128;
+    pci.poolSizeCount = 3;
+    pci.pPoolSizes = poolSizes;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    Check(vkCreateDescriptorPool(device_, &pci, nullptr, &pool), "vkCreateDescriptorPool");
+    descriptorPools_.push_back(pool);
+    return pool;
+}
+
+VkDescriptorSet VulkanDevice::allocateDescriptorSet(VkDescriptorSetLayout layout, const char* what) {
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = descriptorPool_;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkResult r = vkAllocateDescriptorSets(device_, &dai, &set);
+    if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) {
+        // GROW (the vkguide pattern): a fresh pool of the same shape becomes the current pool and
+        // the allocation is retried once. Older pools stay alive — their sets remain valid and are
+        // freed back to them individually (descriptorSetPool_) or at teardown.
+        descriptorPool_ = createSharedDescriptorPool();
+        std::fprintf(stderr, "[vk] descriptor pool exhausted (%s); grew shared pool list to %zu pools\n",
+                     what, descriptorPools_.size());
+        dai.descriptorPool = descriptorPool_;
+        r = vkAllocateDescriptorSets(device_, &dai, &set);
+    }
+    Check(r, what);
+    descriptorSetPool_[set] = dai.descriptorPool;
+    return set;
+}
+
+void VulkanDevice::freeDescriptorSet(VkDescriptorSet set) {
+    if (!set) return;
+    auto it = descriptorSetPool_.find(set);
+    // Sets are always registered at allocation; the fallback covers teardown ordering edge cases.
+    VkDescriptorPool pool = (it != descriptorSetPool_.end()) ? it->second : descriptorPool_;
+    if (pool) vkFreeDescriptorSets(device_, pool, 1, &set);
+    if (it != descriptorSetPool_.end()) descriptorSetPool_.erase(it);
 }
 
 VkDescriptorSet VulkanDevice::pbrMaterialSet(ITexture& base, ITexture& metalRough,
@@ -774,12 +807,8 @@ VkDescriptorSet VulkanDevice::materialSet(VkImageView baseView, VkImageView norm
     auto it = materialSets_.find(key);
     if (it != materialSets_.end()) return it->second;
 
-    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dai.descriptorPool = descriptorPool_;
-    dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &texturedSetLayout_;
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    Check(vkAllocateDescriptorSets(device_, &dai, &set), "vkAllocateDescriptorSets(material-pair)");
+    VkDescriptorSet set =
+        allocateDescriptorSet(texturedSetLayout_, "vkAllocateDescriptorSets(material-pair)");
 
     // binding 0 = base-color image, 1 = base sampler, 3 = normal-map image, 4 = normal sampler.
     // Identical writes to what VulkanTexture's set carried after attachNormalMap(normal) — so the
@@ -849,7 +878,12 @@ void VulkanDevice::DestroyTextureResources() {
     defaultNormalImage_ = VK_NULL_HANDLE;
     defaultNormalAlloc_ = VK_NULL_HANDLE;
 
-    if (descriptorPool_) vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
+    // Slice SC1: the shared pool may have GROWN into several pools; destroy them all (this frees
+    // every set allocated from them, including any not individually returned).
+    for (VkDescriptorPool p : descriptorPools_)
+        if (p) vkDestroyDescriptorPool(device_, p, nullptr);
+    descriptorPools_.clear();
+    descriptorSetPool_.clear();
     if (texturedSetLayout_) vkDestroyDescriptorSetLayout(device_, texturedSetLayout_, nullptr);
     if (pbrMaterialSetLayout_) vkDestroyDescriptorSetLayout(device_, pbrMaterialSetLayout_, nullptr);
     if (environmentSetLayout_) vkDestroyDescriptorSetLayout(device_, environmentSetLayout_, nullptr);

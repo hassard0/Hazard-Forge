@@ -171,6 +171,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>   // Slice SC1: hero-bake load-time report
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -1412,6 +1413,210 @@ static int RunSceneShowcase(const char* outPath) {
                 const hf::asset::PbrMaterial& m = *inst.material;
                 float pc[20];
                 for (int k = 0; k < 16; ++k) pc[k] = world.m[k];
+                pc[16] = m.metallicFactor; pc[17] = m.roughnessFactor;
+                pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterialPBR(*m.baseColor, *m.metalRough, *m.normalMap,
+                                    *m.emissive, *m.occlusion);
+                cmd.BindVertexBuffer(inst.mesh->vertices());
+                cmd.BindIndexBuffer(inst.mesh->indices());
+                cmd.DrawIndexed(inst.mesh->indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u)\n", outPath, cw, ch);
+    return 0;
+}
+
+// --- THE REAL-SPONZA HERO BAKE (Slice SC1, GAP_CLOSING Tier 2). Mirrors the Vulkan --sc1-hero-shot
+// path EXACTLY: loads the FETCHED (gitignored) Khronos PBR Sponza — a multi-file .gltf whose ~70
+// images are EXTERNAL JPG/PNG file URIs (the SC1 loader seam) — and renders a fixed INTERIOR atrium
+// camera looking down the nave in the asset's native meters (no auto-fit): directional sun + the
+// existing shadow path + full PBR with the real textures, sky through the open roof, standard post.
+// Prints the same {meshes, materials, textures, triangles, drawCalls, shaded} stat line. FLOAT-class
+// golden. Fails loudly with a fetch hint when the asset is absent (it is fetched, never committed).
+// Documented fidelity gaps (same as Vulkan): alphaMode MASK/BLEND not honoured (opaque-only
+// pipeline), mip-0-only texture uploads, KHR_materials_* extensions ignored. -----------------------
+static int RunSc1HeroShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+
+    // FAIL LOUDLY if the fetched asset is absent.
+    {
+        std::FILE* probe = std::fopen(HF_SPONZA_MODEL_PATH, "rb");
+        if (!probe) {
+            std::fprintf(stderr,
+                "FATAL: Sponza not found at '%s'.\n"
+                "       Run assets/reference/fetch_reference_assets.sh --sponza first — the asset is "
+                "fetched, not committed.\n", HF_SPONZA_MODEL_PATH);
+            return 1;
+        }
+        std::fclose(probe);
+    }
+
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Lit-PBR pipeline (shared lit.vert + lit_pbr.frag; full 5-texture material set).
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto pbrFs = loadMSL("lit_pbr.frag.gen.metal", "pbr_fragment");
+    rhi::GraphicsPipelineDesc pbrDesc;
+    pbrDesc.vertex = litVs.get(); pbrDesc.fragment = pbrFs.get();
+    pbrDesc.vertexLayout = scene::MeshVertexLayout();
+    pbrDesc.colorFormat = device->Swapchain().ColorFormat();
+    pbrDesc.depthTest = true; pbrDesc.usesFrameUniforms = true;
+    pbrDesc.usesTexture = true; pbrDesc.pbrMaterial = true;
+    pbrDesc.pushConstantSize = sizeof(float) * 20;
+    auto pbrPipeline = device->CreateGraphicsPipeline(pbrDesc);
+
+    // Static depth-only shadow pipeline.
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    // Sky (visible through the open atrium roof) + post.
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    // Import the hero scene (external image URIs resolved by the SC1 loader seam).
+    hf::asset::GltfScene sponza;
+    const auto loadT0 = std::chrono::steady_clock::now();
+    try {
+        sponza = hf::asset::LoadGltfScene(*device, HF_SPONZA_MODEL_PATH);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "FATAL: --sc1-hero-shot could not load '%s': %s\n",
+                     HF_SPONZA_MODEL_PATH, e.what());
+        return 1;
+    }
+    const double loadSec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - loadT0).count();
+    if (sponza.instances.empty()) {
+        std::fprintf(stderr, "FATAL: --sc1-hero-shot loaded ZERO instances from '%s'\n",
+                     HF_SPONZA_MODEL_PATH);
+        return 1;
+    }
+
+    // The stat line (the scale proof) — same fields + formula as the Vulkan path.
+    unsigned long long triangles = 0;
+    for (const auto& inst : sponza.instances)
+        triangles += inst.mesh->indexCount() / 3ull;
+    const unsigned shaded = (unsigned)sponza.instances.size();
+    const unsigned drawCalls = shaded * 2u + 2u;   // shadow + scene passes + sky + post
+    std::printf("[sc1] hero stats: meshes=%zu materials=%zu textures=%zu triangles=%llu "
+                "drawCalls=%u shaded=%u\n",
+                sponza.meshStorage.size(), sponza.materialStorage.size(),
+                sponza.textureCount, triangles, drawCalls, shaded);
+    std::printf("[sc1] sponza load: %.2fs\n", loadSec);
+
+    // Fixed interior camera + sun — IDENTICAL constants to the Vulkan path (FlipProjY excepted).
+    const Vec3 eye{8.2f, 1.7f, 0.0f};
+    const Vec3 center{-9.5f, 3.4f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.22173048f, aspect, 0.1f, 100.0f));  // 70 deg
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        Vec3 lightDir = math::normalize(Vec3{-0.25f, -1.0f, 0.45f});
+        fd.lightDir[0] = lightDir.x; fd.lightDir[1] = lightDir.y; fd.lightDir[2] = lightDir.z;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.96f; fd.lightColor[2] = 0.88f;
+        fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{-0.5f, 5.2f, -0.3f};
+        Vec3 lightEye = sc - lightDir * 30.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-17.0f, 17.0f, -17.0f, 17.0f, 1.0f, 60.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.22173048f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*shadowPipeline);
+            for (const auto& inst : sponza.instances) {
+                cmd.PushConstants(inst.worldTransform.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(inst.mesh->vertices());
+                cmd.BindIndexBuffer(inst.mesh->indices());
+                cmd.DrawIndexed(inst.mesh->indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*pbrPipeline);
+            for (const auto& inst : sponza.instances) {
+                const hf::asset::PbrMaterial& m = *inst.material;
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = inst.worldTransform.m[k];
                 pc[16] = m.metallicFactor; pc[17] = m.roughnessFactor;
                 pc[18] = 0.0f; pc[19] = 0.0f;
                 cmd.PushConstants(pc, sizeof(pc));
@@ -81460,6 +81665,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--scene") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_scene_import.png";
             try { return RunSceneShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --sc1-hero-shot <out.png>: THE REAL-SPONZA HERO BAKE (Slice SC1) — the fetched Khronos PBR
+        // Sponza (multi-file .gltf, ~70 external image URIs) rendered from a fixed interior atrium
+        // camera, sun + shadows + full PBR with the real textures. Same flag string as the Vulkan
+        // harness. Fails loudly with a fetch hint when the asset is absent (fetched, never committed).
+        if (argc > 1 && std::strcmp(argv[1], "--sc1-hero-shot") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_sc1_hero.png";
+            try { return RunSc1HeroShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ibl <out.png>: render the HDR-environment-IBL showcase (Slice R).
