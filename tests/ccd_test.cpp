@@ -300,7 +300,13 @@ int main() {
         // MeasureSweptPairs is a pure summary (two calls byte-equal) + reports the superset + M.
         const ccd::SweptPairMeasure ms1 = ccd::MeasureSweptPairs(mixed, dt, kSweptCell);
         const ccd::SweptPairMeasure ms2 = ccd::MeasureSweptPairs(mixed, dt, kSweptCell);
-        check(std::memcmp(&ms1, &ms2, sizeof(ccd::SweptPairMeasure)) == 0, "MeasureSweptPairs is a pure function (byte-equal)");
+        // Field-wise (NOT memcmp): SweptPairMeasure's trailing `bool` leaves 3 padding bytes that are
+        // indeterminate in a by-value return, so a raw struct memcmp is compiler-dependent (green on MSVC,
+        // fails on gcc). The purity contract is over the meaningful FIELDS, which are bit-deterministic.
+        check(ms1.bodies == ms2.bodies && ms1.sweptPairs == ms2.sweptPairs &&
+                  ms1.discretePairs == ms2.discretePairs && ms1.missedByDiscrete == ms2.missedByDiscrete &&
+                  ms1.supersetOfDiscrete == ms2.supersetOfDiscrete,
+              "MeasureSweptPairs is a pure function (field-equal)");
         check(ms1.supersetOfDiscrete && ms1.missedByDiscrete > 0u, "MeasureSweptPairs reports {superset:true, M>0}");
         check(ms1.sweptPairs >= ms1.discretePairs, "the swept pair count >= the discrete pair count");
     }
