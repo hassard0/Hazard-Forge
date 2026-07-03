@@ -409,6 +409,7 @@ $Goldens = @(
     @{ Name = 'sc1_hero';        Flag = '--sc1-hero-shot' }      # SC1 THE REAL-SPONZA HERO BAKE (gap-roadmap Tier 2; 103 meshes / 25 materials / 69 URI textures / 262k tris / 208 draws; REQUIRES assets/reference/_downloaded/Sponza — run fetch_reference_assets --sponza on the Mac first)
     @{ Name = 'sc3_stack';       Flag = '--sc3-stack-shot' }     # SC3 Sponza through the virtual-geometry stack (2097 clusters, cull-sound, digest 0x7a025cd461ba6902; REQUIRES the fetched Sponza)
     @{ Name = 'sc5_foliage';     Flag = '--sc5-foliage-shot' }   # SC5 foliage scatter at scale (12,123 instances / 3 instanced draws; integer plant digest 0xd8a9963b269d83e3 cross-platform)
+    @{ Name = 'sc6_residency';    Flag = '--sc6-residency-shot' } # SC6 VT page residency under a streaming budget (Tier 2 final; 4-mip heatmap, digest 0xe57f2491f1aad4dc cross-platform)
 )
 
 $winResult = 'SKIP'
