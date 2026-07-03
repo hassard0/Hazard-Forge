@@ -449,6 +449,10 @@ int main(int argc, char** argv) {
     // URIs — the first real multi-million-unit multi-material scene through the full stack) and
     // renders a fixed INTERIOR atrium camera, sun + shadows + full PBR with the real textures.
     const char* sc1HeroShotPath = nullptr;
+    // --sponza-explore: INTERACTIVE windowed fly-through of the REAL Khronos PBR Sponza (the same
+    // asset + pipelines + shadow/scene/post graph as --sc1-hero-shot), driven by a live fly camera
+    // (WASD + right-button mouse-look, like --fly) presenting to the swapchain each frame. ESC quits.
+    bool sponzaExplore = false;
     // Slice SC3 (GAP_CLOSING Tier 2 — SPONZA THROUGH THE VIRTUAL-GEOMETRY STACK): --sc3-stack-shot
     // <out.bmp> pushes the REAL Sponza's heterogeneous geometry through meshlet decomposition ->
     // per-cluster frustum cull (SC1 hero camera) -> auto-LOD (top-10 meshes) and renders the
@@ -3295,6 +3299,16 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--sc1-hero-shot") == 0 || std::strcmp(argv[i], "--sc1-hero") == 0) {
             sc1HeroShotPath = (i + 1 < argc) ? argv[i + 1] : "sc1_hero.bmp";
+            break;
+        }
+    }
+
+    // --sponza-explore: interactive windowed Sponza fly-through. Parsed in its OWN loop (the big
+    // else-if ladder above is at the MSVC C1061 nested-block limit — the SC1 pattern). No argument
+    // (the model path is baked HF_SPONZA_MODEL_PATH); just sets the bool for the handler below.
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--sponza-explore") == 0) {
+            sponzaExplore = true;
             break;
         }
     }
@@ -110196,6 +110210,272 @@ int main(int argc, char** argv) {
             }
             device->WaitIdle();
             return ok ? 0 : 1;
+        }
+
+        // --- SPONZA FLY-THROUGH (--sponza-explore, INTERACTIVE windowed): a real-time navigable
+        // fly-through of the REAL Khronos PBR Sponza. Loads the SAME fetched asset and builds the
+        // SAME shadow -> scene -> post render graph + IDENTICAL pipelines (lit_pbr / lit_pbr_cutout /
+        // shadow / sky / post) as --sc1-hero-shot, so what you fly through is the hero render — but
+        // instead of one capture->BMP, it drives a live runtime::Camera (WASD + right-button
+        // mouse-look, exactly like --fly) and the post pass PRESENTS to the swapchain every frame.
+        // The sun + shadow ortho are WORLD-FIXED (folded into a FrameData template ONCE, camera-
+        // independent); only vp/viewPos/basis/skyParams update per frame from the fly camera. ESC
+        // quits. Reuses the shared window+device; NO new shaders, NO golden (interactive-only). ------
+        if (sponzaExplore) {
+            using math::Mat4; using math::Vec3;
+            std::printf("Sponza fly-through — WASD move, hold RIGHT mouse to look, ESC to quit\n");
+
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // FAIL LOUDLY if the fetched asset is absent (it is gitignored, never committed).
+            {
+                std::FILE* probe = std::fopen(HF_SPONZA_MODEL_PATH, "rb");
+                if (!probe) {
+                    std::fprintf(stderr,
+                        "FATAL: Sponza not found at '%s'.\n"
+                        "       Run assets/reference/fetch_reference_assets.ps1 -Sponza (or "
+                        "fetch_reference_assets.sh --sponza) first — the asset is fetched, not committed.\n",
+                        HF_SPONZA_MODEL_PATH);
+                    device->WaitIdle();
+                    return 1;
+                }
+                std::fclose(probe);
+            }
+
+            // Pipelines — IDENTICAL to --sc1-hero-shot (lit.vert + lit_pbr.frag, the lit_cutout pair,
+            // depth-only shadow, sky, post). swapchain-format LDR; the post pass writes the swapchain.
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto pbrFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_pbr.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto pbrFs = device->CreateShaderModule({std::span<const uint32_t>(pbrFsWords)});
+            rhi::GraphicsPipelineDesc pbrDesc;
+            pbrDesc.vertex = litVs.get();
+            pbrDesc.fragment = pbrFs.get();
+            pbrDesc.vertexLayout = scene::MeshVertexLayout();
+            pbrDesc.colorFormat = device->Swapchain().ColorFormat();
+            pbrDesc.depthTest = true;
+            pbrDesc.usesFrameUniforms = true;
+            pbrDesc.usesTexture = true;
+            pbrDesc.pbrMaterial = true;
+            pbrDesc.pushConstantSize = sizeof(float) * 20;  // mat4 model + float4 material
+            auto pbrPipeline = device->CreateGraphicsPipeline(pbrDesc);
+
+            auto cutVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_cutout.vert.hlsl.spv");
+            auto cutFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_pbr_cutout.frag.hlsl.spv");
+            auto cutVs = device->CreateShaderModule({std::span<const uint32_t>(cutVsWords)});
+            auto cutFs = device->CreateShaderModule({std::span<const uint32_t>(cutFsWords)});
+            rhi::GraphicsPipelineDesc cutDesc = pbrDesc;
+            cutDesc.vertex = cutVs.get();
+            cutDesc.fragment = cutFs.get();
+            auto cutoutPipeline = device->CreateGraphicsPipeline(cutDesc);
+
+            auto shadowVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto shadowVs = device->CreateShaderModule({std::span<const uint32_t>(shadowVsW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc shDesc;
+            shDesc.vertex = shadowVs.get();
+            shDesc.fragment = shadowFs.get();
+            shDesc.vertexLayout = scene::MeshVertexLayout();
+            shDesc.depthTest = true;
+            shDesc.depthOnly = true;
+            shDesc.usesFrameUniforms = true;
+            shDesc.pushConstantSize = sizeof(float) * 16;
+            auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);           // swapchain-format LDR RT
+            auto shadowMap = device->CreateShadowMap(2048);       // fixed size (no resize recreate)
+            device->SetShadowMap(*shadowMap);
+
+            // Import Sponza (same load options as the hero bake: full deterministic CPU mip chains).
+            hf::asset::GltfScene sponza;
+            const auto loadT0 = std::chrono::steady_clock::now();
+            try {
+                hf::asset::GltfLoadOptions loadOpts;
+                loadOpts.generateMipmaps = true;
+                sponza = hf::asset::LoadGltfScene(*device, HF_SPONZA_MODEL_PATH, loadOpts);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "FATAL: --sponza-explore could not load '%s': %s\n",
+                             HF_SPONZA_MODEL_PATH, e.what());
+                device->WaitIdle();
+                return 1;
+            }
+            const double loadSec = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - loadT0).count();
+            if (sponza.instances.empty()) {
+                std::fprintf(stderr, "FATAL: --sponza-explore loaded ZERO instances from '%s'\n",
+                             HF_SPONZA_MODEL_PATH);
+                device->WaitIdle();
+                return 1;
+            }
+            unsigned long long triangles = 0;
+            for (const auto& inst : sponza.instances)
+                triangles += inst.mesh->indexCount() / 3ull;
+            std::printf("[sponza-explore] loaded: meshes=%zu materials=%zu textures=%zu triangles=%llu "
+                        "instances=%zu (%.2fs)\n",
+                        sponza.meshStorage.size(), sponza.materialStorage.size(),
+                        sponza.textureCount, triangles, sponza.instances.size(), loadSec);
+
+            // World-fixed sun + shadow ortho, folded into a FrameData template ONCE (camera-
+            // independent — the SAME light rig the hero bake uses, so lighting matches).
+            FrameData fdTemplate{};
+            {
+                Vec3 lightDir = math::normalize(Vec3{-0.25f, -1.0f, 0.45f});
+                fdTemplate.lightDir[0] = lightDir.x; fdTemplate.lightDir[1] = lightDir.y;
+                fdTemplate.lightDir[2] = lightDir.z;
+                fdTemplate.lightColor[0] = 1.0f; fdTemplate.lightColor[1] = 0.96f;
+                fdTemplate.lightColor[2] = 0.88f; fdTemplate.lightColor[3] = 1.0f;
+                fdTemplate.ptCount[0] = 0.0f;
+                Vec3 sc{-0.5f, 5.2f, -0.3f};
+                Vec3 lightEye = sc - lightDir * 30.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-17.0f, 17.0f, -17.0f, 17.0f, 1.0f, 60.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fdTemplate.lightViewProj[k] = lightVP.m[k];
+            }
+
+            // Fly camera seeded in the atrium looking WEST down the nave (toward -X), matching the
+            // hero framing. Forward(yaw=-pi/2, pitch~0) = (-cos p, sin p, 0) -> -X, a touch upward.
+            runtime::Camera cam;
+            cam.position = {8.2f, 1.7f, 0.0f};
+            cam.yaw = -1.5707963f;   // -pi/2: face -X down the nave
+            cam.SetPitch(0.08f);     // a touch upward so the arches/upper gallery frame the opening view
+            cam.fovY = 1.15f;        // ~66 deg vertical (spec band 60-70)
+            cam.aspect = aspect;
+            cam.znear = 0.1f; cam.zfar = 100.0f;   // Sponza AABB ~30m
+            runtime::FlyCameraController controller;
+
+            // Camera -> FrameData (view-proj + basis + sky params) over the fixed light template.
+            auto makeFrameData = [&](const runtime::Camera& c) {
+                FrameData fd = fdTemplate;
+                Mat4 vp = c.ViewProj();
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                runtime::CameraBasis b = c.Basis();
+                fd.viewPos[0] = b.position.x; fd.viewPos[1] = b.position.y;
+                fd.viewPos[2] = b.position.z; fd.viewPos[3] = 1.0f;
+                fd.camFwd[0]=b.forward.x; fd.camFwd[1]=b.forward.y; fd.camFwd[2]=b.forward.z;
+                fd.camRight[0]=b.right.x; fd.camRight[1]=b.right.y; fd.camRight[2]=b.right.z;
+                fd.camUp[0]=b.up.x; fd.camUp[1]=b.up.y; fd.camUp[2]=b.up.z;
+                fd.skyParams[0] = b.tanHalfFovY; fd.skyParams[1] = b.aspect;
+                return fd;
+            };
+
+            // === Live loop: pump -> camera update -> makeFrameData -> shadow/scene/post -> present. ===
+            bool prevRight = false;
+            auto last = std::chrono::steady_clock::now();
+            bool running = true;
+            while (running) {
+                running = window.PumpEvents();
+                const runtime::InputState& in = window.Input();
+                if (in.Down(runtime::Key::Esc)) running = false;
+                if (window.ConsumeResized()) {
+                    device->WaitIdle();
+                    w = window.FramebufferWidth();
+                    h = window.FramebufferHeight();
+                    device->Swapchain().Recreate(w, h);
+                    rt = device->CreateRenderTarget(w, h);   // shadow map is fixed 2048 — no recreate
+                    cam.aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+                }
+
+                // Mouse-look on RIGHT button (engages/releases relative mouse), like --fly.
+                bool nowRight = in.mouseButtons[1];
+                if (nowRight && !prevRight) window.SetRelativeMouse(true);
+                if (!nowRight && prevRight) window.SetRelativeMouse(false);
+                prevRight = nowRight;
+
+                auto now = std::chrono::steady_clock::now();
+                float dt = std::min(std::chrono::duration<float>(now - last).count(), 0.1f);
+                last = now;
+                controller.Update(cam, in, dt);
+
+                FrameData fd = makeFrameData(cam);
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*shadowPipeline);
+                        for (const auto& inst : sponza.instances) {
+                            cmd.PushConstants(inst.worldTransform.m, sizeof(float) * 16);
+                            cmd.BindVertexBuffer(inst.mesh->vertices());
+                            cmd.BindIndexBuffer(inst.mesh->indices());
+                            cmd.DrawIndexed(inst.mesh->indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        auto drawInstance = [&](const hf::asset::SceneInstance& inst) {
+                            const hf::asset::PbrMaterial& m = *inst.material;
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = inst.worldTransform.m[k];
+                            pc[16] = m.metallicFactor; pc[17] = m.roughnessFactor;
+                            pc[18] = 0.0f;
+                            pc[19] = m.alphaMasked ? m.alphaCutoff : 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterialPBR(*m.baseColor, *m.metalRough, *m.normalMap,
+                                                *m.emissive, *m.occlusion);
+                            cmd.BindVertexBuffer(inst.mesh->vertices());
+                            cmd.BindIndexBuffer(inst.mesh->indices());
+                            cmd.DrawIndexed(inst.mesh->indexCount());
+                        };
+                        cmd.BindPipeline(*pbrPipeline);
+                        for (const auto& inst : sponza.instances)
+                            if (!inst.material->alphaMasked) drawInstance(inst);
+                        cmd.BindPipeline(*cutoutPipeline);
+                        for (const auto& inst : sponza.instances)
+                            if (inst.material->alphaMasked) drawInstance(inst);
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                graph.Execute(*device);   // post pass presents to the swapchain
+            }
+            window.SetRelativeMouse(false);
+            device->WaitIdle();
+            return 0;
         }
 
         // --- Built-in reference asset library showcase (--reference-shot <model.glb> <out.bmp>,
