@@ -68,6 +68,7 @@
 #include "render/lod_gen.h"      // Slice LOD1: deterministic automatic LOD generation (integer QEM decimation; shared with --lod-gen-shot)
 #include "render/sc3_stack.h"    // Slice SC3: Sponza through the virtual-geometry stack (meshlet -> cluster-cull -> auto-LOD at real-content scale; pure CPU composition; shared with --sc3-stack-shot)
 #include "render/sc5_foliage.h"  // Slice SC5: FOLIAGE SCATTER AT SCALE (PCG scatter -> LUT wind bend -> integer LOD -> per-LOD instance transform buffers at 10k+; pure CPU composition; shared with --sc5-foliage-shot)
+#include "render/sc6_residency.h" // Slice SC6: TEXTURE RESIDENCY — VT page feedback driving a streaming budget (camera-path feedback -> StepResidency loads/evicts under budget+hysteresis; pure CPU composition; shared with --sc6-residency-shot)
 #include "render/visbuffer.h"   // Slice DW: visibility-buffer ID packing + CPU coverage reference (PackVisId/UnpackVisId/SurvivorInteriorSamples)
 #include "render/visresolve.h"  // Slice DX: deferred material resolve CPU mirror (ResolveFlatShade/ResolvePixel/EncodeBGRA8)
 #include "render/swraster.h"    // Slice SW1: CPU-reference integer software rasterizer (SwVisBuffer/RasterClusters/PackSw) — shared verbatim with --swraster (Metal)
@@ -458,6 +459,11 @@ int main(int argc, char** argv) {
     // distance-LOD into the 10k+ "field of grass" hero through the instanced-lit path (3 per-LOD
     // instanced draws). Own parse loop below (MSVC C1061). Asset-free (procedural).
     const char* sc5FoliageShotPath = nullptr;
+    // Slice SC6 (GAP_CLOSING Tier 2 — TEXTURE RESIDENCY): --sc6-residency-shot <out.bmp> runs the
+    // canonical textured-plane fly-over feedback -> StepResidency budget+hysteresis trace and
+    // renders the page-residency HEATMAP at the fixed mid-path frame (pure CPU, integer strict-zero;
+    // pinned {peak, loads, evicts, convergedAt, digest}). Own parse loop below (MSVC C1061).
+    const char* sc6ResidencyShotPath = nullptr;
     const char* iblShotPath = nullptr;
     // Substrate-lite layered materials (issue #11, SB1): the HDR-IBL helmet scene rendered through
     // lit_substrate.frag (lit_pbr_ibl + an additive clearcoat lobe). Own parse loop below (MSVC C1061).
@@ -3310,6 +3316,16 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--sc5-foliage-shot") == 0) {
             sc5FoliageShotPath = (i + 1 < argc) ? argv[i + 1] : "sc5_foliage.bmp";
+            break;
+        }
+    }
+
+    // Slice SC6 (GAP_CLOSING Tier 2 — TEXTURE RESIDENCY): --sc6-residency-shot <out.bmp>. Parsed in
+    // its OWN loop (the big else-if ladder above is at the MSVC C1061 nested-block limit). Fully
+    // synthetic (the canonical fly-over) — no asset, only the output path is an argument.
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--sc6-residency-shot") == 0) {
+            sc6ResidencyShotPath = (i + 1 < argc) ? argv[i + 1] : "sc6_residency.bmp";
             break;
         }
     }
@@ -109796,6 +109812,107 @@ int main(int argc, char** argv) {
                                 "%u drawn, 3 instanced draws)\n",
                                 sc5FoliageShotPath, cw, ch2, (uint32_t)plants.size(), rset.Drawn());
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", sc5FoliageShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- TEXTURE RESIDENCY: VT PAGE FEEDBACK DRIVING A STREAMING BUDGET (--sc6-residency-shot
+        // <out.bmp>, Slice SC6, GAP_CLOSING Tier 2 — the LAST Tier-2 slice). PURE CPU — NO GPU
+        // dispatch, NO new shader, NO new RHI: the canonical textured-ground-plane fly-over
+        // generates per-frame VT page FEEDBACK from the camera math (screen-tile ray -> hit UV +
+        // texel density -> vt::SelectMipLevel -> vt::SnapRequest, the VT1 convention), and
+        // sc6::StepResidency loads/evicts pages under a per-frame BUDGET with K-frame HYSTERESIS
+        // (the scene/streaming.h discipline applied to texture pages — the first time the proven
+        // vt.h page math and the streaming budget are CONNECTED). Renders the page-residency
+        // HEATMAP at the fixed mid-path frame (per-mip page grid colored by state: evicted-now red,
+        // loaded-now lime, resident green, pending amber, cold slate, never-requested dark) via the
+        // header's shared Sc6DrawHeatmap -> integer strict-zero cross-backend BY CONSTRUCTION.
+        // All artifacts pinned (sc6_residency.h kSc6Expected*); asserted here like the sc5 gates.
+        if (sc6ResidencyShotPath) {
+            namespace sc6 = hf::render::sc6;
+            const sc6::Sc6CanonicalRun run = sc6::Sc6RunCanonicalShowcase();
+
+            // Pinned-artifact gate: the canonical run's integer trace stats (cross-platform pins).
+            if (run.stats.pages != sc6::kSc6ExpectedPages ||
+                run.stats.peakResident != sc6::kSc6ExpectedPeakResident ||
+                run.stats.totalLoads != sc6::kSc6ExpectedLoads ||
+                run.stats.totalEvicts != sc6::kSc6ExpectedEvicts ||
+                run.stats.convergedAt != sc6::kSc6ExpectedConvergedAt) {
+                std::fprintf(stderr, "FATAL: sc6-residency stats != pinned kSc6Expected* "
+                             "(peak %d loads %lld evicts %lld conv %d)\n",
+                             run.stats.peakResident, (long long)run.stats.totalLoads,
+                             (long long)run.stats.totalEvicts, run.stats.convergedAt);
+                device->WaitIdle(); return 1;
+            }
+            if (run.stats.traceDigest != sc6::kSc6ExpectedTraceDigest) {
+                std::fprintf(stderr, "FATAL: sc6-residency trace digest 0x%016llx != pinned "
+                             "kSc6ExpectedTraceDigest (cross-platform pin broken)\n",
+                             (unsigned long long)run.stats.traceDigest);
+                device->WaitIdle(); return 1;
+            }
+
+            // PROOF (1) two-run determinism (independent full runs, byte-identical traces).
+            if (run.stats.traceDigest != run.statsRepeat.traceDigest ||
+                run.stats.totalLoads != run.statsRepeat.totalLoads ||
+                run.stats.totalEvicts != run.statsRepeat.totalEvicts) {
+                std::fprintf(stderr, "FATAL: sc6-residency two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("sc6-residency determinism: two full fly-over runs BYTE-IDENTICAL "
+                        "(trace digest 0x%016llx)\n", (unsigned long long)run.stats.traceDigest);
+
+            // PROOF (2) the budget is LOAD-BEARING: unthrottled exceeds it in one frame; the
+            // budgeted run never does AND still converges.
+            if (run.unbounded.maxLoadedInFrame <= run.rcfg.loadBudgetPerFrame ||
+                run.stats.maxLoadedInFrame > run.rcfg.loadBudgetPerFrame ||
+                run.stats.convergedAt < 0) {
+                std::fprintf(stderr, "FATAL: sc6-residency budget proof failed (unbounded max %d, "
+                             "budgeted max %d, budget %d, convergedAt %d)\n",
+                             run.unbounded.maxLoadedInFrame, run.stats.maxLoadedInFrame,
+                             run.rcfg.loadBudgetPerFrame, run.stats.convergedAt);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("sc6-residency budget: unthrottled peak %d loads/frame vs budget %d; "
+                        "budgeted run converges at frame %d\n",
+                        run.unbounded.maxLoadedInFrame, run.rcfg.loadBudgetPerFrame,
+                        run.stats.convergedAt);
+
+            // PROOF (3) hysteresis: the flickering view does NOT thrash under K; K=1 reloads.
+            if (run.thrash.loadsHyst != (int64_t)run.thrash.flickerPages ||
+                run.thrash.evictsHyst != 0 || run.thrash.loadsBase <= run.thrash.loadsHyst) {
+                std::fprintf(stderr, "FATAL: sc6-residency hysteresis proof failed\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("sc6-residency hysteresis: %d flickering pages -> K=%d loads=%lld "
+                        "evicts=%lld vs K=1 loads=%lld evicts=%lld (no thrash)\n",
+                        run.thrash.flickerPages, run.rcfg.hysteresisFrames,
+                        (long long)run.thrash.loadsHyst, (long long)run.thrash.evictsHyst,
+                        (long long)run.thrash.loadsBase, (long long)run.thrash.evictsBase);
+
+            // PROOF (4) the pool cap held on every frame.
+            if (!run.stats.capRespected || run.stats.peakResident > run.rcfg.poolCapacity) {
+                std::fprintf(stderr, "FATAL: sc6-residency pool cap exceeded\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("sc6-residency pool cap: peakResident %d <= cap %d (never exceeded)\n",
+                        run.stats.peakResident, run.rcfg.poolCapacity);
+
+            // The pinned stat line.
+            std::printf("sc6-residency: {pages:%d, peakResident:%d, loads:%lld, evicts:%lld, "
+                        "convergedAt:%d, digest:0x%016llx}\n",
+                        run.stats.pages, run.stats.peakResident,
+                        (long long)run.stats.totalLoads, (long long)run.stats.totalEvicts,
+                        run.stats.convergedAt, (unsigned long long)run.stats.traceDigest);
+
+            // The heatmap golden (shared Sc6DrawHeatmap -> identical bytes on Metal by construction).
+            std::vector<uint8_t> bgra;
+            sc6::Sc6DrawHeatmap(run.capture, run.scfg.texture, bgra);
+            bool ok = WriteBMP(sc6ResidencyShotPath, bgra, sc6::kSc6HeatW, sc6::kSc6HeatH);
+            if (ok) std::printf("wrote %s (%ux%u) — VT page-residency heatmap @frame %d "
+                                "(evicted/loaded/resident/pending/cold)\n",
+                                sc6ResidencyShotPath, sc6::kSc6HeatW, sc6::kSc6HeatH,
+                                sc6::kSc6ShotFrame);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", sc6ResidencyShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

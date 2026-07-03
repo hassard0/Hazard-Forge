@@ -91,6 +91,7 @@
 #include "render/cluster_lod.h"     // Slice DV: discrete cluster-LOD selection CPU mirror (BuildLodMeshes/SelectLod, squared form)
 #include "render/sc3_stack.h"       // Slice SC3: Sponza through the virtual-geometry stack (meshlet -> cluster-cull -> auto-LOD at real-content scale; pure CPU composition; shared with --sc3-stack-shot)
 #include "render/sc5_foliage.h"     // Slice SC5: FOLIAGE SCATTER AT SCALE (PCG scatter -> LUT wind bend -> integer LOD -> per-LOD instance transform buffers at 10k+; pure CPU composition; shared with --sc5-foliage-shot)
+#include "render/sc6_residency.h"   // Slice SC6: TEXTURE RESIDENCY — VT page feedback driving a streaming budget (camera-path feedback -> StepResidency loads/evicts under budget+hysteresis; pure CPU composition; shared with --sc6-residency-shot)
 #include "render/visbuffer.h"       // Slice DW: visibility-buffer ID packing + CPU coverage reference (PackVisId/UnpackVisId/InstanceInteriorSamples)
 #include "render/visresolve.h"      // Slice DX: deferred material resolve CPU mirror (ResolveMaterial/DefaultResolveMaterial/ResolveSkyColor/ResolvePixel/EncodeBGRA8) — shared verbatim with --visresolve-shot (Vulkan)
 #include "render/swraster.h"        // Slice SW1: CPU-reference integer software rasterizer (SwVisBuffer/RasterClusters/PackSw/BuildSwRasterScene/ColorSwVisBuffer) — shared verbatim with --swraster-shot (Vulkan)
@@ -65092,6 +65093,81 @@ static int RunFo6HeroShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice SC6 — TEXTURE RESIDENCY: VT PAGE FEEDBACK DRIVING A STREAMING BUDGET (GAP_CLOSING Tier 2, the
+// LAST Tier-2 slice). PURE CPU — NO GPU dispatch, NO new shader, NO new RHI, NO device: runs the IDENTICAL
+// sc6_residency.h canonical pipeline the Vulkan --sc6-residency-shot runs — the textured-ground-plane
+// fly-over generates per-frame VT page FEEDBACK from the camera math (screen-tile ray -> hit UV + texel
+// density -> vt::SelectMipLevel -> vt::SnapRequest, the VT1 convention) and sc6::StepResidency loads/evicts
+// pages under a per-frame BUDGET with K-frame HYSTERESIS (the scene/streaming.h discipline applied to
+// texture pages — the first time the proven vt.h page math and the streaming budget are CONNECTED). The
+// feedback float path is fp-contraction-proof (split-statement, host-baked constants, no libm), everything
+// after the page quantization is integer, and the heatmap pixels come from the SHARED Sc6DrawHeatmap ->
+// integer strict-zero cross-backend BY CONSTRUCTION. The proof lines match the Vulkan side EXACTLY; all
+// artifacts are asserted against the header's kSc6Expected* pins. ------------------------------------------
+static int RunSc6ResidencyShowcase(const char* outPath) {
+    namespace sc6 = hf::render::sc6;
+    const sc6::Sc6CanonicalRun run = sc6::Sc6RunCanonicalShowcase();
+
+    // Pinned-artifact gate: the canonical run's integer trace stats (cross-platform pins).
+    if (run.stats.pages != sc6::kSc6ExpectedPages ||
+        run.stats.peakResident != sc6::kSc6ExpectedPeakResident ||
+        run.stats.totalLoads != sc6::kSc6ExpectedLoads ||
+        run.stats.totalEvicts != sc6::kSc6ExpectedEvicts ||
+        run.stats.convergedAt != sc6::kSc6ExpectedConvergedAt)
+        return fail("sc6-residency stats != pinned kSc6Expected* (cross-platform pin broken)");
+    if (run.stats.traceDigest != sc6::kSc6ExpectedTraceDigest)
+        return fail("sc6-residency trace digest != pinned kSc6ExpectedTraceDigest (cross-platform pin broken)");
+
+    // PROOF (1) two-run determinism (independent full runs, byte-identical traces).
+    if (run.stats.traceDigest != run.statsRepeat.traceDigest ||
+        run.stats.totalLoads != run.statsRepeat.totalLoads ||
+        run.stats.totalEvicts != run.statsRepeat.totalEvicts)
+        return fail("sc6-residency: two runs differ (nondeterministic)");
+    std::printf("sc6-residency determinism: two full fly-over runs BYTE-IDENTICAL "
+                "(trace digest 0x%016llx)\n", (unsigned long long)run.stats.traceDigest);
+
+    // PROOF (2) the budget is LOAD-BEARING: unthrottled exceeds it in one frame; the budgeted run
+    // never does AND still converges.
+    if (run.unbounded.maxLoadedInFrame <= run.rcfg.loadBudgetPerFrame ||
+        run.stats.maxLoadedInFrame > run.rcfg.loadBudgetPerFrame || run.stats.convergedAt < 0)
+        return fail("sc6-residency: budget proof failed");
+    std::printf("sc6-residency budget: unthrottled peak %d loads/frame vs budget %d; "
+                "budgeted run converges at frame %d\n",
+                run.unbounded.maxLoadedInFrame, run.rcfg.loadBudgetPerFrame, run.stats.convergedAt);
+
+    // PROOF (3) hysteresis: the flickering view does NOT thrash under K; K=1 reloads.
+    if (run.thrash.loadsHyst != (int64_t)run.thrash.flickerPages ||
+        run.thrash.evictsHyst != 0 || run.thrash.loadsBase <= run.thrash.loadsHyst)
+        return fail("sc6-residency: hysteresis proof failed");
+    std::printf("sc6-residency hysteresis: %d flickering pages -> K=%d loads=%lld evicts=%lld "
+                "vs K=1 loads=%lld evicts=%lld (no thrash)\n",
+                run.thrash.flickerPages, run.rcfg.hysteresisFrames,
+                (long long)run.thrash.loadsHyst, (long long)run.thrash.evictsHyst,
+                (long long)run.thrash.loadsBase, (long long)run.thrash.evictsBase);
+
+    // PROOF (4) the pool cap held on every frame.
+    if (!run.stats.capRespected || run.stats.peakResident > run.rcfg.poolCapacity)
+        return fail("sc6-residency: pool cap exceeded");
+    std::printf("sc6-residency pool cap: peakResident %d <= cap %d (never exceeded)\n",
+                run.stats.peakResident, run.rcfg.poolCapacity);
+
+    // The pinned stat line.
+    std::printf("sc6-residency: {pages:%d, peakResident:%d, loads:%lld, evicts:%lld, "
+                "convergedAt:%d, digest:0x%016llx}\n",
+                run.stats.pages, run.stats.peakResident,
+                (long long)run.stats.totalLoads, (long long)run.stats.totalEvicts,
+                run.stats.convergedAt, (unsigned long long)run.stats.traceDigest);
+
+    // The heatmap golden (the SHARED Sc6DrawHeatmap — identical bytes to the Vulkan BMP by construction).
+    std::vector<uint8_t> bgra;
+    sc6::Sc6DrawHeatmap(run.capture, run.scfg.texture, bgra);
+    if (!WritePNG(outPath, bgra, sc6::kSc6HeatW, sc6::kSc6HeatH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — VT page-residency heatmap @frame %d "
+                "(evicted/loaded/resident/pending/cold)\n",
+                outPath, sc6::kSc6HeatW, sc6::kSc6HeatH, sc6::kSc6ShotFrame);
+    return 0;
+}
+
 // ===== Slice SC5 — FOLIAGE SCATTER AT SCALE (GAP_CLOSING Tier 2). Mirrors the Vulkan --sc5-foliage-shot path
 // EXACTLY: the canonical knobs live in render/sc5_foliage.h::Sc5DefaultConfig() (ONE source of truth for
 // Vulkan/Metal/test), so the bit-exact integer plant set {pos, orient, scale, bend, lod} is byte-identical
@@ -82320,6 +82396,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--sc5-foliage-shot") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_sc5_foliage.png";
             try { return RunSc5FoliageShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --sc6-residency-shot <out.png>: TEXTURE RESIDENCY (Slice SC6, GAP_CLOSING Tier 2, the LAST
+        // Tier-2 slice) — VT page feedback from the canonical fly-over camera driving the
+        // budget+hysteresis page-residency manager; the mid-path residency HEATMAP via the shared
+        // Sc6DrawHeatmap (PURE CPU, integer strict-zero cross-backend BY CONSTRUCTION). All artifacts
+        // asserted against the kSc6Expected* pins. Same flag string as the Vulkan harness. Asset-free.
+        if (argc > 1 && std::strcmp(argv[1], "--sc6-residency-shot") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_sc6_residency.png";
+            try { return RunSc6ResidencyShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ibl <out.png>: render the HDR-environment-IBL showcase (Slice R).

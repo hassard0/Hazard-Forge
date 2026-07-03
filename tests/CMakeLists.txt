@@ -942,6 +942,24 @@ target_compile_definitions(sc3_stack_test PRIVATE
 # (hf_core), no RHI/device, ASan-eligible.
 hf_add_pure_test(sc5_foliage_test)
 
+# TEXTURE RESIDENCY (Slice SC6, GAP_CLOSING Tier 2 — the LAST Tier-2 slice): the pure-CPU composition
+# header render/sc6_residency.h connecting the proven vt.h page-table math (VtTexture / PageId /
+# SelectMipLevel / SnapRequest) to the scene/streaming.h budget+hysteresis discipline, applied to
+# TEXTURE PAGES: per-frame camera-path VT feedback -> StepResidency loads/evicts under a per-frame
+# budget with K-frame un-requested hysteresis, deterministic (mip,tex,y,x) load priority +
+# oldest-un-requested-first evictions, a hard pool cap. TWO TIERS: (1) ALWAYS-ON synthetic —
+# StepResidency semantics on a tiny page space, then the canonical textured-ground-plane fly-over
+# with pinned {peakResident, loads, evicts, convergedAt, traceDigest}, two-run determinism, the
+# budget-is-load-bearing contrast (unthrottled exceeds the budget in one frame; budgeted converges),
+# the hysteresis thrash contrast (flickering view: K>=2 loads once, K=1 reloads every flicker), and
+# the pool-cap invariant; (2) SPONZA-GATED — the real 69-texture set mapped into page space (each
+# texture its own 4-mip pyramid), object-space feedback from the SC1 hero camera dollied down the
+# nave, pinned {peak, loads, evicts, digest}; SKIPS GRACEFULLY when the fetched asset is absent.
+# Pure C++ (hf_core: cgltf/gltf_loader for the Sponza tier), no RHI/device, ASan-eligible.
+hf_add_pure_test(sc6_residency_test)
+target_compile_definitions(sc6_residency_test PRIVATE
+  "HF_SC6_SPONZA_GLTF=\"${CMAKE_SOURCE_DIR}/assets/reference/_downloaded/Sponza/Sponza.gltf\"")
+
 # Virtual-geometry VISIBILITY BUFFER (Slice DW): the CPU side of the (clusterID, triangleID) ID packing
 # (render/visbuffer.h). Pins PackVisId/UnpackVisId round-trip over the full valid range, kTriIdBits>=7,
 # packing injective (collision-free) over [0,survivorCount)x[0,128), kVisBackground never equals a valid
