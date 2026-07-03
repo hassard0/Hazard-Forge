@@ -9,7 +9,7 @@
 > `samples/hello_triangle`) and a Metal flag (`--<name>`, on `metal_headless/visual_test`). Every flag in this doc has
 > a committed reference render under `tests/golden/metal/` (byte-compared cross-platform at DIFF 0.0000 in
 > `scripts/verify.ps1`). Run `hello_triangle --help` or read `scripts/verify.ps1`'s `$Goldens` table for the complete,
-> always-current list (279 showcases). The determinism that underlies all of this — bit-identical Vulkan/Windows ==
+> always-current list (351 showcases). The determinism that underlies all of this — bit-identical Vulkan/Windows ==
 > Metal/macOS, lockstep/rollback-replayable — is the moat described in `docs/ARCHITECTURE.md`.
 
 ## Rendering & lighting
