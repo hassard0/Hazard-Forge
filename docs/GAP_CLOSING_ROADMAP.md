@@ -51,23 +51,24 @@ into "a launchable scene editor" — the thing newcomers actually judge an engin
 
 ---
 
-## Tier 2 — Real content at scale (techniques exist, scale unproven)
+## Tier 2 — Real content at scale ✅ COMPLETE (2026-07-02)
 
 **The gap, honestly:** every technique is built and golden-verified — meshlet/cluster-LOD/cluster-cull
 (`engine/render/`), software raster, VSM + virtual-texturing page tables (`vsm.h`/`vt.h`),
 clustered/froxel lighting, substrate materials, distance streaming (`engine/scene/streaming.h`) — but
 proven on **fixtures**: ~144 instances of ~12k-tri spheres, 8 point lights, **hand-authored** 3-level
-LODs, homogeneous grids. Nothing has rendered a real Sponza/Bistro through the full stack. #18's fetch
-loop now works (proven with a live CC0 asset), which unblocks this tier.
+LODs, homogeneous grids. The whole tier is now SHIPPED: the real Khronos PBR Sponza (103 meshes / 262k tris /
+69 URI textures) loads and renders through PBR+IBL+shadows, the virtual-geometry stack, 128-light
+clustering, 12k-instance foliage, and VT residency — all golden-verified on both backends.
 
 | Slice | Work | Verify |
 |---|---|---|
-| **SC1 Hero-scene bake** | A `--hero-shot` that fetches + loads the Khronos PBR Sponza (or a substantial CC0 subset) and renders it through PBR+IBL+shadows. First real measure of draw-calls/tris/materials. | 🟢 two-run byte-identical bake + cross-vendor pixel-diff |
-| **SC2 Automatic LOD generation** | Quadric-error-metric decimation to generate LOD1/LOD2 from a high-poly LOD0 (today's 3 LODs are hand-tessellated spheres). Deterministic integer-quantized collapse order. | 🟢 decimated-mesh digest pinned, cross-platform |
-| **SC3 Full-stack at scale** | Push SC1's scene through meshlet→cluster-cull→cluster-LOD→VSM shadow→VT sample → measure it holds (the techniques' first heterogeneous, million-tri, multi-material workout). | 🟢 per-stage digests + 🔵 perf budget |
-| **SC4 Many-light path** | Lift the 8-light cap: a clustered/tiled deferred (or Forward+ light-list) path for 100+ dynamic lights, reusing the existing `clustered.h` froxel cluster grid. | 🟢 light-assignment digest + lit bake |
-| **SC5 Foliage scatter at scale** | Wire the PCG scatter (`pcg.h` PCG1-6) + foliage wind/LOD (`foliage.h`) into a 10k+ instance GPU-driven bake with the integer wind applied on-GPU. | 🟢 placement digest (already shuffle-invariant) + instanced bake |
-| **SC6 Texture-residency integration** | Feed the VT/VSM page-feedback into the streaming budget (today the page math is proven but not driven by a real scene's residency). | 🟢 page-set digest under a deterministic camera path |
+| **SC1 Hero-scene bake** ✅ (`53539d1`+SC1b `53d750b`, golden `sc1_hero`) | A `--hero-shot` that fetches + loads the Khronos PBR Sponza (or a substantial CC0 subset) and renders it through PBR+IBL+shadows. First real measure of draw-calls/tris/materials. | 🟢 two-run byte-identical bake + cross-vendor pixel-diff |
+| **SC2 Auto-LOD** ✅ (shipped as LOD1 `9f4ef09`, golden `lod_gen`) | Quadric-error-metric decimation to generate LOD1/LOD2 from a high-poly LOD0 (today's 3 LODs are hand-tessellated spheres). Deterministic integer-quantized collapse order. | 🟢 decimated-mesh digest pinned, cross-platform |
+| **SC3 Full-stack at scale** ✅ (`4e9110d`, golden `sc3_stack`) | Push SC1's scene through meshlet→cluster-cull→cluster-LOD→VSM shadow→VT sample → measure it holds (the techniques' first heterogeneous, million-tri, multi-material workout). | 🟢 per-stage digests + 🔵 perf budget |
+| **SC4 Many-light** ✅ (shipped as ML1 `91d481e`, golden `manylight`) | Lift the 8-light cap: a clustered/tiled deferred (or Forward+ light-list) path for 100+ dynamic lights, reusing the existing `clustered.h` froxel cluster grid. | 🟢 light-assignment digest + lit bake |
+| **SC5 Foliage at scale** ✅ (`f675e02`, golden `sc5_foliage`, 12,123 instances) | Wire the PCG scatter (`pcg.h` PCG1-6) + foliage wind/LOD (`foliage.h`) into a 10k+ instance GPU-driven bake with the integer wind applied on-GPU. | 🟢 placement digest (already shuffle-invariant) + instanced bake |
+| **SC6 Texture residency** ✅ (`9b5b65a`, golden `sc6_residency`) | Feed the VT/VSM page-feedback into the streaming budget (today the page math is proven but not driven by a real scene's residency). | 🟢 page-set digest under a deterministic camera path |
 
 **Why second:** proves the rendering tech is *real*, not just unit-correct — the credibility gap between
 "has a Nanite-style pipeline" and "renders Sponza." All slices stay golden (deterministic content +
