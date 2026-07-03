@@ -90,6 +90,7 @@
 #include "render/cluster_cull.h"    // Slice DT: per-cluster frustum cull CPU mirror (BuildClusterInstances/CullClusterInstances)
 #include "render/cluster_lod.h"     // Slice DV: discrete cluster-LOD selection CPU mirror (BuildLodMeshes/SelectLod, squared form)
 #include "render/sc3_stack.h"       // Slice SC3: Sponza through the virtual-geometry stack (meshlet -> cluster-cull -> auto-LOD at real-content scale; pure CPU composition; shared with --sc3-stack-shot)
+#include "render/sc5_foliage.h"     // Slice SC5: FOLIAGE SCATTER AT SCALE (PCG scatter -> LUT wind bend -> integer LOD -> per-LOD instance transform buffers at 10k+; pure CPU composition; shared with --sc5-foliage-shot)
 #include "render/visbuffer.h"       // Slice DW: visibility-buffer ID packing + CPU coverage reference (PackVisId/UnpackVisId/InstanceInteriorSamples)
 #include "render/visresolve.h"      // Slice DX: deferred material resolve CPU mirror (ResolveMaterial/DefaultResolveMaterial/ResolveSkyColor/ResolvePixel/EncodeBGRA8) — shared verbatim with --visresolve-shot (Vulkan)
 #include "render/swraster.h"        // Slice SW1: CPU-reference integer software rasterizer (SwVisBuffer/RasterClusters/PackSw/BuildSwRasterScene/ColorSwVisBuffer) — shared verbatim with --swraster-shot (Vulkan)
@@ -65091,6 +65092,325 @@ static int RunFo6HeroShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice SC5 — FOLIAGE SCATTER AT SCALE (GAP_CLOSING Tier 2). Mirrors the Vulkan --sc5-foliage-shot path
+// EXACTLY: the canonical knobs live in render/sc5_foliage.h::Sc5DefaultConfig() (ONE source of truth for
+// Vulkan/Metal/test), so the bit-exact integer plant set {pos, orient, scale, bend, lod} is byte-identical
+// cross-backend BY CONSTRUCTION — asserted here against the pinned INTEGER plant digest (kSc5PlantDigestF120,
+// the cross-PLATFORM pin: pure int32 end to end). The pipeline: a 136x136 jittered-grid PCG scatter over a
+// 40x40 patch -> radial mask -> yaw/scale -> overlap prune = 12,123 plants (pinned) -> the FO1 LUT wind bend
+// at FIXED frame 120 -> integer distance-LOD (1312/5181/4610/1020, pinned) -> Sc5BuildRenderSet's per-LOD
+// instance transform buffers (the FO-A gap fix: the lean sin/cos comes from the committed kFoliageWind16 LUT,
+// NO libm — on x64 the float buffer digest is the MSVC+clang pin kSc5XformDigestF120; on arm64 fp contraction
+// MAY fuse multiply-adds, so the float digest is PRINTED + recompute-checked here, not pinned — the documented
+// x64-pin caveat, see sc5_foliage.h). 11,103 drawn instances (>= 10k) through THREE hardware-instanced draws
+// (near=full sphere / mid=low-poly sphere / far=cube slab). FLOAT visresolve-bar: Metal two-run BYTE-IDENTICAL
+// + provenance; cross-vendor ~the float baseline. NO new shader, NO new RHI. --------------------------------
+static int RunSc5FoliageShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace sc5 = hf::render::sc5;
+    namespace foliage = hf::foliage;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === The bit-exact integer pipeline at the canonical knobs (== the Vulkan --sc5-foliage-shot). ===
+    const sc5::Sc5Config cfg = sc5::Sc5DefaultConfig();
+    const std::vector<foliage::FoliageInstance> plants = sc5::Sc5BuildPlants(cfg, sc5::kSc5Frame);
+    const sc5::Sc5RenderSet rset = sc5::Sc5BuildRenderSet(plants, cfg);
+    const uint64_t plantDigest = sc5::Sc5PlantDigest(plants);
+    const uint64_t xformDigest = sc5::Sc5TransformDigest(rset);
+
+    // Pinned-artifact gate: counts + the INTEGER plant digest (the cross-platform pin — pure int32).
+    if ((uint32_t)plants.size() != sc5::kSc5ExpectedPlants ||
+        rset.counts[0] != sc5::kSc5ExpectedNear || rset.counts[1] != sc5::kSc5ExpectedMid ||
+        rset.counts[2] != sc5::kSc5ExpectedFar || rset.counts[3] != sc5::kSc5ExpectedCulled)
+        return fail("sc5-foliage counts != pinned {12123, 561/4933/5085/1544}");
+    if (plantDigest != sc5::kSc5PlantDigestF120)
+        return fail("sc5-foliage INTEGER plant digest != pinned kSc5PlantDigestF120 (cross-platform pin broken)");
+    if (rset.Drawn() < 10000u) return fail("sc5-foliage drawn < 10000");
+
+    // Per-bucket instance buffers (ONE hardware-instanced draw per LOD bucket).
+    std::vector<scene::InstanceData> instData[3];
+    std::unique_ptr<rhi::IBuffer> instBuf[3];
+    for (int l = 0; l < 3; ++l) {
+        instData[l].reserve(rset.lod[l].size());
+        for (const Mat4& m : rset.lod[l]) {
+            scene::InstanceData inst;
+            for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+            instData[l].push_back(inst);
+        }
+        if (!instData[l].empty()) {
+            rhi::BufferDesc bd;
+            bd.size = (uint64_t)instData[l].size() * sizeof(scene::InstanceData);
+            bd.initialData = instData[l].data();
+            bd.usage = rhi::BufferUsage::Vertex;
+            instBuf[l] = device->CreateBuffer(bd);
+        }
+    }
+
+    // === The EXISTING instanced lit pipeline (the --fo5-scale wiring, verbatim). ===
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = device->Swapchain().ColorFormat();
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    // Calm earth ground + verdant leaf green (== the Vulkan --sc5-foliage-shot palette).
+    const uint8_t groundPx[4] = {96, 84, 64, 255};
+    auto groundTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, groundPx, sizeof(groundPx)});
+    const uint8_t leafPx[4] = {90, 170, 70, 255};
+    auto leafTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, leafPx, sizeof(leafPx)});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    // The per-LOD proxy meshes (== the Vulkan path): near full sphere / mid low-poly / far cube slab.
+    scene::Mesh meshNear = scene::Mesh::Sphere(*device);          // LOD0: 24x16 full
+    scene::Mesh meshMid  = scene::Mesh::Sphere(*device, 10, 7);   // LOD1: low-poly
+    scene::Mesh meshFar  = scene::Mesh::Cube(*device);            // LOD2: billboard-ish slab
+    scene::Mesh* lodMesh[3] = {&meshNear, &meshMid, &meshFar};
+
+    Mat4 groundModel = Mat4::Scale({44.0f, 1.0f, 44.0f});  // covers the ±20 field (== the Vulkan path)
+
+    // LOW camera standing AT the field's south edge (== the Vulkan --sc5-foliage-shot camera; its
+    // ground XZ == cfg.lodCam so the LOD rings fan out from the viewer).
+    const Vec3 eye{0.0f, 3.2f, 22.0f};
+    const Vec3 center{0.0f, 0.8f, -8.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 120.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 0.0f, 0.0f};
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 55.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-34.0f, 34.0f, -34.0f, 34.0f, 1.0f, 110.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graphRg;
+    render::RgResource rgShadow = graphRg.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graphRg.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graphRg.ImportSwapchain("swapchain");
+
+    uint32_t foliageDrawCalls = 0;
+    bool drawCallsCounted = false;
+
+    graphRg.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            cmd.BindPipeline(*instShadowPipeline);
+            for (int l = 0; l < 3; ++l) {
+                if (instData[l].empty()) continue;
+                cmd.BindVertexBuffer(lodMesh[l]->vertices());
+                cmd.BindInstanceBuffer(*instBuf[l]);
+                cmd.BindIndexBuffer(lodMesh[l]->indices());
+                cmd.DrawIndexedInstanced(lodMesh[l]->indexCount(), (uint32_t)instData[l].size());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graphRg.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.95f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            cmd.BindPipeline(*instPipeline);
+            {
+                float material[4] = {0.0f, 0.9f, 0.0f, 0.0f};   // matte verdant foliage
+                cmd.PushConstants(material, sizeof(material));
+                cmd.BindMaterial(*leafTex, *flatNormal);
+                for (int l = 0; l < 3; ++l) {
+                    if (instData[l].empty()) continue;
+                    cmd.BindVertexBuffer(lodMesh[l]->vertices());
+                    cmd.BindInstanceBuffer(*instBuf[l]);
+                    cmd.BindIndexBuffer(lodMesh[l]->indices());
+                    cmd.DrawIndexedInstanced(lodMesh[l]->indexCount(), (uint32_t)instData[l].size());
+                    if (!drawCallsCounted) ++foliageDrawCalls;
+                }
+                drawCallsCounted = true;
+            }
+            cmd.EndRenderPass();
+        });
+
+    graphRg.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graphRg.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    // PROOF (1) THE STAT LINE (== the Vulkan line; the xform digest is PRINTED — the x64 pin, see banner).
+    std::printf("sc5-foliage: FOLIAGE SCATTER AT SCALE {instances:%u, perLod:%u/%u/%u/%u, "
+                "windFrame:%u, digest:0x%016llx, drawCalls:%u}\n",
+                (uint32_t)plants.size(), rset.counts[0], rset.counts[1], rset.counts[2],
+                rset.counts[3], sc5::kSc5Frame, (unsigned long long)xformDigest, foliageDrawCalls);
+    std::printf("sc5-foliage: plant digest 0x%016llx (integer FO2-FO4 data, cross-platform pin "
+                "VERIFIED), drawn %u instances through %u instanced draws\n",
+                (unsigned long long)plantDigest, rset.Drawn(), foliageDrawCalls);
+    if (foliageDrawCalls != 3u) return fail("sc5-foliage drawCalls != 3 (one per LOD bucket)");
+
+    // PROOF (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graphRg.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("sc5-foliage two renders DIFFER (nondeterministic)");
+    std::printf("sc5-foliage: two renders BYTE-IDENTICAL\n");
+
+    // PROOF (3) the field actually renders: green-dominant (leaf) pixel bound + non-uniform image.
+    {
+        uint32_t shaded = 0, leafy = 0;
+        for (size_t p = 0; p + 3 < bgra.size(); p += 4) {
+            const int b = bgra[p + 0], g = bgra[p + 1], r = bgra[p + 2];
+            if (b + g + r > 60) ++shaded;
+            if (g > r + 15 && g > b + 15) ++leafy;
+        }
+        if (shaded == 0 || shaded == (uint32_t)(bgra.size() / 4))
+            return fail("sc5-foliage degenerate image");
+        if (leafy < 20000u) return fail("sc5-foliage leaf-pixel bound < 20000 (field not visible?)");
+        std::printf("sc5-foliage: coverage {shaded:%u, leafGreen:%u} — the 10k field is on screen\n",
+                    shaded, leafy);
+    }
+
+    // PROOF (4) provenance: the uploaded buffers == a RECOMPUTED Sc5BuildRenderSet(Sc5BuildPlants).
+    {
+        const std::vector<foliage::FoliageInstance> regen = sc5::Sc5BuildPlants(cfg, sc5::kSc5Frame);
+        const sc5::Sc5RenderSet rebuild = sc5::Sc5BuildRenderSet(regen, cfg);
+        bool same = true;
+        for (int l = 0; l < 3 && same; ++l)
+            same = rebuild.lod[l].size() == rset.lod[l].size() &&
+                   (rebuild.lod[l].empty() ||
+                    std::memcmp(rebuild.lod[l].data(), rset.lod[l].data(),
+                                rset.lod[l].size() * sizeof(Mat4)) == 0);
+        if (!same || sc5::Sc5TransformDigest(rebuild) != xformDigest)
+            return fail("sc5-foliage provenance: buffers != recomputed Sc5BuildRenderSet(Sc5BuildPlants)");
+    }
+    std::printf("sc5-foliage: provenance buffers == Sc5BuildRenderSet(Sc5BuildPlants(seed))\n");
+
+    // PROOF (5) the wind is LIVE: frame 121's INTEGER plant digest is the OTHER pinned value.
+    {
+        std::vector<foliage::FoliageInstance> alt = plants;
+        foliage::ApplyWind(alt, cfg.wind, sc5::kSc5FrameB);
+        foliage::AssignLods(alt, cfg.lodCam, cfg.nearR, cfg.farR);
+        const uint64_t plantB = sc5::Sc5PlantDigest(alt);
+        if (plantB != sc5::kSc5PlantDigestF121 || plantB == plantDigest)
+            return fail("sc5-foliage wind-liveness: frame-121 plant digest != pinned (or == frame-120)");
+    }
+    std::printf("sc5-foliage: wind LIVE (frame %u vs %u -> different pinned plant digests)\n",
+                sc5::kSc5Frame, sc5::kSc5FrameB);
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — FOLIAGE SCATTER AT SCALE (%u instances, %u drawn, "
+                "3 instanced draws)\n", outPath, cw, ch, (uint32_t)plants.size(), rset.Drawn());
+    return 0;
+}
+
 // ===== Slice PT5 — Deterministic FOLIAGE-ON-TERRAIN composition (composes FLAGSHIP #25 onto FLAGSHIP #26).
 // Mirrors the Vulkan --pt5-meadow-shot path EXACTLY: the SAME bit-exact INTEGER eroded heightfield (PT1
 // GenHeightField -> PT2 ErodeHydraulic -> PT3 ErodeThermal at the IDENTICAL fixed seed/n/octaves/erosion +
@@ -81989,6 +82309,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--sc3-stack-shot") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_sc3_stack.png";
             try { return RunSc3StackShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --sc5-foliage-shot <out.png>: FOLIAGE SCATTER AT SCALE (Slice SC5, GAP_CLOSING Tier 2) —
+        // 12,123 PCG-scattered plants (pinned) with the deterministic LUT wind bend at fixed frame
+        // 120 + integer distance-LOD (1312/5181/4610/1020), 11,103 drawn (>= 10k) through THREE
+        // per-LOD hardware-instanced draws (near sphere / low-poly sphere / cube slab). The integer
+        // plant digest is the cross-platform pin (asserted); the float transform digest is the x64
+        // pin (printed). Same flag string as the Vulkan harness. Asset-free (fully procedural).
+        if (argc > 1 && std::strcmp(argv[1], "--sc5-foliage-shot") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_sc5_foliage.png";
+            try { return RunSc5FoliageShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ibl <out.png>: render the HDR-environment-IBL showcase (Slice R).

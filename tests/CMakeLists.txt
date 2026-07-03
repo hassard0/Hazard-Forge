@@ -930,6 +930,18 @@ target_compile_definitions(sc3_stack_test PRIVATE
   "HF_SC3_TRUCK_GLB=\"${CMAKE_SOURCE_DIR}/assets/models/CesiumMilkTruck.glb\""
   "HF_SC3_SPONZA_GLTF=\"${CMAKE_SOURCE_DIR}/assets/reference/_downloaded/Sponza/Sponza.gltf\"")
 
+# FOLIAGE SCATTER AT SCALE (Slice SC5, GAP_CLOSING Tier 2): the pure-CPU composition header
+# render/sc5_foliage.h (PCG jittered-grid scatter -> radial mask -> yaw/scale transforms -> overlap
+# prune -> deterministic LUT wind bend -> integer distance-LOD -> per-LOD instance transform buffers)
+# pinned at 10k+ instances: 12,123 survivors / 1312+5181+4610 drawn buckets (11,103 >= 10k) + 1,020
+# culled; the INTEGER plant digest (cross-platform pin) AND the FLOAT transform-buffer digest (x64
+# MSVC+clang pin — the LUT-based lean keeps libm out of the transform build, the FO-A gap fix); the
+# wind-liveness proof (frames 120 vs 121 -> different pinned digests for both artifacts); two-run
+# determinism; the PCG5 shuffle-invariance re-asserted at the 18,496-candidate scale (reversed
+# pre-prune input -> identical survivors); LOD partition/consistency; the empty no-op. Pure C++
+# (hf_core), no RHI/device, ASan-eligible.
+hf_add_pure_test(sc5_foliage_test)
+
 # Virtual-geometry VISIBILITY BUFFER (Slice DW): the CPU side of the (clusterID, triangleID) ID packing
 # (render/visbuffer.h). Pins PackVisId/UnpackVisId round-trip over the full valid range, kTriIdBits>=7,
 # packing injective (collision-free) over [0,survivorCount)x[0,128), kVisBackground never equals a valid
