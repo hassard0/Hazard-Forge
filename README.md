@@ -14,8 +14,8 @@ backends, no per-platform drift.
 > 2. **Determinism as a first-class feature.** A fixed-point (Q16.16) physics / animation / AI stack produces
 >    *byte-identical* state on every platform and replays from inputs alone.
 >
-> Backed by **252 deterministic golden-image regression tests** (each diffs `0.0000` cross-vendor), three byte-exact
-> data goldens (engine-state JSON, material-graph JSON, audio WAV), a **118-test** suite that runs clean under
+> Backed by **364 deterministic golden-image regression tests** (each diffs `0.0000` cross-vendor), three byte-exact
+> data goldens (engine-state JSON, material-graph JSON, audio WAV), a large pure-C++-core suite that runs clean under
 > AddressSanitizer, and a graphics-validation-clean (core + synchronization) invariant across every showcase.
 
 ---
@@ -53,7 +53,7 @@ backends, no per-platform drift.
 | **Language / std** | C++20 |
 | **GPU backends** | Vulkan 1.3 (Windows) · Apple Metal (macOS, Apple Silicon) — one HLSL source → SPIR-V + MSL |
 | **Determinism** | Q16.16 fixed-point simulation, bit-identical CPU / Vulkan / Metal, lockstep + rollback replayable |
-| **Verification** | 252 golden images @ `DIFF 0.0000` · 125-test suite · AddressSanitizer-clean · graphics-validation-clean |
+| **Verification** | 364 golden images @ `DIFF 0.0000` · pure-C++-core test suite · AddressSanitizer-clean · graphics-validation-clean |
 | **Footprint** | header-only simulation models, slice-by-slice growth, zero backend symbols above the RHI seam |
 | **Repo** | `github.com/hassard0/Hazard-Forge` |
 
@@ -83,7 +83,8 @@ A full modern renderer — and crucially, *the identical image* on both backends
   probe occlusion → multi-bounce → composite), each stage holding a GPU-equals-CPU bit-exact compute proof.
 - **Reflections** — screen-space reflections, box-projected cubemap probes, dynamic cubemap-capture probes, and
   planar mirror reflections.
-- **Atmosphere & volumetrics** — Gerstner-wave water, raymarched volumetric clouds with ground cloud-shadows, 2D
+- **Atmosphere & volumetrics** — Gerstner-wave water (now also a **physics gameplay volume**: the rendered ocean and
+  rigid-body Archimedes buoyancy are one integer wave equation, lockstep-replayable), raymarched volumetric clouds with ground cloud-shadows, 2D
   light shafts, and a true 3D volumetric fog volume (sun single-scatter + per-cell light injection + shadowed fog).
 - **Post-processing** — HDR bloom, two ambient-occlusion methods (hemisphere SSAO + horizon-search GTAO),
   subsurface scattering, depth of field, motion blur, a data-driven post stack (tonemap / color-grade / chromatic
@@ -103,10 +104,16 @@ A full modern renderer — and crucially, *the identical image* on both backends
   validation clean), multithreaded command recording (byte-identical 1-vs-N workers), a data-driven material /
   shader graph with live runtime authoring and JSON/Graphviz introspection, and an own column-major math library.
 
-Plus the services a game needs: glTF scene import, GPU skeletal animation + blending + a cross-fade state machine,
-a deterministic integer audio mixer (byte-exact WAV), a deterministic networking stack (replication → lossy
-transport with interpolation → client prediction + reconciliation), distance-based scene/terrain streaming with
-LOD, a text/HUD layer, a CPU VFX emitter, a playable game sample, and a docked editor shell.
+Plus the services a game needs, every one deterministic and golden-verified: glTF **and device-free USD/UsdSkel**
+skeletal import, GPU skeletal animation + blending + a cross-fade state machine + **parameter-driven blend spaces** +
+**animation retargeting** across differently-proportioned skeletons, a **gameplay ability system** (integer attributes /
+effects / cooldowns, lockstep+rollback), **first-class integer splines** (roads / scatter / camera rails),
+**landscape authoring** (brush sculpt + splat paint + spline roads with bit-exact undo), a deterministic integer audio
+mixer (byte-exact WAV) **plus room convolution reverb + submix buses**, **signed-distance-field UI text** (crisp scaling
+past the bitmap font), a deterministic networking stack (replication → lossy transport with interpolation → client
+prediction + reconciliation), distance-based scene/terrain streaming with LOD, an expanded VFX renderer (ribbon trails /
+beams / mesh emitters / particle lights) + a hair-strand groom renderer, a text/HUD layer, a playable game sample, and a
+docked editor shell.
 
 ### Deterministic simulation (the headline)
 
@@ -138,7 +145,7 @@ lockstep/rollback proof → lit 3D render` — and lands bit-identical on both b
 | **Articulated ragdoll** (`hf::sim::joint`) | Ball / hinge / cone joints over the rigid-body solver, driving the GPU skinning path — a replayable ragdoll |
 | **Vehicles** (`hf::sim::vehicle`) | Suspension springs + wheel hinges + Coulomb traction, rollback-netcode-ready |
 | **Active ragdoll / physical animation** (`hf::sim::active`) | Angular pose-drive blending physics with animation clips, deterministically |
-| **Crowds** (`hf::sim::boids`) | Grid-hashed steering + flocking + pathfinding-corridor following, lockstep-replayable at scale |
+| **Crowds** (`hf::sim::boids` / `hf::sim::crowd`) | Grid-hashed steering + flocking + pathfinding-corridor following, lockstep-replayable — proven at **10,000+ agents × 200 ticks** with O(N) grid neighbors byte-identical to O(N²) all-pairs |
 | **Convex rigid-body contacts** (`hf::sim::convex`) | Separating-axis test → contact manifold → inertia-tensor angular impulse → settling stacks → lockstep → lit render: boxes that tumble, stack, and interlock byte-for-byte |
 
 Each capability proves its determinism as a hard test — *two peers fed only an input stream converge byte-identical,
@@ -155,7 +162,7 @@ makes one deliberate, uncommon set of guarantees its whole reason for being:
 | Capability | Unreal Engine 5 (typical) | Hazard Forge |
 | --- | --- | --- |
 | Simulation determinism | Floating-point; varies run-to-run and machine-to-machine | Integer fixed-point; bit-identical every run and every platform |
-| Cross-platform reproducibility | Not guaranteed at the byte level | Byte-identical CPU ↔ Vulkan ↔ Metal, proven by 252 golden images |
+| Cross-platform reproducibility | Not guaranteed at the byte level | Byte-identical CPU ↔ Vulkan ↔ Metal, proven by 364 golden images |
 | Lockstep / rollback netcode | Hard — float simulations diverge across peers | Built in — every simulation replays from inputs; rollback re-sims bit-for-bit |
 | Scope of determinism | Mostly gameplay logic | The whole simulation stack: rigid bodies, cloth, fluid, granular media, fracture, ragdolls, vehicles, crowds, convex contacts |
 | Headless / CI verification | Manual and limited | First-class: every feature is a golden-image regression that must diff `0.0000` |
@@ -170,17 +177,17 @@ you need a turnkey AAA content pipeline today, a mature engine is the pragmatic 
 
 ## How correctness is verified
 
-- **Golden images (252).** Each is one headless `visual_test` flag compared to its committed reference at
+- **Golden images (364).** Each is one headless `visual_test` flag compared to its committed reference at
   threshold `0.0` — deterministic, two runs diff `0.0000`. The same scene on Windows/Vulkan must match the macOS/
   Metal reference cross-vendor.
 - **Byte-exact data goldens (3).** The engine-state JSON (`--introspect`), the material-graph JSON, and the audio
   WAV (`--audio-render`) are matched byte for byte.
-- **Unit tests (118).** A suite over the pure-C++ core — math, ECS, render graph, every header-only render and
+- **Unit tests.** A large suite over the pure-C++ core — math, ECS, render graph, every header-only render and
   simulation model, codegen, networking, audio, editor — that runs clean under AddressSanitizer.
 - **Graphics-validation-clean.** Every showcase runs under the core + synchronization validation layers with zero
   errors; the render graph's auto-inserted barriers are proven hazard-free.
 - **One-command cross-platform gate.** `scripts/verify.ps1` runs the Windows/Vulkan tests + the data-golden byte
-  matches, then drives a macOS machine over SSH to build the Metal target once and compare **all 252** references
+  matches, then drives a macOS machine over SSH to build the Metal target once and compare **all 364** references
   at `DIFF 0.0000`, printing a per-golden table and an overall `VERIFY: PASS/FAIL`.
 
 ---
@@ -240,7 +247,7 @@ scripts\verify.ps1
 ```
 
 Runs the Windows/Vulkan tests (plus the engine-state-JSON and audio-WAV byte matches) locally and drives a macOS
-machine over SSH to build the Metal target once and compare **all 252** references at threshold `0.0`. Prints a
+machine over SSH to build the Metal target once and compare **all 364** references at threshold `0.0`. Prints a
 per-golden DIFF table and an overall `VERIFY: PASS/FAIL`. (`-SkipWindows` / `-SkipMac` run one half.)
 
 ---
@@ -318,7 +325,7 @@ hazard-forge/
 ├── samples/hello_triangle/     Vulkan sample: every showcase via --*-shot capture + --fly + --introspect
 ├── metal_headless/             Standalone no-Conan/no-SDL Metal target (visual_test, every showcase)
 ├── tests/                      Pure unit tests + golden/{metal,introspect,material,audio}
-├── scripts/verify.ps1          Cross-platform gate: Windows tests + data goldens + Mac 252-image compare
+├── scripts/verify.ps1          Cross-platform gate: Windows tests + data goldens + Mac 364-image compare
 ├── ci/                         Staged GitHub Actions workflow (see ci/README.md)
 └── docs/                       ARCHITECTURE.md + per-slice specs/plans
 ```

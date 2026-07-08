@@ -9,7 +9,7 @@
 > `samples/hello_triangle`) and a Metal flag (`--<name>`, on `metal_headless/visual_test`). Every flag in this doc has
 > a committed reference render under `tests/golden/metal/` (byte-compared cross-platform at DIFF 0.0000 in
 > `scripts/verify.ps1`). Run `hello_triangle --help` or read `scripts/verify.ps1`'s `$Goldens` table for the complete,
-> always-current list (351 showcases). The determinism that underlies all of this — bit-identical Vulkan/Windows ==
+> always-current list (364 showcases). The determinism that underlies all of this — bit-identical Vulkan/Windows ==
 > Metal/macOS, lockstep/rollback-replayable — is the moat described in `docs/ARCHITECTURE.md`.
 
 ## Rendering & lighting
@@ -268,17 +268,50 @@ enrollment is documented follow-up work; scene entity create/delete is not enrol
 `--replay-record`/`--replay-verify` (record→replay→assert-determinism), `--determinism-stress` (the rollback fuzzer).
 See ARCHITECTURE "The Agent Experience (AX) product".
 
+## Parity++ audit — fourteen new capabilities
+
+A focused gap-closing audit against a modern-engine feature checklist. Each is built to the house determinism discipline
+(integer fixed-point core, host-baked LUTs, no runtime transcendentals / RNG / clock on the state path; a float bridge
+only for the lit render) and backed by a committed golden. Thirteen register a new golden; the fourteenth upgrades the
+interactive Sponza fly-through. Every honest caveat below is carried verbatim from the slice header. See ARCHITECTURE
+"Parity++ capability slices" for the full write-ups.
+
+| Capability | Ships? | See it (flag) | ARCHITECTURE / notes |
+|---|---|---|---|
+| **Deterministic gameplay ability system** (attribute sets, gameplay effects, cooldowns, ability activation) | ✅ | `--gas1-duel` | `engine/game/ability.h`, golden `gas1_duel`. Pure integer (Q16.16 / `uint32`, no float, no wall clock — durations/cooldowns are TICKS); base-vs-current attribute split with a pinned fold order; stacking (stack/refresh/ignore); periodic damage-over-time; deterministic failure enums; lockstep + rollback (duel-trace `0xf74f7e4198440670`). A peer re-derives every damage number and cooldown bit-for-bit |
+| **Water gameplay volume** (analytic-Gerstner surface driving Archimedes buoyancy + drag) | ✅ | `--wv1-float` | `engine/sim/water_body.h`, golden `wv1_float`. The render ocean and the physics ocean are one integer-Gerstner equation; **zero-byte** analytic/stateless water snapshot; lockstep-replayable. *Honest gaps:* height-only physics surface (horizontal crest-pinch kept in the render only); render-vs-sim agree as the same *equation*, not the same *bits* (within-LSB band) |
+| **First-class deterministic splines** (Catmull-Rom eval + arc-length + scatter + swept road-strip + camera track) | ✅ | `--sp1-road` | `engine/spline/spline.h`, golden `sp1_road`. Pure int32/int64 (no float/`<cmath>`); the 2-point spline is an exact integer lerp; stateless (lockstep inherited by consumers). *Honest gap:* **uniform** Catmull-Rom can overshoot/loop/cusp under very uneven control-point spacing — author roughly-even spacing (centripetal-via-LUT is future); `\|coord\| ≤ 2²⁹` |
+| **Deterministic blend spaces** (phase-synced 1D/2D parametric animation blending) | ✅ | `--an1-blend` | `engine/anim/blend_space.h`, golden `an1_blend`. Integer params/weights/barycentric math + tick-based slew (replayable, not frame-rate-coupled); **normalized-phase** foot-plant alignment; the reused float pose-blend seam; cross-compiler digests. *Honest gap:* a fixed **authored** 2D triangulation (no Delaunay) |
+| **Rigid-body force-field volumes** (radial / vortex / wind AABB volumes) | ✅ | `--ff1-fields` | `engine/sim/force_field.h`, golden `ff1_fields`. The PT2 particle field math applied to `fpx` bodies pre-step; bit-exact + lockstep with a toggle command; linear-falloff force pinned **bit-exact** to the particle math. *Honest gaps:* linear force at the center of mass only (no field-gradient torque); center-gated volumes; frictionless ground contact (bodies coast on exit) |
+| **Landscape authoring** (sculpt/flatten/smooth brushes + splat paint + spline-carved roads + bit-exact undo) | ✅ | `--la1-landscape-shot` / `--la1-landscape` | `engine/terrain/terrain_author.h`, golden `la1_landscape`. Every edit a pure integer op over a Q16.16 + `uint8×4`-splat `AuthoredTerrain`; flat-core brush ("flatten hits exactly"); splat re-sums to exactly 255; the road carve composes SP1; bit-exact reversible history |
+| **VFX renderer variety** (ribbon trails + beams + mesh emitters + particle lights) | ✅ | `--vr1-vfx` | `engine/vfx/vfx_render.h`, golden `vr1_vfx`. Four deterministic geometry generators over the bit-exact particle sim; particle lights feed the existing clustered many-light path (`manylight.h`/`clustered.h` byte-untouched). *Honest notes:* velocity-aligned ribbons kink at a direction reversal; beams are **visual-only** (no gameplay hit query) |
+| **Hair strand renderer** (tangent-aligned camera-facing ribbons + Kajiya-Kay anisotropic shading) | ✅ | `--hrr1-groom-shot` / `--hrr1-groom` | `engine/render/hair_render.h` + `shaders/hair_kajiya.frag.hlsl`, golden `hrr1_groom`. Turns the bit-exact HR1 strand sim (formerly debug dots) into a lit groom; the pure-integer groom scene (sim digest `0x2fe41334235921fd`) + the one documented render-only float ribbon crossing (the `ClothToRenderMesh` twin) |
+| **Deterministic animation retargeting** (bind-delta rotation transfer + root-motion height scaling) | ✅ | `--an2-retarget` | `engine/anim/retarget.h`, golden `an2_retarget`. Plays one skeleton's clip on a differently-proportioned skeleton; one `QuantizeFx` float→integer boundary then integer quaternion algebra (cross-compiler by construction); **self-retarget is a bit-exact identity**. *Honest gap:* assumes unit quaternions (integer-sqrt normalize for non-unit inputs is future) |
+| **Deterministic crowd simulation at 10,000+ agents** (O(N) grid-neighbor separation, archetypes, goal-seek) | ✅ | `--cr1-crowd` | `engine/sim/crowd.h`, golden `cr1_crowd`. Scales where the O(N²) boids separation could not; the **key pin:** the O(N) grid separation sum == the O(N²) all-pairs sum **bit-for-bit** (integer add is associative); lockstep-replayable; proven **10,000 agents × 200 ticks** (digest `0xc80b1b212fadfeb0`). Pure CPU, no new shader |
+| **Deterministic convolution reverb + submix bus graph** (integer Q15 MAC, synthetic room impulse response) | ✅ | `--au2-reverb-shot` / `--au2-reverb` | `engine/audio/reverb.h`, golden `au2_reverb`. Integer Q15 MAC (int32 IR so a unit impulse is a bit-exact identity); wet/dry sends through the submix bus math; byte-identical int16 samples MSVC == clang. *Honest gaps:* **room / space** reverb, **NOT binaural HRTF**; a Q15 feedback path decays to exact silence; offline (no real-time device output) |
+| **Deterministic USD/UsdSkel skeletal-animation import** (bone hierarchy + skin weights + TRS clips) | ✅ | `--sk1-import-shot` / `--sk1-import` | `engine/asset/usd_skel.h`, golden `sk1_import`. A **second, device-free** skeletal importer alongside glTF (which already imports skeletal but is device-coupled); pure-CPU, dependency-free, byte-identical text parse; composes with the retarget/blend stack with zero new anim code. *Honest scope:* the binary-FBX and USDA-geometry importers remain geometry-only |
+| **Deterministic signed-distance-field text** (integer SDF glyph gen + proportional layout with kerning) | ✅ | `--uf1-text-shot` / `--uf1-text` | `engine/ui/sdf_text.h`, golden `uf1_text`. Scales crisply past the fixed 8×8 monospace bitmap; integer point-to-segment SDF + advances + pair kerning + line-break; bit-identical every compiler/backend. *Honest scope:* hand-authored **monoline stroke** glyphs, a ~40-glyph Latin subset (A–Z / 0–9 / punct), **NOT a TTF/FreeType loader**; no Unicode/bidi/shaping; shader-free (a GPU SDF-text shader is the future capstone) |
+| **Upgraded interactive Sponza fly-through** (live HDR + bloom + physical Rayleigh/Mie sky) | ✅ | `--sponza-explore` (+ `--sponza-explore-shot`) | `samples/hello_triangle/main.cpp`. The real multi-material PBR Sponza fly-through now runs the full HDR `RGBA16F` → bloom → ACES post stack + the physical AT1 sky live. **No new golden** — anchored by the existing SC1 / AT1 / bloom goldens it reuses |
+
+*Honest note — an attempted slice deferred:* a decal **material-channel** blending slice (DM1) was prototyped but is **not
+shipped** — its Vulkan path worked, but a Metal-specific reconstruction bug blocked the cross-platform golden, so
+material-channel decals are **not** claimed. The shipped screen-space decal remains texture/color projection + alpha
+blend (`--decal`, golden `decal`).
+
 ---
 
 ### Genuinely not yet built (honest gaps / roadmap)
 
 These are real features Hazard Forge does **not** yet ship, tracked as future flagships: a visual-scripting / Blueprint
 layer (#24), a UMG-class retained-mode UI framework (#30), a cinematic Sequencer (#25), a GPU profiler / frame-debugger
-UI (#31), HRTF audio (#26 — the deterministic integer mixer, node-DSP graph, AND 3D spatialization now ship, see
-"Audio" above; true HRTF convolution and real-time device output remain), a production
+UI (#31), HRTF audio (#26 — the deterministic integer mixer, node-DSP graph, 3D spatialization, AND now **room
+convolution reverb + submix buses** (`--au2-reverb`) all ship, see "Audio" and "Parity++ audit" above; true binaural HRTF
+convolution and real-time device output remain), a production
 networking layer (#27 — dedicated server / RPC / replication graph; a deterministic lockstep *substrate* ships beneath
 it), a PCG framework (#22), foliage-at-scale (#21), temporal upscaling (#20, TSR/FSR/DLSS-class), broader platform
-targets (#23, Linux / mobile / console), and wider asset import (#15/#16 — FBX/USD; glTF + OBJ-geometry ship).
+targets (#23, Linux / mobile / console), and wider asset import (#15/#16 — **device-free USD/UsdSkel skeletal import now
+ships** (`--sk1-import`) alongside device-coupled glTF skeletal; binary-FBX and the beyond-first-mesh USDA importers remain
+geometry-only).
 (Metal hardware ray tracing *through the RHI* — #42/#35 — now SHIPS: `engine/rhi_metal/` implements the accel seam,
 `SupportsHardwareRayQuery()` is true on Apple-silicon, and `--rt2-query-rhi`/`--rt3-shadow`/`--rt4-reflect`/`--rt6-hero`
 run real Metal HW RT byte-equal to the CPU reference.) See the roadmap in the project notes.
