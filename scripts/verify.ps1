@@ -424,6 +424,7 @@ $Goldens = @(
     @{ Name = 'an2_retarget';     Flag = '--an2-retarget' }        # AN2 deterministic animation retargeting (parity++ AN2; bind-delta + root-scale, digest e861d306897f2d75)
     @{ Name = 'cr1_crowd';        Flag = '--cr1-crowd' }           # CR1 deterministic crowd sim at 10k+ agents (parity++ crowds; O(N) grid==all-pairs, digest c80b1b212fadfeb0)
     @{ Name = 'au2_reverb';       Flag = '--au2-reverb-shot' }     # AU2 deterministic convolution reverb + submix buses (parity++ audio; integer Q15 MAC, digest 0xe294f310e3227811)
+    @{ Name = 'sk1_import';       Flag = '--sk1-import-shot' }     # SK1 deterministic USD/UsdSkel skeletal import (parity++ asset; 2nd device-free skeletal importer, digest f7a315563d264826)
 )
 
 $winResult = 'SKIP'
