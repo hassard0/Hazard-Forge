@@ -15,7 +15,7 @@ Running the whole pure suite on each toolchain therefore proves cross-platform d
 | Platform | Toolchain | Result |
 |---|---|---|
 | Windows | MSVC 19.4x (x64) | full `ctest` green (197/197), pure-core digests pinned |
-| macOS | Apple clang (arm64) | 364 Metal render goldens `DIFF 0.0000` + pure-core digests match |
+| macOS | Apple clang (arm64) | 371 Metal render goldens `DIFF 0.0000` + pure-core digests match |
 | **Linux** | **gcc 14 (x64)** | **135 / 135 pure-core tests pass — every Windows-pinned digest reproduced** |
 
 The 135 Linux/gcc passes include every deterministic-simulation family (rigid, cloth, fluid, grain,

@@ -9,7 +9,7 @@
 > `samples/hello_triangle`) and a Metal flag (`--<name>`, on `metal_headless/visual_test`). Every flag in this doc has
 > a committed reference render under `tests/golden/metal/` (byte-compared cross-platform at DIFF 0.0000 in
 > `scripts/verify.ps1`). Run `hello_triangle --help` or read `scripts/verify.ps1`'s `$Goldens` table for the complete,
-> always-current list (364 showcases). The determinism that underlies all of this — bit-identical Vulkan/Windows ==
+> always-current list (371 showcases). The determinism that underlies all of this — bit-identical Vulkan/Windows ==
 > Metal/macOS, lockstep/rollback-replayable — is the moat described in `docs/ARCHITECTURE.md`.
 
 ## Rendering & lighting
@@ -297,6 +297,25 @@ interactive Sponza fly-through. Every honest caveat below is carried verbatim fr
 shipped** — its Vulkan path worked, but a Metal-specific reconstruction bug blocked the cross-platform golden, so
 material-channel decals are **not** claimed. The shipped screen-space decal remains texture/color projection + alpha
 blend (`--decal`, golden `decal`).
+
+## Next-tier capability slices — seven new capabilities
+
+A second gap-closing audit adding the **depth layer** on the gameplay-framework, animation, AI, cinematics, and
+destruction pillars. Each is built to the same house determinism discipline (integer fixed-point core, host-baked LUTs,
+no runtime transcendentals / RNG / clock on the state path; a float bridge only for the lit render), backed by a
+committed golden, and **composes an existing shipped header read-only / byte-untouched** rather than editing it. Every
+honest caveat below is carried verbatim from the slice header. See ARCHITECTURE "Next-tier capability slices" for the
+full write-ups.
+
+| Capability | Ships? | See it (flag) | ARCHITECTURE / notes |
+|---|---|---|---|
+| **Deterministic gameplay-tag layer** (interned hierarchical tag containers gating abilities / effects) | ✅ | `--gt1-tags-shot` | `engine/game/gameplay_tags.h`, golden `gt1_tags`. Pure integer (tags interned to `uint32` ids; sorted-deduped id-vector containers; a **static authored registry**, no runtime string hashing). **Segment-boundary** query matching (owning `"A.B.C"` matches `"A"` / `"A.B"`; `"A.BB"` does **not** match `"A.B"`); effective tags = owned ∪ live-effect grants (follows the GAS1 lifecycle); pinned-order gating (blocked / required) + immunity via a filtered ability, composing `ability.h` read-only. Trace `0x807d1bc4f5e9c28f`; a peer re-derives every tag-gated outcome bit-for-bit |
+| **Deterministic animation layering** (notifies + additive poses + layered slot blending + montages) | ✅ | `--al1-layer-shot` | `engine/anim/anim_layer.h`, golden `al1_layer`. Composes `animation.h` / `retarget.h` read-only; one float boundary (clip sample → `QuantizeFx`), everything downstream integer. Notifies fire on the **half-open** `(prevTick, curTick]` window (loop-aware, fired exactly once, ascending order); additive compose is pinned (`base ⊗ weightedDelta`); a **notify → gameplay-event bridge** applies a GAS1 damage effect at the exact hit tick. Pose digest `0x79f5a9b0a781e775` |
+| **Deterministic behavior-tree depth + utility AI** (parallel + stateful decorators + services + utility scoring) | ✅ | `--bt1-behavior-shot` | `engine/ai/behavior_tree.h`, golden `bt1_behavior`. Closes `ai.h`'s own self-declared gap as a new additive header composing `ai.h` read-only (byte-untouched). Flat index graph + a parallel per-node state array carrying decorator / service memory (cooldown / retry / loop) + **observer-abort** (pinned: on abort the child is not ticked, its memory reset); integer utility scoring; a guard NPC patrol → chase → attack → flee. Digest `0x9fcd062431f97292`, pure CPU, no new shader |
+| **Deterministic morph targets / blend shapes** (per-vertex deltas + weighted blend + weight track) | ✅ | `--mp1-morph-shot` | `engine/anim/morph.h`, golden `mp1_morph`. Integer Q16.16 blend path (`ApplyMorphFx`, the pinned determinism path) + a matching float authoring path; composes with skinning in the **pinned morph→skin order** (order matters under bone rotation); optional normal deltas. Digest `0x83670e4484312df3`. *Honest caveat:* the asset is a **hand-authored glTF-style accessor literal** (`Mp1MorphAsset`), **NOT** parsed from a binary `.glb` — `gltf_loader.cpp`'s "YAGNI: morph" stays byte-untouched (a full cgltf morph-accessor read is future) |
+| **Deterministic cinematic semantic tracks** (camera-cut / audio / material-param / sub-sequence nesting) | ✅ | `--sq2-cinematic` | `engine/seq/seq_tracks.h`, golden `sq2_cinematic`. A new header composing `seq.h` S1–S6 read-only (byte-untouched); pure integer, no `<cmath>`. Camera-cut = piecewise-constant `ActiveCamera(t)`; audio one-shots on the half-open `[prev, cur)` window (the **scrub-equality lemma**); material-param via a `seq.h` scalar track; sub-sequence nesting at a clamped play-rate-scaled local time. **`Seek(N)` == play-to-`N`** byte-for-byte; pixel digest `0x10a63b075559de01`. *Honest scope:* the camera / material tracks are **value-producing queries**, not live float-render mutations |
+| **Deterministic ability targeting shapes + gameplay cues** (sphere / box / cone overlap + a cue event stream) | ✅ | `--gc1-cues` | `engine/game/gameplay_cues.h`, golden `gc1_cues`. Sphere / box(AABB) / cone overlap → the ascending-id **set** of hit entities (optional GT1 tag filter); **integer, no trig** (exact int64 distance² / AABB compares; the cone uses a **pinned host cosine threshold**, no `acos`). Plus a deterministic **cue event stream** (impact / buff / death) carrying a GT1 tag + source / target / location / magnitude / tick; composes GAS1 / GT1 read-only. Final `0xf80ce1458fe4f432`. *Honest scope:* cues are the **event layer** a presentation layer consumes, **NOT rendered VFX**; entities are static (no movement system yet); box is **AABB only** (OBB is future) |
+| **Deterministic convex-cell fracture hulls** (exact integer per-cell hulls + debris + dust) | ✅ | `--dh1-shatter-shot` | `engine/sim/fracture_hull.h`, golden `dh1_shatter`. Upgrades the fracture flagship's **approximate** colliders (FR4 bounding sphere / FR8 AABB box) to **exact integer convex-cell hulls** from `fract.h`'s FR2 CSR lattice-sample set (deterministic incremental 3D hull, exact int64 `orient3d`, ascending order), colliding face-to-face through the shipped GJK/EPA solver (`gjk::StepHullWorld`) + debris + an impact dust puff. `fract.h` / `gjk.h` / `manifold.h` / `particles.h` read-only — the FR1–FR8 goldens stay **byte-frozen**. Scene digest `0x2ebb8c28912b74ac`, lockstep-replayable. *Honest caveats:* cells over the `kMaxHullVerts = 20` ceiling or degenerate (coplanar / collinear) **fall back to the FR8 AABB box** (`exact = false`); contacts are **single-point GJK/EPA** (not multi-point manifolds) |
 
 ---
 
