@@ -421,6 +421,7 @@ $Goldens = @(
     @{ Name = 'la1_landscape';    Flag = '--la1-landscape-shot' } # LA1 landscape authoring (parity++ #5; sculpt/paint/spline-road + bit-exact undo, digest 7368c12f1f50e17c)
     @{ Name = 'vr1_vfx';          Flag = '--vr1-vfx' }            # VR1 VFX renderer variety (parity++ #6; ribbons/beams/mesh-emitters/particle-lights, digest 4c5b2968f2263079)
     @{ Name = 'hrr1_groom';       Flag = '--hrr1-groom-shot' }    # HRR1 hair strand renderer (parity++ #7; Kajiya-Kay ribbons over the bit-exact HR1 sim, simDigest 0x2fe41334235921fd)
+    @{ Name = 'an2_retarget';     Flag = '--an2-retarget' }        # AN2 deterministic animation retargeting (parity++ AN2; bind-delta + root-scale, digest e861d306897f2d75)
 )
 
 $winResult = 'SKIP'
