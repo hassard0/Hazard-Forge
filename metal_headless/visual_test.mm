@@ -150,6 +150,7 @@
 #include "terrain/terrain_author.h"  // Slice LA1: LANDSCAPE AUTHORING (AuthoredTerrain/MakeFlatTerrain/MakeProcTerrain/ApplyRaiseBrush/ApplyFlattenBrush/ApplySmoothBrush/ApplyPaintBrush/ApplyCarveRoad + the Recorded* twins + TerrainHistory Undo/Redo + BuildAuthoredTerrainMesh + RunLandscapeShotScenario/RenderLandscapeShot — heightmap brush sculpting (flat-core integer-smoothstep falloff) + splat-layer painting (largest-remainder renorm to exactly 255) + the SP1 spline-carved road (flatten-to-spline-height bed + smoothstep shoulder + road-layer paint); PURE CPU Q16.16 integer, every op recorded/reversible via the TERRAIN-LOCAL ED5-recipe history — edit_history.h byte-untouched) — a NEW additive sibling #including terrain/procterrain.h + spline/spline.h + net/session.h read-only; the Metal --la1-landscape runs the IDENTICAL pure-CPU scenario + SHARED shaded-relief raster the Vulkan --la1-landscape-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "vfx/vfx_render.h"          // Slice VR1: VFX RENDERER VARIETY (TrailHistory/UpdateTrails/BuildRibbons + BuildBeam + BuildMeshInstances/OrientFromVelocity + BuildParticleLights/ParticleLightsToClustered + RunVfxShotScenario/RenderVfxShot — ribbon trails (per-slot ring buffer, seed-guarded slot reuse, monotonic age taper, SweepStrip winding) + pcg-jittered beams (jitter=0 == the exact straight strip; VISUAL-ONLY, no gameplay hit) + velocity-oriented mesh-emitter instances (SP1 integer half-angle yaw+pitch quaternions) + brightest-N particle lights feeding the EXISTING ML1 clustered assignment; PURE Q16.16/integer geometry generators) — a NEW additive sibling #including sim/particles.h + sim/particle_author.h + spline/spline.h + render/clustered.h + render/manylight.h read-only (ALL byte-untouched); the Metal --vr1-vfx runs the IDENTICAL pure-CPU PA1-fountain scenario + SHARED side-view raster the Vulkan --vr1-vfx-shot runs (strict-zero cross-backend BY CONSTRUCTION; the ML1 assignDigest stat is the ONE float, pinned per-toolchain-family)
 #include "anim/blend_space.h"        // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Metal --an1-blend runs the IDENTICAL pure-CPU 240-tick scenario + SHARED raster the Vulkan --an1-blend-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "anim/retarget.h"           // Slice AN2: DETERMINISTIC ANIMATION RETARGETING (RetargetMap/BuildRetargetMap, Retarget, FxQuat algebra, ForwardKinematics, RunRetargetShotScenario/RenderRetargetShot — play one skeleton's clip on a DIFFERENTLY-PROPORTIONED skeleton via the bind-delta rotation retarget + root-motion height scale; INTEGER Q16.16 quats past the ONE QuantizeFx boundary; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + motion_match.h read-only; the Metal --an2-retarget runs the IDENTICAL pure-CPU scenario + SHARED stick-figure raster the Vulkan --an2-retarget-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
@@ -48805,6 +48806,59 @@ static int RunAn1BlendShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice AN2 — DETERMINISTIC ANIMATION RETARGETING showcase (--an2-retarget) (play one skeleton's
+// clip on a DIFFERENTLY-PROPORTIONED skeleton — the bind-delta rotation retarget R = (tbind (x)
+// conj(sbind)) (x) sanim in INTEGER Q16.16 quats + the root-motion height scale; hf::anim::retarget).
+// PURE CPU — NO GPU compute, NO new shader, NO new RHI; retarget.h is header-only, so on Metal it runs
+// the IDENTICAL fixed scenario the Vulkan --an2-retarget-shot runs on Windows
+// (retarget.h::RunRetargetShotScenario — a name-matched map from a normal SOURCE onto a LONG-legged/
+// SHORT-armed TARGET, the clip sampled at 4 keyframes, integer forward-kinematics) AND the SHARED pure-
+// integer side-by-side stick-figure raster (retarget.h::RenderRetargetShot — the identical function both
+// backends call) -> bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). The proof
+// lines match the Vulkan side EXACTLY. New golden tests/golden/metal/an2_retarget.png (baked on the Mac
+// by the controller); two runs DIFF 0.0000.
+static int RunAn2RetargetShowcase(const char* outPath) {
+    namespace rtn = hf::anim::retarget;
+
+    // THE SCENARIO (== retarget_test): the fixed source->target retarget over 4 keyframes, run twice.
+    const rtn::RetargetShotRun rtRun  = rtn::RunRetargetShotScenario();
+    const rtn::RetargetShotRun rtRun2 = rtn::RunRetargetShotScenario();
+
+    // PROOF (1) two-run IDENTICAL (integer model-space + local-pose digests).
+    if (rtRun.digest != rtRun2.digest || rtRun.sourceDigest != rtRun2.sourceDigest ||
+        rtRun.targetDigest != rtRun2.targetDigest || rtRun.localDigest != rtRun2.localDigest)
+        return fail("an2-retarget: two runs differ (nondeterministic retarget)");
+    std::printf("an2-retarget: two-run IDENTICAL {source:%016llx, target:%016llx, local:%016llx}\n",
+                (unsigned long long)rtRun.sourceDigest, (unsigned long long)rtRun.targetDigest,
+                (unsigned long long)rtRun.localDigest);
+
+    // PROOF (2) the target really is differently proportioned (long legs) — the whole point.
+    const std::vector<rtn::FxJointModel> tgtBindFk =
+        rtn::ForwardKinematics(rtRun.map.target, rtn::BindPose(rtRun.map.target));
+    const std::vector<rtn::FxJointModel> srcBindFk =
+        rtn::ForwardKinematics(rtRun.map.source, rtn::BindPose(rtRun.map.source));
+    if (tgtBindFk[6].pos.y == srcBindFk[6].pos.y || rtRun.heightRatio == rtn::kOne)
+        return fail("an2-retarget: target not re-proportioned");
+    std::printf("an2-retarget: target re-proportioned {srcFootY:%d, tgtFootY:%d, ratio:%d}\n",
+                srcBindFk[6].pos.y, tgtBindFk[6].pos.y, rtRun.heightRatio);
+
+    std::printf("an2-retarget: stats {srcBones:%d, tgtBones:%d, mapped:%d, frames:%d, ratio:%d, "
+                "digest:%016llx}\n",
+                rtRun.srcBones, rtRun.tgtBones, rtRun.mapped, (int)rtRun.frames.size(),
+                rtRun.heightRatio, (unsigned long long)rtRun.digest);
+
+    // --- Golden: the SHARED pure-integer raster (retarget.h::RenderRetargetShot — the identical
+    // function the Vulkan --an2-retarget-shot calls; strict-zero BY CONSTRUCTION). ---
+    std::vector<uint8_t> rtImg;
+    uint32_t rtW = 0, rtH = 0;
+    rtn::RenderRetargetShot(rtRun, rtImg, rtW, rtH);
+    if (!WritePNG(outPath, rtImg, rtW, rtH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — an2 deterministic animation retargeting (source vs long-legged "
+                "target, %d keyframes)\n",
+                outPath, rtW, rtH, (int)rtRun.frames.size());
+    return 0;
+}
+
 // ===== Slice FF1 — RIGID-BODY FORCE-FIELD VOLUMES showcase (--ff1-fields) (the PT2 particle field math —
 // radial/vortex/wind — applied to fpx rigid bodies with bounded AABB volumes, hf::sim::ff). PURE CPU — NO
 // GPU compute, NO new shader, NO new RHI; force_field.h is header-only Q16.16 integer math, so on Metal it
@@ -82356,6 +82410,18 @@ int main(int argc, char** argv) {
                          std::strcmp(argv[1], "--an1-blend-shot") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_an1_blend.png";
             try { return RunAn1BlendShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --an2-retarget <out.png>: render the DETERMINISTIC ANIMATION RETARGETING showcase (Slice AN2,
+        // hf::anim::retarget — play one skeleton's clip on a DIFFERENTLY-PROPORTIONED skeleton via the
+        // bind-delta rotation retarget + root-motion height scale, INTEGER Q16.16 quats). PURE CPU — runs
+        // the IDENTICAL retarget.h source->long-legged-target scenario + SHARED side-by-side stick-figure
+        // raster the Vulkan --an2-retarget-shot runs -> bit-identical cross-backend BY CONSTRUCTION; the
+        // proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && (std::strcmp(argv[1], "--an2-retarget") == 0 ||
+                         std::strcmp(argv[1], "--an2-retarget-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_an2_retarget.png";
+            try { return RunAn2RetargetShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ff1-fields <out.png>: render the RIGID-BODY FORCE-FIELD VOLUMES showcase (Slice FF1,

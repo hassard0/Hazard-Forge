@@ -124,6 +124,7 @@
 #include "terrain/terrain_author.h"  // Slice LA1: LANDSCAPE AUTHORING (AuthoredTerrain/MakeFlatTerrain/MakeProcTerrain/ApplyRaiseBrush/ApplyFlattenBrush/ApplySmoothBrush/ApplyPaintBrush/ApplyCarveRoad + the Recorded* twins + TerrainHistory Undo/Redo + BuildAuthoredTerrainMesh + RunLandscapeShotScenario/RenderLandscapeShot — heightmap brush sculpting (flat-core integer-smoothstep falloff) + splat-layer painting (largest-remainder renorm to exactly 255) + the SP1 spline-carved road (flatten-to-spline-height bed + smoothstep shoulder + road-layer paint); PURE CPU Q16.16 integer, every op recorded/reversible via the TERRAIN-LOCAL ED5-recipe history — edit_history.h byte-untouched, the documented enrollment choice) — a NEW additive sibling #including terrain/procterrain.h + spline/spline.h + net/session.h read-only; the Vulkan --la1-landscape-shot + Metal --la1-landscape run the IDENTICAL pure-CPU scenario + shared shaded-relief raster
 #include "vfx/vfx_render.h"     // Slice VR1: VFX RENDERER VARIETY (TrailHistory/UpdateTrails/BuildRibbons + BuildBeam + BuildMeshInstances/OrientFromVelocity + BuildParticleLights/ParticleLightsToClustered + RunVfxShotScenario/RenderVfxShot — ribbon trails (per-slot ring buffer, seed-guarded slot reuse, monotonic age taper, SweepStrip winding) + pcg-jittered beams (jitter=0 == the exact straight strip; VISUAL-ONLY, no gameplay hit) + velocity-oriented mesh-emitter instances (SP1 integer half-angle yaw+pitch quaternions) + brightest-N particle lights feeding the EXISTING ML1 clustered assignment; the four Niagara renderer-variety generators as PURE Q16.16/integer functions of (pool, params, tick)) — a NEW additive sibling #including sim/particles.h + sim/particle_author.h + spline/spline.h + render/clustered.h + render/manylight.h read-only (ALL byte-untouched); the Vulkan --vr1-vfx-shot + Metal --vr1-vfx run the IDENTICAL pure-CPU PA1-fountain scenario + shared side-view raster (strict-zero cross-backend BY CONSTRUCTION; the ML1 assignDigest stat is the ONE float, pinned per-toolchain-family)
 #include "anim/blend_space.h"   // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Vulkan --an1-blend-shot + Metal --an1-blend run the IDENTICAL pure-CPU 240-tick scenario + shared raster
+#include "anim/retarget.h"      // Slice AN2: DETERMINISTIC ANIMATION RETARGETING (RetargetMap/BuildRetargetMap, Retarget, FxQuat algebra, ForwardKinematics, RunRetargetShotScenario/RenderRetargetShot — play one skeleton's clip on a DIFFERENTLY-PROPORTIONED skeleton via the bind-delta rotation retarget + root-motion height scale; INTEGER Q16.16 quats past the ONE QuantizeFx boundary; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + motion_match.h read-only; the Vulkan --an2-retarget-shot + Metal --an2-retarget run the IDENTICAL pure-CPU scenario + shared stick-figure raster (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"          // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids, brute-force all-pairs Reynolds seek+separation) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "ai/ai.h"              // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree — a FLAT index graph + an integer blackboard + a fixed-DFS-order tick; PURE CPU integer, the BEACHHEAD of the DETERMINISTIC AI flagship #28) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Vulkan --ai1-tree-shot + Metal --ai1-tree run the IDENTICAL pure-CPU tick + 2D node-graph viz
@@ -4380,6 +4381,19 @@ int main(int argc, char** argv) {
     const char* an1BlendShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--an1-blend-shot") == 0) { an1BlendShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice AN2: --an2-retarget-shot <out.bmp> (DETERMINISTIC ANIMATION RETARGETING — play one
+    // skeleton's clip on a DIFFERENTLY-PROPORTIONED skeleton, hf::anim::retarget; the bind-delta
+    // rotation retarget R = (tbind (x) conj(sbind)) (x) sanim in INTEGER Q16.16 quats + the root-motion
+    // height scale, everything integer past the ONE QuantizeFx boundary). PURE CPU: NO GPU dispatch, NO
+    // new shader, NO new RHI; both backends run the IDENTICAL retarget.h scenario (SOURCE stick figure
+    // posed by the clip + the long-legged/short-armed TARGET playing the retargeted motion) + the SHARED
+    // pure-integer side-by-side raster -> strict-zero cross-backend BY CONSTRUCTION. Its OWN loop (the
+    // standalone-loop pattern, C1061).
+    const char* an2RetargetShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--an2-retarget-shot") == 0) { an2RetargetShotPath = argv[i + 1]; break; }
     }
 
     // Slice FF1: --ff1-fields-shot <out.bmp> (RIGID-BODY FORCE-FIELD VOLUMES — the PT2 particle field
@@ -60392,6 +60406,63 @@ int main(int argc, char** argv) {
                                 "sweep + per-tick weight bars, %d ticks)\n",
                                 an1BlendShotPath, bsW, bsH, bsn::kShotSteps);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", an1BlendShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DETERMINISTIC ANIMATION RETARGETING (--an2-retarget-shot <out.bmp>, Slice AN2,
+        // hf::anim::retarget). PURE CPU — NO GPU dispatch, NO new shader, NO new RHI; both Vulkan-Windows
+        // and Metal-Mac run the IDENTICAL pure-CPU scenario (retarget.h::RunRetargetShotScenario — a
+        // name-matched bone map from a normal-proportioned SOURCE onto a LONG-legged/SHORT-armed TARGET,
+        // the source clip sampled at 4 keyframes, the bind-delta rotation retarget R = (tbind (x)
+        // conj(sbind)) (x) sanim in INTEGER Q16.16 quats + the root-motion 2x height scale, integer
+        // forward-kinematics for the model-space joints) and the SHARED pure-integer side-by-side stick-
+        // figure raster (SOURCE posed by the clip left, TARGET playing the retargeted motion right) ->
+        // strict-zero cross-backend BY CONSTRUCTION. Asserts two-run identity + the pinned stat line.
+        if (an2RetargetShotPath) {
+            namespace rtn = hf::anim::retarget;
+
+            // THE SCENARIO (== retarget_test): the fixed source->target retarget over 4 keyframes, twice.
+            const rtn::RetargetShotRun rtRun  = rtn::RunRetargetShotScenario();
+            const rtn::RetargetShotRun rtRun2 = rtn::RunRetargetShotScenario();
+
+            // PROOF (1) two-run IDENTICAL (integer model-space + local-pose digests).
+            if (rtRun.digest != rtRun2.digest || rtRun.sourceDigest != rtRun2.sourceDigest ||
+                rtRun.targetDigest != rtRun2.targetDigest || rtRun.localDigest != rtRun2.localDigest) {
+                std::fprintf(stderr, "FATAL: an2-retarget two runs differ (nondeterministic retarget)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("an2-retarget: two-run IDENTICAL {source:%016llx, target:%016llx, local:%016llx}\n",
+                        (unsigned long long)rtRun.sourceDigest, (unsigned long long)rtRun.targetDigest,
+                        (unsigned long long)rtRun.localDigest);
+
+            // PROOF (2) the target really is differently proportioned (long legs) — the whole point.
+            const std::vector<rtn::FxJointModel> tgtBindFk =
+                rtn::ForwardKinematics(rtRun.map.target, rtn::BindPose(rtRun.map.target));
+            const std::vector<rtn::FxJointModel> srcBindFk =
+                rtn::ForwardKinematics(rtRun.map.source, rtn::BindPose(rtRun.map.source));
+            if (tgtBindFk[6].pos.y == srcBindFk[6].pos.y || rtRun.heightRatio == rtn::kOne) {
+                std::fprintf(stderr, "FATAL: an2-retarget target not re-proportioned\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("an2-retarget: target re-proportioned {srcFootY:%d, tgtFootY:%d, ratio:%d}\n",
+                        srcBindFk[6].pos.y, tgtBindFk[6].pos.y, rtRun.heightRatio);
+
+            std::printf("an2-retarget: stats {srcBones:%d, tgtBones:%d, mapped:%d, frames:%d, ratio:%d, "
+                        "digest:%016llx}\n",
+                        rtRun.srcBones, rtRun.tgtBones, rtRun.mapped, (int)rtRun.frames.size(),
+                        rtRun.heightRatio, (unsigned long long)rtRun.digest);
+
+            // --- Golden: the SHARED pure-integer raster (retarget.h::RenderRetargetShot — the identical
+            // function both backends call; strict-zero BY CONSTRUCTION). ---
+            std::vector<uint8_t> rtImg;
+            uint32_t rtW = 0, rtH = 0;
+            rtn::RenderRetargetShot(rtRun, rtImg, rtW, rtH);
+            bool ok = WriteBMP(an2RetargetShotPath, rtImg, rtW, rtH);
+            if (ok) std::printf("wrote %s (%ux%u) — an2 deterministic animation retargeting (source vs "
+                                "long-legged target, %d keyframes)\n",
+                                an2RetargetShotPath, rtW, rtH, (int)rtRun.frames.size());
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", an2RetargetShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

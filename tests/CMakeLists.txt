@@ -1687,6 +1687,24 @@ hf_add_pure_test(spline_test)
 # (byte-untouched).
 hf_add_pure_test(blend_space_test)
 
+# Slice AN2 — DETERMINISTIC ANIMATION RETARGETING (engine/anim/retarget.h, hf::anim::retarget; the
+# parity++ audit AN2 gap + the animation-pillar continuation after AN1 blend spaces): play one
+# skeleton's clip on a DIFFERENTLY-PROPORTIONED skeleton — the feature UE5 authors as the IK Rig /
+# IK Retargeter, made deterministic. NAME-matched bone map (Joint carries no name -> a parallel name
+# array; case-exact match, unmatched holds bind, overrides win); the PINNED bind-delta rotation
+# retarget R = (tbind (x) conj(sbind)) (x) sanim in INTEGER Q16.16 quaternions (Hamilton product +
+# CONJUGATE-inverse for unit quats — division-free, no sqrt; the delta collapses to identity EXACTLY on
+# self-retarget so the source motion reproduces BIT-EXACT); translations from the TARGET bind (preserve
+# proportions) with ONLY the root scaled by the leg-length height ratio (2.0 for the 2x-tall target);
+# integer forward-kinematics for the model-space palette. Everything past the ONE QuantizeFx boundary is
+# integer -> cross-compiler exact BY CONSTRUCTION (the MM1/AN1 discipline; exact binary-fraction clip
+# sampled AT keyframe times). Pins: identity self-retarget field-exact per frame, the two hand-derived
+# bind-delta cases + full-map delta with target proportions, the root scale + non-root-holds-bind, the
+# unmapped-holds-bind + override, and the shot digests PINNED identical MSVC + clang (standalone:
+# clang++ -std=c++20 -I engine -I tests tests/retarget_test.cpp engine/anim/animation.cpp). Pure C++
+# (hf_core), ASan-eligible. animation.h/skeleton.h/motion_match.h composed read-only (byte-untouched).
+hf_add_pure_test(retarget_test)
+
 # Slice FO1 (the BEACHHEAD of FLAGSHIP #25, DETERMINISTIC FOLIAGE AT SCALE): the deterministic integer WIND FIELD
 # (engine/foliage/foliage.h) — WindBend(wind,pos,frame) is a Q16.16 bend angle from a sum of host-baked sine "gust"
 # waves indexed by an integer phase accumulator into the committed kFoliageWind16 LUT (the audio kSineTable copied
