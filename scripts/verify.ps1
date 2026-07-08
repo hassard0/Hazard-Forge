@@ -426,6 +426,7 @@ $Goldens = @(
     @{ Name = 'au2_reverb';       Flag = '--au2-reverb-shot' }     # AU2 deterministic convolution reverb + submix buses (parity++ audio; integer Q15 MAC, digest 0xe294f310e3227811)
     @{ Name = 'sk1_import';       Flag = '--sk1-import-shot' }     # SK1 deterministic USD/UsdSkel skeletal import (parity++ asset; 2nd device-free skeletal importer, digest f7a315563d264826)
     @{ Name = 'uf1_text';         Flag = '--uf1-text-shot' }       # UF1 deterministic SDF text (parity++ UI; integer SDF glyph gen + proportional layout/kerning, digest baca98f42661ce00)
+    @{ Name = 'gt1_tags';         Flag = '--gt1-tags-shot' }       # GT1 deterministic gameplay-tag layer (next-tier #1; hierarchical tags gating GAS, trace 807d1bc4f5e9c28f)
 )
 
 $winResult = 'SKIP'
