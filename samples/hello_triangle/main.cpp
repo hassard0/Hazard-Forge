@@ -128,6 +128,7 @@
 #include "vfx/vfx_render.h"     // Slice VR1: VFX RENDERER VARIETY (TrailHistory/UpdateTrails/BuildRibbons + BuildBeam + BuildMeshInstances/OrientFromVelocity + BuildParticleLights/ParticleLightsToClustered + RunVfxShotScenario/RenderVfxShot — ribbon trails (per-slot ring buffer, seed-guarded slot reuse, monotonic age taper, SweepStrip winding) + pcg-jittered beams (jitter=0 == the exact straight strip; VISUAL-ONLY, no gameplay hit) + velocity-oriented mesh-emitter instances (SP1 integer half-angle yaw+pitch quaternions) + brightest-N particle lights feeding the EXISTING ML1 clustered assignment; the four Niagara renderer-variety generators as PURE Q16.16/integer functions of (pool, params, tick)) — a NEW additive sibling #including sim/particles.h + sim/particle_author.h + spline/spline.h + render/clustered.h + render/manylight.h read-only (ALL byte-untouched); the Vulkan --vr1-vfx-shot + Metal --vr1-vfx run the IDENTICAL pure-CPU PA1-fountain scenario + shared side-view raster (strict-zero cross-backend BY CONSTRUCTION; the ML1 assignDigest stat is the ONE float, pinned per-toolchain-family)
 #include "anim/blend_space.h"   // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Vulkan --an1-blend-shot + Metal --an1-blend run the IDENTICAL pure-CPU 240-tick scenario + shared raster
 #include "anim/retarget.h"      // Slice AN2: DETERMINISTIC ANIMATION RETARGETING (RetargetMap/BuildRetargetMap, Retarget, FxQuat algebra, ForwardKinematics, RunRetargetShotScenario/RenderRetargetShot — play one skeleton's clip on a DIFFERENTLY-PROPORTIONED skeleton via the bind-delta rotation retarget + root-motion height scale; INTEGER Q16.16 quats past the ONE QuantizeFx boundary; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + motion_match.h read-only; the Vulkan --an2-retarget-shot + Metal --an2-retarget run the IDENTICAL pure-CPU scenario + shared stick-figure raster (strict-zero cross-backend BY CONSTRUCTION)
+#include "anim/anim_layer.h"     // Slice AL1: DETERMINISTIC ANIMATION LAYERING (NotifyTrack/SampleNotifies, ApplyAdditive, AnimLayerStack/EvaluateLayers, Montage/MontagePlayer/StepMontage/JumpToSection, the notify->GT1/GAS1 tagged-effect bridge, RunAl1ShotScenario/RenderAl1Shot — clip notifies/events + additive poses + layered blend-per-bone slot blending + montages, all Q16.16 integer past the ONE QuantizeFx boundary over the EXISTING retarget FxQuat algebra + SampleLocalPose; PURE CPU) — a NEW additive sibling #including anim/animation.h + retarget.h + skeleton.h + seq/seq.h + game/gameplay_tags.h read-only; the Vulkan --al1-layer-shot + Metal --al1-layer run the IDENTICAL pure-CPU scenario (walking legs + an upper-body attack montage + a spine lean + notify markers + the target's health reacting at the hit notify) + shared stick-figure raster (strict-zero cross-backend BY CONSTRUCTION)
 #include "asset/usd_skel_shot.h" // Slice SK1: DETERMINISTIC SKELETAL-ANIMATION ASSET IMPORT (USD/UsdSkel; ImportUsdSkel/UsdSkelImport/DigestUsdSkel/NormalizeInfluences + RunSk1ShotScenario/RenderSk1Shot) — a SECOND, DEVICE-FREE, clean-room skeletal importer (glTF already imports skeletal but is device-coupled; fbx/usd were geometry-only) parsing UsdSkel text -> anim::Skeleton + scene::SkinnedVertex + anim::Animation; a NEW additive sibling #including asset/usd_skel.h (usd_loader.h/skeleton.h/animation.h/scene/vertex.h read-only) + anim/retarget.h read-only for the shot; the Vulkan --sk1-import-shot + Metal --sk1-import run the IDENTICAL pure-CPU scenario (import -> SampleLocalPose -> QuantizePose -> integer FK) + shared stick-figure raster (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"          // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids, brute-force all-pairs Reynolds seek+separation) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot
 #include "sim/crowd.h"          // Slice CR1: DETERMINISTIC CROWD AT 10k+ AGENTS (Mass-class archetype crowd, hf::sim::crowd) — composes the byte-frozen BD2 boids.h grid for O(N) separation (vs BD1's all-pairs O(N²)), 3-archetype types + goal-seek + lockstep/rollback; RunCrowdShotScenario/RenderCrowdShot shared verbatim with the Metal --cr1-crowd; PURE CPU strict-integer, NO new shader
@@ -4421,6 +4422,20 @@ int main(int argc, char** argv) {
     const char* an2RetargetShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--an2-retarget-shot") == 0) { an2RetargetShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice AL1: --al1-layer-shot <out.bmp> (DETERMINISTIC ANIMATION LAYERING — clip notifies/events +
+    // additive poses + layered slot blending + montages + the notify->GT1/GAS1 tagged-effect bridge,
+    // hf::anim::layer; the half-open (prevTick, curTick] notify window, the additive base (x) delta compose,
+    // the per-bone-masked layered fold, the linear montage blend, all INTEGER Q16.16 past the ONE
+    // QuantizeFx boundary). PURE CPU: NO GPU dispatch, NO new shader, NO new RHI; both backends run the
+    // IDENTICAL anim_layer.h scenario (a stick figure walking [legs] while the upper body plays an attack
+    // montage [arm windup+strike] with a spine lean [additive], footstep+hit notify markers, and the
+    // target's health dropping at the hit notify) + the SHARED pure-integer raster -> strict-zero cross-
+    // backend BY CONSTRUCTION. Its OWN loop (the standalone-loop pattern, C1061).
+    const char* al1LayerShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--al1-layer-shot") == 0) { al1LayerShotPath = argv[i + 1]; break; }
     }
 
     // Slice CR1: --cr1-crowd-shot <out.bmp> (DETERMINISTIC CROWD AT 10k+ AGENTS, the Mass-class archetype
@@ -60639,6 +60654,61 @@ int main(int argc, char** argv) {
                                 "long-legged target, %d keyframes)\n",
                                 an2RetargetShotPath, rtW, rtH, (int)rtRun.frames.size());
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", an2RetargetShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DETERMINISTIC ANIMATION LAYERING (--al1-layer-shot <out.bmp>, Slice AL1, hf::anim::layer).
+        // PURE CPU — NO GPU dispatch, NO new shader, NO new RHI; both Vulkan-Windows and Metal-Mac run the
+        // IDENTICAL pure-CPU scenario (anim_layer.h::RunAl1ShotScenario — a 9-bone stick figure walking
+        // [legs, translation swings] while an upper-body-masked attack MONTAGE [right-arm windup+strike]
+        // plays over a spine LEAN [additive base (x) delta], footstep + "hit" NOTIFIES firing on the exact
+        // half-open ticks, and the montage "hit" notify routing to a GT1/GAS1 damage ability BEFORE the GAS
+        // step so the target's health drops on exactly the hit tick) and the SHARED pure-integer raster
+        // (the figure over frames + the notify/weight timeline strip + the target health bar) -> strict-zero
+        // cross-backend BY CONSTRUCTION. Asserts two-run identity + the pinned stat line.
+        if (al1LayerShotPath) {
+            namespace aln = hf::anim::layer;
+
+            // THE SCENARIO (== anim_layer_test): the fixed 20-tick layering scenario, run twice.
+            const aln::Al1ShotRun r1 = aln::RunAl1ShotScenario();
+            const aln::Al1ShotRun r2 = aln::RunAl1ShotScenario();
+
+            // PROOF (1) two-run IDENTICAL (pose + health + notify digests).
+            if (r1.digest != r2.digest || r1.poseDigest != r2.poseDigest ||
+                r1.healthDigest != r2.healthDigest || r1.notifyDigest != r2.notifyDigest) {
+                std::fprintf(stderr, "FATAL: al1-layer two runs differ (nondeterministic layering)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("al1-layer: two-run IDENTICAL {pose:%016llx, health:%016llx, notify:%016llx}\n",
+                        (unsigned long long)r1.poseDigest, (unsigned long long)r1.healthDigest,
+                        (unsigned long long)r1.notifyDigest);
+
+            // PROOF (2) the notify->effect bridge fired: the hit notify landed and the target took damage.
+            const aln::fx preHp  = r1.frames[(size_t)(r1.hitTick > 0 ? r1.hitTick - 1 : 0)].targetHp;
+            const aln::fx postHp = r1.frames[(size_t)r1.hitTick].targetHp;
+            if (r1.hitTick < 0 || postHp != preHp - aln::kAl1HitDamage) {
+                std::fprintf(stderr, "FATAL: al1-layer hit notify did not apply the tagged damage on time\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("al1-layer: bridge fired {hitTick:%d, hpBefore:%d, hpAfter:%d}\n",
+                        r1.hitTick, (int)(preHp >> 16), (int)(postHp >> 16));
+
+            std::printf("al1-layer: stats {bones:%d, layers:%d, notifies:%d, sections:%d, hitTick:%d, "
+                        "digest:%016llx}\n",
+                        r1.bones, r1.layers, r1.notifies, r1.sections, r1.hitTick,
+                        (unsigned long long)r1.digest);
+
+            // --- Golden: the SHARED pure-integer raster (anim_layer.h::RenderAl1Shot — the identical
+            // function both backends call; strict-zero BY CONSTRUCTION). ---
+            std::vector<uint8_t> alImg;
+            uint32_t alW = 0, alH = 0;
+            aln::RenderAl1Shot(r1, alImg, alW, alH);
+            bool ok = WriteBMP(al1LayerShotPath, alImg, alW, alH);
+            if (ok) std::printf("wrote %s (%ux%u) — al1 deterministic animation layering (walk + upper-body "
+                                "attack montage + additive lean, %d notifies, hit@%d)\n",
+                                al1LayerShotPath, alW, alH, r1.notifies, r1.hitTick);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", al1LayerShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

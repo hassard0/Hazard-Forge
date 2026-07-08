@@ -153,6 +153,7 @@
 #include "terrain/terrain_author.h"  // Slice LA1: LANDSCAPE AUTHORING (AuthoredTerrain/MakeFlatTerrain/MakeProcTerrain/ApplyRaiseBrush/ApplyFlattenBrush/ApplySmoothBrush/ApplyPaintBrush/ApplyCarveRoad + the Recorded* twins + TerrainHistory Undo/Redo + BuildAuthoredTerrainMesh + RunLandscapeShotScenario/RenderLandscapeShot — heightmap brush sculpting (flat-core integer-smoothstep falloff) + splat-layer painting (largest-remainder renorm to exactly 255) + the SP1 spline-carved road (flatten-to-spline-height bed + smoothstep shoulder + road-layer paint); PURE CPU Q16.16 integer, every op recorded/reversible via the TERRAIN-LOCAL ED5-recipe history — edit_history.h byte-untouched) — a NEW additive sibling #including terrain/procterrain.h + spline/spline.h + net/session.h read-only; the Metal --la1-landscape runs the IDENTICAL pure-CPU scenario + SHARED shaded-relief raster the Vulkan --la1-landscape-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "vfx/vfx_render.h"          // Slice VR1: VFX RENDERER VARIETY (TrailHistory/UpdateTrails/BuildRibbons + BuildBeam + BuildMeshInstances/OrientFromVelocity + BuildParticleLights/ParticleLightsToClustered + RunVfxShotScenario/RenderVfxShot — ribbon trails (per-slot ring buffer, seed-guarded slot reuse, monotonic age taper, SweepStrip winding) + pcg-jittered beams (jitter=0 == the exact straight strip; VISUAL-ONLY, no gameplay hit) + velocity-oriented mesh-emitter instances (SP1 integer half-angle yaw+pitch quaternions) + brightest-N particle lights feeding the EXISTING ML1 clustered assignment; PURE Q16.16/integer geometry generators) — a NEW additive sibling #including sim/particles.h + sim/particle_author.h + spline/spline.h + render/clustered.h + render/manylight.h read-only (ALL byte-untouched); the Metal --vr1-vfx runs the IDENTICAL pure-CPU PA1-fountain scenario + SHARED side-view raster the Vulkan --vr1-vfx-shot runs (strict-zero cross-backend BY CONSTRUCTION; the ML1 assignDigest stat is the ONE float, pinned per-toolchain-family)
 #include "anim/blend_space.h"        // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Metal --an1-blend runs the IDENTICAL pure-CPU 240-tick scenario + SHARED raster the Vulkan --an1-blend-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "anim/anim_layer.h"          // Slice AL1: DETERMINISTIC ANIMATION LAYERING (NotifyTrack/SampleNotifies, ApplyAdditive, AnimLayerStack/EvaluateLayers, Montage/MontagePlayer/StepMontage/JumpToSection, the notify->GT1/GAS1 tagged-effect bridge, RunAl1ShotScenario/RenderAl1Shot — clip notifies/events + additive poses + layered blend-per-bone slot blending + montages, all Q16.16 integer past the ONE QuantizeFx boundary over the EXISTING retarget FxQuat algebra + SampleLocalPose; PURE CPU) — a NEW additive sibling #including anim/animation.h + retarget.h + skeleton.h + seq/seq.h + game/gameplay_tags.h read-only; the Metal --al1-layer runs the IDENTICAL pure-CPU scenario + SHARED stick-figure raster the Vulkan --al1-layer-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "anim/retarget.h"           // Slice AN2: DETERMINISTIC ANIMATION RETARGETING (RetargetMap/BuildRetargetMap, Retarget, FxQuat algebra, ForwardKinematics, RunRetargetShotScenario/RenderRetargetShot — play one skeleton's clip on a DIFFERENTLY-PROPORTIONED skeleton via the bind-delta rotation retarget + root-motion height scale; INTEGER Q16.16 quats past the ONE QuantizeFx boundary; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + motion_match.h read-only; the Metal --an2-retarget runs the IDENTICAL pure-CPU scenario + SHARED stick-figure raster the Vulkan --an2-retarget-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "asset/usd_skel_shot.h"     // Slice SK1: DETERMINISTIC SKELETAL-ANIMATION ASSET IMPORT (USD/UsdSkel; ImportUsdSkel/RunSk1ShotScenario/RenderSk1Shot) — a SECOND, DEVICE-FREE, clean-room skeletal importer (glTF's is device-coupled; fbx/usd were geometry-only) parsing UsdSkel text -> anim::Skeleton + scene::SkinnedVertex + anim::Animation; header-only, so on Metal it runs the IDENTICAL pure-CPU scenario + SHARED stick-figure raster the Vulkan --sk1-import-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
@@ -48952,6 +48953,57 @@ static int RunAn2RetargetShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice AL1 — DETERMINISTIC ANIMATION LAYERING showcase (--al1-layer) (clip notifies/events +
+// additive poses + layered slot blending + montages + the notify->GT1/GAS1 tagged-effect bridge;
+// hf::anim::layer). PURE CPU — NO GPU compute, NO new shader, NO new RHI; anim_layer.h is header-only, so
+// on Metal it runs the IDENTICAL fixed scenario the Vulkan --al1-layer-shot runs on Windows
+// (anim_layer.h::RunAl1ShotScenario — a 9-bone stick figure walking [legs] while an upper-body-masked
+// attack MONTAGE [right-arm windup+strike] plays over a spine LEAN [additive], footstep + "hit" NOTIFIES
+// firing on the exact half-open ticks, the montage "hit" notify routing to a GT1/GAS1 damage ability
+// BEFORE the GAS step so the target's health drops on exactly the hit tick) AND the SHARED pure-integer
+// raster (anim_layer.h::RenderAl1Shot — the identical function both backends call) -> bit-identical cross-
+// backend BY CONSTRUCTION (strict zero-differing-pixel). The proof lines match the Vulkan side EXACTLY. New
+// golden tests/golden/metal/al1_layer.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunAl1LayerShowcase(const char* outPath) {
+    namespace aln = hf::anim::layer;
+
+    // THE SCENARIO (== anim_layer_test): the fixed 20-tick layering scenario, run twice.
+    const aln::Al1ShotRun r1 = aln::RunAl1ShotScenario();
+    const aln::Al1ShotRun r2 = aln::RunAl1ShotScenario();
+
+    // PROOF (1) two-run IDENTICAL (pose + health + notify digests).
+    if (r1.digest != r2.digest || r1.poseDigest != r2.poseDigest ||
+        r1.healthDigest != r2.healthDigest || r1.notifyDigest != r2.notifyDigest)
+        return fail("al1-layer: two runs differ (nondeterministic layering)");
+    std::printf("al1-layer: two-run IDENTICAL {pose:%016llx, health:%016llx, notify:%016llx}\n",
+                (unsigned long long)r1.poseDigest, (unsigned long long)r1.healthDigest,
+                (unsigned long long)r1.notifyDigest);
+
+    // PROOF (2) the notify->effect bridge fired: the hit notify landed and the target took damage on time.
+    const aln::fx preHp  = r1.frames[(size_t)(r1.hitTick > 0 ? r1.hitTick - 1 : 0)].targetHp;
+    const aln::fx postHp = r1.frames[(size_t)r1.hitTick].targetHp;
+    if (r1.hitTick < 0 || postHp != preHp - aln::kAl1HitDamage)
+        return fail("al1-layer: hit notify did not apply the tagged damage on time");
+    std::printf("al1-layer: bridge fired {hitTick:%d, hpBefore:%d, hpAfter:%d}\n",
+                r1.hitTick, (int)(preHp >> 16), (int)(postHp >> 16));
+
+    std::printf("al1-layer: stats {bones:%d, layers:%d, notifies:%d, sections:%d, hitTick:%d, "
+                "digest:%016llx}\n",
+                r1.bones, r1.layers, r1.notifies, r1.sections, r1.hitTick,
+                (unsigned long long)r1.digest);
+
+    // --- Golden: the SHARED pure-integer raster (anim_layer.h::RenderAl1Shot — the identical function the
+    // Vulkan --al1-layer-shot calls; strict-zero BY CONSTRUCTION). ---
+    std::vector<uint8_t> alImg;
+    uint32_t alW = 0, alH = 0;
+    aln::RenderAl1Shot(r1, alImg, alW, alH);
+    if (!WritePNG(outPath, alImg, alW, alH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — al1 deterministic animation layering (walk + upper-body attack "
+                "montage + additive lean, %d notifies, hit@%d)\n",
+                outPath, alW, alH, r1.notifies, r1.hitTick);
+    return 0;
+}
+
 // ===== Slice CR1 — DETERMINISTIC CROWD AT 10k+ AGENTS showcase (--cr1-crowd) (the Mass-class archetype
 // crowd — O(N) grid separation via the byte-frozen BD2 boids.h spatial-hash [vs BD1's all-pairs O(N²)], a
 // 3-archetype crowd streaming toward goals, deterministic + lockstep-replayable; hf::sim::crowd). PURE CPU —
@@ -82706,6 +82758,18 @@ int main(int argc, char** argv) {
                          std::strcmp(argv[1], "--an2-retarget-shot") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_an2_retarget.png";
             try { return RunAn2RetargetShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --al1-layer <out.png>: render the DETERMINISTIC ANIMATION LAYERING showcase (Slice AL1,
+        // hf::anim::layer — clip notifies/events + additive poses + layered slot blending + montages + the
+        // notify->GT1/GAS1 tagged-effect bridge, INTEGER Q16.16 past the ONE QuantizeFx boundary). PURE CPU
+        // — runs the IDENTICAL anim_layer.h walk+attack-montage+lean scenario + SHARED stick-figure/timeline/
+        // health raster the Vulkan --al1-layer-shot runs -> bit-identical cross-backend BY CONSTRUCTION; the
+        // proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && (std::strcmp(argv[1], "--al1-layer") == 0 ||
+                         std::strcmp(argv[1], "--al1-layer-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_al1_layer.png";
+            try { return RunAl1LayerShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --uf1-text <out.png>: render the DETERMINISTIC SDF TEXT showcase (Slice UF1, hf::ui::sdf —

@@ -1727,6 +1727,25 @@ hf_add_pure_test(blend_space_test)
 # (hf_core), ASan-eligible. animation.h/skeleton.h/motion_match.h composed read-only (byte-untouched).
 hf_add_pure_test(retarget_test)
 
+# Slice AL1 — DETERMINISTIC ANIMATION LAYERING (engine/anim/anim_layer.h, hf::anim::layer; the next-tier
+# parity gap on the animation pillar after AN1 blend spaces + AN2 retargeting): clip NOTIFIES/events +
+# ADDITIVE poses + LAYERED slot blending (blend-per-bone) + MONTAGES + the notify->GT1/GAS1 tagged-effect
+# BRIDGE — the UE5 Anim Notifies / Additive+Layered anim / Montages tier, made deterministic. Operates on
+# retarget::FxJointPose (Q16.16 integer local pose); the ONE float boundary is the clip sample
+# (SampleLocalPose -> QuantizePose), everything downstream is integer (the additive base (x) delta compose
+# with an identity-slerp integer-normalize nlerp, the per-bone-masked layered fold, the linear montage
+# blend curve, integer FK) -> cross-compiler exact BY CONSTRUCTION (the MM1/AN2 discipline; exact binary-
+# fraction fixtures sampled AT keyframe times). NOTIFY window is HALF-OPEN (prevTick, curTick] (the mirror
+# of seq::SampleEvents [tPrev, t), reused read-only, not reinvented). Pins: the notify boundary/loop-wrap/
+# order + trace digest, additive w0==base + w1 base(x)delta + a mid-weight nlerp + identity-delta==base,
+# the upper-body-masked layered blend (leg holds base / arm follows the wave) + fold-order-matters + weight-
+# 0==base, the montage 2-section linear blend curve + hit-notify tick + JumpToSection + no-blend==raw-clip,
+# the bridge health trace (target -25 on exactly the hit tick), and the shot digests PINNED identical MSVC
+# + clang (standalone: clang++ -std=c++20 -I engine -I tests -I third_party tests/anim_layer_test.cpp
+# engine/anim/animation.cpp). Pure C++ (hf_core), ASan-eligible. animation.h/retarget.h/skeleton.h/seq.h/
+# gameplay_tags.h/ability.h composed read-only (byte-untouched).
+hf_add_pure_test(anim_layer_test)
+
 # Slice SK1 — DETERMINISTIC SKELETAL-ANIMATION ASSET IMPORT (USD / UsdSkel; engine/asset/usd_skel.h,
 # hf::asset; the parity++ asset-import gap). gltf_loader.h ALREADY imports skin+skeleton+animation (device-
 # coupled via cgltf), but fbx_loader.h / usd_loader.h are GEOMETRY ONLY — SK1 adds a SECOND, DEVICE-FREE,
