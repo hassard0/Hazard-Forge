@@ -416,6 +416,7 @@ $Goldens = @(
     @{ Name = 'gas1_duel';        Flag = '--gas1-duel' }          # GAS1 deterministic ability system (parity++ #1; attribute/effect/cooldown duel trace f74f7e4198440670, kit a092a05e3a6b1a50)
     @{ Name = 'wv1_float';        Flag = '--wv1-float' }          # WV1 water gameplay volume (parity++ #2; analytic integer-Gerstner buoyancy, digest 8eaa0116a528c87d)
     @{ Name = 'sp1_road';         Flag = '--sp1-road' }           # SP1 first-class integer splines (parity++ #3; eval+arc+scatter+sweep+camera, digest 24fa72580c7c2cef)
+    @{ Name = 'an1_blend';        Flag = '--an1-blend' }          # AN1 deterministic blend spaces (parity++ #4; phase-synced 1D/2D parametric blending, digests 956fe8b0/7731e08b/538ba1d1)
 )
 
 $winResult = 'SKIP'
