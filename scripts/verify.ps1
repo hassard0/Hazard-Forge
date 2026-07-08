@@ -422,6 +422,7 @@ $Goldens = @(
     @{ Name = 'vr1_vfx';          Flag = '--vr1-vfx' }            # VR1 VFX renderer variety (parity++ #6; ribbons/beams/mesh-emitters/particle-lights, digest 4c5b2968f2263079)
     @{ Name = 'hrr1_groom';       Flag = '--hrr1-groom-shot' }    # HRR1 hair strand renderer (parity++ #7; Kajiya-Kay ribbons over the bit-exact HR1 sim, simDigest 0x2fe41334235921fd)
     @{ Name = 'an2_retarget';     Flag = '--an2-retarget' }        # AN2 deterministic animation retargeting (parity++ AN2; bind-delta + root-scale, digest e861d306897f2d75)
+    @{ Name = 'cr1_crowd';        Flag = '--cr1-crowd' }           # CR1 deterministic crowd sim at 10k+ agents (parity++ crowds; O(N) grid==all-pairs, digest c80b1b212fadfeb0)
 )
 
 $winResult = 'SKIP'
