@@ -145,6 +145,7 @@
 #include "sim/hulljoint.h"           // Slice HF4: hull friction + joints HULL JOINTS COMPOSED (JointedHullWorld/JointedHullStepConfig/StepJointedHullWorld(N)/MeasureJointedHull — the joint.h ball/angular-limit solvers composed with the HF3 hull friction contacts in ONE deterministic tick) — int64 -> hulljoint_step.comp is Vulkan-only (NOT in hf_gen_msl); the Metal --hf4-joint runs the CPU hulljoint::StepJointedHullWorldN (byte-identical to the Vulkan GPU result by construction)
 #include "game/verdict.h"            // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Metal --vd1-world runs the IDENTICAL pure-CPU script the Vulkan --vd1-world-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "game/ability.h"            // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Metal --gas1-duel runs the IDENTICAL pure-CPU 60-tick duel the Vulkan --gas1-duel-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "game/gameplay_tags.h"      // Slice GT1: A DETERMINISTIC GAMEPLAY-TAG LAYER (TagRegistry/TagContainer/HasTagQuery/TagRules/TryActivateTagged/StepTagged/RunTaggedLockstep/RunTaggedRollback/RunSkirmish — hierarchical interned tags gating GAS1 abilities/effects via a thin adapter; PURE CPU integer) — a NEW additive sibling #including game/ability.h READ-ONLY/BYTE-UNTOUCHED; the Metal --gt1-tags runs the IDENTICAL pure-CPU 14-tick tag skirmish the Vulkan --gt1-tags-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "ai/ai.h"                   // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Metal --ai1-tree runs the IDENTICAL pure-CPU tick + 2D node-graph viz the Vulkan --ai1-tree-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/water_body.h"          // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Metal --wv1-float runs the IDENTICAL pure-CPU 480-tick scenario + SHARED raster the Vulkan --wv1-float-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "spline/spline.h"           // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Metal --sp1-road runs the IDENTICAL pure-CPU scenario + SHARED top-down raster the Vulkan --sp1-road-shot runs (strict-zero cross-backend BY CONSTRUCTION)
@@ -49308,6 +49309,137 @@ static int RunGas1DuelShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GT1 — A DETERMINISTIC GAMEPLAY-TAG LAYER showcase (--gt1-tags) (hierarchical tag containers
+// gating abilities/effects, hf::game::tags). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
+// gameplay_tags.h is header-only integer math (#includes game/ability.h READ-ONLY/BYTE-UNTOUCHED), so on
+// Metal it runs the IDENTICAL pure-CPU 14-tick tag skirmish the Vulkan --gt1-tags-shot runs on Windows
+// (RunSkirmish — a stun effect grants State.Stunned that BLOCKS the target's abilities, an Immune.Fire target
+// nullifies fire, an empower buff gates a required-tag Smite) -> the tag-timeline state grid is bit-identical
+// cross-backend BY CONSTRUCTION (strict zero-differing-pixel). The 4 proof lines match the Vulkan side
+// EXACTLY. New golden tests/golden/metal/gt1_tags.png (baked on the Mac by the controller); two runs DIFF
+// 0.0000.
+static int RunGt1TagsShowcase(const char* outPath) {
+    namespace tagns = hf::game::tags;
+    namespace gasns = hf::game::gas;
+
+    const tagns::TagRegistry reg = tagns::MakeTagRegistry();
+
+    // THE SCENARIO (== gameplay_tags_test + the Vulkan --gt1-tags-shot): the FIXED 14-tick skirmish, twice.
+    const tagns::SkirmishRun run  = tagns::RunSkirmish();
+    const tagns::SkirmishRun run2 = tagns::RunSkirmish();
+
+    // PROOF (1) the tag layer is AUTHORED (registry/rules/kit — the test pins these digests).
+    const uint64_t regDigest = tagns::DigestRules(tagns::MakeSkirmishRules(reg));
+    const uint64_t kitDigest = gasns::DigestKit(tagns::MakeSkirmishKit());
+    std::printf("gt1-tags: authored {tags:%u, rules:%s, kit:%s}\n", reg.size(),
+                tagns::DigestHex(regDigest).c_str(), tagns::DigestHex(kitDigest).c_str());
+
+    // PROOF (2) two-run BYTE-IDENTICAL.
+    if (!tagns::TaggedStatesEqual(run.finalWorld, run2.finalWorld) || run.traceDigest != run2.traceDigest)
+        return fail("gt1-tags: two runs differ (nondeterministic tag layer)");
+    std::printf("gt1-tags: skirmish two-run BYTE-IDENTICAL {trace:%s}\n",
+                tagns::DigestHex(run.traceDigest).c_str());
+
+    // PROOF (3) lockstep: a peer fed ONLY the command stream re-derives the tag-gated skirmish bit-for-bit.
+    bool identical = false;
+    const tagns::TaggedWorld authority = tagns::RunTaggedLockstep(
+        tagns::MakeSkirmishWorld(reg), tagns::MakeSkirmishKit(), tagns::MakeSkirmishRules(reg), reg,
+        tagns::MakeSkirmishStream(), tagns::kSkirmishTicks, &identical);
+    if (!identical || !tagns::TaggedStatesEqual(authority, run.finalWorld))
+        return fail("gt1-tags: lockstep peers diverged");
+    std::printf("gt1-tags: lockstep peer re-derives the skirmish bit-for-bit {identical:true}\n");
+
+    // PROOF (4) rollback corrects a GENUINELY-diverged mispredicted activation (t6 Smite mispredicted as a
+    // Fire the immune Villain nullifies -> the smite never lands), the divergence asserted non-vacuous.
+    std::vector<tagns::TagCommand> mispredict = tagns::MakeSkirmishStream();
+    for (size_t mi = 0; mi < mispredict.size(); ++mi)
+        if (mispredict[mi].tick == 6u) mispredict[mi].abilityId = tagns::kAbFire;
+    bool corrected = false, diverged = false;
+    (void)tagns::RunTaggedRollback(tagns::MakeSkirmishWorld(reg), tagns::MakeSkirmishKit(),
+                                   tagns::MakeSkirmishRules(reg), reg, tagns::MakeSkirmishStream(),
+                                   mispredict, tagns::kSkirmishTicks, 6u, &corrected, &diverged);
+    if (!corrected || !diverged) return fail("gt1-tags: rollback failed");
+    std::printf("gt1-tags: rollback corrects a mispredicted activation {diverged:true, corrected:true}\n");
+
+    const gasns::GasEntity& hero = run.finalWorld.gas.entities[0];
+    const gasns::GasEntity& vil  = run.finalWorld.gas.entities[1];
+    std::printf("gt1-tags: finals {Hero:{hp:%d}, Villain:{hp:%d}}\n",
+                (int)(hero.attrs.base[gasns::kAttrHealth] >> gasns::kFrac),
+                (int)(vil.attrs.base[gasns::kAttrHealth]  >> gasns::kFrac));
+    std::printf("gt1-tags: stats {entities:2, tags:%u, abilities:4, effectsApplied:%u, ticks:%u, digest:%s}\n",
+                reg.size(), run.effectsApplied, tagns::kSkirmishTicks,
+                tagns::DigestHex(tagns::DigestTaggedWorld(run.finalWorld)).c_str());
+
+    // --- Golden: the SAME PURE-INTEGER tag-timeline STATE GRID as the Vulkan --gt1-tags-shot (identical by
+    // construction). Two entity rows (Hero top, Villain bottom); per row a health bar lane + a tag-state
+    // strip (purple = Stunned, gold = Empowered, orange = Burning, cyan tint = Immune) + an activation-outcome
+    // strip (green = ok, cyan = immune-nullified, red = tag-blocked, amber = missing-required). ---
+    const int kTicksN = (int)tagns::kSkirmishTicks, kColPx = 20, kMargin = 24;
+    const int kLaneHealth = 80, kLaneGap = 8, kTagStrip = 30, kEvents = 14;
+    const int kPanelH = kLaneHealth + kLaneGap + kTagStrip + kLaneGap + kEvents;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kTicksN * kColPx);
+    const uint32_t imgH = (uint32_t)(kMargin * 3 + kPanelH * 2);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, float r, float g, float b) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(b * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(g * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(r * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto fillRect = [&](int x0, int y0, int w, int h, float r, float g, float b) {
+        for (int dy = 0; dy < h; ++dy)
+            for (int dx = 0; dx < w; ++dx)
+                putPx(x0 + dx, y0 + dy, r, g, b);
+    };
+    for (int who = 0; who < 2; ++who) {
+        const int px0 = kMargin;
+        const int py0 = kMargin + who * (kPanelH + kMargin);
+        int ly = py0;
+        // Health lane.
+        fillRect(px0 - 2, ly - 2, kTicksN * kColPx + 4, kLaneHealth + 4, 0.16f, 0.16f, 0.18f);
+        fillRect(px0, ly, kTicksN * kColPx, kLaneHealth, 0.055f, 0.047f, 0.039f);
+        for (int t = 0; t < kTicksN; ++t) {
+            const tagns::SkirmishTickSample& s = run.samples[(size_t)t];
+            int hpx = (int)(((int64_t)(s.health[who] >> gasns::kFrac) * (int64_t)(kLaneHealth - 2)) / (int64_t)100);
+            if (hpx < 0) hpx = 0; if (hpx > kLaneHealth - 2) hpx = kLaneHealth - 2;
+            fillRect(px0 + t * kColPx + 2, ly + kLaneHealth - 1 - hpx, kColPx - 4, hpx, 0.85f, 0.32f, 0.25f);
+        }
+        ly += kLaneHealth + kLaneGap;
+        // Tag-state strip.
+        fillRect(px0 - 2, ly - 2, kTicksN * kColPx + 4, kTagStrip + 4, 0.16f, 0.16f, 0.18f);
+        for (int t = 0; t < kTicksN; ++t) {
+            const tagns::SkirmishTickSample& s = run.samples[(size_t)t];
+            float r = 0.07f, g = 0.07f, b = 0.08f;
+            if (s.immune[who])    { r = 0.10f; g = 0.42f; b = 0.50f; }
+            if (s.burning[who])   { r = 0.95f; g = 0.55f; b = 0.15f; }
+            if (s.empowered[who]) { r = 0.92f; g = 0.78f; b = 0.20f; }
+            if (s.stunned[who])   { r = 0.62f; g = 0.28f; b = 0.85f; }
+            fillRect(px0 + t * kColPx + 2, ly + 2, kColPx - 4, kTagStrip - 4, r, g, b);
+        }
+        ly += kTagStrip + kLaneGap;
+        // Activation-outcome strip.
+        for (int t = 0; t < kTicksN; ++t) {
+            const tagns::SkirmishTickSample& s = run.samples[(size_t)t];
+            float r = 0.055f, g = 0.047f, b = 0.039f;
+            if (s.castMissReq[who]) { r = 0.95f; g = 0.65f; b = 0.15f; }
+            if (s.castBlocked[who]) { r = 0.90f; g = 0.20f; b = 0.20f; }
+            if (s.castImmune[who])  { r = 0.20f; g = 0.75f; b = 0.80f; }
+            if (s.castOk[who])      { r = 0.30f; g = 0.85f; b = 0.35f; }
+            fillRect(px0 + t * kColPx + 2, ly, kColPx - 4, kEvents, r, g, b);
+        }
+    }
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — gt1 tag-skirmish timeline (2 entities, %u tags, %u ticks, %u activations)\n",
+                outPath, imgW, imgH, reg.size(), tagns::kSkirmishTicks, run.activationsOk);
+    return 0;
+}
+
 // ===== Slice VD2 — Deterministic Gameplay / Netcode THE SYSTEM SCHEDULE + THE GAMEPLAY TICK showcase
 // (--vd2-tick) (the 2nd slice of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO new
 // RHI; the verdict.h gameplay systems + schedule are header-only integer math, so on Metal it runs the IDENTICAL
@@ -82656,6 +82788,17 @@ int main(int argc, char** argv) {
                          std::strcmp(argv[1], "--gas1-duel-shot") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_gas1_duel.png";
             try { return RunGas1DuelShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gt1-tags <out.png>: render the DETERMINISTIC GAMEPLAY-TAG LAYER showcase (Slice GT1, hf::game::tags
+        // — hierarchical tag containers gating GAS1 abilities/effects via a thin adapter). PURE CPU — runs the
+        // IDENTICAL gameplay_tags.h 14-tick tag skirmish the Vulkan --gt1-tags-shot runs -> the tag-timeline
+        // state grid is bit-identical cross-backend BY CONSTRUCTION; the 4 proof lines match the Vulkan side
+        // EXACTLY. NO shader added.
+        if (argc > 1 && (std::strcmp(argv[1], "--gt1-tags") == 0 ||
+                         std::strcmp(argv[1], "--gt1-tags-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_gt1_tags.png";
+            try { return RunGt1TagsShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ai1-tree <out.png>: render the Deterministic AI BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK

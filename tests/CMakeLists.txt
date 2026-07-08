@@ -2041,6 +2041,21 @@ target_compile_definitions(graph_introspect_test PRIVATE
 # ASan-eligible; pure integer, ZERO backend symbols.
 hf_add_pure_test(ability_test)
 
+# Slice GT1 — A DETERMINISTIC GAMEPLAY-TAG LAYER (engine/game/gameplay_tags.h, hf::game::tags): hierarchical
+# dotted tags interned to stable uint32 ids (auto-interned prefixes), sorted-id TagContainers, and SEGMENT-
+# boundary hierarchy query matching (owning "A.B.C" query-matches "A"/"A.B" but NOT "A.BB" — the raw-prefix
+# false-positive guard). gameplay_tags.h #includes game/ability.h READ-ONLY / BYTE-UNTOUCHED: the tag gates
+# COMPOSE onto GAS1 through a thin adapter (required/blocked gate activation; effect immunityTags nullify an
+# effect via a filtered single-ability kit reusing gas::TryActivate verbatim; effect grantsTags follow the
+# GAS1 effect lifecycle through the DERIVED effective-tag set). Pins: the intern/hierarchy ids + the segment-
+# boundary guard, container Add/Remove/HasAny/HasAll + dedup + sorted-order digest, the four gating mechanics
+# (required pass/fail, blocked, immune nullify, grant add+expire at the exact tick), the FIXED 14-tick
+# stun/immune/empower skirmish (trace digest + exact finals + blocked-before-missing-required precedence),
+# and lockstep + rollback (a genuinely-diverged tag mispredict corrected) + snapshot completeness (omitting
+# the owned tag container makes the immune Villain take fire damage — the control). Pure C++ (hf_core),
+# ASan-eligible; pure integer, ZERO backend symbols.
+hf_add_pure_test(gameplay_tags_test)
+
 # Slice WV1 — THE WATER GAMEPLAY VOLUME (engine/sim/water_body.h, hf::sim::water): the analytic integer
 # Gerstner surface (host-baked ik.h sine LUT — zero runtime transcendentals) driving rigid-body Archimedes
 # buoyancy + drag (couple.h CP7 SphereCapVolume reused VERBATIM against the analytic surface — the render
