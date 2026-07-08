@@ -147,6 +147,7 @@
 #include "game/ability.h"            // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Metal --gas1-duel runs the IDENTICAL pure-CPU 60-tick duel the Vulkan --gas1-duel-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "game/gameplay_tags.h"      // Slice GT1: A DETERMINISTIC GAMEPLAY-TAG LAYER (TagRegistry/TagContainer/HasTagQuery/TagRules/TryActivateTagged/StepTagged/RunTaggedLockstep/RunTaggedRollback/RunSkirmish — hierarchical interned tags gating GAS1 abilities/effects via a thin adapter; PURE CPU integer) — a NEW additive sibling #including game/ability.h READ-ONLY/BYTE-UNTOUCHED; the Metal --gt1-tags runs the IDENTICAL pure-CPU 14-tick tag skirmish the Vulkan --gt1-tags-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "ai/ai.h"                   // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Metal --ai1-tree runs the IDENTICAL pure-CPU tick + 2D node-graph viz the Vulkan --ai1-tree-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "ai/behavior_tree.h"        // Slice BT1: DETERMINISTIC BEHAVIOR-TREE DEPTH + UTILITY AI (parallel/cooldown/observer-abort/retry/loop/service/utility node kinds + BuildGuardTree/RunBt1Scenario/RenderBt1Shot) — a NEW additive header COMPOSING ai/ai.h READ-ONLY (Blackboard/Status/kMaxBbKeys byte-untouched); the Metal --bt1-behavior runs the IDENTICAL pure-CPU guard scenario + SHARED strict-zero integer timeline raster the Vulkan --bt1-behavior-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/water_body.h"          // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Metal --wv1-float runs the IDENTICAL pure-CPU 480-tick scenario + SHARED raster the Vulkan --wv1-float-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "spline/spline.h"           // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Metal --sp1-road runs the IDENTICAL pure-CPU scenario + SHARED top-down raster the Vulkan --sp1-road-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/force_field.h"         // Slice FF1: RIGID-BODY FORCE-FIELD VOLUMES (FieldVolume/EvalFieldForce/ApplyFields/StepFieldWorld/SimFieldTick/RunFieldLockstep/RunFieldRollback/RunFieldShotScenario/RenderFieldShot — the PT2 particle field math (radial/vortex/wind, particles.h read-only) applied to fpx RIGID BODIES with bounded AABB volumes; velocities mutated pre-step (the WV1 discipline), dv = F*invMass*dt, LINEAR force only; PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/particles.h read-only; the Metal --ff1-fields runs the IDENTICAL pure-CPU 240-tick scenario + SHARED top-down raster the Vulkan --ff1-fields-shot runs (strict-zero cross-backend BY CONSTRUCTION)
@@ -49004,6 +49005,51 @@ static int RunAl1LayerShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice BT1 — DETERMINISTIC BEHAVIOR-TREE DEPTH + UTILITY AI showcase (--bt1-behavior). PURE CPU —
+// runs the IDENTICAL behavior_tree.h guard scenario (a SERVICE refreshes threat every 4 ticks, a UTILITY
+// selector picks patrol/chase/attack/flee, the chosen branch runs a PARALLEL move+aim + a COOLDOWN-gated
+// attack pulse) + the SHARED pure-integer timeline raster (behavior_tree.h::RenderBt1Shot — the identical
+// function both backends call) -> bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel).
+// The proof lines match the Vulkan side EXACTLY. NO shader added. =====
+static int RunBt1BehaviorShowcase(const char* outPath) {
+    namespace bt = hf::ai;
+
+    // THE SCENARIO (== behavior_tree_test): the fixed 16-tick guard scenario, run twice.
+    const bt::Bt1ShotRun r1 = bt::RunBt1Scenario();
+    const bt::Bt1ShotRun r2 = bt::RunBt1Scenario();
+
+    // PROOF (1) two-run IDENTICAL trace digest.
+    if (r1.digest != r2.digest)
+        return fail("bt1-behavior: two runs differ (nondeterministic behavior tree)");
+    std::printf("bt1-behavior determinism: two runs BYTE-IDENTICAL {digest:0x%016llx}\n",
+                (unsigned long long)r1.digest);
+
+    // PROOF (2) the pinned decision story.
+    const bool story =
+        r1.patrolToChaseTick == 4 && r1.chaseToAttackTick == 8 && r1.attackToFleeTick == 12 &&
+        r1.frames[8].attackReady == 1 && r1.frames[9].attackReady == 0 &&
+        r1.frames[10].attackReady == 0 && r1.frames[11].attackReady == 0 &&
+        r1.serviceRuns == 4 && r1.utilityChoices == 16;
+    if (!story)
+        return fail("bt1-behavior: decision story broken");
+    std::printf("bt1-behavior story: PATROL->CHASE@%d->ATTACK@%d->FLEE@%d (attack pulse@8, "
+                "cooldown blocks 9-11)\n",
+                r1.patrolToChaseTick, r1.chaseToAttackTick, r1.attackToFleeTick);
+    std::printf("bt1-behavior: {nodes:%d, ticks:%d, utilityChoices:%d, aborts:%d, digest:0x%016llx}\n",
+                r1.nodes, r1.ticks, r1.utilityChoices, r1.aborts, (unsigned long long)r1.digest);
+
+    // --- Golden: the SHARED pure-integer raster (behavior_tree.h::RenderBt1Shot — the identical function the
+    // Vulkan --bt1-behavior-shot calls; strict-zero BY CONSTRUCTION). ---
+    std::vector<uint8_t> btImg;
+    uint32_t btW = 0, btH = 0;
+    bt::RenderBt1Shot(r1, btImg, btW, btH);
+    if (!WritePNG(outPath, btImg, btW, btH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — bt1 deterministic behavior tree (parallel + stateful decorators + "
+                "service + utility; guard patrol->chase->attack->flee)\n",
+                outPath, btW, btH);
+    return 0;
+}
+
 // ===== Slice CR1 — DETERMINISTIC CROWD AT 10k+ AGENTS showcase (--cr1-crowd) (the Mass-class archetype
 // crowd — O(N) grid separation via the byte-frozen BD2 boids.h spatial-hash [vs BD1's all-pairs O(N²)], a
 // 3-archetype crowd streaming toward goals, deterministic + lockstep-replayable; hf::sim::crowd). PURE CPU —
@@ -82770,6 +82816,16 @@ int main(int argc, char** argv) {
                          std::strcmp(argv[1], "--al1-layer-shot") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_al1_layer.png";
             try { return RunAl1LayerShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --bt1-behavior <out.png>: DETERMINISTIC BEHAVIOR-TREE DEPTH + UTILITY AI (Slice BT1, hf::ai —
+        // parallel/stateful-decorator/service/utility node kinds over ai.h's frozen Blackboard). PURE CPU —
+        // runs the IDENTICAL behavior_tree.h guard scenario + SHARED strict-zero timeline raster the Vulkan
+        // --bt1-behavior-shot runs -> bit-identical cross-backend BY CONSTRUCTION; proof lines match EXACTLY.
+        if (argc > 1 && (std::strcmp(argv[1], "--bt1-behavior") == 0 ||
+                         std::strcmp(argv[1], "--bt1-behavior-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_bt1_behavior.png";
+            try { return RunBt1BehaviorShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --uf1-text <out.png>: render the DETERMINISTIC SDF TEXT showcase (Slice UF1, hf::ui::sdf —

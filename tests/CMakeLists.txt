@@ -1514,6 +1514,20 @@ hf_add_pure_test(ai_lockstep_test)
 # loop); the bit-exact part is the AI1-AI5 integer world. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(ai_render_test)
 
+# Deterministic BEHAVIOR-TREE DEPTH + UTILITY AI (Slice BT1, next-tier parity gap #3, closing ai.h's OWN L37
+# gap: "no parallel/decorator-with-memory, no JSON tree loader, no utility AI"). A NEW additive header
+# (engine/ai/behavior_tree.h) COMPOSING ai.h READ-ONLY/BYTE-FROZEN (Blackboard/Status/kMaxBbKeys) — the AI1
+# tick is STATELESS, so the stateful node kinds (cooldown/retry/loop decorators, service nodes, the
+# observer-abort blackboard-condition) ride a NEW per-node BtxState memory array rather than editing the
+# frozen AI1 switch. Pins: PARALLEL RequireOne/RequireAll success+failure policies + deterministic child tick
+# order; COOLDOWN blocks EXACTLY N ticks (pinned re-allow); the OBSERVER-ABORT interrupts a Running subtree at
+# the EXACT flip tick (child not ticked / reset); RETRY/LOOP counts; SERVICE updates the blackboard every
+# interval ticks exactly + stops on deactivation; UTILITY highest-score wins with lowest-index tie-break + a
+# score change flips selection at the exact tick; THE GUARD NPC TRACE (PATROL->CHASE->ATTACK->FLEE with the
+# cooldown-gated attack pulse) digest + pinned transitions; two-run determinism; empty/all-failure -> Failure.
+# Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(behavior_tree_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16

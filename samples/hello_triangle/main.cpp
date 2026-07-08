@@ -134,6 +134,7 @@
 #include "sim/crowd.h"          // Slice CR1: DETERMINISTIC CROWD AT 10k+ AGENTS (Mass-class archetype crowd, hf::sim::crowd) — composes the byte-frozen BD2 boids.h grid for O(N) separation (vs BD1's all-pairs O(N²)), 3-archetype types + goal-seek + lockstep/rollback; RunCrowdShotScenario/RenderCrowdShot shared verbatim with the Metal --cr1-crowd; PURE CPU strict-integer, NO new shader
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "ai/ai.h"              // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree — a FLAT index graph + an integer blackboard + a fixed-DFS-order tick; PURE CPU integer, the BEACHHEAD of the DETERMINISTIC AI flagship #28) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Vulkan --ai1-tree-shot + Metal --ai1-tree run the IDENTICAL pure-CPU tick + 2D node-graph viz
+#include "ai/behavior_tree.h"   // Slice BT1: DETERMINISTIC BEHAVIOR-TREE DEPTH + UTILITY AI (BtxNode/BtxTree/BtxState/TickBtxTree + parallel/cooldown/observer-abort/retry/loop/service/utility node kinds + BuildGuardTree/RunBt1Scenario/RenderBt1Shot — the reactive/stateful BT nodes ai.h's L37 gap disclaims, PURE-INTEGER, per-node memory carried across ticks) — a NEW additive header COMPOSING ai/ai.h READ-ONLY (Blackboard/Status/kMaxBbKeys byte-untouched); the Vulkan --bt1-behavior-shot + Metal --bt1-behavior run the IDENTICAL pure-CPU guard scenario + SHARED strict-zero integer timeline raster
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "render/water.h"  // Slice CF: Gerstner water displacement/normal + the fixed showcase wave set
@@ -4436,6 +4437,18 @@ int main(int argc, char** argv) {
     const char* al1LayerShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--al1-layer-shot") == 0) { al1LayerShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice BT1: --bt1-behavior-shot <out.bmp> (DETERMINISTIC BEHAVIOR-TREE DEPTH + UTILITY AI —
+    // engine/ai/behavior_tree.h, hf::ai; the parallel/stateful-decorator/service/utility node kinds ai.h's
+    // L37 gap disclaims, PURE-INTEGER, per-node BtxState memory carried across ticks). PURE CPU: NO GPU
+    // dispatch, NO new shader, NO new RHI; both backends run the IDENTICAL behavior_tree.h guard scenario
+    // (a service refreshes threat every 4 ticks -> a utility selector picks patrol/chase/attack/flee -> the
+    // chosen branch runs a parallel move+aim + a cooldown-gated attack pulse) + the SHARED pure-integer
+    // timeline raster (RenderBt1Shot) -> strict-zero cross-backend BY CONSTRUCTION. Its OWN loop (C1061).
+    const char* bt1BehaviorShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--bt1-behavior-shot") == 0) { bt1BehaviorShotPath = argv[i + 1]; break; }
     }
 
     // Slice CR1: --cr1-crowd-shot <out.bmp> (DETERMINISTIC CROWD AT 10k+ AGENTS, the Mass-class archetype
@@ -60709,6 +60722,63 @@ int main(int argc, char** argv) {
                                 "attack montage + additive lean, %d notifies, hit@%d)\n",
                                 al1LayerShotPath, alW, alH, r1.notifies, r1.hitTick);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", al1LayerShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DETERMINISTIC BEHAVIOR-TREE DEPTH + UTILITY AI (--bt1-behavior-shot <out.bmp>, Slice BT1,
+        // hf::ai; engine/ai/behavior_tree.h). PURE CPU — NO GPU dispatch, NO new shader, NO new RHI; both
+        // Vulkan-Windows and Metal-Mac run the IDENTICAL pure-CPU guard scenario (behavior_tree.h::
+        // RunBt1Scenario — a SERVICE refreshes the threat/attack-score blackboard slots every 4 ticks, a
+        // UTILITY selector scores patrol/chase/attack/flee and picks the highest, the chosen branch runs a
+        // PARALLEL move+aim and, on attack, a COOLDOWN-gated attack pulse) + the SHARED pure-integer timeline
+        // raster (behavior_tree.h::RenderBt1Shot) -> strict-zero cross-backend BY CONSTRUCTION. Asserts
+        // two-run digest identity + the pinned decision story. STANDALONE branch (C1061). ---
+        if (bt1BehaviorShotPath) {
+            namespace bt = hf::ai;
+
+            // THE SCENARIO (== behavior_tree_test): the fixed 16-tick guard scenario, run twice.
+            const bt::Bt1ShotRun r1 = bt::RunBt1Scenario();
+            const bt::Bt1ShotRun r2 = bt::RunBt1Scenario();
+
+            // PROOF (1) two-run IDENTICAL trace digest.
+            if (r1.digest != r2.digest) {
+                std::fprintf(stderr, "FATAL: bt1-behavior two runs differ (nondeterministic behavior tree)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("bt1-behavior determinism: two runs BYTE-IDENTICAL {digest:0x%016llx}\n",
+                        (unsigned long long)r1.digest);
+
+            // PROOF (2) the pinned decision story: PATROL[0,4) -> CHASE[4,8) -> ATTACK[8,12) -> FLEE[12,16),
+            // with the cooldown-gated attack pulse firing once on entering ATTACK (tick 8).
+            const bool story =
+                r1.patrolToChaseTick == 4 && r1.chaseToAttackTick == 8 && r1.attackToFleeTick == 12 &&
+                r1.frames[8].attackReady == 1 && r1.frames[9].attackReady == 0 &&
+                r1.frames[10].attackReady == 0 && r1.frames[11].attackReady == 0 &&
+                r1.serviceRuns == 4 && r1.utilityChoices == 16;
+            if (!story) {
+                std::fprintf(stderr, "FATAL: bt1-behavior decision story broken (transitions %d/%d/%d, "
+                             "attackReady@8=%d, serviceRuns=%d)\n",
+                             r1.patrolToChaseTick, r1.chaseToAttackTick, r1.attackToFleeTick,
+                             r1.frames[8].attackReady, r1.serviceRuns);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("bt1-behavior story: PATROL->CHASE@%d->ATTACK@%d->FLEE@%d (attack pulse@8, "
+                        "cooldown blocks 9-11)\n",
+                        r1.patrolToChaseTick, r1.chaseToAttackTick, r1.attackToFleeTick);
+            std::printf("bt1-behavior: {nodes:%d, ticks:%d, utilityChoices:%d, aborts:%d, digest:0x%016llx}\n",
+                        r1.nodes, r1.ticks, r1.utilityChoices, r1.aborts, (unsigned long long)r1.digest);
+
+            // --- Golden: the SHARED pure-integer raster (behavior_tree.h::RenderBt1Shot — the identical
+            // function both backends call; strict-zero BY CONSTRUCTION). ---
+            std::vector<uint8_t> btImg;
+            uint32_t btW = 0, btH = 0;
+            bt::RenderBt1Shot(r1, btImg, btW, btH);
+            bool ok = WriteBMP(bt1BehaviorShotPath, btImg, btW, btH);
+            if (ok) std::printf("wrote %s (%ux%u) — bt1 deterministic behavior tree (parallel + stateful "
+                                "decorators + service + utility; guard patrol->chase->attack->flee)\n",
+                                bt1BehaviorShotPath, btW, btH);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", bt1BehaviorShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
