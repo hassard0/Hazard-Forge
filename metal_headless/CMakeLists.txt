@@ -1156,6 +1156,12 @@ hf_gen_msl(post_stack.frag       post_stack.frag.hlsl       frag post_stack_frag
 # it consumes the SPIR-V on Vulkan.
 hf_gen_msl(ui.vert ui.vert.hlsl vert ui_vertex)
 hf_gen_msl(ui.frag ui.frag.hlsl frag ui_fragment)
+# Hair strand renderer (Slice HRR1): the Kajiya-Kay anisotropic fragment for the HRR1 camera-facing
+# hair ribbons (engine/render/hair_render.h) — a lit.frag clone (same bindings, same PSInput, pairs
+# with the EXISTING lit.vert; the strand tangent rides the vertex TANGENT slot). Standard float ops
+# only (no int64, no storage images) -> the same HLSL->SPIR-V->MSL toolchain as lit.frag. NEW file,
+# NEW gen command — every existing shader's gen line (and so its MSL and golden) is untouched.
+hf_gen_msl(hair_kajiya.frag hair_kajiya.frag.hlsl frag hair_kajiya_fragment)
 
 add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
 

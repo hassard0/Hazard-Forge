@@ -2061,6 +2061,11 @@ hf_compile_shaders(
     "shaders/autoexposure_histogram.comp.hlsl:cs"
     "shaders/autoexposure_reduce.comp.hlsl:cs"
     "shaders/tonemap_autoexp.frag.hlsl:ps"
+    # Hair strand renderer (Slice HRR1): the Kajiya-Kay anisotropic fragment for the HRR1 camera-facing
+    # hair ribbons (engine/render/hair_render.h). Pairs with the EXISTING lit.vert (the strand tangent
+    # rides the vertex TANGENT slot); same FrameData/shadow/material bindings as lit.frag. NEW file,
+    # ADDITIVE entry — every existing shader's compile line is untouched.
+    "shaders/hair_kajiya.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

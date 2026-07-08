@@ -122,6 +122,7 @@
 #include "sim/couple_gf.h"           // Slice GF1: deterministic grain<->fluid coupling unified two-pool world + shared-grid cross query (CGFWorld/MakeCGFGrid/BuildCGFNeighbors) — shared verbatim with cgf_gf/cgf_fg_{count,scan,emit}.comp + the Vulkan --cgf-query-shot
 #include "sim/couple_cf.h"           // Slice CF1: deterministic cloth<->fluid coupling (the WET-CLOTH core, Track-S S1) — CFLWorld/CFLScene/StepClothFluidSteps/CountFluidBelow, the pure-CPU --cf1-couple-shot harness
 #include "sim/hair.h"                // Slice HR1: deterministic strand/hair PBD rods (Track-S S2) — HairStrands/InitStrands/BuildHairConstraints/StepHairSteps/HairDigest, the pure-CPU --hr1-hair-shot harness
+#include "render/hair_render.h"  // Slice HRR1: the hair STRAND RENDERER — MakeGroomScene (the pure-integer scalp-cap groom) + HairToRenderMesh (tapered camera-facing Kajiya-Kay ribbons) + HairRenderDigest, the --hrr1-groom-shot capstone
 #include "sim/softbody.h"            // Slice SB1: deterministic volumetric soft body PBD lattice (Track-S S3) — SoftLattice/InitLattice/BuildSoftConstraints/BuildSoftCells/StepSoftBodySteps/SoftBodyDigest, the pure-CPU --sb1-soft-shot harness
 #include "anim/motion_match.h"       // Slice MM1: DETERMINISTIC MOTION MATCHING (Track-S S4 / flagship #33) — BuildMotionDatabase/MatchPose/StepMotionMatch/RunMMLockstep + the MakeMMTestRig/MakeMMIdleClip/MakeMMWalkClip fixtures, the pure-CPU --mm1-locomotion-shot harness
 #include "sim/fract.h"               // Slice FR1: deterministic rigid-body fracture cell pre-fracture / Voronoi decomposition (FractField/FractSeed/ClassifyFractCells) — shared verbatim with fract_classify.comp + the Vulkan --fract-cells-shot
@@ -55836,6 +55837,311 @@ static int RunClothRenderShowcase(const char* outPath) {
     return 0;
 }
 
+// --- THE HAIR STRAND RENDERER capstone (Slice HRR1, parity++ audit #7). Mirrors the Vulkan
+// --hrr1-groom-shot EXACTLY: the SAME pure-integer scalp-cap groom (render/hair_render.h::
+// MakeGroomScene — 64 strands on an 8x8 scalp-sphere-cap grid, k_bend ramped 0 -> kOne) settled by
+// the SAME bit-exact hair.h::StepHairSteps (the provenance; hf_core shared byte-for-byte with the
+// Vulkan build), the SAME HairToRenderMesh (tapered CAMERA-FACING ribbons — side = normalize(
+// cross(tangent, viewDir)), the strand TANGENT in the vertex TANGENT slot, the camera-facing normal
+// in the NORMAL slot, uv.y = root->tip) and the SAME shared framing constants, rendered through
+// lit.vert + the NEW hair_kajiya.frag (Kajiya-Kay: diffuse = sin(T,L), spec = sin(T,H)^shininess,
+// root->tip albedo ramp; lit.frag's FrameData/shadow/material bindings) + sky + static-shadow + post.
+// FLOAT visresolve bar (the CL6/FPX6 precedent): Metal-render == Metal-golden DIFF 0.0000 (two-run) +
+// provenance + coverage + the anisotropic-highlight band stats; cross-vendor ~the float baseline.
+// HONEST: no strand<->strand self-shadowing (deep-opacity maps future); camera-facing ribbons shimmer
+// at grazing tangents. One offscreen frame -> PNG (new golden hrr1_groom.png). --------------------
+static int RunHairGroomShowcase(const char* outPath) {
+    namespace hairr = hf::render::hairr;
+    namespace hair = hf::sim::hair;
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // 1) The groom sim (PURE INTEGER — the provenance; == the Vulkan --hrr1-groom-shot config ==
+    //    hair_render_test). Two runs BYTE-IDENTICAL.
+    hairr::GroomScene g = hairr::MakeGroomScene();
+    std::vector<hair::HairVert> settled = g.verts;
+    hair::StepHairSteps(g.hs, settled, g.hc, g.excl, g.kBend, g.params, hairr::kGroomSteps);
+    {
+        std::vector<hair::HairVert> b = g.verts;
+        hair::StepHairSteps(g.hs, b, g.hc, g.excl, g.kBend, g.params, hairr::kGroomSteps);
+        if (settled.size() != b.size() ||
+            std::memcmp(settled.data(), b.data(), settled.size() * sizeof(hair::HairVert)) != 0)
+            return fail("hrr1-groom two sim runs differ (nondeterministic)");
+    }
+    const uint64_t kSimDigest = hair::HairDigest(settled);
+
+    // 2) HairToRenderMesh with the SHARED framing (the mesh stays in SIM world coordinates).
+    const Vec3 eye{hairr::kGroomEyeX, hairr::kGroomEyeY, hairr::kGroomEyeZ};
+    const Vec3 center{hairr::kGroomCenterX, hairr::kGroomCenterY, hairr::kGroomCenterZ};
+    std::vector<hairr::HairRenderVertex> rv;
+    std::vector<uint32_t> hairIdx;
+    hairr::HairToRenderMesh(g.hs, settled, eye, hairr::kGroomWidthRootQ,
+                            hairr::kGroomWidthTipQ, rv, hairIdx);
+    const uint32_t kVertCount = (uint32_t)rv.size();
+    const uint32_t kTriCount = (uint32_t)(hairIdx.size() / 3);
+    const uint64_t kMeshDigest = hairr::HairRenderDigest(rv, hairIdx);
+
+    // PROOF (1) PROVENANCE: the count contract + a FRESH scene re-simulated + re-meshed re-derives
+    // the exact quantized digest from inputs alone.
+    if (kVertCount != (uint32_t)(g.hs.S * g.hs.M * 2) ||
+        kTriCount != (uint32_t)(g.hs.S * (g.hs.M - 1) * 2))
+        return fail("hrr1-groom mesh counts wrong (provenance broken)");
+    {
+        hairr::GroomScene g2 = hairr::MakeGroomScene();
+        std::vector<hair::HairVert> s2 = g2.verts;
+        hair::StepHairSteps(g2.hs, s2, g2.hc, g2.excl, g2.kBend, g2.params, hairr::kGroomSteps);
+        std::vector<hairr::HairRenderVertex> rv2;
+        std::vector<uint32_t> idx2;
+        hairr::HairToRenderMesh(g2.hs, s2, eye, hairr::kGroomWidthRootQ,
+                                hairr::kGroomWidthTipQ, rv2, idx2);
+        if (hairr::HairRenderDigest(rv2, idx2) != kMeshDigest)
+            return fail("hrr1-groom mesh digest not re-derivable (provenance broken)");
+    }
+    std::printf("hrr1-groom provenance: mesh re-derived from a fresh sim (simDigest 0x%016llx, "
+                "meshDigest 0x%016llx)\n",
+                (unsigned long long)kSimDigest, (unsigned long long)kMeshDigest);
+
+    // The ribbon mesh in scene::Vertex (TANGENT = the strand tangent, NORMAL = camera-facing,
+    // uv = (rail, root->tip); the warm chestnut base — IDENTICAL constants to the Vulkan path).
+    std::vector<scene::Vertex> hairVerts(rv.size());
+    for (size_t vi = 0; vi < rv.size(); ++vi) {
+        scene::Vertex& v = hairVerts[vi];
+        v.pos[0] = rv[vi].px; v.pos[1] = rv[vi].py; v.pos[2] = rv[vi].pz;
+        v.color[0] = 0.42f; v.color[1] = 0.26f; v.color[2] = 0.13f;
+        v.uv[0] = rv[vi].u; v.uv[1] = rv[vi].v;
+        v.normal[0] = rv[vi].nx; v.normal[1] = rv[vi].ny; v.normal[2] = rv[vi].nz;
+        v.tangent[0] = rv[vi].tx; v.tangent[1] = rv[vi].ty; v.tangent[2] = rv[vi].tz;
+    }
+    rhi::BufferDesc hvbDesc;
+    hvbDesc.size = (uint64_t)hairVerts.size() * sizeof(scene::Vertex);
+    hvbDesc.initialData = hairVerts.data();
+    hvbDesc.usage = rhi::BufferUsage::Vertex;
+    auto hairVB = device->CreateBuffer(hvbDesc);
+    rhi::BufferDesc hibDesc;
+    hibDesc.size = (uint64_t)hairIdx.size() * sizeof(uint32_t);
+    hibDesc.initialData = hairIdx.data();
+    hibDesc.usage = rhi::BufferUsage::Index;
+    auto hairIB = device->CreateBuffer(hibDesc);
+    scene::Mesh hairMesh{std::move(hairVB), std::move(hairIB), (uint32_t)hairIdx.size()};
+
+    // lit.vert + the NEW Kajiya-Kay fragment (the CL6 pipeline desc with the fragment swapped).
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto kajFs = loadMSL("hair_kajiya.frag.gen.metal", "hair_kajiya_fragment");
+    rhi::GraphicsPipelineDesc kajDesc;
+    kajDesc.vertex = litVs.get(); kajDesc.fragment = kajFs.get();
+    kajDesc.vertexLayout = scene::MeshVertexLayout();
+    kajDesc.colorFormat = device->Swapchain().ColorFormat();
+    kajDesc.depthTest = true; kajDesc.usesFrameUniforms = true;
+    kajDesc.usesTexture = true; kajDesc.pushConstantSize = sizeof(float) * 20;
+    auto kajPipeline = device->CreateGraphicsPipeline(kajDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    auto whiteTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+    Mat4 meshModel = Mat4::Identity();
+
+    // Fixed 3/4 camera + camera-side light (== the Vulkan path; FlipProjY per the Metal convention).
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.35f; fd.lightDir[1] = -0.6f; fd.lightDir[2] = -0.7f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f;
+        fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.35f, -0.6f, -0.7f});
+        Vec3 sc{hairr::kGroomCenterX, hairr::kGroomCenterY, hairr::kGroomCenterZ};
+        Vec3 lightEye = sc - lightDir * 16.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-10.0f, 10.0f, -16.0f, 16.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    auto renderOnce = [&](std::vector<uint8_t>& outBGRA, uint32_t& outW, uint32_t& outH) -> bool {
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(meshModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(hairMesh.vertices());
+                cmd.BindIndexBuffer(hairMesh.indices());
+                cmd.DrawIndexed(hairMesh.indexCount());
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                cmd.BindPipeline(*skyPipe);
+                cmd.Draw(3);
+                cmd.BindPipeline(*kajPipeline);
+                {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = meshModel.m[k];
+                    // material.x = ks (Kajiya specular strength), material.y * 128 = shininess.
+                    pc[16] = 0.35f; pc[17] = 0.5f; pc[18] = 0.0f; pc[19] = 0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*whiteTex, *flatNormal);
+                    cmd.BindVertexBuffer(hairMesh.vertices());
+                    cmd.BindIndexBuffer(hairMesh.indices());
+                    cmd.DrawIndexed(hairMesh.indexCount());
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*rt);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        return device->GetCapturedPixels(outBGRA, outW, outH);
+    };
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!renderOnce(bgra, cw, ch)) return fail("hrr1-groom no captured pixels");
+
+    // PROOF (3) coverage + PROOF (4) the anisotropic highlight — measured over HAIR pixels only (the
+    // WARM-CHROMA mask r > b + 10: the groom's golden albedo vs the neutral/cool sky; an
+    // off-background diff would count the bright sky gradient). == the Vulkan metrics exactly.
+    uint32_t hairPx = 0;
+    {
+        uint8_t minL = 255, maxL = 0;
+        uint32_t maxRow = 0;
+        for (size_t p = 0; p + 3 < bgra.size(); p += 4) {
+            const uint8_t b = bgra[p + 0], g2 = bgra[p + 1], r = bgra[p + 2];
+            if ((int)r > (int)b + 10) {                   // the warm-chroma hair mask
+                ++hairPx;
+                const uint8_t lum = (uint8_t)(((int)r * 54 + (int)g2 * 183 + (int)b * 19) >> 8);
+                if (lum < minL) minL = lum;
+                if (lum > maxL) { maxL = lum; maxRow = (uint32_t)((p / 4) / cw); }
+            }
+        }
+        if (hairPx < 5000 || (maxL - minL) < 16)
+            return fail("hrr1-groom coverage weak — not a lit groom");
+        uint32_t firstX = cw, lastX = 0, brightCount = 0;
+        for (uint32_t x = 0; x < cw; ++x) {
+            const size_t p = ((size_t)maxRow * cw + x) * 4;
+            const uint8_t b = bgra[p + 0], g2 = bgra[p + 1], r = bgra[p + 2];
+            if ((int)r <= (int)b + 10) continue;          // hair pixels only
+            const uint8_t lum = (uint8_t)(((int)r * 54 + (int)g2 * 183 + (int)b * 19) >> 8);
+            if ((int)lum * 5 >= (int)maxL * 4) {
+                if (x < firstX) firstX = x;
+                if (x > lastX) lastX = x;
+                ++brightCount;
+            }
+        }
+        const uint32_t bandSpan = (lastX >= firstX) ? (lastX - firstX + 1u) : 0u;
+        if (bandSpan < 30u || brightCount < 8u)
+            return fail("hrr1-groom highlight band too narrow — the anisotropy did not read");
+        std::printf("hrr1-groom anisotropy: brightest hair row %u, near-max band spans %u px across "
+                    "%u bright px (>> one ~10 px ribbon — the Kajiya-Kay highlight runs ACROSS "
+                    "strands; band shape verified visually per the capstone precedent)\n",
+                    maxRow, bandSpan, brightCount);
+    }
+
+    // PROOF (1) provenance / stats line.
+    std::printf("hrr1-groom: {strands:%d, verts:%u, tris:%u, hairPx:%u, simDigest:0x%016llx, "
+                "meshDigest:0x%016llx} (fixed-point strand sim -> Kajiya-Kay lit ribbons)\n",
+                g.hs.S, kVertCount, kTriCount, hairPx,
+                (unsigned long long)kSimDigest, (unsigned long long)kMeshDigest);
+
+    // PROOF (2) determinism.
+    {
+        std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+        if (!renderOnce(bgra2, cw2, ch2) || bgra2.size() != bgra.size() ||
+            std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+            return fail("hrr1-groom two renders differ (nondeterministic)");
+        std::printf("hrr1-groom determinism: two renders BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (5) the empty no-op.
+    {
+        std::vector<hairr::HairRenderVertex> ev;
+        std::vector<uint32_t> ei;
+        hair::HairStrands empty;
+        hairr::HairToRenderMesh(empty, {}, eye, hairr::kGroomWidthRootQ,
+                                hairr::kGroomWidthTipQ, ev, ei);
+        if (!ev.empty() || !ei.empty())
+            return fail("hrr1-groom empty strand set produced geometry");
+        std::printf("hrr1-groom empty: base only (no-op)\n");
+    }
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — Kajiya-Kay lit groom over the bit-exact strand sim "
+                "(%d strands, %u ribbon tris)\n", outPath, cw, ch, g.hs.S, kTriCount);
+    return 0;
+}
+
 // --- Deterministic GPU Navmesh INTEGER HEIGHTFIELD SPAN RASTERIZATION showcase (Slice NAV1, the
 // BEACHHEAD of FLAGSHIP #7). UNLIKE --fpx (int64 integrator -> CPU on Metal), the span rasterizer is
 // PURE INT32 (TriColumnAabb add/sub/compare + the three-edge PointInTriXZ cover test + TriYSpan, NO
@@ -82512,6 +82818,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cloth-render") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cloth_render.png";
             try { return RunClothRenderShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --hrr1-groom-shot <out.png>: render THE HAIR STRAND RENDERER capstone (Slice HRR1,
+        // parity++ audit #7). Mirrors the Vulkan --hrr1-groom-shot EXACTLY: the SAME pure-integer
+        // scalp-cap groom (render/hair_render.h::MakeGroomScene) settled by the SAME bit-exact
+        // hair.h::StepHairSteps (hf_core shared byte-for-byte) -> the SAME HairToRenderMesh tapered
+        // camera-facing Kajiya ribbons (strand TANGENT in the vertex TANGENT slot) -> lit.vert + the
+        // NEW hair_kajiya.frag (Kajiya-Kay diffuse sin(T,L) + spec sin(T,H)^shininess + the root->tip
+        // albedo ramp) + sky + static-shadow + post. FLOAT visresolve bar (the CL6 precedent):
+        // Metal-render == Metal-golden DIFF 0.0000 (two-run) + provenance (quantized HairRenderDigest
+        // re-derived from a fresh sim) + hair-mask coverage + the anisotropic-highlight band stats;
+        // cross-vendor ~the float baseline. New golden tests/golden/metal/hrr1_groom.png.
+        if (argc > 1 && std::strcmp(argv[1], "--hrr1-groom-shot") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_hrr1_groom.png";
+            try { return RunHairGroomShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --nav-raster <out.png>: render the Deterministic GPU Navmesh INTEGER HEIGHTFIELD SPAN

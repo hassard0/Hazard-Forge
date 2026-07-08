@@ -1523,6 +1523,18 @@ hf_add_pure_test(cloth_test)
 # (the CF1/FR8 precedent — NO new shader, NO new RHI). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(hair_test)
 
+# Slice HRR1 — THE HAIR STRAND RENDERER (engine/render/hair_render.h): tapered CAMERA-FACING ribbon
+# geometry over the HR1 deterministic strand sim, carrying the strand TANGENT in the vertex TANGENT
+# slot for Kajiya-Kay shading (shaders/hair_kajiya.frag.hlsl). Pins the deterministic scalp-cap groom
+# scene (MakeGroomScene, pure integer — the render's provenance; settled HairDigest PINNED MSVC ==
+# clang), the hand-checked camera-facing ribbon frame (side = cross(tangent, viewDir), normal toward
+# the camera, the root->tip width taper, the pinned SweepStrip winding), the degenerate guards
+# (tangent parallel to viewDir -> the up fallback -> the +X fallback; empty-mesh guards), the frame
+# invariants over the full groom mesh, two-build byte-identical determinism, and the QUANTIZED mesh
+# digest (HairRenderDigest, the std::fma float discipline) PINNED cross-compiler. Pure C++ (hf_core),
+# ASan-eligible.
+hf_add_pure_test(hair_render_test)
+
 # Slice SB1 — DETERMINISTIC VOLUMETRIC SOFT BODY CORE (engine/sim/softbody.h, Track-S S3 of
 # docs/SUPERIORITY_ROADMAP.md): Q16.16 PBD volumetric lattice — an NxNxN particle cube with STRETCH
 # (axis edges) + SHEAR (both face diagonals) + per-cell VOLUME preservation (the v1 isotropic
