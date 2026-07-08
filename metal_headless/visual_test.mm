@@ -147,6 +147,7 @@
 #include "spline/spline.h"           // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Metal --sp1-road runs the IDENTICAL pure-CPU scenario + SHARED top-down raster the Vulkan --sp1-road-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/force_field.h"         // Slice FF1: RIGID-BODY FORCE-FIELD VOLUMES (FieldVolume/EvalFieldForce/ApplyFields/StepFieldWorld/SimFieldTick/RunFieldLockstep/RunFieldRollback/RunFieldShotScenario/RenderFieldShot — the PT2 particle field math (radial/vortex/wind, particles.h read-only) applied to fpx RIGID BODIES with bounded AABB volumes; velocities mutated pre-step (the WV1 discipline), dv = F*invMass*dt, LINEAR force only; PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/particles.h read-only; the Metal --ff1-fields runs the IDENTICAL pure-CPU 240-tick scenario + SHARED top-down raster the Vulkan --ff1-fields-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "terrain/terrain_author.h"  // Slice LA1: LANDSCAPE AUTHORING (AuthoredTerrain/MakeFlatTerrain/MakeProcTerrain/ApplyRaiseBrush/ApplyFlattenBrush/ApplySmoothBrush/ApplyPaintBrush/ApplyCarveRoad + the Recorded* twins + TerrainHistory Undo/Redo + BuildAuthoredTerrainMesh + RunLandscapeShotScenario/RenderLandscapeShot — heightmap brush sculpting (flat-core integer-smoothstep falloff) + splat-layer painting (largest-remainder renorm to exactly 255) + the SP1 spline-carved road (flatten-to-spline-height bed + smoothstep shoulder + road-layer paint); PURE CPU Q16.16 integer, every op recorded/reversible via the TERRAIN-LOCAL ED5-recipe history — edit_history.h byte-untouched) — a NEW additive sibling #including terrain/procterrain.h + spline/spline.h + net/session.h read-only; the Metal --la1-landscape runs the IDENTICAL pure-CPU scenario + SHARED shaded-relief raster the Vulkan --la1-landscape-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "vfx/vfx_render.h"          // Slice VR1: VFX RENDERER VARIETY (TrailHistory/UpdateTrails/BuildRibbons + BuildBeam + BuildMeshInstances/OrientFromVelocity + BuildParticleLights/ParticleLightsToClustered + RunVfxShotScenario/RenderVfxShot — ribbon trails (per-slot ring buffer, seed-guarded slot reuse, monotonic age taper, SweepStrip winding) + pcg-jittered beams (jitter=0 == the exact straight strip; VISUAL-ONLY, no gameplay hit) + velocity-oriented mesh-emitter instances (SP1 integer half-angle yaw+pitch quaternions) + brightest-N particle lights feeding the EXISTING ML1 clustered assignment; PURE Q16.16/integer geometry generators) — a NEW additive sibling #including sim/particles.h + sim/particle_author.h + spline/spline.h + render/clustered.h + render/manylight.h read-only (ALL byte-untouched); the Metal --vr1-vfx runs the IDENTICAL pure-CPU PA1-fountain scenario + SHARED side-view raster the Vulkan --vr1-vfx-shot runs (strict-zero cross-backend BY CONSTRUCTION; the ML1 assignDigest stat is the ONE float, pinned per-toolchain-family)
 #include "anim/blend_space.h"        // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Metal --an1-blend runs the IDENTICAL pure-CPU 240-tick scenario + SHARED raster the Vulkan --an1-blend-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
@@ -48927,6 +48928,70 @@ static int RunLa1LandscapeShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice VR1 — VFX RENDERER VARIETY showcase (--vr1-vfx) (ribbon trails + jittered beams + mesh
+// emitters + particle lights, hf::vfx::render). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
+// vfx_render.h is header-only Q16.16 integer geometry generation, so on Metal it runs the IDENTICAL fixed
+// scenario the Vulkan --vr1-vfx-shot runs on Windows (vfx_render.h::RunVfxShotScenario — the PA1-authored
+// pulsing fountain stepped 96 ticks with per-tick ribbon-trail recording, then the FOUR deterministic
+// integer geometry generators: ribbon trails with monotonic age taper, the pcg-jittered beam arcing over
+// the plume, velocity-oriented mesh-emitter instances via the SP1 integer half-angle yaw+pitch, and the
+// brightest-64 particle lights fed through the EXISTING ML1 clustered assignment) AND the SHARED
+// pure-integer side-view raster (vfx_render.h::RenderVfxShot — the identical function both backends call)
+// -> bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). The ML1 assignDigest line
+// is the ONE float stat (clustered.h pow/log slice math) — pinned per-toolchain-family, the documented
+// ML1 convention (the Mac prints its own value; a last-ULP libm divergence surfaces explicitly there, NOT
+// in the strict-zero golden). The proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/vr1_vfx.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunVr1VfxShowcase(const char* outPath) {
+    namespace vrns = hf::vfx::render;
+
+    // THE SCENARIO (== vfx_render_test): the FIXED PA1-fountain VFX composition, run twice.
+    const vrns::VfxShotRun vrRun  = vrns::RunVfxShotScenario();
+    const vrns::VfxShotRun vrRun2 = vrns::RunVfxShotScenario();
+
+    // PROOF (1) two-run BYTE-IDENTICAL across every generator digest (the pure-integer proof).
+    if (vrRun.digest != vrRun2.digest || vrRun.trailsDigest != vrRun2.trailsDigest ||
+        vrRun.ribbonDigest != vrRun2.ribbonDigest || vrRun.beamDigest != vrRun2.beamDigest ||
+        vrRun.instDigest != vrRun2.instDigest || vrRun.lightDigest != vrRun2.lightDigest)
+        return fail("vr1-vfx: two runs differ (nondeterministic generators)");
+    std::printf("vr1-vfx: two-run BYTE-IDENTICAL {digest:%016llx}\n",
+                (unsigned long long)vrRun.digest);
+
+    // PROOF (2) the generator contracts live: one mesh instance per ALIVE particle EXACTLY, exactly
+    // min(64, alive) particle lights, and the beam's exact segment counts.
+    if ((uint32_t)vrRun.instances.size() != vrRun.aliveCount ||
+        (uint32_t)vrRun.lights.size() !=
+            (vrRun.aliveCount < vrns::kShotLightN ? vrRun.aliveCount : vrns::kShotLightN) ||
+        vrRun.beam.positions.size() != (size_t)(vrns::kShotBeamSegs + 1) * 2u ||
+        vrRun.beam.indices.size() != (size_t)vrns::kShotBeamSegs * 6u)
+        return fail("vr1-vfx: generator contract broke");
+    std::printf("vr1-vfx: meshInst == alive EXACT, lights == min(64, alive), beam segment "
+                "counts EXACT\n");
+
+    std::printf("vr1-vfx: stats {particles:%u, trails:%u, ribbonTris:%u, beamSegs:%d, "
+                "meshInst:%u, lights:%u, digest:%016llx}\n",
+                vrRun.aliveCount, vrRun.ribbons.trailCount,
+                (uint32_t)(vrRun.ribbons.geom.indices.size() / 3u), vrns::kShotBeamSegs,
+                (uint32_t)vrRun.instances.size(), (uint32_t)vrRun.lights.size(),
+                (unsigned long long)vrRun.digest);
+    std::printf("vr1-vfx: ml1 assignment {maxPerCluster:%u, totalAssignments:%llu, "
+                "assignDigest:%016llx} (float clustered seam — toolchain-family pin)\n",
+                vrRun.assignStats.maxPerCluster,
+                (unsigned long long)vrRun.assignStats.totalAssignments,
+                (unsigned long long)vrRun.assignDigest);
+
+    // --- Golden: the SHARED pure-integer side-view raster (vfx_render.h::RenderVfxShot — the identical
+    // function the Vulkan --vr1-vfx-shot calls; strict-zero BY CONSTRUCTION). ---
+    std::vector<uint8_t> vrImg;
+    uint32_t vrW = 0, vrH = 0;
+    vrns::RenderVfxShot(vrRun, vrImg, vrW, vrH);
+    if (!WritePNG(outPath, vrImg, vrW, vrH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — vr1 vfx renderer variety (ribbon trails + jittered beam + mesh "
+                "emitters + particle lights)\n",
+                outPath, vrW, vrH);
+    return 0;
+}
+
 // ===== Slice GAS1 — A DETERMINISTIC GAMEPLAY ABILITY SYSTEM showcase (--gas1-duel) (attributes + effects +
 // cooldowns, the GAS-class core, hf::game::gas). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
 // ability.h is header-only Q16.16 integer math, so on Metal it runs the IDENTICAL pure-CPU 60-tick duel the
@@ -82009,6 +82074,18 @@ int main(int argc, char** argv) {
                          std::strcmp(argv[1], "--la1-landscape-shot") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_la1_landscape.png";
             try { return RunLa1LandscapeShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vr1-vfx <out.png>: render the VFX RENDERER VARIETY showcase (Slice VR1, hf::vfx::render —
+        // ribbon trails + pcg-jittered beams + velocity-oriented mesh emitters + brightest-N particle
+        // lights over the PA1-authored pulsing fountain). PURE CPU — runs the IDENTICAL vfx_render.h
+        // fixed scenario + SHARED pure-integer side-view raster the Vulkan --vr1-vfx-shot runs ->
+        // bit-identical cross-backend BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY
+        // (the ML1 assignDigest is the ONE toolchain-family float stat). NO shader added.
+        if (argc > 1 && (std::strcmp(argv[1], "--vr1-vfx") == 0 ||
+                         std::strcmp(argv[1], "--vr1-vfx-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_vr1_vfx.png";
+            try { return RunVr1VfxShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gas1-duel <out.png>: render the DETERMINISTIC GAMEPLAY ABILITY SYSTEM showcase (Slice GAS1,

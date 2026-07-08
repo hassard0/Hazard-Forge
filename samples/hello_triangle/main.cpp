@@ -121,6 +121,7 @@
 #include "spline/spline.h"      // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Vulkan --sp1-road-shot + Metal --sp1-road run the IDENTICAL pure-CPU scenario + shared top-down raster
 #include "sim/force_field.h"    // Slice FF1: RIGID-BODY FORCE-FIELD VOLUMES (FieldVolume/EvalFieldForce/ApplyFields/StepFieldWorld/SimFieldTick/RunFieldLockstep/RunFieldRollback/RunFieldShotScenario/RenderFieldShot — the PT2 particle field math (radial/vortex/wind, particles.h read-only) applied to fpx RIGID BODIES with bounded AABB volumes; velocities mutated pre-step (the WV1 discipline), dv = F*invMass*dt, LINEAR force only (no field torque — documented v1); PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/particles.h read-only; the Vulkan --ff1-fields-shot + Metal --ff1-fields run the IDENTICAL pure-CPU 240-tick scenario + shared top-down raster
 #include "terrain/terrain_author.h"  // Slice LA1: LANDSCAPE AUTHORING (AuthoredTerrain/MakeFlatTerrain/MakeProcTerrain/ApplyRaiseBrush/ApplyFlattenBrush/ApplySmoothBrush/ApplyPaintBrush/ApplyCarveRoad + the Recorded* twins + TerrainHistory Undo/Redo + BuildAuthoredTerrainMesh + RunLandscapeShotScenario/RenderLandscapeShot — heightmap brush sculpting (flat-core integer-smoothstep falloff) + splat-layer painting (largest-remainder renorm to exactly 255) + the SP1 spline-carved road (flatten-to-spline-height bed + smoothstep shoulder + road-layer paint); PURE CPU Q16.16 integer, every op recorded/reversible via the TERRAIN-LOCAL ED5-recipe history — edit_history.h byte-untouched, the documented enrollment choice) — a NEW additive sibling #including terrain/procterrain.h + spline/spline.h + net/session.h read-only; the Vulkan --la1-landscape-shot + Metal --la1-landscape run the IDENTICAL pure-CPU scenario + shared shaded-relief raster
+#include "vfx/vfx_render.h"     // Slice VR1: VFX RENDERER VARIETY (TrailHistory/UpdateTrails/BuildRibbons + BuildBeam + BuildMeshInstances/OrientFromVelocity + BuildParticleLights/ParticleLightsToClustered + RunVfxShotScenario/RenderVfxShot — ribbon trails (per-slot ring buffer, seed-guarded slot reuse, monotonic age taper, SweepStrip winding) + pcg-jittered beams (jitter=0 == the exact straight strip; VISUAL-ONLY, no gameplay hit) + velocity-oriented mesh-emitter instances (SP1 integer half-angle yaw+pitch quaternions) + brightest-N particle lights feeding the EXISTING ML1 clustered assignment; the four Niagara renderer-variety generators as PURE Q16.16/integer functions of (pool, params, tick)) — a NEW additive sibling #including sim/particles.h + sim/particle_author.h + spline/spline.h + render/clustered.h + render/manylight.h read-only (ALL byte-untouched); the Vulkan --vr1-vfx-shot + Metal --vr1-vfx run the IDENTICAL pure-CPU PA1-fountain scenario + shared side-view raster (strict-zero cross-backend BY CONSTRUCTION; the ML1 assignDigest stat is the ONE float, pinned per-toolchain-family)
 #include "anim/blend_space.h"   // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Vulkan --an1-blend-shot + Metal --an1-blend run the IDENTICAL pure-CPU 240-tick scenario + shared raster
 #include "sim/boids.h"          // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids, brute-force all-pairs Reynolds seek+separation) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
@@ -4392,6 +4393,18 @@ int main(int argc, char** argv) {
     const char* la1LandscapeShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--la1-landscape-shot") == 0) { la1LandscapeShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice VR1: --vr1-vfx-shot <out.bmp> (VFX RENDERER VARIETY — ribbon trails + jittered beams +
+    // velocity-oriented mesh emitters + brightest-N particle lights over the PA1-authored pulsing
+    // fountain, hf::vfx::render). PURE CPU: NO GPU dispatch, NO new shader, NO new RHI; both backends
+    // run the IDENTICAL vfx_render.h fixed scenario (the PA1 fountain stepped 96 ticks with per-tick
+    // trail recording, then all FOUR deterministic integer geometry generators + the ML1 clustered
+    // assignment over the particle lights) + the SHARED pure-integer side-view raster -> strict-zero
+    // cross-backend BY CONSTRUCTION. Its OWN loop (the standalone-loop pattern, C1061).
+    const char* vr1VfxShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--vr1-vfx-shot") == 0) { vr1VfxShotPath = argv[i + 1]; break; }
     }
 
     // Slice GJ5: --gjk-lockstep-shot <out.bmp> (Deterministic General Convex-Hull Contacts LOCKSTEP + ROLLBACK
@@ -60510,6 +60523,72 @@ int main(int argc, char** argv) {
                                 "splat paint + spline-carved road)\n",
                                 la1LandscapeShotPath, laW, laH);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", la1LandscapeShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- VFX RENDERER VARIETY (--vr1-vfx-shot <out.bmp>, Slice VR1, hf::vfx::render). PURE CPU —
+        // NO GPU dispatch, NO new shader, NO new RHI; both Vulkan-Windows and Metal-Mac run the
+        // IDENTICAL pure-CPU scenario (vfx_render.h::RunVfxShotScenario — the PA1-authored pulsing
+        // fountain stepped 96 ticks with per-tick ribbon-trail recording, then the FOUR deterministic
+        // integer geometry generators: ribbon trails with monotonic age taper, the pcg-jittered beam
+        // arcing over the plume, velocity-oriented mesh-emitter instances via the SP1 integer half-angle
+        // yaw+pitch, and the brightest-64 particle lights fed through the EXISTING ML1 clustered
+        // assignment) and the SHARED pure-integer side-view raster (vfx_render.h::RenderVfxShot) ->
+        // strict-zero cross-backend BY CONSTRUCTION. The ML1 assignDigest line is the ONE float stat
+        // (clustered.h pow/log slice math) — pinned per-toolchain-family, the documented ML1 convention.
+        if (vr1VfxShotPath) {
+            namespace vrns = hf::vfx::render;
+
+            // THE SCENARIO (== vfx_render_test): the FIXED PA1-fountain VFX composition, run twice.
+            const vrns::VfxShotRun vrRun  = vrns::RunVfxShotScenario();
+            const vrns::VfxShotRun vrRun2 = vrns::RunVfxShotScenario();
+
+            // PROOF (1) two-run BYTE-IDENTICAL across every generator digest (the pure-integer proof).
+            if (vrRun.digest != vrRun2.digest || vrRun.trailsDigest != vrRun2.trailsDigest ||
+                vrRun.ribbonDigest != vrRun2.ribbonDigest || vrRun.beamDigest != vrRun2.beamDigest ||
+                vrRun.instDigest != vrRun2.instDigest || vrRun.lightDigest != vrRun2.lightDigest) {
+                std::fprintf(stderr, "FATAL: vr1-vfx two runs differ (nondeterministic generators)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vr1-vfx: two-run BYTE-IDENTICAL {digest:%016llx}\n",
+                        (unsigned long long)vrRun.digest);
+
+            // PROOF (2) the generator contracts live: one mesh instance per ALIVE particle EXACTLY,
+            // exactly min(64, alive) particle lights, and the beam's exact segment counts.
+            if ((uint32_t)vrRun.instances.size() != vrRun.aliveCount ||
+                (uint32_t)vrRun.lights.size() !=
+                    (vrRun.aliveCount < vrns::kShotLightN ? vrRun.aliveCount : vrns::kShotLightN) ||
+                vrRun.beam.positions.size() != (size_t)(vrns::kShotBeamSegs + 1) * 2u ||
+                vrRun.beam.indices.size() != (size_t)vrns::kShotBeamSegs * 6u) {
+                std::fprintf(stderr, "FATAL: vr1-vfx generator contract broke\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vr1-vfx: meshInst == alive EXACT, lights == min(64, alive), beam segment "
+                        "counts EXACT\n");
+
+            std::printf("vr1-vfx: stats {particles:%u, trails:%u, ribbonTris:%u, beamSegs:%d, "
+                        "meshInst:%u, lights:%u, digest:%016llx}\n",
+                        vrRun.aliveCount, vrRun.ribbons.trailCount,
+                        (uint32_t)(vrRun.ribbons.geom.indices.size() / 3u), vrns::kShotBeamSegs,
+                        (uint32_t)vrRun.instances.size(), (uint32_t)vrRun.lights.size(),
+                        (unsigned long long)vrRun.digest);
+            std::printf("vr1-vfx: ml1 assignment {maxPerCluster:%u, totalAssignments:%llu, "
+                        "assignDigest:%016llx} (float clustered seam — toolchain-family pin)\n",
+                        vrRun.assignStats.maxPerCluster,
+                        (unsigned long long)vrRun.assignStats.totalAssignments,
+                        (unsigned long long)vrRun.assignDigest);
+
+            // --- Golden: the SHARED pure-integer side-view raster (vfx_render.h::RenderVfxShot — the
+            // identical function both backends call; strict-zero BY CONSTRUCTION). ---
+            std::vector<uint8_t> vrImg;
+            uint32_t vrW = 0, vrH = 0;
+            vrns::RenderVfxShot(vrRun, vrImg, vrW, vrH);
+            bool ok = WriteBMP(vr1VfxShotPath, vrImg, vrW, vrH);
+            if (ok) std::printf("wrote %s (%ux%u) — vr1 vfx renderer variety (ribbon trails + jittered "
+                                "beam + mesh emitters + particle lights)\n",
+                                vr1VfxShotPath, vrW, vrH);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vr1VfxShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

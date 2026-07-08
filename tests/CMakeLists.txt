@@ -2006,6 +2006,20 @@ hf_add_pure_test(force_field_test)
 # (MSVC == clang). Pure C++ (hf_core), pure integer authoring, ASan-eligible; ZERO backend symbols.
 hf_add_pure_test(terrain_author_test)
 
+# Slice VR1 — VFX RENDERER VARIETY (engine/vfx/vfx_render.h, hf::vfx::render): ribbon trails + jittered
+# beams + mesh emitters + particle lights over the deterministic particle sim (PT1-PT6) + the PA1
+# authored fountain — the four Niagara renderer-variety generators as PURE Q16.16/integer functions of
+# (pool, params, tick). Pins: the trail ring-buffer fold digest (deterministic ascending-slot record,
+# seed-guarded slot reuse, dead-trail expiry), the ribbon strip digest (SweepStrip winding, NO degenerate
+# index triples, MONOTONIC age taper) + the documented direction-reversal KINK worst case, the beam
+# digest (exact segment counts, anchored endpoints, jitter=0 == the EXACT straight-lerp strip identity),
+# the mesh-instance digest (count == alive EXACTLY, unit-to-±LSB half-angle yaw+pitch quaternions
+# tracking velocity), the brightest-N light selection (min(N, alive) EXACT, brightest-then-lowest-slot
+# tie-break) + the ML1 clustered-assignment composition digest (render/clustered.h + render/manylight.h
+# byte-UNTOUCHED; toolchain-family pin, the ML1 convention), and the pinned shared showcase scenario
+# (MSVC == clang). Pure C++ (hf_core), ASan-eligible; ZERO backend symbols.
+hf_add_pure_test(vfx_render_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)
