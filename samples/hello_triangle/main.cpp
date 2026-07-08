@@ -117,6 +117,7 @@
 #include "sim/hulljoint.h"      // Slice HF4: hull friction + joints HULL JOINTS COMPOSED (JointedHullWorld/JointedHullStepConfig/StepJointedHullWorld(N)/MeasureJointedHull — the joint.h ball/angular-limit solvers composed with the HF3 hull friction contacts in ONE deterministic tick; a NEW additive header #including sim/hullfric.h + sim/joint.h read-only; the one-deterministic-step headline of FLAGSHIP #30) — shared verbatim with hulljoint_step.comp (int64, Vulkan-only, NOT in hf_gen_msl) + the Vulkan --hf4-joint-shot; Metal --hf4-joint runs the CPU path
 #include "game/verdict.h"       // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict — the pinned-identity deterministic entity world + the unified command bus generalizing convex::ConvexCommand; PURE CPU integer, the BEACHHEAD of FLAGSHIP #27) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Vulkan --vd1-world-shot + Metal --vd1-world run the IDENTICAL pure-CPU script
 #include "game/ability.h"       // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Vulkan --gas1-duel-shot + Metal --gas1-duel run the IDENTICAL pure-CPU 60-tick duel
+#include "sim/water_body.h"     // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer, the render ocean and the physics ocean are the same equation) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Vulkan --wv1-float-shot + Metal --wv1-float run the IDENTICAL pure-CPU 480-tick float scenario + shared raster
 #include "sim/boids.h"          // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids, brute-force all-pairs Reynolds seek+separation) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "ai/ai.h"              // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree — a FLAT index graph + an integer blackboard + a fixed-DFS-order tick; PURE CPU integer, the BEACHHEAD of the DETERMINISTIC AI flagship #28) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Vulkan --ai1-tree-shot + Metal --ai1-tree run the IDENTICAL pure-CPU tick + 2D node-graph viz
@@ -4328,6 +4329,17 @@ int main(int argc, char** argv) {
     const char* gas1DuelShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--gas1-duel-shot") == 0) { gas1DuelShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice WV1: --wv1-float-shot <out.bmp> (THE WATER GAMEPLAY VOLUME — the analytic integer Gerstner
+    // surface driving rigid-body Archimedes buoyancy + drag, hf::sim::water; the rendered ocean and the
+    // physics ocean are the same equation). PURE CPU: NO GPU dispatch, NO new shader, NO new RHI; both
+    // backends run the IDENTICAL water_body.h fixed scenario (3 density-authored spheres dropped onto the
+    // 3-wave showcase ocean, 480 ticks) + the SHARED pure-integer side-view raster -> strict-zero
+    // cross-backend BY CONSTRUCTION. Its OWN loop (the standalone-loop pattern, C1061).
+    const char* wv1FloatShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--wv1-float-shot") == 0) { wv1FloatShotPath = argv[i + 1]; break; }
     }
 
     // Slice GJ5: --gjk-lockstep-shot <out.bmp> (Deterministic General Convex-Hull Contacts LOCKSTEP + ROLLBACK
@@ -60086,6 +60098,88 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — vd1 entity-world state side-view (%u live entities, nextId %u)\n",
                                 vd1WorldShotPath, imgW, imgH, drawn, world.nextId);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vd1WorldShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- THE WATER GAMEPLAY VOLUME (--wv1-float-shot <out.bmp>, Slice WV1, hf::sim::water). PURE CPU —
+        // NO GPU dispatch, NO new shader, NO new RHI; both Vulkan-Windows and Metal-Mac run the IDENTICAL
+        // pure-CPU scenario (water_body.h::RunWaterShotScenario — 3 density-authored spheres of rho
+        // 0.35/0.60/1.50 dropped onto the FIXED 3-wave integer Gerstner ocean, 480 ticks: the light/medium
+        // ones ride DIFFERENT wave phases, the dense one sinks to the AABB floor) and the SHARED pure-integer
+        // side-view raster (the wave-surface polyline at the final tick + the water fill + the volume outline
+        // + the 3 spheres) -> strict-zero cross-backend BY CONSTRUCTION. Asserts the 3 proofs (two-run
+        // byte-identical, lockstep peer re-derivation, rollback via the ZERO-BYTE water snapshot — the water
+        // is analytic/stateless, so the rollback state is the fpx bodies ALONE).
+        if (wv1FloatShotPath) {
+            namespace wv = hf::sim::water;
+            namespace wvfpx = hf::sim::fpx;
+
+            // THE SCENARIO (== water_body_test): the FIXED 480-tick 3-sphere float, run twice.
+            const wv::WaterShotRun wvRun  = wv::RunWaterShotScenario();
+            const wv::WaterShotRun wvRun2 = wv::RunWaterShotScenario();
+
+            // PROOF (1) two-run BYTE-IDENTICAL.
+            if (wvRun.digest != wvRun2.digest || wvRun.traceDigest != wvRun2.traceDigest) {
+                std::fprintf(stderr, "FATAL: wv1-float two runs differ (nondeterministic water volume)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("wv1-float: two-run BYTE-IDENTICAL {digest:%016llx, trace:%016llx}\n",
+                        (unsigned long long)wvRun.digest, (unsigned long long)wvRun.traceDigest);
+
+            // PROOF (2) lockstep: a peer fed ONLY the impulse-command stream re-derives the float bit-for-bit.
+            std::vector<wvfpx::FxCommand> wvAuth;
+            wvAuth.push_back(wvfpx::FxCommand{30u, wvfpx::kCmdImpulse, 0u,
+                                              wvfpx::FxVec3{wv::Snap(1.5), 0, 0}});
+            wvAuth.push_back(wvfpx::FxCommand{90u, wvfpx::kCmdImpulse, 1u,
+                                              wvfpx::FxVec3{0, wv::Snap(2.0), wv::Snap(-0.5)}});
+            const wv::WaterBody wvOcean = wv::ShowcaseWater();
+            const wvfpx::FxWorld wvInit = wv::MakeShotWorld();
+            const wvfpx::FxWorld wvAuthority =
+                wv::RunWaterLockstep(wvOcean, wvInit, wvAuth, 240, wvOcean.tickDt, 4);
+            const wvfpx::FxWorld wvReplica =
+                wv::RunWaterLockstep(wvOcean, wvInit, wvAuth, 240, wvOcean.tickDt, 4);
+            if (!wv::WaterWorldsEqual(wvAuthority, wvReplica)) {
+                std::fprintf(stderr, "FATAL: wv1-float lockstep peers diverged\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("wv1-float: lockstep peer re-derives the floating bodies bit-for-bit "
+                        "{identical:true}\n");
+
+            // PROOF (3) rollback corrects a GENUINELY-diverged mispredicted impulse via the ZERO-BYTE water
+            // snapshot (the snapshot is the fpx body vector ALONE — the analytic ocean re-derives from tick).
+            std::vector<wvfpx::FxCommand> wvMis = wvAuth;
+            wvMis[1].arg = wvfpx::FxVec3{wv::Snap(-2.0), 0, 0};
+            const wvfpx::FxWorld wvMisFull =
+                wv::RunWaterLockstep(wvOcean, wvInit, wvMis, 240, wvOcean.tickDt, 4);
+            const wvfpx::FxWorld wvCorrected =
+                wv::RunWaterRollback(wvOcean, wvInit, wvAuth, wvMis, 240, 60, wvOcean.tickDt, 4);
+            const bool wvDiverged = !wv::WaterWorldsEqual(wvMisFull, wvAuthority);
+            const bool wvOk = wv::WaterWorldsEqual(wvCorrected, wvAuthority);
+            if (!wvDiverged || !wvOk) {
+                std::fprintf(stderr, "FATAL: wv1-float rollback failed {diverged:%d, corrected:%d}\n",
+                             (int)wvDiverged, (int)wvOk);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("wv1-float: rollback corrects a mispredicted impulse via the ZERO-BYTE water "
+                        "snapshot {diverged:true, corrected:true}\n");
+
+            std::printf("wv1-float: stats {waves:%u, bodies:%u, steps:%d, digest:%016llx, "
+                        "depths:[%d,%d,%d]}\n",
+                        wvOcean.waveCount, wv::kShotBodies, wv::kShotSteps,
+                        (unsigned long long)wvRun.digest, wvRun.depths[0], wvRun.depths[1],
+                        wvRun.depths[2]);
+
+            // --- Golden: the SHARED pure-integer side-view raster (water_body.h::RenderWaterShot — the
+            // identical function both backends call; strict-zero BY CONSTRUCTION). ---
+            std::vector<uint8_t> wvImg;
+            uint32_t wvW = 0, wvH = 0;
+            wv::RenderWaterShot(wvRun, wvImg, wvW, wvH);
+            bool ok = WriteBMP(wv1FloatShotPath, wvImg, wvW, wvH);
+            if (ok) std::printf("wrote %s (%ux%u) — wv1 water gameplay volume (3 spheres riding the "
+                                "integer Gerstner ocean, %d ticks)\n",
+                                wv1FloatShotPath, wvW, wvH, wv::kShotSteps);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", wv1FloatShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

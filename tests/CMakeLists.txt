@@ -1925,6 +1925,19 @@ target_compile_definitions(graph_introspect_test PRIVATE
 # ASan-eligible; pure integer, ZERO backend symbols.
 hf_add_pure_test(ability_test)
 
+# Slice WV1 — THE WATER GAMEPLAY VOLUME (engine/sim/water_body.h, hf::sim::water): the analytic integer
+# Gerstner surface (host-baked ik.h sine LUT — zero runtime transcendentals) driving rigid-body Archimedes
+# buoyancy + drag (couple.h CP7 SphereCapVolume reused VERBATIM against the analytic surface — the render
+# ocean and the physics ocean are the same equation). Pins: the hand force balance at exact half-submersion,
+# flat-water rho=0.5 half-submerged settle (the analytic Archimedes pin, tighter than CP7's SPH-quantile
+# version), the wave-period bob (measured period vs the analytic wave period + the phase-locked trace
+# digest), the dense sink to the AABB floor, IDENTITY-AT-ZERO (zero water -> RunWaterLockstep ==
+# fpx::RunLockstep BIT-EXACT), different-(x,z) bodies riding different phases, lockstep + rollback with the
+# ZERO-BYTE WATER SNAPSHOT headline (the water is analytic/stateless — the snapshot is the fpx bodies
+# alone), and the pinned showcase scenario + raster digests (MSVC == clang). Pure C++ (hf_core), pure
+# integer sim, ASan-eligible; ZERO backend symbols.
+hf_add_pure_test(water_body_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

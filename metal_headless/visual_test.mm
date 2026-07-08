@@ -143,6 +143,7 @@
 #include "game/verdict.h"            // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Metal --vd1-world runs the IDENTICAL pure-CPU script the Vulkan --vd1-world-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "game/ability.h"            // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Metal --gas1-duel runs the IDENTICAL pure-CPU 60-tick duel the Vulkan --gas1-duel-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "ai/ai.h"                   // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Metal --ai1-tree runs the IDENTICAL pure-CPU tick + 2D node-graph viz the Vulkan --ai1-tree-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "sim/water_body.h"          // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Metal --wv1-float runs the IDENTICAL pure-CPU 480-tick scenario + SHARED raster the Vulkan --wv1-float-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
@@ -48615,6 +48616,72 @@ static int RunVd1WorldShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice WV1 — THE WATER GAMEPLAY VOLUME showcase (--wv1-float) (the analytic integer Gerstner surface
+// driving rigid-body Archimedes buoyancy + drag, hf::sim::water). PURE CPU — NO GPU compute, NO new shader,
+// NO new RHI; water_body.h is header-only Q16.16 integer math (the ONE transcendental — sine — is the ik.h
+// host-baked LUT), so on Metal it runs the IDENTICAL fixed scenario the Vulkan --wv1-float-shot runs on
+// Windows (water_body.h::RunWaterShotScenario — 3 density-authored spheres of rho 0.35/0.60/1.50 dropped
+// onto the FIXED 3-wave integer Gerstner ocean, 480 ticks) AND the SHARED pure-integer side-view raster
+// (water_body.h::RenderWaterShot — the identical function both backends call) -> bit-identical
+// cross-backend BY CONSTRUCTION (strict zero-differing-pixel). The 3 proof lines match the Vulkan side
+// EXACTLY. New golden tests/golden/metal/wv1_float.png (baked on the Mac by the controller); two runs
+// DIFF 0.0000.
+static int RunWv1FloatShowcase(const char* outPath) {
+    namespace wv = hf::sim::water;
+    namespace wvfpx = hf::sim::fpx;
+
+    // THE SCENARIO (== water_body_test): the FIXED 480-tick 3-sphere float, run twice.
+    const wv::WaterShotRun wvRun  = wv::RunWaterShotScenario();
+    const wv::WaterShotRun wvRun2 = wv::RunWaterShotScenario();
+
+    // PROOF (1) two-run BYTE-IDENTICAL.
+    if (wvRun.digest != wvRun2.digest || wvRun.traceDigest != wvRun2.traceDigest)
+        return fail("wv1-float: two runs differ (nondeterministic water volume)");
+    std::printf("wv1-float: two-run BYTE-IDENTICAL {digest:%016llx, trace:%016llx}\n",
+                (unsigned long long)wvRun.digest, (unsigned long long)wvRun.traceDigest);
+
+    // PROOF (2) lockstep: a peer fed ONLY the impulse-command stream re-derives the float bit-for-bit.
+    std::vector<wvfpx::FxCommand> wvAuth;
+    wvAuth.push_back(wvfpx::FxCommand{30u, wvfpx::kCmdImpulse, 0u, wvfpx::FxVec3{wv::Snap(1.5), 0, 0}});
+    wvAuth.push_back(wvfpx::FxCommand{90u, wvfpx::kCmdImpulse, 1u,
+                                      wvfpx::FxVec3{0, wv::Snap(2.0), wv::Snap(-0.5)}});
+    const wv::WaterBody wvOcean = wv::ShowcaseWater();
+    const wvfpx::FxWorld wvInit = wv::MakeShotWorld();
+    const wvfpx::FxWorld wvAuthority = wv::RunWaterLockstep(wvOcean, wvInit, wvAuth, 240, wvOcean.tickDt, 4);
+    const wvfpx::FxWorld wvReplica = wv::RunWaterLockstep(wvOcean, wvInit, wvAuth, 240, wvOcean.tickDt, 4);
+    if (!wv::WaterWorldsEqual(wvAuthority, wvReplica))
+        return fail("wv1-float: lockstep peers diverged");
+    std::printf("wv1-float: lockstep peer re-derives the floating bodies bit-for-bit {identical:true}\n");
+
+    // PROOF (3) rollback corrects a GENUINELY-diverged mispredicted impulse via the ZERO-BYTE water
+    // snapshot (the snapshot is the fpx body vector ALONE — the analytic ocean re-derives from tick).
+    std::vector<wvfpx::FxCommand> wvMis = wvAuth;
+    wvMis[1].arg = wvfpx::FxVec3{wv::Snap(-2.0), 0, 0};
+    const wvfpx::FxWorld wvMisFull = wv::RunWaterLockstep(wvOcean, wvInit, wvMis, 240, wvOcean.tickDt, 4);
+    const wvfpx::FxWorld wvCorrected =
+        wv::RunWaterRollback(wvOcean, wvInit, wvAuth, wvMis, 240, 60, wvOcean.tickDt, 4);
+    const bool wvDiverged = !wv::WaterWorldsEqual(wvMisFull, wvAuthority);
+    const bool wvOk = wv::WaterWorldsEqual(wvCorrected, wvAuthority);
+    if (!wvDiverged || !wvOk) return fail("wv1-float: rollback failed");
+    std::printf("wv1-float: rollback corrects a mispredicted impulse via the ZERO-BYTE water snapshot "
+                "{diverged:true, corrected:true}\n");
+
+    std::printf("wv1-float: stats {waves:%u, bodies:%u, steps:%d, digest:%016llx, depths:[%d,%d,%d]}\n",
+                wvOcean.waveCount, wv::kShotBodies, wv::kShotSteps, (unsigned long long)wvRun.digest,
+                wvRun.depths[0], wvRun.depths[1], wvRun.depths[2]);
+
+    // --- Golden: the SHARED pure-integer side-view raster (water_body.h::RenderWaterShot — the identical
+    // function the Vulkan --wv1-float-shot calls; strict-zero BY CONSTRUCTION). ---
+    std::vector<uint8_t> wvImg;
+    uint32_t wvW = 0, wvH = 0;
+    wv::RenderWaterShot(wvRun, wvImg, wvW, wvH);
+    if (!WritePNG(outPath, wvImg, wvW, wvH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — wv1 water gameplay volume (3 spheres riding the integer Gerstner "
+                "ocean, %d ticks)\n",
+                outPath, wvW, wvH, wv::kShotSteps);
+    return 0;
+}
+
 // ===== Slice GAS1 — A DETERMINISTIC GAMEPLAY ABILITY SYSTEM showcase (--gas1-duel) (attributes + effects +
 // cooldowns, the GAS-class core, hf::game::gas). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
 // ability.h is header-only Q16.16 integer math, so on Metal it runs the IDENTICAL pure-CPU 60-tick duel the
@@ -81639,6 +81706,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vd1-world") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vd1_world.png";
             try { return RunVd1WorldShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --wv1-float <out.png>: render THE WATER GAMEPLAY VOLUME showcase (Slice WV1, hf::sim::water — the
+        // analytic integer Gerstner surface driving CP7 Archimedes buoyancy + drag on fpx bodies). PURE CPU —
+        // runs the IDENTICAL water_body.h 480-tick 3-sphere scenario + SHARED raster the Vulkan
+        // --wv1-float-shot runs -> bit-identical cross-backend BY CONSTRUCTION; the 3 proof lines match the
+        // Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && (std::strcmp(argv[1], "--wv1-float") == 0 ||
+                         std::strcmp(argv[1], "--wv1-float-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_wv1_float.png";
+            try { return RunWv1FloatShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gas1-duel <out.png>: render the DETERMINISTIC GAMEPLAY ABILITY SYSTEM showcase (Slice GAS1,
