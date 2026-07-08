@@ -430,6 +430,7 @@ $Goldens = @(
     @{ Name = 'al1_layer';        Flag = '--al1-layer-shot' }      # AL1 deterministic anim layering (next-tier #2; notifies+additive+montages+notify->GAS bridge, pose 79f5a9b0a781e775)
     @{ Name = 'bt1_behavior';     Flag = '--bt1-behavior-shot' }   # BT1 deterministic behavior-tree depth + utility AI (next-tier #3; parallel/decorators/service/utility+observer-abort, digest 0x9fcd062431f97292)
     @{ Name = 'mp1_morph';        Flag = '--mp1-morph-shot' }      # MP1 deterministic morph targets/blend shapes (next-tier #5; vertex-delta blend + weight track + morph->skin order, digest 83670e4484312df3)
+    @{ Name = 'sq2_cinematic';    Flag = '--sq2-cinematic' }       # SQ2 deterministic sequencer semantic tracks (next-tier #6; camera-cut/audio/material/sub-sequence + Seek==Play scrub, pixDigest 0x10a63b075559de01)
 )
 
 $winResult = 'SKIP'
