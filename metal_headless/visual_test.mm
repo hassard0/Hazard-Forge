@@ -141,6 +141,7 @@
 #include "sim/hullfric.h"            // Slice HF1: hull friction + joints THE TAGGED FRICTION MANIFOLD ON THE EPA NORMAL (HullFrictionManifold/BuildHullFrictionManifold/CachedHullFrictionContact/MatchHullFrictionCache/UpdateHullFrictionCache/BuildAllHullFrictionManifoldsPairs/MeasureHullFriction — wraps the FROZEN warmhull keyed manifold + the fric::MakeTangentBasis integer tangent basis on the sign-corrected EPA normal + the basis-axis cache field) — int64 -> hullfric_points.comp is Vulkan-only (NOT in hf_gen_msl); the Metal --hf1-points runs the CPU hullfric::BuildAllHullFrictionManifoldsPairs (byte-identical to the Vulkan GPU result by construction)
 #include "sim/hulljoint.h"           // Slice HF4: hull friction + joints HULL JOINTS COMPOSED (JointedHullWorld/JointedHullStepConfig/StepJointedHullWorld(N)/MeasureJointedHull — the joint.h ball/angular-limit solvers composed with the HF3 hull friction contacts in ONE deterministic tick) — int64 -> hulljoint_step.comp is Vulkan-only (NOT in hf_gen_msl); the Metal --hf4-joint runs the CPU hulljoint::StepJointedHullWorldN (byte-identical to the Vulkan GPU result by construction)
 #include "game/verdict.h"            // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Metal --vd1-world runs the IDENTICAL pure-CPU script the Vulkan --vd1-world-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "game/ability.h"            // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Metal --gas1-duel runs the IDENTICAL pure-CPU 60-tick duel the Vulkan --gas1-duel-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "ai/ai.h"                   // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Metal --ai1-tree runs the IDENTICAL pure-CPU tick + 2D node-graph viz the Vulkan --ai1-tree-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
@@ -48614,6 +48615,135 @@ static int RunVd1WorldShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GAS1 — A DETERMINISTIC GAMEPLAY ABILITY SYSTEM showcase (--gas1-duel) (attributes + effects +
+// cooldowns, the GAS-class core, hf::game::gas). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
+// ability.h is header-only Q16.16 integer math, so on Metal it runs the IDENTICAL pure-CPU 60-tick duel the
+// Vulkan --gas1-duel-shot runs on Windows (ability.h::RunDuelScenario — the FIXED KitBuilder-authored kit +
+// command stream: fireballs + burn DoT, a shield mid-fight, haste stacked to the cap, deterministic
+// cooldown/cost rejections) -> the attribute-timeline strip chart is bit-identical cross-backend BY
+// CONSTRUCTION (strict zero-differing-pixel). The 4 proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/gas1_duel.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunGas1DuelShowcase(const char* outPath) {
+    namespace gasns = hf::game::gas;
+
+    // THE SCENARIO (== ability_test + the Vulkan --gas1-duel-shot): the FIXED 60-tick duel, run twice.
+    const gasns::DuelRun run  = gasns::RunDuelScenario();
+    const gasns::DuelRun run2 = gasns::RunDuelScenario();
+
+    // PROOF (1) the kit is AUTHORED (KitBuilder-built; the test pins this digest).
+    const uint64_t kitDigest = gasns::DigestKit(gasns::MakeCoreKit());
+    std::printf("gas1-duel: kit authored via KitBuilder {abilities:3, digest:%s}\n",
+                gasns::DigestHex(kitDigest).c_str());
+
+    // PROOF (2) two-run BYTE-IDENTICAL.
+    if (!gasns::GasStatesEqual(run.finalWorld, run2.finalWorld) || run.traceDigest != run2.traceDigest)
+        return fail("gas1-duel: two runs differ (nondeterministic ability system)");
+    std::printf("gas1-duel: duel two-run BYTE-IDENTICAL {trace:%s}\n",
+                gasns::DigestHex(run.traceDigest).c_str());
+
+    // PROOF (3) lockstep: a peer fed ONLY the command stream re-derives the duel bit-for-bit.
+    bool identical = false;
+    const gasns::GasWorld authority = gasns::RunGasLockstep(gasns::MakeDuelWorld(), gasns::MakeCoreKit(),
+                                                            gasns::MakeDuelStream(), gasns::kDuelTicks,
+                                                            &identical);
+    if (!identical || !gasns::GasStatesEqual(authority, run.finalWorld))
+        return fail("gas1-duel: lockstep peers diverged");
+    std::printf("gas1-duel: lockstep peer re-derives the duel bit-for-bit {identical:true}\n");
+
+    // PROOF (4) rollback corrects a GENUINELY-diverged mispredicted activation (t12 fireball mispredicted
+    // as a haste), with the divergence asserted non-vacuous.
+    std::vector<gasns::GasCommand> mispredict = gasns::MakeDuelStream();
+    for (size_t mi = 0; mi < mispredict.size(); ++mi) {
+        if (mispredict[mi].tick == 12u) {
+            mispredict[mi].abilityId = gasns::kAbilityHaste;
+            mispredict[mi].target    = mispredict[mi].caster;
+        }
+    }
+    bool corrected = false, diverged = false;
+    (void)gasns::RunGasRollback(gasns::MakeDuelWorld(), gasns::MakeCoreKit(), gasns::MakeDuelStream(),
+                                mispredict, gasns::kDuelTicks, 10u, &corrected, &diverged);
+    if (!corrected || !diverged) return fail("gas1-duel: rollback failed");
+    std::printf("gas1-duel: rollback corrects a mispredicted activation {diverged:true, corrected:true}\n");
+
+    const gasns::GasEntity& duelA = run.finalWorld.entities[0];
+    const gasns::GasEntity& duelB = run.finalWorld.entities[1];
+    std::printf("gas1-duel: finals {A:{hp:%d, mana:%d}, B:{hp:%d, mana:%d}}\n",
+                (int)(duelA.attrs.base[gasns::kAttrHealth] >> gasns::kFrac),
+                (int)(duelA.attrs.base[gasns::kAttrMana] >> gasns::kFrac),
+                (int)(duelB.attrs.base[gasns::kAttrHealth] >> gasns::kFrac),
+                (int)(duelB.attrs.base[gasns::kAttrMana] >> gasns::kFrac));
+    std::printf("gas1-duel: stats {entities:2, abilities:3, effectsApplied:%u, steps:%u, digest:%s}\n",
+                run.effectsApplied, gasns::kDuelTicks,
+                gasns::DigestHex(gasns::DigestGasWorld(run.finalWorld)).c_str());
+
+    // --- Golden: the SAME PURE-INTEGER attribute-timeline strip chart as the Vulkan --gas1-duel-shot
+    // (identical by construction). Two entity panels (A top, B bottom); per panel the health/mana/armor
+    // lanes (per-tick bars, integer-scaled heights), a DoT burn-mark row at the health-lane top, and an
+    // activation/cooldown event strip (green = ok cast, red = deterministic rejection, dim = a cooldown
+    // counter running). ---
+    const int kTicksN = (int)gasns::kDuelTicks, kColPx = 10, kMargin = 24;
+    const int kLaneHealth = 90, kLaneMana = 70, kLaneArmor = 50, kLaneGap = 8, kEvents = 14;
+    const int kPanelH = kLaneHealth + kLaneGap + kLaneMana + kLaneGap + kLaneArmor + kLaneGap + kEvents;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kTicksN * kColPx);
+    const uint32_t imgH = (uint32_t)(kMargin * 3 + kPanelH * 2);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, float r, float g, float b) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(b * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(g * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(r * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto fillRect = [&](int x0, int y0, int w, int h, float r, float g, float b) {
+        for (int dy = 0; dy < h; ++dy)
+            for (int dx = 0; dx < w; ++dx)
+                putPx(x0 + dx, y0 + dy, r, g, b);
+    };
+    // One lane: per-tick bars of the sampled current (Q16.16 -> whole units, integer-scaled).
+    auto drawLane = [&](int x0, int y0, int laneH, int laneMax, int who, int what) {
+        fillRect(x0 - 2, y0 - 2, kTicksN * kColPx + 4, laneH + 4, 0.16f, 0.16f, 0.18f);  // frame
+        fillRect(x0, y0, kTicksN * kColPx, laneH, 0.055f, 0.047f, 0.039f);               // bed
+        for (int t = 0; t < kTicksN; ++t) {
+            const gasns::DuelTickSample& s = run.samples[(size_t)t];
+            const gasns::fx v = (what == 0) ? s.health[who] : (what == 1) ? s.mana[who] : s.armor[who];
+            int hpx = (int)(((int64_t)(v >> gasns::kFrac) * (int64_t)(laneH - 2)) / (int64_t)laneMax);
+            if (hpx < 0) hpx = 0;
+            if (hpx > laneH - 2) hpx = laneH - 2;
+            float r = 0.85f, g = 0.32f, b = 0.25f;                    // health: warm red
+            if (what == 1) { r = 0.25f; g = 0.45f; b = 0.85f; }       // mana: blue
+            if (what == 2) { r = 0.25f; g = 0.72f; b = 0.62f; }       // armor: teal
+            fillRect(x0 + t * kColPx + 1, y0 + laneH - 1 - hpx, kColPx - 2, hpx, r, g, b);
+            if (what == 0 && s.burnActive[who])
+                fillRect(x0 + t * kColPx + 1, y0, kColPx - 2, 3, 0.95f, 0.55f, 0.15f);   // DoT mark
+        }
+    };
+    for (int who = 0; who < 2; ++who) {
+        const int px0 = kMargin;
+        const int py0 = kMargin + who * (kPanelH + kMargin);
+        int ly = py0;
+        drawLane(px0, ly, kLaneHealth, 200, who, 0); ly += kLaneHealth + kLaneGap;
+        drawLane(px0, ly, kLaneMana,   100, who, 1); ly += kLaneMana + kLaneGap;
+        drawLane(px0, ly, kLaneArmor,   25, who, 2); ly += kLaneArmor + kLaneGap;
+        for (int t = 0; t < kTicksN; ++t) {
+            const gasns::DuelTickSample& s = run.samples[(size_t)t];
+            float r = 0.055f, g = 0.047f, b = 0.039f;
+            if (s.cdActive[who]) { r = 0.30f; g = 0.30f; b = 0.32f; }   // the cooldown marker
+            if (s.castFail[who]) { r = 0.90f; g = 0.20f; b = 0.20f; }   // a deterministic rejection
+            if (s.castOk[who])   { r = 0.30f; g = 0.85f; b = 0.35f; }   // a successful activation
+            fillRect(px0 + t * kColPx + 1, ly, kColPx - 2, kEvents, r, g, b);
+        }
+    }
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — gas1 duel attribute timeline (2 entities, %u ticks, %u activations)\n",
+                outPath, imgW, imgH, gasns::kDuelTicks, run.activationsOk);
+    return 0;
+}
+
 // ===== Slice VD2 — Deterministic Gameplay / Netcode THE SYSTEM SCHEDULE + THE GAMEPLAY TICK showcase
 // (--vd2-tick) (the 2nd slice of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO new
 // RHI; the verdict.h gameplay systems + schedule are header-only integer math, so on Metal it runs the IDENTICAL
@@ -81509,6 +81639,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vd1-world") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vd1_world.png";
             try { return RunVd1WorldShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gas1-duel <out.png>: render the DETERMINISTIC GAMEPLAY ABILITY SYSTEM showcase (Slice GAS1,
+        // hf::game::gas — attributes + effects + cooldowns, the GAS-class core). PURE CPU — runs the
+        // IDENTICAL ability.h 60-tick duel (the FIXED KitBuilder-authored kit + command stream) the Vulkan
+        // --gas1-duel-shot runs -> the attribute-timeline strip chart is bit-identical cross-backend BY
+        // CONSTRUCTION; the 4 proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && (std::strcmp(argv[1], "--gas1-duel") == 0 ||
+                         std::strcmp(argv[1], "--gas1-duel-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_gas1_duel.png";
+            try { return RunGas1DuelShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ai1-tree <out.png>: render the Deterministic AI BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK

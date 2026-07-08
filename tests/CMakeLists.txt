@@ -1910,6 +1910,21 @@ target_compile_definitions(graph_introspect_test PRIVATE
   "HF_MAT3_JSON=\"${CMAKE_SOURCE_DIR}/assets/materials/showcase3.mat.json\""
   "HF_MAT3_GOLDEN=\"${CMAKE_SOURCE_DIR}/tests/golden/material/showcase3_graph.json\"")
 
+# Slice GAS1 (A DETERMINISTIC GAMEPLAY ABILITY SYSTEM, hf::game::gas — engine/game/ability.h, a NEW additive
+# sibling #including game/verdict.h READ-ONLY): attribute sets (fixed-enum Q16.16 arrays with the GAS
+# base-vs-current split), gameplay effects (add/multiply/override; instant/N-tick/infinite; stack/refresh/ignore
+# stacking; periodic DoT), abilities (cost + cooldown + effect lists, deterministic failure enums), and the
+# command+snapshot lockstep mold. Pins: THE FOLD ORDER (base -> adds ascending instance id -> multiplies ->
+# override-last-wins — application-order-independent, exact currents), stacking (cap / refresh-duration-only /
+# ignore), DoT exactness (fires every periodTicks, exact total, exact expiry tick), the cooldown+cost gates
+# (pinned reasons, the exact ready tick, exact deduction), the FIXED 60-tick duel (authored-kit digest + the
+# attribute-trace digest + exact final integers — MSVC == clang), the zero-effect identity (currents == bases
+# every tick), lockstep (a peer re-derives the duel bit-for-bit from the command stream alone), rollback (a
+# genuinely-diverged mispredicted activation corrected bit-exactly + the non-diverging control), and snapshot
+# completeness (omitting cooldowns or active effects diverges — the controls). Pure C++ (hf_core),
+# ASan-eligible; pure integer, ZERO backend symbols.
+hf_add_pure_test(ability_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)
