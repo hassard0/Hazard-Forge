@@ -414,6 +414,7 @@ $Goldens = @(
     @{ Name = 'sc5_foliage';     Flag = '--sc5-foliage-shot' }   # SC5 foliage scatter at scale (12,123 instances / 3 instanced draws; integer plant digest 0xd8a9963b269d83e3 cross-platform)
     @{ Name = 'sc6_residency';    Flag = '--sc6-residency-shot' } # SC6 VT page residency under a streaming budget (Tier 2 final; 4-mip heatmap, digest 0xe57f2491f1aad4dc cross-platform)
     @{ Name = 'gas1_duel';        Flag = '--gas1-duel' }          # GAS1 deterministic ability system (parity++ #1; attribute/effect/cooldown duel trace f74f7e4198440670, kit a092a05e3a6b1a50)
+    @{ Name = 'wv1_float';        Flag = '--wv1-float' }          # WV1 water gameplay volume (parity++ #2; analytic integer-Gerstner buoyancy, digest 8eaa0116a528c87d)
 )
 
 $winResult = 'SKIP'
