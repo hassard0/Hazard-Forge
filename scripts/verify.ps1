@@ -387,6 +387,7 @@ $Goldens = @(
     @{ Name = 'cf1_couple';    Flag = '--cf1-couple-shot' }  # CF1 cloth<->fluid coupling (superiority S1; fluid pooled on the sagging hammock, digests 0x1a97a446acc1ec52/0xc1ef0d4d5332c7e5)
     @{ Name = 'fr8_hull';      Flag = '--fr8-hull-shot' }    # FR8 convex-shard rubble (superiority R4; angular boxes via fric.h SAT, digest 0xa5a9b8f5158108d2)
     @{ Name = 'dh1_shatter';   Flag = '--dh1-shatter-shot' } # DH1 EXACT convex-cell fracture hulls + debris + dust (Track-R; per-fragment exact Voronoi-cell hull via fhull::BuildCellHull settled through gjk::StepHullWorld GJK/EPA, gjk.h AS-IS -> shards rest FACE-flat + interlock; + severed-bond dust motes; strict-zero integer convex-hull wireframe; PURE CPU both backends, scene digest 0x2ebb8c28912b74ac)
+    @{ Name = 'fo1_impostor';     Flag = '--fo1-impostor' }        # FO1 deterministic foliage impostor addressing + cross-fade LOD (audit FO-B; octahedral cell select + Bayer dither cross-fade, digest 0x104198cb9fd5dfaf; GPU billboard render deferred to FO2)
     @{ Name = 'lod_gen';       Flag = '--lod-gen-shot' }     # LOD1 deterministic QEM auto-LOD (superiority S6; 3 LODs side-by-side, digests 0xeade209d8e61838f/0xbedec704837c71f4/0x1a9821628ab77e80)
     @{ Name = 'manylight';     Flag = '--manylight' }        # ML1 many-light SSBO path (superiority S7; 128 lights, assignDigest 0x42d5535632f152ea)
     @{ Name = 'hr1_hair';      Flag = '--hr1-hair-shot' }    # HR1 deterministic strand sim (superiority S2; stiffness fan, digest 0x4f241b7fbdadbadc)
