@@ -1727,6 +1727,24 @@ hf_add_pure_test(blend_space_test)
 # (hf_core), ASan-eligible. animation.h/skeleton.h/motion_match.h composed read-only (byte-untouched).
 hf_add_pure_test(retarget_test)
 
+# Slice SK1 — DETERMINISTIC SKELETAL-ANIMATION ASSET IMPORT (USD / UsdSkel; engine/asset/usd_skel.h,
+# hf::asset; the parity++ asset-import gap). gltf_loader.h ALREADY imports skin+skeleton+animation (device-
+# coupled via cgltf), but fbx_loader.h / usd_loader.h are GEOMETRY ONLY — SK1 adds a SECOND, DEVICE-FREE,
+# clean-room skeletal importer (USD, the cleanest text source after glTF) matching the usd_loader/fbx_loader
+# discipline: parse UsdSkel (Skeleton joints/bindTransforms/restTransforms, per-vertex primvars:skel:joint*,
+# SkelAnimation TRS timeSamples) into anim::Skeleton + scene::SkinnedVertex + anim::Animation, so an imported
+# rig is posed/skinned/retargeted by the EXISTING stack with ZERO new anim code. USD conventions handled:
+# matrix4d row-major/row-vector <-> engine column-major/column-vector CANCEL (straight m[k]=d[k] copy);
+# quat (w,x,y,z)->(x,y,z,w); joints topologically reordered (parent<child); weights truncated to top-4 +
+# renormalized. Pins: the skeleton hierarchy/names/rest-TRS/inverse-bind, the skin indices+weights + the >4
+# truncation, the clip channels + keyframe/interp sampling, a skinned-vertex pose round-trip, the AN2 self-
+# retarget compose, and the import + shot digests PINNED identical MSVC + clang (translation-only bind/rest
+# -> exactly-representable folds; standalone: clang++ -std=c++20 -I engine -I tests tests/usd_skel_test.cpp
+# engine/anim/animation.cpp). Pure C++ (hf_core), ASan-eligible. gltf_loader/skeleton.h/animation.h/
+# retarget.h/usd_loader.h composed read-only (byte-untouched). The asset is a hand-authored UsdSkel LITERAL
+# imported through the real parser (no .usd file on disk).
+hf_add_pure_test(usd_skel_test)
+
 # Slice FO1 (the BEACHHEAD of FLAGSHIP #25, DETERMINISTIC FOLIAGE AT SCALE): the deterministic integer WIND FIELD
 # (engine/foliage/foliage.h) — WindBend(wind,pos,frame) is a Q16.16 bend angle from a sum of host-baked sine "gust"
 # waves indexed by an integer phase accumulator into the committed kFoliageWind16 LUT (the audio kSineTable copied

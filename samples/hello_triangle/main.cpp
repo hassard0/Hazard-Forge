@@ -126,6 +126,7 @@
 #include "vfx/vfx_render.h"     // Slice VR1: VFX RENDERER VARIETY (TrailHistory/UpdateTrails/BuildRibbons + BuildBeam + BuildMeshInstances/OrientFromVelocity + BuildParticleLights/ParticleLightsToClustered + RunVfxShotScenario/RenderVfxShot — ribbon trails (per-slot ring buffer, seed-guarded slot reuse, monotonic age taper, SweepStrip winding) + pcg-jittered beams (jitter=0 == the exact straight strip; VISUAL-ONLY, no gameplay hit) + velocity-oriented mesh-emitter instances (SP1 integer half-angle yaw+pitch quaternions) + brightest-N particle lights feeding the EXISTING ML1 clustered assignment; the four Niagara renderer-variety generators as PURE Q16.16/integer functions of (pool, params, tick)) — a NEW additive sibling #including sim/particles.h + sim/particle_author.h + spline/spline.h + render/clustered.h + render/manylight.h read-only (ALL byte-untouched); the Vulkan --vr1-vfx-shot + Metal --vr1-vfx run the IDENTICAL pure-CPU PA1-fountain scenario + shared side-view raster (strict-zero cross-backend BY CONSTRUCTION; the ML1 assignDigest stat is the ONE float, pinned per-toolchain-family)
 #include "anim/blend_space.h"   // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Vulkan --an1-blend-shot + Metal --an1-blend run the IDENTICAL pure-CPU 240-tick scenario + shared raster
 #include "anim/retarget.h"      // Slice AN2: DETERMINISTIC ANIMATION RETARGETING (RetargetMap/BuildRetargetMap, Retarget, FxQuat algebra, ForwardKinematics, RunRetargetShotScenario/RenderRetargetShot — play one skeleton's clip on a DIFFERENTLY-PROPORTIONED skeleton via the bind-delta rotation retarget + root-motion height scale; INTEGER Q16.16 quats past the ONE QuantizeFx boundary; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + motion_match.h read-only; the Vulkan --an2-retarget-shot + Metal --an2-retarget run the IDENTICAL pure-CPU scenario + shared stick-figure raster (strict-zero cross-backend BY CONSTRUCTION)
+#include "asset/usd_skel_shot.h" // Slice SK1: DETERMINISTIC SKELETAL-ANIMATION ASSET IMPORT (USD/UsdSkel; ImportUsdSkel/UsdSkelImport/DigestUsdSkel/NormalizeInfluences + RunSk1ShotScenario/RenderSk1Shot) — a SECOND, DEVICE-FREE, clean-room skeletal importer (glTF already imports skeletal but is device-coupled; fbx/usd were geometry-only) parsing UsdSkel text -> anim::Skeleton + scene::SkinnedVertex + anim::Animation; a NEW additive sibling #including asset/usd_skel.h (usd_loader.h/skeleton.h/animation.h/scene/vertex.h read-only) + anim/retarget.h read-only for the shot; the Vulkan --sk1-import-shot + Metal --sk1-import run the IDENTICAL pure-CPU scenario (import -> SampleLocalPose -> QuantizePose -> integer FK) + shared stick-figure raster (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"          // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids, brute-force all-pairs Reynolds seek+separation) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot
 #include "sim/crowd.h"          // Slice CR1: DETERMINISTIC CROWD AT 10k+ AGENTS (Mass-class archetype crowd, hf::sim::crowd) — composes the byte-frozen BD2 boids.h grid for O(N) separation (vs BD1's all-pairs O(N²)), 3-archetype types + goal-seek + lockstep/rollback; RunCrowdShotScenario/RenderCrowdShot shared verbatim with the Metal --cr1-crowd; PURE CPU strict-integer, NO new shader
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
@@ -4419,6 +4420,19 @@ int main(int argc, char** argv) {
     const char* cr1CrowdShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--cr1-crowd-shot") == 0) { cr1CrowdShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice SK1: --sk1-import-shot <out.bmp> (DETERMINISTIC SKELETAL-ANIMATION ASSET IMPORT — USD/UsdSkel,
+    // hf::asset::ImportUsdSkel; the parity++ asset-import gap: glTF already imports skeletal but is device-
+    // coupled, fbx/usd were geometry-only, so SK1 is a SECOND, DEVICE-FREE, clean-room skeletal importer).
+    // PURE CPU: NO GPU dispatch, NO new shader, NO new RHI; both backends run the IDENTICAL usd_skel_shot.h
+    // scenario (import the authored 3-joint rig + 6-vertex skin + Z-bend clip, sample AT keyframes, snap to
+    // Q16.16 at the ONE boundary, integer forward-kinematics for the model-space joints, + a self-retarget
+    // through AN2) + the SHARED pure-integer overlaid stick-figure raster -> strict-zero cross-backend BY
+    // CONSTRUCTION. Its OWN loop (the standalone-loop pattern, C1061).
+    const char* sk1ImportShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--sk1-import-shot") == 0) { sk1ImportShotPath = argv[i + 1]; break; }
     }
 
     // Slice FF1: --ff1-fields-shot <out.bmp> (RIGID-BODY FORCE-FIELD VOLUMES — the PT2 particle field
@@ -60466,6 +60480,54 @@ int main(int argc, char** argv) {
         // forward-kinematics for the model-space joints) and the SHARED pure-integer side-by-side stick-
         // figure raster (SOURCE posed by the clip left, TARGET playing the retargeted motion right) ->
         // strict-zero cross-backend BY CONSTRUCTION. Asserts two-run identity + the pinned stat line.
+        // Slice SK1: --sk1-import-shot — DETERMINISTIC SKELETAL-ANIMATION ASSET IMPORT (USD/UsdSkel). The
+        // Vulkan sample and Metal-Mac run the IDENTICAL pure-CPU scenario (usd_skel_shot.h::RunSk1ShotScenario
+        // — import the hand-authored UsdSkel rig via the real device-free parser, then pose the imported
+        // skeleton by the imported clip at 3 keyframes through SampleLocalPose -> QuantizePose -> integer FK,
+        // plus a self-retarget through AN2) and the SHARED pure-integer overlaid stick-figure raster ->
+        // strict-zero cross-backend BY CONSTRUCTION. Asserts two-run identity + the pinned stat line.
+        if (sk1ImportShotPath) {
+            namespace sk1 = hf::asset::sk1;
+
+            const sk1::Sk1ShotRun run  = sk1::RunSk1ShotScenario();
+            const sk1::Sk1ShotRun run2 = sk1::RunSk1ShotScenario();
+
+            // PROOF (1) two-run IDENTICAL (import + integer pose + retarget-compose digests).
+            if (run.digest != run2.digest || run.importDigest != run2.importDigest ||
+                run.poseDigest != run2.poseDigest || run.retargetDigest != run2.retargetDigest) {
+                std::fprintf(stderr, "FATAL: sk1-import two runs differ (nondeterministic import/pose)\n");
+                device->WaitIdle(); return 1;
+            }
+            // PROOF (2) the import actually decoded a rig (not an empty stub).
+            if (!run.import.ok || run.bones != 3 || run.verts != 6 || run.clips != 1) {
+                std::fprintf(stderr, "FATAL: sk1-import decoded no rig {ok:%d bones:%d verts:%d clips:%d}\n",
+                             (int)run.import.ok, run.bones, run.verts, run.clips);
+                device->WaitIdle(); return 1;
+            }
+            // PROOF (3) the imported rig feeds AN2 bit-exact (self-retarget reproduces the imported pose).
+            if (run.poseDigest != run.retargetDigest) {
+                std::fprintf(stderr, "FATAL: sk1-import self-retarget diverged from imported pose\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("sk1-import: two-run IDENTICAL {import:%016llx, pose:%016llx, retarget:%016llx}\n",
+                        (unsigned long long)run.importDigest, (unsigned long long)run.poseDigest,
+                        (unsigned long long)run.retargetDigest);
+            std::printf("sk1-import: stats {bones:%d, verts:%d, clips:%d, keyframes:%d, frames:%d, "
+                        "digest:%016llx}\n",
+                        run.bones, run.verts, run.clips, run.keyframes, (int)run.frames.size(),
+                        (unsigned long long)run.digest);
+
+            std::vector<uint8_t> skImg; uint32_t skW = 0, skH = 0;
+            sk1::RenderSk1Shot(run, skImg, skW, skH);
+            bool ok = WriteBMP(sk1ImportShotPath, skImg, skW, skH);
+            if (ok) std::printf("wrote %s (%ux%u) — sk1 deterministic USD skeletal import (imported rig posed "
+                                "by the clip, %d bones / %d keyframes)\n",
+                                sk1ImportShotPath, skW, skH, run.bones, run.keyframes);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", sk1ImportShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
         if (an2RetargetShotPath) {
             namespace rtn = hf::anim::retarget;
 
