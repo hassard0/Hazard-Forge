@@ -2247,3 +2247,16 @@ hf_add_pure_test(vfx_render_test)
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)
 add_test(NAME rhi_smoke COMMAND rhi_smoke)
+
+# benchmarks/moat_proofs — the RUNNABLE "proofs UE5 structurally loses" binary (strategic-moat item #5,
+# docs/BEAT_UE5_PLAN.md Phase 3). A pure-CPU proof binary that COMPOSES the shipped determinism substrate
+# READ-ONLY (verdict / net session + authority_verify / replay fork / pcg) and asserts the six pinned
+# deterministic outcomes: cross-platform determinism, desync detection, provable anti-cheat, reproducible
+# counterfactual, reproducible procedural gen, and the inputs<<state bandwidth win. It is ALSO the ctest
+# (exits 0 iff all six proofs pass), so verify.ps1 runs it. Source lives in benchmarks/; it needs the
+# tests/ include dir for test_main.h. Pure C++ (hf_core), ASan-eligible like the other pure targets.
+add_executable(hf_moat_proofs ${CMAKE_CURRENT_SOURCE_DIR}/../benchmarks/moat_proofs.cpp)
+target_link_libraries(hf_moat_proofs PRIVATE hf_core)
+target_include_directories(hf_moat_proofs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+hf_apply_sanitizer(hf_moat_proofs)
+add_test(NAME hf_moat_proofs COMMAND hf_moat_proofs)
