@@ -119,6 +119,7 @@
 #include "game/ability.h"       // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Vulkan --gas1-duel-shot + Metal --gas1-duel run the IDENTICAL pure-CPU 60-tick duel
 #include "sim/water_body.h"     // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer, the render ocean and the physics ocean are the same equation) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Vulkan --wv1-float-shot + Metal --wv1-float run the IDENTICAL pure-CPU 480-tick float scenario + shared raster
 #include "spline/spline.h"      // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Vulkan --sp1-road-shot + Metal --sp1-road run the IDENTICAL pure-CPU scenario + shared top-down raster
+#include "sim/force_field.h"    // Slice FF1: RIGID-BODY FORCE-FIELD VOLUMES (FieldVolume/EvalFieldForce/ApplyFields/StepFieldWorld/SimFieldTick/RunFieldLockstep/RunFieldRollback/RunFieldShotScenario/RenderFieldShot — the PT2 particle field math (radial/vortex/wind, particles.h read-only) applied to fpx RIGID BODIES with bounded AABB volumes; velocities mutated pre-step (the WV1 discipline), dv = F*invMass*dt, LINEAR force only (no field torque — documented v1); PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/particles.h read-only; the Vulkan --ff1-fields-shot + Metal --ff1-fields run the IDENTICAL pure-CPU 240-tick scenario + shared top-down raster
 #include "anim/blend_space.h"   // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Vulkan --an1-blend-shot + Metal --an1-blend run the IDENTICAL pure-CPU 240-tick scenario + shared raster
 #include "sim/boids.h"          // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids, brute-force all-pairs Reynolds seek+separation) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
@@ -4366,6 +4367,17 @@ int main(int argc, char** argv) {
     const char* an1BlendShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--an1-blend-shot") == 0) { an1BlendShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice FF1: --ff1-fields-shot <out.bmp> (RIGID-BODY FORCE-FIELD VOLUMES — the PT2 particle field
+    // math (radial/vortex/wind) applied to fpx rigid bodies with bounded AABB volumes, hf::sim::ff;
+    // velocities mutated pre-step, the WV1 discipline). PURE CPU: NO GPU dispatch, NO new shader, NO new
+    // RHI; both backends run the IDENTICAL force_field.h fixed scenario (a radial burst ring + a vortex
+    // swirl + a wind lane pushing boxes, 12 bodies, 240 ticks) + the SHARED pure-integer top-down raster
+    // -> strict-zero cross-backend BY CONSTRUCTION. Its OWN loop (the standalone-loop pattern, C1061).
+    const char* ff1FieldsShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--ff1-fields-shot") == 0) { ff1FieldsShotPath = argv[i + 1]; break; }
     }
 
     // Slice GJ5: --gjk-lockstep-shot <out.bmp> (Deterministic General Convex-Hull Contacts LOCKSTEP + ROLLBACK
@@ -60342,6 +60354,86 @@ int main(int argc, char** argv) {
                                 "sweep + per-tick weight bars, %d ticks)\n",
                                 an1BlendShotPath, bsW, bsH, bsn::kShotSteps);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", an1BlendShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- RIGID-BODY FORCE-FIELD VOLUMES (--ff1-fields-shot <out.bmp>, Slice FF1, hf::sim::ff). PURE
+        // CPU — NO GPU dispatch, NO new shader, NO new RHI; both Vulkan-Windows and Metal-Mac run the
+        // IDENTICAL pure-CPU scenario (force_field.h::RunFieldShotScenario — a RADIAL BURST blasting a
+        // 6-ring outward + a VORTEX swirling 3 riders + a WIND LANE pushing 3 boxes across the
+        // frictionless floor, 12 bodies, 240 ticks, body trails) and the SHARED pure-integer top-down
+        // raster -> strict-zero cross-backend BY CONSTRUCTION. Asserts the 3 proofs (two-run
+        // byte-identical, lockstep peer re-derivation WITH mid-run volume-toggle commands, rollback
+        // correcting a mispredicted toggle via the bodies + ONE-BYTE-PER-VOLUME enabled-bits snapshot —
+        // volume geometry/config is authored and adds ZERO snapshot bytes).
+        if (ff1FieldsShotPath) {
+            namespace fld = hf::sim::ff;
+            namespace ffx = hf::sim::fpx;
+
+            // THE SCENARIO (== force_field_test): the FIXED 240-tick 3-volume/12-body run, run twice.
+            const fld::FieldShotRun ffRun  = fld::RunFieldShotScenario();
+            const fld::FieldShotRun ffRun2 = fld::RunFieldShotScenario();
+
+            // PROOF (1) two-run BYTE-IDENTICAL.
+            if (ffRun.digest != ffRun2.digest || ffRun.traceDigest != ffRun2.traceDigest) {
+                std::fprintf(stderr, "FATAL: ff1-fields two runs differ (nondeterministic force fields)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("ff1-fields: two-run BYTE-IDENTICAL {digest:%016llx, trace:%016llx}\n",
+                        (unsigned long long)ffRun.digest, (unsigned long long)ffRun.traceDigest);
+
+            // PROOF (2) lockstep: a peer fed ONLY the command stream (a wind toggle OFF/ON + an impulse)
+            // re-derives the fielded world bit-for-bit.
+            std::vector<fld::FfCommand> ffAuth;
+            ffAuth.push_back(fld::FfCommand{20u, fld::kFfCmdToggle, ffx::FxCommand{}, 2u, 0u});
+            ffAuth.push_back(fld::FfCommand{30u, fld::kFfCmdBody,
+                                            ffx::FxCommand{30u, ffx::kCmdImpulse, 9u,
+                                                           ffx::FxVec3{0, 0, fld::Snap(0.5)}}, 0u, 0u});
+            ffAuth.push_back(fld::FfCommand{51u, fld::kFfCmdToggle, ffx::FxCommand{}, 2u, 1u});
+            const std::vector<fld::FieldVolume> ffVols = fld::ShowcaseVolumes();
+            const ffx::FxWorld ffInit = fld::MakeFieldShotWorld();
+            const fld::fx ffDt = fld::kOne / 60;
+            const ffx::FxWorld ffAuthority = fld::RunFieldLockstep(ffVols, ffInit, ffAuth, 120, ffDt, 4);
+            const ffx::FxWorld ffReplica = fld::RunFieldLockstep(ffVols, ffInit, ffAuth, 120, ffDt, 4);
+            if (!fld::FfWorldsEqual(ffAuthority, ffReplica)) {
+                std::fprintf(stderr, "FATAL: ff1-fields lockstep peers diverged\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("ff1-fields: lockstep peer re-derives the fielded bodies bit-for-bit "
+                        "(toggles included) {identical:true}\n");
+
+            // PROOF (3) rollback corrects a GENUINELY-diverged mispredicted TOGGLE (the wrong volume) via
+            // the bodies + enabled-bits snapshot (one byte per volume — the config stays authored).
+            std::vector<fld::FfCommand> ffMis = ffAuth;
+            ffMis[2] = fld::FfCommand{51u, fld::kFfCmdToggle, ffx::FxCommand{}, 1u, 0u};
+            const ffx::FxWorld ffMisFull = fld::RunFieldLockstep(ffVols, ffInit, ffMis, 120, ffDt, 4);
+            const ffx::FxWorld ffCorrected =
+                fld::RunFieldRollback(ffVols, ffInit, ffAuth, ffMis, 120, 50, ffDt, 4);
+            const bool ffDiverged = !fld::FfWorldsEqual(ffMisFull, ffAuthority);
+            const bool ffOk = fld::FfWorldsEqual(ffCorrected, ffAuthority);
+            if (!ffDiverged || !ffOk) {
+                std::fprintf(stderr, "FATAL: ff1-fields rollback failed {diverged:%d, corrected:%d}\n",
+                             (int)ffDiverged, (int)ffOk);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("ff1-fields: rollback corrects a mispredicted toggle via the bodies + "
+                        "enabled-bits snapshot {diverged:true, corrected:true}\n");
+
+            std::printf("ff1-fields: stats {volumes:%u, bodies:%u, steps:%d, digest:%016llx}\n",
+                        (unsigned)ffRun.volumesUsed.size(), fld::kShotBodies, fld::kShotSteps,
+                        (unsigned long long)ffRun.digest);
+
+            // --- Golden: the SHARED pure-integer top-down raster (force_field.h::RenderFieldShot — the
+            // identical function both backends call; strict-zero BY CONSTRUCTION). ---
+            std::vector<uint8_t> ffImg;
+            uint32_t ffW = 0, ffH = 0;
+            fld::RenderFieldShot(ffRun, ffImg, ffW, ffH);
+            bool ok = WriteBMP(ff1FieldsShotPath, ffImg, ffW, ffH);
+            if (ok) std::printf("wrote %s (%ux%u) — ff1 rigid-body force-field volumes (radial burst + "
+                                "vortex swirl + wind lane, %d ticks)\n",
+                                ff1FieldsShotPath, ffW, ffH, fld::kShotSteps);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ff1FieldsShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

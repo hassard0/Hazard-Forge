@@ -1977,6 +1977,22 @@ hf_add_pure_test(ability_test)
 # integer sim, ASan-eligible; ZERO backend symbols.
 hf_add_pure_test(water_body_test)
 
+# Slice FF1 — RIGID-BODY FORCE-FIELD VOLUMES (engine/sim/force_field.h, hf::sim::ff): the PT2 particle
+# force-field math (radial/vortex/wind, particles.h read-only) applied to fpx RIGID BODIES with bounded
+# AABB volumes — velocities mutated pre-step (the WV1 discipline), dv = F*invMass*dt, LINEAR force only
+# (no field torque, documented v1 gap). Pins: TWIN FIDELITY (EvalFieldForce(kFalloffLinear) ==
+# particles::AccumulateForce BIT-EXACT over a grid — the twin can never drift from PT2), the ANALYTIC
+# radial-ring burst (axis-aligned ring displacements EXACTLY 32*N*(N+1), designed-exact constants), the
+# vortex orbit (exact first-tick tangential dv, orbit direction, outward-spiral honesty, pinned trajectory
+# digest), the BOUNDED wind lane (inside body pushed across the frictionless fpx floor — exact pinned
+# displacement, NO stick-slip because fpx ground contact has no friction; the OUTSIDE body BIT-EXACT vs a
+# no-field control), IDENTITY-AT-ZERO (no volumes / all-disabled -> RunFieldLockstep == fpx::RunLockstep
+# BIT-EXACT), the falloff exactness (inverse-square quarter-at-2x EXACT integers + the near-clamp
+# plateau), LOCKSTEP + ROLLBACK with mid-run TOGGLE commands (snapshot = bodies + ONE BYTE PER VOLUME; the
+# restore-without-bits control proves the enabled bits ARE state), and the pinned showcase scenario +
+# raster digests (MSVC == clang). Pure C++ (hf_core), pure integer, ASan-eligible; ZERO backend symbols.
+hf_add_pure_test(force_field_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)
