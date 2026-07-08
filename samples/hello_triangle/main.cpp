@@ -122,6 +122,7 @@
 #include "sim/hullfric.h"       // Slice HF1: hull friction + joints THE TAGGED FRICTION MANIFOLD ON THE EPA NORMAL (HullFrictionManifold/BuildHullFrictionManifold/CachedHullFrictionContact/MatchHullFrictionCache/UpdateHullFrictionCache/BuildAllHullFrictionManifoldsPairs/MeasureHullFriction — wraps the FROZEN warmhull keyed manifold + the fric::MakeTangentBasis integer tangent basis on the sign-corrected EPA normal + the basis-axis cache field; the friction BEACHHEAD of FLAGSHIP #30) — shared verbatim with hullfric_points.comp (int64, Vulkan-only, NOT in hf_gen_msl) + the Vulkan --hf1-points-shot; Metal --hf1-points runs the CPU path
 #include "sim/hulljoint.h"      // Slice HF4: hull friction + joints HULL JOINTS COMPOSED (JointedHullWorld/JointedHullStepConfig/StepJointedHullWorld(N)/MeasureJointedHull — the joint.h ball/angular-limit solvers composed with the HF3 hull friction contacts in ONE deterministic tick; a NEW additive header #including sim/hullfric.h + sim/joint.h read-only; the one-deterministic-step headline of FLAGSHIP #30) — shared verbatim with hulljoint_step.comp (int64, Vulkan-only, NOT in hf_gen_msl) + the Vulkan --hf4-joint-shot; Metal --hf4-joint runs the CPU path
 #include "game/verdict.h"       // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict — the pinned-identity deterministic entity world + the unified command bus generalizing convex::ConvexCommand; PURE CPU integer, the BEACHHEAD of FLAGSHIP #27) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Vulkan --vd1-world-shot + Metal --vd1-world run the IDENTICAL pure-CPU script
+#include "net/authority_verify.h" // Slice AC1: SERVER-AUTHORITATIVE RE-SIMULATION VERIFIER (provable anti-cheat, hf::net) — a server RE-SIMULATES a suspect client's input stream + compares per-tick DigestSnapshot to REJECT a faked outcome at the EXACT tick of divergence; composes verdict.h (RunVerdictLockstep/SimVerdictTick/DigestSnapshot) + session.h (NS5 DesyncDetector) READ-ONLY; the Vulkan --ac1-verify-shot + Metal --ac1-verify run the IDENTICAL pure-integer verification-report viz (RenderAc1VerifyViz). UE5 (float physics) STRUCTURALLY can't re-derive a client's outcomes bit-for-bit.
 #include "game/ability.h"       // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Vulkan --gas1-duel-shot + Metal --gas1-duel run the IDENTICAL pure-CPU 60-tick duel
 #include "game/gameplay_tags.h" // Slice GT1: A DETERMINISTIC GAMEPLAY-TAG LAYER (TagRegistry/TagContainer/HasTagQuery/TagRules/TryActivateTagged/StepTagged/RunTaggedLockstep/RunTaggedRollback/RunSkirmish — hierarchical interned tags gating GAS1 abilities/effects via a thin adapter; PURE CPU integer) — a NEW additive sibling #including game/ability.h READ-ONLY/BYTE-UNTOUCHED; the Vulkan --gt1-tags-shot + Metal --gt1-tags run the IDENTICAL pure-CPU 14-tick tag skirmish
 #include "game/gameplay_cues.h" // Slice GC1: DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES (sphere/box/cone overlap -> ascending-id target set + GT1 tag filter; a deterministic cue EVENT stream impact/buff/death; AreaActivate composes GAS1/GT1 via an adapter; RenderGc1CuesViz; PURE CPU integer geometry, cone half-angle a pinned host cos threshold — NO runtime trig) — a NEW additive sibling #including game/gameplay_tags.h READ-ONLY/BYTE-UNTOUCHED; the Vulkan --gc1-cues-shot + Metal --gc1-cues run the IDENTICAL pure-CPU cue battle (cues are the EVENT layer, NOT rendered VFX)
@@ -4129,6 +4130,18 @@ int main(int argc, char** argv) {
     const char* sq2CinematicShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--sq2-cinematic-shot") == 0) { sq2CinematicShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice AC1: --ac1-verify-shot <out.bmp> (SERVER-AUTHORITATIVE RE-SIMULATION VERIFIER — provable anti-cheat,
+    // engine/net/authority_verify.h, hf::net). PURE CPU: NO GPU dispatch, NO new shader, NO new RHI; both backends
+    // build the IDENTICAL canonical adversarial scenario (two clients — honest + cheater — submit input streams,
+    // the server RE-SIMULATES authoritatively + compares per-tick DigestSnapshot), then call the SAME
+    // RenderAc1VerifyViz (a verification-report: two lanes over ticks, green=match/red=divergence cells, a
+    // VERIFIED/REJECTED banner per client + a marker at the caught tick, a server digest strip) -> strict-zero
+    // cross-backend BY CONSTRUCTION. Its OWN parse loop (the standalone-loop C1061 pattern).
+    const char* ac1VerifyShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--ac1-verify-shot") == 0) { ac1VerifyShotPath = argv[i + 1]; break; }
     }
 
     // Slice WE1: --we1-clouddensity-shot <out.bmp> (Deterministic integer DRIFTING CLOUD-DENSITY field —
@@ -58932,6 +58945,66 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — we3 deterministic integer time-of-day (dayFrames=%u)\n",
                                 we3TodShotPath, kImg, kImg, wx::kDayFrames);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", we3TodShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        if (ac1VerifyShotPath) {
+            namespace acnet = hf::net;
+            // SERVER-AUTHORITATIVE RE-SIMULATION VERIFIER (Slice AC1). PURE CPU: the IDENTICAL
+            // RenderAc1VerifyViz the Metal --ac1-verify runs (a verification report over the canonical
+            // adversarial scenario) -> the pixels are bit-identical cross-backend BY CONSTRUCTION (strict
+            // zero-differing-pixel). NO shader added.
+            std::vector<uint8_t> img1, img2;
+            acnet::Ac1VizStats s1{}, s2{};
+            acnet::RenderAc1VerifyViz(img1, s1);
+            acnet::RenderAc1VerifyViz(img2, s2);
+            const bool twoRunIdentical = (img1.size() == img2.size()) &&
+                                         (std::memcmp(img1.data(), img2.data(), img1.size()) == 0) &&
+                                         (s1.pixDigest == s2.pixDigest);
+            if (!twoRunIdentical) {
+                std::fprintf(stderr, "FATAL: ac1-verify two runs differ\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // CORRECTNESS CONTROLS (match the Metal --ac1-verify side EXACTLY): re-run the verifier and assert
+            // the honest client VERIFIES and the cheater is caught at its exact impossible-outcome tick.
+            hf::game::verdict::VerdictWorld world0;
+            const acnet::Ac1Scenario sc = acnet::BuildAc1Scenario(world0);
+            const hf::game::verdict::VerdictSnapshot w0Snap = hf::game::verdict::SnapshotWorld(world0);
+            const acnet::VerifyResult honest =
+                acnet::Verify(w0Snap, sc.params, sc.honestInputs, sc.honestClaim, sc.ticks);
+            const acnet::VerifyResult cheater =
+                acnet::Verify(w0Snap, sc.params, sc.honestInputs, sc.cheaterClaim, sc.ticks);
+            const bool verdictOk = honest.ok && honest.firstDivergentTick == -1 &&
+                                   !cheater.ok && cheater.firstDivergentTick == (int)acnet::kAc1CheatTick &&
+                                   s1.honestVerdict && s1.cheaterCaughtTick == (int)acnet::kAc1CheatTick;
+            // Input commitment: a changed input flips the pin (the integrity control).
+            std::vector<hf::game::verdict::Command> changed = sc.honestInputs;
+            if (!changed.empty()) changed[0].arg.x = (hf::game::verdict::fx)((int64_t)changed[0].arg.x + (int64_t)hf::game::verdict::kOne);
+            const bool commitOk = (acnet::CommitInputStream(sc.honestInputs) == sc.inputCommitment) &&
+                                  (acnet::CommitInputStream(changed) != sc.inputCommitment);
+            if (!verdictOk || !commitOk) {
+                std::fprintf(stderr, "FATAL: ac1-verify verdict/commitment control failed\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // PROOF lines (match the Metal --ac1-verify side EXACTLY).
+            std::printf("ac1-verify: server RE-SIMULATES the client input stream + compares per-tick DigestSnapshot\n");
+            std::printf("ac1-verify: HONEST client VERIFIED {firstDivergentTick:%d}\n", honest.firstDivergentTick);
+            std::printf("ac1-verify: CHEATER client REJECTED @ tick %d {server:%s != client:%s}\n",
+                        cheater.firstDivergentTick, cheater.serverDigest.c_str(), cheater.clientDigest.c_str());
+            std::printf("ac1-verify: input-stream commitment {commit:%s} (a changed input flips it)\n",
+                        sc.inputCommitment.c_str());
+            std::printf("ac1-verify: two-run BYTE-IDENTICAL {pixDigest:0x%016llx}\n",
+                        (unsigned long long)s1.pixDigest);
+            std::printf("ac1-verify: {ticks:%u, clients:%u, honestVerdict:%s, cheaterCaughtTick:%d}\n",
+                        s1.ticks, s1.clients, s1.honestVerdict ? "VERIFIED" : "REJECTED", s1.cheaterCaughtTick);
+
+            bool ok = WriteBMP(ac1VerifyShotPath, img1, s1.width, s1.height);
+            if (ok) std::printf("wrote %s (%ux%u) — ac1 provable anti-cheat verification report (honest VERIFIED, cheater REJECTED @ %d)\n",
+                                ac1VerifyShotPath, s1.width, s1.height, s1.cheaterCaughtTick);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ac1VerifyShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

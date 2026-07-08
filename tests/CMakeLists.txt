@@ -1475,6 +1475,20 @@ hf_add_pure_test(hulljoint_render_test)
 # spawn/despawn/command script (the 4 spec proof lines). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(verdict_test)
 
+# Slice AC1 — SERVER-AUTHORITATIVE RE-SIMULATION VERIFIER (provable anti-cheat, engine/net/authority_verify.h,
+# hf::net). Because the whole HF sim is bit-exact deterministic (VD1-VD6 whole-world lockstep from an input
+# stream ALONE), a server can INGEST a suspect client's inputs, RE-SIMULATE authoritatively, and PROVE via a
+# per-tick DigestSnapshot comparison whether the client faked its outcomes — rejecting the diverging peer at the
+# EXACT tick of divergence (a category UE5's float Chaos/Mass is structurally disqualified from). authority_verify.h
+# composes verdict.h (RunVerdictLockstep/SimVerdictTick/DigestSnapshot) + session.h (the NS5 DesyncDetector
+# located-divergence machinery) READ-ONLY; it adds NO field, edits NO frozen function. Pins: an HONEST claim
+# verifies (firstDivergentTick == -1); a single-tick tampered claim is caught at EXACTLY that tick (server's true
+# digest pinned); the divergence is CAUSAL (ticks < T match); the input-stream commitment pins + a changed input
+# flips it; two verifier runs are byte-identical (reproducible fairness); a multi-client honest+cheater scenario
+# verifies the honest one + catches the cheater's impossible-outcome tick; an empty/zero-tick stream verifies
+# trivially + an under-claim is rejected. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(authority_verify_test)
+
 # Deterministic AI Slice 1 (Slice AI1, the BEACHHEAD of the DETERMINISTIC AI flagship, issue #28, hf::ai):
 # the integer BLACKBOARD + the FLAT decision-tree node graph + the deterministic TICK. Asserts: TickTree
 # two-run determinism (same tree+blackboard -> same Status + same DigestBlackboard); selector returns the
