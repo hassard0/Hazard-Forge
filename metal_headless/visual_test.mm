@@ -112,6 +112,7 @@
 #include "pcg/pcg.h"                // Slice PCG1: deterministic PCG seeded hash-PRNG primitive (PcgHash/PcgRand01/PcgRandRange/PcgUnitDir/PcgStream) Q16.16 pure-int32 — reuses particles.h ParticleHash + EmitDir; the Metal --pcg1-hash runs the IDENTICAL pure-integer point-plot the Vulkan --pcg1-hash-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "wfc/wfc_render.h"          // Slice WFC-S6: WFC LIT 3D render bridge (WfcToRenderInstances / WfcRenderStyle / TileOf / WfcTileKinds) — the ONE float crossing of FLAGSHIP #29; the Metal --wfc6-render runs the IDENTICAL tileset/seed/grid/style/camera the Vulkan --wfc6-render-shot runs (instance set byte-identical BY CONSTRUCTION)
 #include "econ/econ_render.h"        // Slice ECON-S6: ECON LIT 3D render bridge (EconToRenderInstances / EconRenderStyle / EconBarItems) — the ONE float crossing of FLAGSHIP #30; the Metal --econ6-render runs the IDENTICAL showcase state/script/style/camera the Vulkan --econ6-render-shot runs (instance set byte-identical BY CONSTRUCTION)
+#include "seq/seq_tracks.h"          // Slice SQ2: DETERMINISTIC SEQUENCER SEMANTIC TRACK TYPES (camera-cut/audio/material/sub-sequence) composing seq.h read-only; the Metal --sq2-cinematic runs the IDENTICAL pure-integer RenderSq2CinematicViz the Vulkan --sq2-cinematic-shot runs (strict-zero cross-backend BY CONSTRUCTION, NO shader)
 #include "seq/seq_render.h"          // Slice SEQ-S6: SEQ LIT 3D render bridge (SeqTransformToMat4 / SeqToRenderInstances / MakeCutsceneTrail) — the ONE float crossing of FLAGSHIP #25; the Metal --seq-render runs the IDENTICAL MakeCutsceneTrail + SeqToRenderInstances + camera the Vulkan --seq-render-shot runs (the motion trail byte-identical BY CONSTRUCTION). seq.h stays the <cmath>-free bit-exact header.
 #include "foliage/foliage.h"        // Slice FO1 (FLAGSHIP #25 beachhead): deterministic integer WIND FIELD (kFoliageWind16 LUT / Gust / WindField / WindBend) Q16.16 — the audio kSineTable copied verbatim, NO runtime sin; the Metal --fo1-wind runs the IDENTICAL pure-integer wind heatmap the Vulkan --fo1-wind-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "terrain/procterrain.h"    // Slice PT1 (FLAGSHIP #26 beachhead): deterministic integer fBm HEIGHTFIELD (IntHashLattice/IntValueNoise/IntHeight/GenHeightField) Q16.16 — the strict-integer twin of the FLOAT terrain::Height, NO runtime sin/sqrt/floor; the Metal --pt1-height runs the IDENTICAL pure-integer grayscale heightmap the Vulkan --pt1-height-shot runs (strict-zero cross-backend BY CONSTRUCTION)
@@ -46909,6 +46910,51 @@ static int RunPcg1HashShowcase(const char* outPath) {
 // sensitivity, the zero-octaves flat no-op, provenance) match the Vulkan side EXACTLY. The fixed SEED/OCT/WORLD/IMG
 // MUST be IDENTICAL to the Vulkan --pt1-height-shot. New golden tests/golden/metal/pt1_height.png (baked on the
 // Mac by the controller); two runs DIFF 0.0000.
+// ===== Slice SQ2 — DETERMINISTIC SEQUENCER SEMANTIC TRACK TYPES showcase (--sq2-cinematic) (next-tier parity gap #6,
+// engine/seq/seq_tracks.h composing seq.h READ-ONLY). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
+// seq_tracks.h is header-only pure-integer Q16.16 (camera-cut ActiveCamera / audio SampleAudioCues half-open windows /
+// material SampleMaterialParam / sub-sequence recursive EvalTimeline + SeekCine==PlayCine scrub), so on Metal it
+// evaluates the IDENTICAL cinematic the Vulkan --sq2-cinematic-shot evaluates on Windows and calls the SAME
+// RenderSq2CinematicViz -> the multi-track timeline-editor strip is bit-identical cross-backend BY CONSTRUCTION
+// (strict zero-differing-pixel). The proof lines (two-run identical, scrub-equality, camera cut, depth-2) match the
+// Vulkan side EXACTLY. New golden tests/golden/metal/sq2_cinematic.png (baked on the Mac by the controller).
+static int RunSq2CinematicShowcase(const char* outPath) {
+    namespace sq = hf::seq;
+    std::vector<uint8_t> img1, img2;
+    sq::Sq2VizStats s1{}, s2{};
+    sq::RenderSq2CinematicViz(img1, s1);
+    sq::RenderSq2CinematicViz(img2, s2);
+    const bool twoRunIdentical = (img1.size() == img2.size()) &&
+                                 (std::memcmp(img1.data(), img2.data(), img1.size()) == 0) &&
+                                 (s1.pixDigest == s2.pixDigest);
+    if (!twoRunIdentical) return fail("sq2-cinematic: two runs differ");
+
+    const sq::Timeline cine = sq::MakeSq2Cinematic();
+    const uint64_t play = sq::DigestCine(sq::PlayCine(cine, sq::kSq2Dt, sq::kSq2ScrubTick));
+    const uint64_t seek = sq::DigestCine(sq::SeekCine(cine, sq::kSq2Dt, sq::kSq2ScrubTick));
+    const bool scrubExact = (play == seek);
+    const bool camCut = (sq::ActiveCamera(cine.camera, sq::kOne, cine.defaultCamera) == 0) &&
+                        (sq::ActiveCamera(cine.camera, 2 * sq::kOne, cine.defaultCamera) == 1);
+    const bool depth2 = (sq::SubDepth(cine) == 2);
+    if (!scrubExact || !camCut || !depth2)
+        return fail("sq2-cinematic: scrub-equality / camera-cut / depth-2 control failed");
+
+    std::printf("sq2-cinematic: semantic sequencer tracks (tracks=%u, cuts=%u, cues=%u, subDepth=%d, ticks=%u)\n",
+                s1.tracks, s1.cuts, s1.cues, s1.subDepth, s1.ticks);
+    std::printf("sq2-cinematic: two-run BYTE-IDENTICAL {pixDigest:0x%016llx}\n",
+                (unsigned long long)s1.pixDigest);
+    std::printf("sq2-cinematic: SeekCine(N) == PlayCine to N {play:0x%016llx, seek:0x%016llx} EQUAL\n",
+                (unsigned long long)play, (unsigned long long)seek);
+    std::printf("sq2-cinematic: camera cut -> shot A cam0 / shot B cam1 {ok:true}\n");
+    std::printf("sq2-cinematic: sub-sequence depth {subDepth:%d}\n", s1.subDepth);
+    std::printf("sq2-cinematic: provenance {evalDigest:0x%016llx}\n", (unsigned long long)s1.evalDigest);
+
+    if (!WritePNG(outPath, img1, s1.width, s1.height)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — sq2 deterministic sequencer semantic-track cinematic (tracks=%u, subDepth=%d)\n",
+                outPath, s1.width, s1.height, s1.tracks, s1.subDepth);
+    return 0;
+}
+
 // ===== Slice WE1 — Deterministic integer DRIFTING CLOUD-DENSITY showcase (--we1-clouddensity) (the BEACHHEAD of
 // FLAGSHIP #27, DETERMINISTIC DYNAMIC WEATHER, hf::weather). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
 // weather.h is header-only pure-integer math (IntCloudDensity/GenCloudSlice, a drifted integer fBm value-noise over
@@ -82676,6 +82722,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--pt1-height") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_pt1_height.png";
             try { return RunPt1HeightShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --sq2-cinematic <out.png>: render the DETERMINISTIC SEQUENCER SEMANTIC TRACK TYPES showcase (Slice SQ2,
+        // next-tier parity gap #6). PURE CPU — runs the IDENTICAL seq_tracks.h RenderSq2CinematicViz the Vulkan
+        // --sq2-cinematic-shot runs (a multi-track cinematic-timeline editor strip over MakeSq2Cinematic(), pure
+        // integer pixel writes) -> the pixels are bit-identical cross-backend BY CONSTRUCTION; the proof lines match
+        // the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--sq2-cinematic") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_sq2_cinematic.png";
+            try { return RunSq2CinematicShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --we1-clouddensity <out.png>: render the Deterministic integer DRIFTING CLOUD-DENSITY showcase (Slice WE1,

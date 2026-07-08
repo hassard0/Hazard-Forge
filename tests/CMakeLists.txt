@@ -224,6 +224,16 @@ hf_add_pure_test(seq_test)
 # digest deterministically. The golden is the pinned hash IN the test (NO image, NO render-bake). Pure CPU
 # (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(seq_editor_test)
+# Slice SQ2 — DETERMINISTIC SEQUENCER SEMANTIC TRACK TYPES (engine/seq/seq_tracks.h, next-tier parity gap
+# #6). A NEW header COMPOSING seq.h READ-ONLY (seq.h byte-untouched): camera-cut tracks (piecewise-constant
+# ActiveCamera), audio tracks (half-open one-shot cues, the seq.h SampleEvents convention), material/param
+# tracks (seq.h ScalarTrack + easing), and sub-sequence NESTING (recursive Timeline eval, playRate + clamp
+# convention, depth>=2). Pure-CPU strict-integer Q16.16, NO <cmath>/float/shader. The load-bearing claim:
+# SeekCine(N) == PlayCine to N (the deterministic scrub — state AND fired-cue trace) UE5's float playback
+# cannot hold. Also demonstrates AU2 composition (a fired cue retriggers an audio_graph envelope). Asserts
+# the camera/audio/material/subseq pins + the scrub equality + pinned cross-platform digests (evalDigest /
+# cineDigest / viz pixDigest) IN the test (NO image / render-bake). Pure CPU (hf_core), ASan-eligible.
+hf_add_pure_test(seq_tracks_test)
 # UMG-Designer WIDGET-TREE EDITOR view + edit data models (engine/editor/widget_editor_data.h +
 # engine/editor/widget_edit_ops.h, issue #30 — the GUI half of the UMG-class UI framework). Pure CPU
 # (hf_core) over the deterministic UI runtime (engine/ui/widget.h): BuildWidgetEditorView computes the

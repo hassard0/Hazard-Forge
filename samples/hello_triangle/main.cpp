@@ -91,6 +91,7 @@
 #include "wfc/wfc_render.h"     // Slice WFC-S6: WFC LIT 3D render bridge (WfcToRenderInstances / WfcRenderStyle / TileOf / WfcTileKinds) — the ONE float crossing of FLAGSHIP #29; turns a collapsed integer tilemap (wfc::Generate, bit-exact) into per-tile cube transforms for the --wfc6-render-shot money-shot. wfc.h stays self-contained.
 #include "econ/econ_render.h"    // Slice ECON-S6: ECON LIT 3D render bridge (EconToRenderInstances / EconRenderStyle / EconBarItems) — the ONE float crossing of FLAGSHIP #30; turns the bit-exact integer ledger (econ::EconState after the fixed showcase script) into per-(entity,item) bar transforms for the --econ6-render-shot economy-skyline money-shot. econ.h stays self-contained.
 #include "ui/widget_render.h"    // Slice WIDGET-S6: UI labeled-layout render bridge (WidgetTreeToLabels / DigestLabels / kLabelInset) — the ONE float crossing of FLAGSHIP #30's UI (the showcase's LayoutText NDC convert); turns the bit-exact integer S2 layout (widget.h SolveLayout) into per-widget text labels at their computed pixel Rect origins for the --ui-shot money-shot. widget.h stays self-contained.
+#include "seq/seq_tracks.h"      // Slice SQ2: DETERMINISTIC SEQUENCER SEMANTIC TRACK TYPES (camera-cut/audio/material/sub-sequence) composing seq.h read-only; the pure-integer --sq2-cinematic-shot timeline-editor viz (strict-zero cross-backend, NO shader)
 #include "seq/seq_render.h"      // Slice SEQ-S6: SEQ LIT 3D render bridge (SeqTransformToMat4 / SeqToRenderInstances / MakeCutsceneTrail) — the ONE float crossing of FLAGSHIP #25 (the deterministic cinematic sequencer); turns the bit-exact Q16.16 transform timeline (seq::SampleTransform along a FIXED cutscene TransformTrack) into a ghosted motion-trail of cube transforms for the --seq-render-shot money-shot. seq.h stays the <cmath>-free bit-exact header.
 #include "foliage/foliage.h"    // Slice FO1 (FLAGSHIP #25 beachhead): deterministic integer WIND FIELD (kFoliageWind16 LUT / Gust / WindField / WindBend) Q16.16 — the audio kSineTable copied verbatim, NO runtime sin; the Vulkan --fo1-wind-shot pure-integer wind heatmap (strict-zero cross-backend)
 #include "terrain/procterrain.h" // Slice PT1 (FLAGSHIP #26 beachhead): deterministic integer fBm HEIGHTFIELD (IntHashLattice/IntValueNoise/IntHeight/GenHeightField) Q16.16 — the strict-integer twin of the FLOAT terrain::Height, NO runtime sin/sqrt/floor; the Vulkan --pt1-height-shot pure-integer grayscale heightmap (strict-zero cross-backend)
@@ -4104,6 +4105,17 @@ int main(int argc, char** argv) {
     const char* pt1HeightShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--pt1-height-shot") == 0) { pt1HeightShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice SQ2: --sq2-cinematic-shot <out.bmp> (DETERMINISTIC SEQUENCER SEMANTIC TRACK TYPES — camera-cut
+    // + audio + material/param + sub-sequence, engine/seq/seq_tracks.h composing seq.h READ-ONLY). PURE CPU:
+    // NO GPU dispatch, NO new shader, NO new RHI; both backends call the IDENTICAL pure-integer
+    // RenderSq2CinematicViz (a multi-track timeline-editor strip: camera-cut colored blocks, audio cue
+    // markers, the material value curve, the nested sub-sequence bar, a playhead + a camera "viewport" cell)
+    // -> strict-zero cross-backend BY CONSTRUCTION. Its OWN parse loop (the standalone-loop C1061 pattern).
+    const char* sq2CinematicShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--sq2-cinematic-shot") == 0) { sq2CinematicShotPath = argv[i + 1]; break; }
     }
 
     // Slice WE1: --we1-clouddensity-shot <out.bmp> (Deterministic integer DRIFTING CLOUD-DENSITY field —
@@ -58656,6 +58668,59 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — we3 deterministic integer time-of-day (dayFrames=%u)\n",
                                 we3TodShotPath, kImg, kImg, wx::kDayFrames);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", we3TodShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        if (sq2CinematicShotPath) {
+            namespace sq = hf::seq;
+            // DETERMINISTIC SEQUENCER SEMANTIC TRACK TYPES (Slice SQ2). PURE CPU: the IDENTICAL
+            // RenderSq2CinematicViz the Metal --sq2-cinematic runs (a multi-track cinematic-timeline
+            // editor strip over MakeSq2Cinematic()) -> the pixels are bit-identical cross-backend BY
+            // CONSTRUCTION (strict zero-differing-pixel). NO shader added.
+            std::vector<uint8_t> img1, img2;
+            sq::Sq2VizStats s1{}, s2{};
+            sq::RenderSq2CinematicViz(img1, s1);
+            sq::RenderSq2CinematicViz(img2, s2);
+            const bool twoRunIdentical = (img1.size() == img2.size()) &&
+                                         (std::memcmp(img1.data(), img2.data(), img1.size()) == 0) &&
+                                         (s1.pixDigest == s2.pixDigest);
+            if (!twoRunIdentical) {
+                std::fprintf(stderr, "FATAL: sq2-cinematic two runs differ\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // CORRECTNESS CONTROLS (match the Metal --sq2-cinematic side EXACTLY):
+            const sq::Timeline cine = sq::MakeSq2Cinematic();
+            // (1) scrub == play: seeking to the scrub tick is bit-identical to playing to it.
+            const uint64_t play = sq::DigestCine(sq::PlayCine(cine, sq::kSq2Dt, sq::kSq2ScrubTick));
+            const uint64_t seek = sq::DigestCine(sq::SeekCine(cine, sq::kSq2Dt, sq::kSq2ScrubTick));
+            const bool scrubExact = (play == seek);
+            // (2) camera cut: shot A cam0, shot B cam1 across the 2s cut.
+            const bool camCut = (sq::ActiveCamera(cine.camera, sq::kOne, cine.defaultCamera) == 0) &&
+                                (sq::ActiveCamera(cine.camera, 2 * sq::kOne, cine.defaultCamera) == 1);
+            // (3) sub-sequence nests to depth 2.
+            const bool depth2 = (sq::SubDepth(cine) == 2);
+            if (!scrubExact || !camCut || !depth2) {
+                std::fprintf(stderr, "FATAL: sq2-cinematic scrub-equality / camera-cut / depth-2 control failed\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // PROOF lines (match the Metal --sq2-cinematic side EXACTLY).
+            std::printf("sq2-cinematic: semantic sequencer tracks (tracks=%u, cuts=%u, cues=%u, subDepth=%d, ticks=%u)\n",
+                        s1.tracks, s1.cuts, s1.cues, s1.subDepth, s1.ticks);
+            std::printf("sq2-cinematic: two-run BYTE-IDENTICAL {pixDigest:0x%016llx}\n",
+                        (unsigned long long)s1.pixDigest);
+            std::printf("sq2-cinematic: SeekCine(N) == PlayCine to N {play:0x%016llx, seek:0x%016llx} EQUAL\n",
+                        (unsigned long long)play, (unsigned long long)seek);
+            std::printf("sq2-cinematic: camera cut -> shot A cam0 / shot B cam1 {ok:true}\n");
+            std::printf("sq2-cinematic: sub-sequence depth {subDepth:%d}\n", s1.subDepth);
+            std::printf("sq2-cinematic: provenance {evalDigest:0x%016llx}\n", (unsigned long long)s1.evalDigest);
+
+            bool ok = WriteBMP(sq2CinematicShotPath, img1, s1.width, s1.height);
+            if (ok) std::printf("wrote %s (%ux%u) — sq2 deterministic sequencer semantic-track cinematic (tracks=%u, subDepth=%d)\n",
+                                sq2CinematicShotPath, s1.width, s1.height, s1.tracks, s1.subDepth);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", sq2CinematicShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
