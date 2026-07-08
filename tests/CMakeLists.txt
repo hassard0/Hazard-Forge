@@ -1650,6 +1650,31 @@ hf_add_pure_test(pcg_test)
 # Pure C++ (hf_core), ASan-eligible. pcg.h/seq.h/fpx.h composed read-only (byte-untouched).
 hf_add_pure_test(spline_test)
 
+# Slice AN1 — DETERMINISTIC BLEND SPACES (engine/anim/blend_space.h, hf::anim::bs; parity++ audit item
+# #4 / the long-open gap-roadmap AN1 row): 1D + 2D parameter-driven animation blending — the
+# "idle/walk/run by speed" and "strafe by speed x direction" locomotion primitive UE5 authors as Blend
+# Spaces, made deterministic. INTEGER parameters/weights (Q16.16): the 1D bracketing search + exact
+# lerp factor, the 2D FIXED AUTHORED triangulation (Delaunay is float-hostile — authored tris are the
+# honest v1) with boundary-inclusive int64 orientation containment (first-tri-wins tie-break) + int64
+# Cramer barycentrics (w2 = the exact residual, the sum is kOne EXACTLY) + the nearest-edge/vertex
+# outside-hull clamp, tick-based parameter SLEW (rate/tick, 0 = instant — replayable, not wall-clock),
+# and NORMALIZED-PHASE time sync (each clip sampled at phase*duration_i — the foot-plant alignment
+# rule naive same-absolute-time blending breaks; the test pins BOTH values to prove the distinction:
+# phase-synced blended foot z == +24576, naive == 0 — the swing cancels, sliding feet). The pose math
+# REUSES animation.h's SampleLocalPose + BlendLocalPoses (the existing 2-pose seam; 3-way = the pinned
+# LEFT-FOLD nested composition — nlerp is non-associative, the ORDER is the contract, not exactness);
+# w == 0/kOne take the DIRECT sample path so identity-at-sample/vertex is FIELD-EXACT. Pins: the 1D
+# weight conventions + midway 50/50 (hand-derived quantized components + digest), the exact centroid
+# thirds {21845,21845,21846} + the hand-derived left-fold pose (32768.25 -> llround 32768), edge/clamp/
+# tie-break conventions, the exact slew ramp + instant identity + phase wrap, the FSM BlendDriver1D
+# adapter (the bound StateMachine float param through the ONE QuantizeFx boundary), and the shot
+# scenario digests PINNED identical MSVC + clang (exact binary-fraction fixtures, translation-only
+# rotations — the MM1 discipline; standalone: clang++ -std=c++20 -I engine -I tests
+# tests/blend_space_test.cpp engine/anim/animation.cpp engine/anim/state_machine.cpp). Pure C++
+# (hf_core), ASan-eligible. animation.h/skeleton.h/state_machine.h/motion_match.h composed read-only
+# (byte-untouched).
+hf_add_pure_test(blend_space_test)
+
 # Slice FO1 (the BEACHHEAD of FLAGSHIP #25, DETERMINISTIC FOLIAGE AT SCALE): the deterministic integer WIND FIELD
 # (engine/foliage/foliage.h) — WindBend(wind,pos,frame) is a Q16.16 bend angle from a sum of host-baked sine "gust"
 # waves indexed by an integer phase accumulator into the committed kFoliageWind16 LUT (the audio kSineTable copied

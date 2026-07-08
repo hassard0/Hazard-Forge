@@ -145,6 +145,7 @@
 #include "ai/ai.h"                   // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Metal --ai1-tree runs the IDENTICAL pure-CPU tick + 2D node-graph viz the Vulkan --ai1-tree-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/water_body.h"          // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Metal --wv1-float runs the IDENTICAL pure-CPU 480-tick scenario + SHARED raster the Vulkan --wv1-float-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "spline/spline.h"           // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Metal --sp1-road runs the IDENTICAL pure-CPU scenario + SHARED top-down raster the Vulkan --sp1-road-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "anim/blend_space.h"        // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Metal --an1-blend runs the IDENTICAL pure-CPU 240-tick scenario + SHARED raster the Vulkan --an1-blend-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
@@ -48735,6 +48736,71 @@ static int RunSp1RoadShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice AN1 — DETERMINISTIC BLEND SPACES showcase (--an1-blend) (1D + 2D parameter-driven animation
+// blending — integer params/weights/point-in-triangle/barycentric + tick-based slew + normalized-phase clip
+// sync over the EXISTING animation.h blend seam; hf::anim::bs). PURE CPU — NO GPU compute, NO new shader, NO
+// new RHI; blend_space.h is header-only, so on Metal it runs the IDENTICAL fixed scenario the Vulkan
+// --an1-blend-shot runs on Windows (blend_space.h::RunBlendShotScenario — the 240-tick slewed parameter sweep
+// through the 5-sample/4-triangle locomotion diamond, incl. the deliberate below-hull leg exercising the
+// nearest-edge clamp) AND the SHARED pure-integer raster (blend_space.h::RenderBlendShot — the identical
+// function both backends call) -> bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel).
+// The proof lines match the Vulkan side EXACTLY. New golden tests/golden/metal/an1_blend.png (baked on the
+// Mac by the controller); two runs DIFF 0.0000.
+static int RunAn1BlendShowcase(const char* outPath) {
+    namespace bsn = hf::anim::bs;
+
+    // THE SCENARIO (== blend_space_test): the FIXED 240-tick parameter sweep, run twice.
+    const bsn::BlendShotRun bsRun  = bsn::RunBlendShotScenario();
+    const bsn::BlendShotRun bsRun2 = bsn::RunBlendShotScenario();
+
+    // PROOF (1) two-run IDENTICAL (integer weights + quantized pose probes).
+    if (bsRun.pathDigest != bsRun2.pathDigest || bsRun.weightsDigest != bsRun2.weightsDigest ||
+        bsRun.poseDigest != bsRun2.poseDigest || bsRun.digest != bsRun2.digest)
+        return fail("an1-blend: two runs differ (nondeterministic blend space)");
+    std::printf("an1-blend: two-run IDENTICAL {path:%016llx, weights:%016llx, pose:%016llx}\n",
+                (unsigned long long)bsRun.pathDigest, (unsigned long long)bsRun.weightsDigest,
+                (unsigned long long)bsRun.poseDigest);
+
+    // PROOF (2) identity-at-vertex, live: the parameter AT each sample point yields weight kOne on
+    // that sample (the direct-sample path — no float blend).
+    bool vertexIdentity = true;
+    for (size_t vi = 0; vi < bsRun.space.samples.size(); ++vi) {
+        const bsn::Weights2D vw = bsn::EvaluateWeights2D(
+            bsRun.space, bsRun.space.samples[vi].x, bsRun.space.samples[vi].y);
+        const bool hit = (vw.i0 == (int32_t)vi && vw.w0 == bsn::kOne) ||
+                         (vw.i1 == (int32_t)vi && vw.w1 == bsn::kOne) ||
+                         (vw.i2 == (int32_t)vi && vw.w2 == bsn::kOne);
+        if (!hit || vw.clamped) vertexIdentity = false;
+    }
+    if (!vertexIdentity) return fail("an1-blend: identity-at-vertex broke");
+    std::printf("an1-blend: identity-at-vertex EXACT (weight kOne at every sample point, "
+                "direct-sample path)\n");
+
+    // PROOF (3) the below-hull leg really clamps to the nearest edge (the pinned convention).
+    int bsClamped = 0;
+    for (const bsn::BlendShotStep& st : bsRun.steps) bsClamped += st.clamped;
+    if (bsClamped <= 0 || bsRun.steps.back().clamped != 1)
+        return fail("an1-blend: below-hull clamp leg did not clamp");
+    std::printf("an1-blend: below-hull leg clamps to the nearest edge {clampedTicks:%d}\n", bsClamped);
+
+    std::printf("an1-blend: stats {samples:%u, tris:%u, steps:%d, pathDigest:%016llx, "
+                "weightsDigest:%016llx}\n",
+                (unsigned)bsRun.space.samples.size(), (unsigned)bsRun.space.tris.size(),
+                bsn::kShotSteps, (unsigned long long)bsRun.pathDigest,
+                (unsigned long long)bsRun.weightsDigest);
+
+    // --- Golden: the SHARED pure-integer raster (blend_space.h::RenderBlendShot — the identical
+    // function the Vulkan --an1-blend-shot calls; strict-zero BY CONSTRUCTION). ---
+    std::vector<uint8_t> bsImg;
+    uint32_t bsW = 0, bsH = 0;
+    bsn::RenderBlendShot(bsRun, bsImg, bsW, bsH);
+    if (!WritePNG(outPath, bsImg, bsW, bsH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — an1 deterministic blend space (locomotion diamond sweep + "
+                "per-tick weight bars, %d ticks)\n",
+                outPath, bsW, bsH, bsn::kShotSteps);
+    return 0;
+}
+
 // ===== Slice GAS1 — A DETERMINISTIC GAMEPLAY ABILITY SYSTEM showcase (--gas1-duel) (attributes + effects +
 // cooldowns, the GAS-class core, hf::game::gas). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
 // ability.h is header-only Q16.16 integer math, so on Metal it runs the IDENTICAL pure-CPU 60-tick duel the
@@ -81782,6 +81848,17 @@ int main(int argc, char** argv) {
                          std::strcmp(argv[1], "--sp1-road-shot") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_sp1_road.png";
             try { return RunSp1RoadShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --an1-blend <out.png>: render the DETERMINISTIC BLEND SPACES showcase (Slice AN1, hf::anim::bs
+        // — 1D + 2D parameter-driven blending: integer weights/barycentrics, tick-based slew,
+        // normalized-phase clip sync). PURE CPU — runs the IDENTICAL blend_space.h 240-tick locomotion-
+        // diamond sweep + SHARED raster the Vulkan --an1-blend-shot runs -> bit-identical cross-backend
+        // BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && (std::strcmp(argv[1], "--an1-blend") == 0 ||
+                         std::strcmp(argv[1], "--an1-blend-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_an1_blend.png";
+            try { return RunAn1BlendShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gas1-duel <out.png>: render the DETERMINISTIC GAMEPLAY ABILITY SYSTEM showcase (Slice GAS1,
