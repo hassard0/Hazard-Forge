@@ -1114,6 +1114,19 @@ hf_add_pure_test(active_test)
 # (hf_core), ASan-eligible. boids.h #includes sim/fpx.h read-only.
 hf_add_pure_test(boids_test)
 
+# Deterministic Crowd Simulation at 10k+ Agents (Slice CR1, the parity++ audit's CROWD-SCALE gap): the
+# Mass-class ARCHETYPE crowd (engine/sim/crowd.h, hf::sim::crowd) — proves Hazard Forge's crowd at 10,000+
+# agents with O(N) GRID neighbour separation (the byte-frozen BD2 boids.h spatial-hash reused read-only)
+# instead of BD1's all-pairs O(N²), deterministic + lockstep-replayable. PURE CPU strict-integer (Q16.16), NO
+# new shader. Pins GRID==ALLPAIRS (the O(N) grid separation step == the O(N²) brute-force reference bit-for-bit
+# — the KEY correctness pin), SCALE (10,000 agents x 200 ticks, full-state digest + wall-time, the O(N) proof),
+# ARCHETYPES (3 types with different maxSpeed/sepRadius/goalWeight produce different trajectories; runner
+# outruns pedestrian outruns wanderer), GOAL-SEEK (a lone agent approaches its goal monotonically while far),
+# LOCKSTEP+ROLLBACK (a peer re-derives a 1k crowd bit-for-bit; rollback corrects a mispredicted goal-change;
+# snapshot completeness — dropping velocity OR archetype diverges), determinism (two runs digest-identical).
+# Pure C++ (hf_core), ASan-eligible. crowd.h #includes sim/boids.h read-only (which #includes sim/fpx.h).
+hf_add_pure_test(crowd_test)
+
 # Deterministic Fixed-Point Physics Slice 1 (Slice FPX1, the BEACHHEAD of FLAGSHIP #6): the Q16.16
 # fixed-point INTEGRATOR + integer broadphase core (engine/sim/fpx.h) the GPU
 # shaders/fpx_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Pins fxmul known products

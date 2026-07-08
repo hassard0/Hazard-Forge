@@ -126,6 +126,7 @@
 #include "anim/blend_space.h"   // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Vulkan --an1-blend-shot + Metal --an1-blend run the IDENTICAL pure-CPU 240-tick scenario + shared raster
 #include "anim/retarget.h"      // Slice AN2: DETERMINISTIC ANIMATION RETARGETING (RetargetMap/BuildRetargetMap, Retarget, FxQuat algebra, ForwardKinematics, RunRetargetShotScenario/RenderRetargetShot — play one skeleton's clip on a DIFFERENTLY-PROPORTIONED skeleton via the bind-delta rotation retarget + root-motion height scale; INTEGER Q16.16 quats past the ONE QuantizeFx boundary; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + motion_match.h read-only; the Vulkan --an2-retarget-shot + Metal --an2-retarget run the IDENTICAL pure-CPU scenario + shared stick-figure raster (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"          // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids, brute-force all-pairs Reynolds seek+separation) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot
+#include "sim/crowd.h"          // Slice CR1: DETERMINISTIC CROWD AT 10k+ AGENTS (Mass-class archetype crowd, hf::sim::crowd) — composes the byte-frozen BD2 boids.h grid for O(N) separation (vs BD1's all-pairs O(N²)), 3-archetype types + goal-seek + lockstep/rollback; RunCrowdShotScenario/RenderCrowdShot shared verbatim with the Metal --cr1-crowd; PURE CPU strict-integer, NO new shader
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "ai/ai.h"              // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree — a FLAT index graph + an integer blackboard + a fixed-DFS-order tick; PURE CPU integer, the BEACHHEAD of the DETERMINISTIC AI flagship #28) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Vulkan --ai1-tree-shot + Metal --ai1-tree run the IDENTICAL pure-CPU tick + 2D node-graph viz
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
@@ -4394,6 +4395,19 @@ int main(int argc, char** argv) {
     const char* an2RetargetShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--an2-retarget-shot") == 0) { an2RetargetShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice CR1: --cr1-crowd-shot <out.bmp> (DETERMINISTIC CROWD AT 10k+ AGENTS, the Mass-class archetype
+    // crowd, hf::sim::crowd; the parity++ audit's crowd-scale gap — boids.h's BD1 separation is all-pairs
+    // O(N²) and its golden proves only ~256 agents, so CR1 composes the byte-frozen BD2 spatial-hash grid
+    // read-only for O(N) neighbour separation + a 3-archetype (pedestrian/runner/wanderer) crowd that
+    // streams toward goals, deterministic + lockstep-replayable). PURE CPU — NO GPU dispatch, NO new shader,
+    // NO new RHI; both backends run the IDENTICAL crowd.h scenario (RunCrowdShotScenario — 3600 agents in 3
+    // streams settled toward 3 goals) + the SHARED pure-integer top-down density raster -> strict-zero
+    // cross-backend BY CONSTRUCTION. Its OWN loop (the standalone-loop pattern, C1061).
+    const char* cr1CrowdShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--cr1-crowd-shot") == 0) { cr1CrowdShotPath = argv[i + 1]; break; }
     }
 
     // Slice FF1: --ff1-fields-shot <out.bmp> (RIGID-BODY FORCE-FIELD VOLUMES — the PT2 particle field
@@ -60463,6 +60477,52 @@ int main(int argc, char** argv) {
                                 "long-legged target, %d keyframes)\n",
                                 an2RetargetShotPath, rtW, rtH, (int)rtRun.frames.size());
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", an2RetargetShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DETERMINISTIC CROWD AT 10k+ AGENTS (--cr1-crowd-shot <out.bmp>, Slice CR1, hf::sim::crowd).
+        // PURE CPU — NO GPU dispatch, NO new shader, NO new RHI; both Vulkan-Windows and Metal-Mac run the
+        // IDENTICAL pure-CPU scenario (crowd.h::RunCrowdShotScenario — 3600 agents across 3 archetypes
+        // [pedestrian/runner/wanderer] laid out in 3 lanes, each seeking one of 3 goals, settled 140 ticks
+        // via the O(N) grid-separation StepCrowd that composes the byte-frozen BD2 boids.h spatial-hash) and
+        // the SHARED pure-integer top-down density raster (agents as archetype-coloured dots flowing to the
+        // white goal crosses) -> strict-zero cross-backend BY CONSTRUCTION. Asserts two-run identity + the
+        // pinned stat line.
+        if (cr1CrowdShotPath) {
+            namespace cr = hf::sim::crowd;
+
+            // THE SCENARIO (== crowd_test's shot case): the fixed 3600-agent 140-tick crowd, run twice.
+            const cr::CrowdShotRun r1 = cr::RunCrowdShotScenario();
+            const cr::CrowdShotRun r2 = cr::RunCrowdShotScenario();
+
+            // PROOF (1) two-run IDENTICAL (the full-state integer digest).
+            if (r1.digest != r2.digest) {
+                std::fprintf(stderr, "FATAL: cr1-crowd two runs differ (nondeterministic crowd)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cr1-crowd: two-run IDENTICAL {digest:%016llx}\n", (unsigned long long)r1.digest);
+
+            // PROOF (2) the crowd flowed toward its goals (mean L1-to-goal dropped).
+            if (r1.meanToGoalN >= r1.meanToGoal0) {
+                std::fprintf(stderr, "FATAL: cr1-crowd did not converge toward goals\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cr1-crowd: stats {agents:%d, archetypes:%d, ticks:%d, goals:%d, meanToGoal:%d->%d, "
+                        "digest:%016llx}\n",
+                        r1.agents, r1.archetypes, r1.ticks, r1.goalCount, r1.meanToGoal0, r1.meanToGoalN,
+                        (unsigned long long)r1.digest);
+
+            // --- Golden: the SHARED pure-integer raster (crowd.h::RenderCrowdShot — the identical function
+            // both backends call; strict-zero BY CONSTRUCTION). ---
+            std::vector<uint8_t> crImg;
+            uint32_t crW = 0, crH = 0;
+            cr::RenderCrowdShot(r1, crImg, crW, crH);
+            bool ok = WriteBMP(cr1CrowdShotPath, crImg, crW, crH);
+            if (ok) std::printf("wrote %s (%ux%u) — cr1 deterministic crowd (%d agents, 3 archetypes, %d "
+                                "streams to %d goals, %d ticks)\n",
+                                cr1CrowdShotPath, crW, crH, r1.agents, r1.archetypes, r1.goalCount, r1.ticks);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cr1CrowdShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

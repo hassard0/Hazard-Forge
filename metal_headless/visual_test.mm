@@ -152,6 +152,7 @@
 #include "anim/blend_space.h"        // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Metal --an1-blend runs the IDENTICAL pure-CPU 240-tick scenario + SHARED raster the Vulkan --an1-blend-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "anim/retarget.h"           // Slice AN2: DETERMINISTIC ANIMATION RETARGETING (RetargetMap/BuildRetargetMap, Retarget, FxQuat algebra, ForwardKinematics, RunRetargetShotScenario/RenderRetargetShot — play one skeleton's clip on a DIFFERENTLY-PROPORTIONED skeleton via the bind-delta rotation retarget + root-motion height scale; INTEGER Q16.16 quats past the ONE QuantizeFx boundary; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + motion_match.h read-only; the Metal --an2-retarget runs the IDENTICAL pure-CPU scenario + SHARED stick-figure raster the Vulkan --an2-retarget-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
+#include "sim/crowd.h"               // Slice CR1: DETERMINISTIC CROWD AT 10k+ AGENTS (Mass-class archetype crowd, hf::sim::crowd) — composes the byte-frozen BD2 boids.h grid for O(N) separation; RunCrowdShotScenario/RenderCrowdShot run IDENTICAL to the Vulkan --cr1-crowd-shot (strict-zero cross-backend BY CONSTRUCTION); PURE CPU, NO new shader
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
@@ -48859,6 +48860,46 @@ static int RunAn2RetargetShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CR1 — DETERMINISTIC CROWD AT 10k+ AGENTS showcase (--cr1-crowd) (the Mass-class archetype
+// crowd — O(N) grid separation via the byte-frozen BD2 boids.h spatial-hash [vs BD1's all-pairs O(N²)], a
+// 3-archetype crowd streaming toward goals, deterministic + lockstep-replayable; hf::sim::crowd). PURE CPU —
+// NO GPU compute, NO new shader, NO new RHI; crowd.h is header-only integer Q16.16 math, so on Metal it runs
+// the IDENTICAL fixed scenario the Vulkan --cr1-crowd-shot runs on Windows (crowd.h::RunCrowdShotScenario —
+// 3600 agents across 3 archetypes [pedestrian/runner/wanderer] in 3 lanes, each seeking one of 3 goals,
+// settled 140 ticks) AND the SHARED pure-integer top-down density raster (crowd.h::RenderCrowdShot — the
+// identical function both backends call) -> bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-
+// pixel). The proof lines match the Vulkan side EXACTLY. New golden tests/golden/metal/cr1_crowd.png (baked on
+// the Mac by the controller); two runs DIFF 0.0000.
+static int RunCr1CrowdShowcase(const char* outPath) {
+    namespace cr = hf::sim::crowd;
+
+    // THE SCENARIO (== crowd_test's shot case): the fixed 3600-agent 140-tick crowd, run twice.
+    const cr::CrowdShotRun r1 = cr::RunCrowdShotScenario();
+    const cr::CrowdShotRun r2 = cr::RunCrowdShotScenario();
+
+    // PROOF (1) two-run IDENTICAL (the full-state integer digest).
+    if (r1.digest != r2.digest) return fail("cr1-crowd: two runs differ (nondeterministic crowd)");
+    std::printf("cr1-crowd: two-run IDENTICAL {digest:%016llx}\n", (unsigned long long)r1.digest);
+
+    // PROOF (2) the crowd flowed toward its goals (mean L1-to-goal dropped).
+    if (r1.meanToGoalN >= r1.meanToGoal0) return fail("cr1-crowd: did not converge toward goals");
+    std::printf("cr1-crowd: stats {agents:%d, archetypes:%d, ticks:%d, goals:%d, meanToGoal:%d->%d, "
+                "digest:%016llx}\n",
+                r1.agents, r1.archetypes, r1.ticks, r1.goalCount, r1.meanToGoal0, r1.meanToGoalN,
+                (unsigned long long)r1.digest);
+
+    // --- Golden: the SHARED pure-integer raster (crowd.h::RenderCrowdShot — the identical function the
+    // Vulkan --cr1-crowd-shot calls; strict-zero BY CONSTRUCTION). ---
+    std::vector<uint8_t> crImg;
+    uint32_t crW = 0, crH = 0;
+    cr::RenderCrowdShot(r1, crImg, crW, crH);
+    if (!WritePNG(outPath, crImg, crW, crH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cr1 deterministic crowd (%d agents, 3 archetypes, %d streams to %d "
+                "goals, %d ticks)\n",
+                outPath, crW, crH, r1.agents, r1.archetypes, r1.goalCount, r1.ticks);
+    return 0;
+}
+
 // ===== Slice FF1 — RIGID-BODY FORCE-FIELD VOLUMES showcase (--ff1-fields) (the PT2 particle field math —
 // radial/vortex/wind — applied to fpx rigid bodies with bounded AABB volumes, hf::sim::ff). PURE CPU — NO
 // GPU compute, NO new shader, NO new RHI; force_field.h is header-only Q16.16 integer math, so on Metal it
@@ -82422,6 +82463,18 @@ int main(int argc, char** argv) {
                          std::strcmp(argv[1], "--an2-retarget-shot") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_an2_retarget.png";
             try { return RunAn2RetargetShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cr1-crowd <out.png>: render the DETERMINISTIC CROWD AT 10k+ AGENTS showcase (Slice CR1,
+        // hf::sim::crowd — the Mass-class archetype crowd with O(N) grid separation composing the byte-frozen
+        // BD2 boids.h spatial-hash; 3 archetypes streaming toward goals). PURE CPU — runs the IDENTICAL
+        // crowd.h 3600-agent 140-tick scenario + SHARED top-down density raster the Vulkan --cr1-crowd-shot
+        // runs -> bit-identical cross-backend BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY.
+        // NO shader added.
+        if (argc > 1 && (std::strcmp(argv[1], "--cr1-crowd") == 0 ||
+                         std::strcmp(argv[1], "--cr1-crowd-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_cr1_crowd.png";
+            try { return RunCr1CrowdShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ff1-fields <out.png>: render the RIGID-BODY FORCE-FIELD VOLUMES showcase (Slice FF1,
