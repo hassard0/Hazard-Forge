@@ -417,6 +417,7 @@ $Goldens = @(
     @{ Name = 'wv1_float';        Flag = '--wv1-float' }          # WV1 water gameplay volume (parity++ #2; analytic integer-Gerstner buoyancy, digest 8eaa0116a528c87d)
     @{ Name = 'sp1_road';         Flag = '--sp1-road' }           # SP1 first-class integer splines (parity++ #3; eval+arc+scatter+sweep+camera, digest 24fa72580c7c2cef)
     @{ Name = 'an1_blend';        Flag = '--an1-blend' }          # AN1 deterministic blend spaces (parity++ #4; phase-synced 1D/2D parametric blending, digests 956fe8b0/7731e08b/538ba1d1)
+    @{ Name = 'ff1_fields';       Flag = '--ff1-fields' }         # FF1 rigid-body force-field volumes (parity++ quick win; radial/vortex/wind, digest 98e2c0fd3bc370b5)
 )
 
 $winResult = 'SKIP'
