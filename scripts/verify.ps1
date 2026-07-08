@@ -419,6 +419,7 @@ $Goldens = @(
     @{ Name = 'an1_blend';        Flag = '--an1-blend' }          # AN1 deterministic blend spaces (parity++ #4; phase-synced 1D/2D parametric blending, digests 956fe8b0/7731e08b/538ba1d1)
     @{ Name = 'ff1_fields';       Flag = '--ff1-fields' }         # FF1 rigid-body force-field volumes (parity++ quick win; radial/vortex/wind, digest 98e2c0fd3bc370b5)
     @{ Name = 'la1_landscape';    Flag = '--la1-landscape-shot' } # LA1 landscape authoring (parity++ #5; sculpt/paint/spline-road + bit-exact undo, digest 7368c12f1f50e17c)
+    @{ Name = 'vr1_vfx';          Flag = '--vr1-vfx' }            # VR1 VFX renderer variety (parity++ #6; ribbons/beams/mesh-emitters/particle-lights, digest 4c5b2968f2263079)
 )
 
 $winResult = 'SKIP'
