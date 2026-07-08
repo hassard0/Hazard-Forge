@@ -144,6 +144,7 @@
 #include "game/ability.h"            // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Metal --gas1-duel runs the IDENTICAL pure-CPU 60-tick duel the Vulkan --gas1-duel-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "ai/ai.h"                   // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Metal --ai1-tree runs the IDENTICAL pure-CPU tick + 2D node-graph viz the Vulkan --ai1-tree-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/water_body.h"          // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Metal --wv1-float runs the IDENTICAL pure-CPU 480-tick scenario + SHARED raster the Vulkan --wv1-float-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "spline/spline.h"           // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Metal --sp1-road runs the IDENTICAL pure-CPU scenario + SHARED top-down raster the Vulkan --sp1-road-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
@@ -48682,6 +48683,58 @@ static int RunWv1FloatShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice SP1 — FIRST-CLASS DETERMINISTIC SPLINES showcase (--sp1-road) (the Q16.16 uniform Catmull-Rom
+// core + fixed-K arc-length reparam driving the three consumers: spline-scatter (pcg), the swept road strip,
+// the rail camera; hf::spline). PURE CPU — NO GPU compute, NO new shader, NO new RHI; spline.h is header-only
+// Q16.16 integer math, so on Metal it runs the IDENTICAL fixed scenario the Vulkan --sp1-road-shot runs on
+// Windows (spline.h::RunSplineShotScenario — the 6-point S-curve -> road strip + fence posts both edges +
+// camera markers) AND the SHARED pure-integer top-down raster (spline.h::RenderSplineShot — the identical
+// function both backends call) -> bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel).
+// Splines are STATELESS (pure functions of the control points) so there is NO lockstep/rollback proof by
+// design; the proof lines match the Vulkan side EXACTLY. New golden tests/golden/metal/sp1_road.png (baked
+// on the Mac by the controller); two runs DIFF 0.0000.
+static int RunSp1RoadShowcase(const char* outPath) {
+    namespace sl = hf::spline;
+
+    // THE SCENARIO (== spline_test): the FIXED S-curve road, run twice.
+    const sl::SplineShotRun spRun  = sl::RunSplineShotScenario();
+    const sl::SplineShotRun spRun2 = sl::RunSplineShotScenario();
+
+    // PROOF (1) two-run BYTE-IDENTICAL (the stateless pure-function determinism proof).
+    if (spRun.digest != spRun2.digest)
+        return fail("sp1-road: two runs differ (nondeterministic spline eval)");
+    std::printf("sp1-road: two-run BYTE-IDENTICAL {digest:%016llx}\n", (unsigned long long)spRun.digest);
+
+    // PROOF (2) exact knot interpolation (the eval-core identity, live).
+    bool knots = true;
+    for (int i = 0; i < sl::SegmentCount(spRun.spline); ++i) {
+        const sl::FxVec3 a = sl::Eval(spRun.spline, i, 0);
+        const sl::FxVec3& p = spRun.spline.points[(size_t)i];
+        if (a.x != p.x || a.y != p.y || a.z != p.z) knots = false;
+    }
+    if (!knots) return fail("sp1-road: knot interpolation broke");
+    std::printf("sp1-road: Catmull-Rom interpolates its knots exactly {segments:%d}\n",
+                sl::SegmentCount(spRun.spline));
+    std::printf("sp1-road: STATELESS — no lockstep harness by design (pure function of the "
+                "control points; consumers inherit netcode via seq/pcg)\n");
+
+    std::printf("sp1-road: stats {points:%u, samples:%u, instances:%u, stripTris:%u, digest:%016llx}\n",
+                (unsigned)spRun.spline.points.size(), (unsigned)(spRun.strip.positions.size() / 2),
+                (unsigned)(spRun.postsL.size() + spRun.postsR.size()),
+                (unsigned)(spRun.strip.indices.size() / 3), (unsigned long long)spRun.digest);
+
+    // --- Golden: the SHARED pure-integer top-down raster (spline.h::RenderSplineShot — the identical
+    // function the Vulkan --sp1-road-shot calls; strict-zero BY CONSTRUCTION). ---
+    std::vector<uint8_t> spImg;
+    uint32_t spW = 0, spH = 0;
+    sl::RenderSplineShot(spRun, spImg, spW, spH);
+    if (!WritePNG(outPath, spImg, spW, spH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — sp1 deterministic spline road (S-curve strip + fence scatter + "
+                "camera rail)\n",
+                outPath, spW, spH);
+    return 0;
+}
+
 // ===== Slice GAS1 — A DETERMINISTIC GAMEPLAY ABILITY SYSTEM showcase (--gas1-duel) (attributes + effects +
 // cooldowns, the GAS-class core, hf::game::gas). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
 // ability.h is header-only Q16.16 integer math, so on Metal it runs the IDENTICAL pure-CPU 60-tick duel the
@@ -81717,6 +81770,18 @@ int main(int argc, char** argv) {
                          std::strcmp(argv[1], "--wv1-float-shot") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_wv1_float.png";
             try { return RunWv1FloatShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --sp1-road <out.png>: render the FIRST-CLASS DETERMINISTIC SPLINES showcase (Slice SP1,
+        // hf::spline — the Q16.16 uniform Catmull-Rom core + arc-length reparam driving spline-scatter,
+        // the swept road strip, and the rail camera). PURE CPU — runs the IDENTICAL spline.h S-curve
+        // scenario + SHARED top-down raster the Vulkan --sp1-road-shot runs -> bit-identical
+        // cross-backend BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY (STATELESS — no
+        // lockstep by design). NO shader added.
+        if (argc > 1 && (std::strcmp(argv[1], "--sp1-road") == 0 ||
+                         std::strcmp(argv[1], "--sp1-road-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_sp1_road.png";
+            try { return RunSp1RoadShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gas1-duel <out.png>: render the DETERMINISTIC GAMEPLAY ABILITY SYSTEM showcase (Slice GAS1,

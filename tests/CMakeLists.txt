@@ -1636,6 +1636,20 @@ hf_add_pure_test(particle_author_test)
 # (hf_core), ASan-eligible. pcg.h #includes fpx.h + particles.h read-only.
 hf_add_pure_test(pcg_test)
 
+# Slice SP1 — FIRST-CLASS DETERMINISTIC SPLINES (engine/spline/spline.h, hf::spline): the Q16.16 uniform
+# Catmull-Rom eval core (int64 Horner, mirrored-endpoint convention) + fixed-K chord-table arc-length
+# reparameterization + the three consumers (spline-scatter -> pcg::PcgInstance, the swept road strip, the
+# rail camera). STATELESS (pure functions of the control points) — deliberately NO lockstep harness; the
+# netcode story is inherited by consumers (seq.h camera distance, pcg-seeded scatter). Pins: exact knot
+# interpolation + fixed (seg,t) samples; the 2-point exact-integer-lerp identity; closed-loop bit-exact
+# wrap; analytic-vs-FD tangent band; pinned arc total/table digest/mid-curve position; pinned scatter
+# positions/yaws/spacing/digest + PruneOverlaps shuffle-invariance composition; pinned strip counts/digest,
+# no degenerate tris, width-perpendicular bands, the collinear straight-strip identity; camera endpoint
+# exactness; the pinned showcase-scenario digest + two-run-identical raster. All digests MSVC == clang
+# (the test compiles standalone: clang++ -std=c++20 -I engine -I tests -I third_party tests/spline_test.cpp).
+# Pure C++ (hf_core), ASan-eligible. pcg.h/seq.h/fpx.h composed read-only (byte-untouched).
+hf_add_pure_test(spline_test)
+
 # Slice FO1 (the BEACHHEAD of FLAGSHIP #25, DETERMINISTIC FOLIAGE AT SCALE): the deterministic integer WIND FIELD
 # (engine/foliage/foliage.h) — WindBend(wind,pos,frame) is a Q16.16 bend angle from a sum of host-baked sine "gust"
 # waves indexed by an integer phase accumulator into the committed kFoliageWind16 LUT (the audio kSineTable copied

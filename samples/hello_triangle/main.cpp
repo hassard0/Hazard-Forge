@@ -118,6 +118,7 @@
 #include "game/verdict.h"       // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict — the pinned-identity deterministic entity world + the unified command bus generalizing convex::ConvexCommand; PURE CPU integer, the BEACHHEAD of FLAGSHIP #27) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Vulkan --vd1-world-shot + Metal --vd1-world run the IDENTICAL pure-CPU script
 #include "game/ability.h"       // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Vulkan --gas1-duel-shot + Metal --gas1-duel run the IDENTICAL pure-CPU 60-tick duel
 #include "sim/water_body.h"     // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer, the render ocean and the physics ocean are the same equation) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Vulkan --wv1-float-shot + Metal --wv1-float run the IDENTICAL pure-CPU 480-tick float scenario + shared raster
+#include "spline/spline.h"      // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Vulkan --sp1-road-shot + Metal --sp1-road run the IDENTICAL pure-CPU scenario + shared top-down raster
 #include "sim/boids.h"          // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids, brute-force all-pairs Reynolds seek+separation) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "ai/ai.h"              // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree — a FLAT index graph + an integer blackboard + a fixed-DFS-order tick; PURE CPU integer, the BEACHHEAD of the DETERMINISTIC AI flagship #28) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Vulkan --ai1-tree-shot + Metal --ai1-tree run the IDENTICAL pure-CPU tick + 2D node-graph viz
@@ -4340,6 +4341,17 @@ int main(int argc, char** argv) {
     const char* wv1FloatShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--wv1-float-shot") == 0) { wv1FloatShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice SP1: --sp1-road-shot <out.bmp> (FIRST-CLASS DETERMINISTIC SPLINES — the Q16.16 uniform
+    // Catmull-Rom core + arc-length reparam driving the three consumers: spline-scatter (pcg), the swept
+    // road strip, the rail camera; hf::spline). PURE CPU: NO GPU dispatch, NO new shader, NO new RHI; both
+    // backends run the IDENTICAL spline.h fixed scenario (the 6-point S-curve -> road strip + fence posts
+    // both edges + camera markers) + the SHARED pure-integer top-down raster -> strict-zero cross-backend
+    // BY CONSTRUCTION. Its OWN loop (the standalone-loop pattern, C1061).
+    const char* sp1RoadShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--sp1-road-shot") == 0) { sp1RoadShotPath = argv[i + 1]; break; }
     }
 
     // Slice GJ5: --gjk-lockstep-shot <out.bmp> (Deterministic General Convex-Hull Contacts LOCKSTEP + ROLLBACK
@@ -60180,6 +60192,69 @@ int main(int argc, char** argv) {
                                 "integer Gerstner ocean, %d ticks)\n",
                                 wv1FloatShotPath, wvW, wvH, wv::kShotSteps);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", wv1FloatShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- FIRST-CLASS DETERMINISTIC SPLINES (--sp1-road-shot <out.bmp>, Slice SP1, hf::spline). PURE
+        // CPU — NO GPU dispatch, NO new shader, NO new RHI; both Vulkan-Windows and Metal-Mac run the
+        // IDENTICAL pure-CPU scenario (spline.h::RunSplineShotScenario — the FIXED 6-point S-curve spline
+        // evaluated by the Q16.16 uniform Catmull-Rom core, arc-length reparameterized by the fixed-16
+        // chord table, swept into the road strip, fence posts scattered along both edges via the pcg hash
+        // + pruned by pcg::PruneOverlaps, camera-track samples at fixed arc fractions) and the SHARED
+        // pure-integer top-down raster (spline.h::RenderSplineShot) -> strict-zero cross-backend BY
+        // CONSTRUCTION. Splines are STATELESS (pure functions of the control points) so there is NO
+        // lockstep/rollback proof by design — the determinism proof is the pinned scenario digest +
+        // two-run byte-identity (the netcode story is inherited by the seq.h/pcg consumers).
+        if (sp1RoadShotPath) {
+            namespace sl = hf::spline;
+
+            // THE SCENARIO (== spline_test): the FIXED S-curve road, run twice.
+            const sl::SplineShotRun spRun  = sl::RunSplineShotScenario();
+            const sl::SplineShotRun spRun2 = sl::RunSplineShotScenario();
+
+            // PROOF (1) two-run BYTE-IDENTICAL (the stateless pure-function determinism proof).
+            if (spRun.digest != spRun2.digest) {
+                std::fprintf(stderr, "FATAL: sp1-road two runs differ (nondeterministic spline eval)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("sp1-road: two-run BYTE-IDENTICAL {digest:%016llx}\n",
+                        (unsigned long long)spRun.digest);
+
+            // PROOF (2) exact knot interpolation + closed-loop wrap (the eval-core identities, live).
+            bool knots = true;
+            for (int i = 0; i < sl::SegmentCount(spRun.spline); ++i) {
+                const sl::FxVec3 a = sl::Eval(spRun.spline, i, 0);
+                const sl::FxVec3& p = spRun.spline.points[(size_t)i];
+                if (a.x != p.x || a.y != p.y || a.z != p.z) knots = false;
+            }
+            if (!knots) {
+                std::fprintf(stderr, "FATAL: sp1-road knot interpolation broke\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("sp1-road: Catmull-Rom interpolates its knots exactly {segments:%d}\n",
+                        sl::SegmentCount(spRun.spline));
+            std::printf("sp1-road: STATELESS — no lockstep harness by design (pure function of the "
+                        "control points; consumers inherit netcode via seq/pcg)\n");
+
+            std::printf("sp1-road: stats {points:%u, samples:%u, instances:%u, stripTris:%u, "
+                        "digest:%016llx}\n",
+                        (unsigned)spRun.spline.points.size(),
+                        (unsigned)(spRun.strip.positions.size() / 2),
+                        (unsigned)(spRun.postsL.size() + spRun.postsR.size()),
+                        (unsigned)(spRun.strip.indices.size() / 3),
+                        (unsigned long long)spRun.digest);
+
+            // --- Golden: the SHARED pure-integer top-down raster (spline.h::RenderSplineShot — the
+            // identical function both backends call; strict-zero BY CONSTRUCTION). ---
+            std::vector<uint8_t> spImg;
+            uint32_t spW = 0, spH = 0;
+            sl::RenderSplineShot(spRun, spImg, spW, spH);
+            bool ok = WriteBMP(sp1RoadShotPath, spImg, spW, spH);
+            if (ok) std::printf("wrote %s (%ux%u) — sp1 deterministic spline road (S-curve strip + "
+                                "fence scatter + camera rail)\n",
+                                sp1RoadShotPath, spW, spH);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", sp1RoadShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
