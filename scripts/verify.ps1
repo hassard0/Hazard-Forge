@@ -428,6 +428,7 @@ $Goldens = @(
     @{ Name = 'uf1_text';         Flag = '--uf1-text-shot' }       # UF1 deterministic SDF text (parity++ UI; integer SDF glyph gen + proportional layout/kerning, digest baca98f42661ce00)
     @{ Name = 'gt1_tags';         Flag = '--gt1-tags-shot' }       # GT1 deterministic gameplay-tag layer (next-tier #1; hierarchical tags gating GAS, trace 807d1bc4f5e9c28f)
     @{ Name = 'al1_layer';        Flag = '--al1-layer-shot' }      # AL1 deterministic anim layering (next-tier #2; notifies+additive+montages+notify->GAS bridge, pose 79f5a9b0a781e775)
+    @{ Name = 'bt1_behavior';     Flag = '--bt1-behavior-shot' }   # BT1 deterministic behavior-tree depth + utility AI (next-tier #3; parallel/decorators/service/utility+observer-abort, digest 0x9fcd062431f97292)
 )
 
 $winResult = 'SKIP'
