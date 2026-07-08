@@ -2117,6 +2117,24 @@ hf_add_pure_test(ability_test)
 # ASan-eligible; pure integer, ZERO backend symbols.
 hf_add_pure_test(gameplay_tags_test)
 
+# Slice GC1 — DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES (engine/game/gameplay_cues.h,
+# hf::game::cues): deterministic sphere/box(AABB)/cone overlap queries -> the ascending-id SET of affected
+# entities (optional GT1 tag FILTER for friendly-fire off), plus a deterministic gameplay-CUE event stream
+# (impact/buff/death) each carrying a GT1 cue tag + source/target/location/magnitude/tick. gameplay_cues.h
+# #includes game/gameplay_tags.h READ-ONLY / BYTE-UNTOUCHED (which pulls game/ability.h + game/verdict.h
+# read-only): the area path COMPOSES onto GAS1 through an adapter (cost/cooldown committed VERBATIM via a
+# zero-effect filtered gas::TryActivate; each effect applied per-target GT1-immunity-gated). Pure integer
+# geometry (exact distance²/AABB compares; the cone half-angle is a PINNED host cos threshold vs an integer
+# normalized dot via FxISqrt/fxdiv — NO runtime trig). Pins: sphere/box/cone in/out/boundary conventions
+# (dist²==r² and |delta|==half and dot==cos all INCLUSIVE; radius-0; at-apex INCLUDED; behind excluded),
+# the friendly-fire tag filter, area-apply (N enemies hit, allies/outside untouched, cost paid once) + the
+# cue stream, the FIXED 10-tick cue battle (trace digest + exact finals + impact/buff/death at exact ticks),
+# single-target GAS1 compat, and lockstep + rollback (a mispredicted area hit corrected) + snapshot
+# completeness (dropping positions -> wrong targets -> diverges). Pure C++ (hf_core), ASan-eligible; pure
+# integer, ZERO backend symbols. Cues are the deterministic EVENT layer, NOT rendered VFX (presentation is
+# downstream).
+hf_add_pure_test(gameplay_cues_test)
+
 # Slice WV1 — THE WATER GAMEPLAY VOLUME (engine/sim/water_body.h, hf::sim::water): the analytic integer
 # Gerstner surface (host-baked ik.h sine LUT — zero runtime transcendentals) driving rigid-body Archimedes
 # buoyancy + drag (couple.h CP7 SphereCapVolume reused VERBATIM against the analytic surface — the render

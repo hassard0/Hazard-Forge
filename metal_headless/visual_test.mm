@@ -147,6 +147,7 @@
 #include "game/verdict.h"            // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Metal --vd1-world runs the IDENTICAL pure-CPU script the Vulkan --vd1-world-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "game/ability.h"            // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Metal --gas1-duel runs the IDENTICAL pure-CPU 60-tick duel the Vulkan --gas1-duel-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "game/gameplay_tags.h"      // Slice GT1: A DETERMINISTIC GAMEPLAY-TAG LAYER (TagRegistry/TagContainer/HasTagQuery/TagRules/TryActivateTagged/StepTagged/RunTaggedLockstep/RunTaggedRollback/RunSkirmish — hierarchical interned tags gating GAS1 abilities/effects via a thin adapter; PURE CPU integer) — a NEW additive sibling #including game/ability.h READ-ONLY/BYTE-UNTOUCHED; the Metal --gt1-tags runs the IDENTICAL pure-CPU 14-tick tag skirmish the Vulkan --gt1-tags-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "game/gameplay_cues.h"       // Slice GC1: DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES (sphere/box/cone overlap -> ascending-id target set + GT1 tag filter; a deterministic impact/buff/death cue EVENT stream; AreaActivate composes GAS1/GT1 via an adapter; RenderGc1CuesViz; PURE CPU integer geometry, cone half-angle a pinned host cos threshold — NO runtime trig) — a NEW additive sibling #including game/gameplay_tags.h READ-ONLY/BYTE-UNTOUCHED; the Metal --gc1-cues runs the IDENTICAL pure-CPU cue battle + RenderGc1CuesViz the Vulkan --gc1-cues-shot runs (strict-zero cross-backend BY CONSTRUCTION; cues are the EVENT layer, NOT rendered VFX)
 #include "ai/ai.h"                   // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Metal --ai1-tree runs the IDENTICAL pure-CPU tick + 2D node-graph viz the Vulkan --ai1-tree-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "ai/behavior_tree.h"        // Slice BT1: DETERMINISTIC BEHAVIOR-TREE DEPTH + UTILITY AI (parallel/cooldown/observer-abort/retry/loop/service/utility node kinds + BuildGuardTree/RunBt1Scenario/RenderBt1Shot) — a NEW additive header COMPOSING ai/ai.h READ-ONLY (Blackboard/Status/kMaxBbKeys byte-untouched); the Metal --bt1-behavior runs the IDENTICAL pure-CPU guard scenario + SHARED strict-zero integer timeline raster the Vulkan --bt1-behavior-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/water_body.h"          // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Metal --wv1-float runs the IDENTICAL pure-CPU 480-tick scenario + SHARED raster the Vulkan --wv1-float-shot runs (strict-zero cross-backend BY CONSTRUCTION)
@@ -46955,6 +46956,67 @@ static int RunSq2CinematicShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GC1 — DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES showcase (--gc1-cues) (next-tier parity
+// gap #8, engine/game/gameplay_cues.h composing gameplay_tags.h/ability.h/verdict.h READ-ONLY). PURE CPU — NO GPU
+// compute, NO new shader, NO new RHI; gameplay_cues.h is header-only pure-integer Q16.16 (sphere/box/cone overlap
+// via exact distance²/AABB compares + a cone half-angle PINNED host cos threshold vs an integer normalized dot —
+// FxISqrt/fxdiv, NO runtime trig; the AreaActivate adapter over GAS1/GT1; a deterministic impact/buff/death cue
+// EVENT stream), so on Metal it runs the IDENTICAL cue battle the Vulkan --gc1-cues-shot runs on Windows and calls
+// the SAME RenderGc1CuesViz -> the battlefield/targeting/cue viz is bit-identical cross-backend BY CONSTRUCTION
+// (strict zero-differing-pixel). The proof lines (two-run identical, lockstep, rollback) match the Vulkan side
+// EXACTLY. New golden tests/golden/metal/gc1_cues.png (baked on the Mac by the controller). Cues are the
+// deterministic EVENT layer, NOT rendered VFX (presentation is a downstream layer).
+static int RunGc1CuesShowcase(const char* outPath) {
+    namespace cuens = hf::game::cues;
+    namespace gasns = hf::game::gas;
+    namespace tagns = hf::game::tags;
+
+    const tagns::TagRegistry reg = cuens::MakeCuesRegistry();
+    const uint64_t kitDigest = gasns::DigestKit(cuens::MakeCuesKit());
+    std::printf("gc1-cues: authored {tags:%u, kit:%s}\n", reg.size(), cuens::DigestHex(kitDigest).c_str());
+
+    const cuens::BattleRun run  = cuens::RunCuesBattle();
+    const cuens::BattleRun run2 = cuens::RunCuesBattle();
+    if (!cuens::CuesStatesEqual(run.finalWorld, run2.finalWorld) || run.traceDigest != run2.traceDigest)
+        return fail("gc1-cues: two runs differ (nondeterministic targeting/cues)");
+    std::printf("gc1-cues: battle two-run BYTE-IDENTICAL {trace:%s}\n", cuens::DigestHex(run.traceDigest).c_str());
+
+    bool identical = false;
+    const cuens::CuesWorld authority = cuens::RunCuesLockstep(
+        cuens::MakeBattleWorld(reg), cuens::MakeCuesKit(), cuens::MakeCuesTagRules(),
+        cuens::MakeCueRules(reg), reg, cuens::MakeBattleStream(reg), cuens::kBattleTicks, &identical);
+    if (!identical || !cuens::CuesStatesEqual(authority, run.finalWorld))
+        return fail("gc1-cues: lockstep peers diverged");
+    std::printf("gc1-cues: lockstep peer re-derives the battle bit-for-bit {identical:true}\n");
+
+    std::vector<cuens::AreaCommand> mispredict = cuens::MakeBattleStream(reg);
+    for (cuens::AreaCommand& c : mispredict)
+        if (c.tick == 3u) { c.abilityId = cuens::kAbShield; c.shape = cuens::MakeSingleShape(1u); }
+    bool corrected = false, diverged = false;
+    (void)cuens::RunCuesRollback(cuens::MakeBattleWorld(reg), cuens::MakeCuesKit(), cuens::MakeCuesTagRules(),
+                                 cuens::MakeCueRules(reg), reg, cuens::MakeBattleStream(reg), mispredict,
+                                 cuens::kBattleTicks, 3u, &corrected, &diverged);
+    if (!corrected || !diverged)
+        return fail("gc1-cues: rollback failed");
+    std::printf("gc1-cues: rollback corrects a mispredicted area hit {diverged:true, corrected:true}\n");
+
+    std::vector<uint8_t> img1, img2;
+    cuens::Gc1VizStats s1{}, s2{};
+    cuens::RenderGc1CuesViz(img1, s1);
+    cuens::RenderGc1CuesViz(img2, s2);
+    if (img1.size() != img2.size() || std::memcmp(img1.data(), img2.data(), img1.size()) != 0 ||
+        s1.pixDigest != s2.pixDigest)
+        return fail("gc1-cues: viz two runs differ");
+    std::printf("gc1-cues: viz two-run BYTE-IDENTICAL {pixDigest:0x%016llx}\n", (unsigned long long)s1.pixDigest);
+    std::printf("gc1-cues: stats {entities:%u, shapes:%u, targetsHit:%u, cues:%u, ticks:%u, digest:%s}\n",
+                s1.entities, s1.shapes, s1.targetsHit, s1.cues, s1.ticks, cuens::DigestHex(s1.battleDigest).c_str());
+
+    if (!WritePNG(outPath, img1, s1.width, s1.height)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — gc1 targeting-shapes + cue-stream battle (%u entities, %u shapes, %u hits, %u cues)\n",
+                outPath, s1.width, s1.height, s1.entities, s1.shapes, s1.targetsHit, s1.cues);
+    return 0;
+}
+
 // ===== Slice WE1 — Deterministic integer DRIFTING CLOUD-DENSITY showcase (--we1-clouddensity) (the BEACHHEAD of
 // FLAGSHIP #27, DETERMINISTIC DYNAMIC WEATHER, hf::weather). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
 // weather.h is header-only pure-integer math (IntCloudDensity/GenCloudSlice, a drifted integer fBm value-noise over
@@ -82739,6 +82801,16 @@ int main(int argc, char** argv) {
         // --we1-clouddensity-shot runs (the 2D grayscale density slab over a fixed seed/frame/coverage/octaves/world/n,
         // pure-integer pixel map) -> the cloud-density field is bit-identical cross-backend BY CONSTRUCTION; the proof
         // lines match the Vulkan side EXACTLY. NO shader added.
+        // --gc1-cues <out.png>: render the DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES showcase (Slice
+        // GC1, next-tier parity gap #8). PURE CPU — runs the IDENTICAL gameplay_cues.h RunCuesBattle + shared
+        // RenderGc1CuesViz the Vulkan --gc1-cues-shot runs (sphere/box/cone targeting over a battlefield + a
+        // deterministic impact/buff/death cue stream) -> bit-identical cross-backend BY CONSTRUCTION; the proof
+        // lines match the Vulkan side EXACTLY. NO shader added. Cues are the EVENT layer, NOT rendered VFX.
+        if (argc > 1 && std::strcmp(argv[1], "--gc1-cues") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_gc1_cues.png";
+            try { return RunGc1CuesShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
         if (argc > 1 && std::strcmp(argv[1], "--we1-clouddensity") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_we1_clouddensity.png";
             try { return RunWe1CloudDensityShowcase(out); }

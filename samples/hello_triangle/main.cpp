@@ -122,6 +122,7 @@
 #include "game/verdict.h"       // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict — the pinned-identity deterministic entity world + the unified command bus generalizing convex::ConvexCommand; PURE CPU integer, the BEACHHEAD of FLAGSHIP #27) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Vulkan --vd1-world-shot + Metal --vd1-world run the IDENTICAL pure-CPU script
 #include "game/ability.h"       // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Vulkan --gas1-duel-shot + Metal --gas1-duel run the IDENTICAL pure-CPU 60-tick duel
 #include "game/gameplay_tags.h" // Slice GT1: A DETERMINISTIC GAMEPLAY-TAG LAYER (TagRegistry/TagContainer/HasTagQuery/TagRules/TryActivateTagged/StepTagged/RunTaggedLockstep/RunTaggedRollback/RunSkirmish — hierarchical interned tags gating GAS1 abilities/effects via a thin adapter; PURE CPU integer) — a NEW additive sibling #including game/ability.h READ-ONLY/BYTE-UNTOUCHED; the Vulkan --gt1-tags-shot + Metal --gt1-tags run the IDENTICAL pure-CPU 14-tick tag skirmish
+#include "game/gameplay_cues.h" // Slice GC1: DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES (sphere/box/cone overlap -> ascending-id target set + GT1 tag filter; a deterministic cue EVENT stream impact/buff/death; AreaActivate composes GAS1/GT1 via an adapter; RenderGc1CuesViz; PURE CPU integer geometry, cone half-angle a pinned host cos threshold — NO runtime trig) — a NEW additive sibling #including game/gameplay_tags.h READ-ONLY/BYTE-UNTOUCHED; the Vulkan --gc1-cues-shot + Metal --gc1-cues run the IDENTICAL pure-CPU cue battle (cues are the EVENT layer, NOT rendered VFX)
 #include "sim/water_body.h"     // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer, the render ocean and the physics ocean are the same equation) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Vulkan --wv1-float-shot + Metal --wv1-float run the IDENTICAL pure-CPU 480-tick float scenario + shared raster
 #include "spline/spline.h"      // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Vulkan --sp1-road-shot + Metal --sp1-road run the IDENTICAL pure-CPU scenario + shared top-down raster
 #include "sim/force_field.h"    // Slice FF1: RIGID-BODY FORCE-FIELD VOLUMES (FieldVolume/EvalFieldForce/ApplyFields/StepFieldWorld/SimFieldTick/RunFieldLockstep/RunFieldRollback/RunFieldShotScenario/RenderFieldShot — the PT2 particle field math (radial/vortex/wind, particles.h read-only) applied to fpx RIGID BODIES with bounded AABB volumes; velocities mutated pre-step (the WV1 discipline), dv = F*invMass*dt, LINEAR force only (no field torque — documented v1); PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/particles.h read-only; the Vulkan --ff1-fields-shot + Metal --ff1-fields run the IDENTICAL pure-CPU 240-tick scenario + shared top-down raster
@@ -4388,6 +4389,18 @@ int main(int argc, char** argv) {
     const char* gt1TagsShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--gt1-tags-shot") == 0) { gt1TagsShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice GC1: --gc1-cues-shot <out.bmp> (DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES,
+    // hf::game::cues). PURE CPU: NO GPU dispatch, NO new shader, NO new RHI; both backends run the IDENTICAL
+    // pure-CPU cue battle (gameplay_cues.h's FIXED RunCuesBattle: a sphere/box/cone fireball over a 6-entity
+    // battlefield with friendly-fire-off tag filtering + a deterministic impact/buff/death cue stream) and
+    // render the SHARED RenderGc1CuesViz (a battlefield map with the shaded targeting shapes + hit rings + cue
+    // markers, a per-entity health timeline, a cue-stream ribbon) -> strict-zero cross-backend BY
+    // CONSTRUCTION. Its OWN loop (the standalone-loop pattern, C1061).
+    const char* gc1CuesShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--gc1-cues-shot") == 0) { gc1CuesShotPath = argv[i + 1]; break; }
     }
 
     // Slice WV1: --wv1-float-shot <out.bmp> (THE WATER GAMEPLAY VOLUME — the analytic integer Gerstner
@@ -61442,6 +61455,90 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — gt1 tag-skirmish timeline (2 entities, %u tags, %u ticks, %u activations)\n",
                                 gt1TagsShotPath, imgW, imgH, reg.size(), tagns::kSkirmishTicks, run.activationsOk);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gt1TagsShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES (--gc1-cues-shot <out.bmp>, Slice GC1,
+        // hf::game::cues). PURE CPU — NO GPU dispatch, NO new shader, NO new RHI; both Vulkan-Windows and
+        // Metal-Mac run the IDENTICAL pure-CPU cue battle (gameplay_cues.h::RunCuesBattle — sphere/box/cone
+        // targeting shapes resolving the affected-entity set with a friendly-fire-off tag filter, then an
+        // AreaActivate adapter over GAS1/GT1 that applies effects per target + emits a deterministic
+        // impact/buff/death cue EVENT stream), assert the proofs (authored kit digest, two-run byte-identical,
+        // lockstep peer re-derivation, rollback correction of a mispredicted area hit) and render the SHARED
+        // RenderGc1CuesViz -> strict-zero cross-backend BY CONSTRUCTION. Cues are the deterministic EVENT
+        // layer, NOT rendered VFX (presentation is a downstream layer).
+        if (gc1CuesShotPath) {
+            namespace cuens = hf::game::cues;
+            namespace gasns = hf::game::gas;
+            namespace tagns = hf::game::tags;
+
+            const tagns::TagRegistry reg = cuens::MakeCuesRegistry();
+
+            // PROOF (1) the kit/rules are AUTHORED (the test pins these digests).
+            const uint64_t kitDigest = gasns::DigestKit(cuens::MakeCuesKit());
+            std::printf("gc1-cues: authored {tags:%u, kit:%s}\n", reg.size(), cuens::DigestHex(kitDigest).c_str());
+
+            // THE SCENARIO (== gameplay_cues_test + the Metal --gc1-cues): the FIXED 10-tick battle, twice.
+            const cuens::BattleRun run  = cuens::RunCuesBattle();
+            const cuens::BattleRun run2 = cuens::RunCuesBattle();
+
+            // PROOF (2) two-run BYTE-IDENTICAL (world + cue stream + trace digest).
+            if (!cuens::CuesStatesEqual(run.finalWorld, run2.finalWorld) || run.traceDigest != run2.traceDigest) {
+                std::fprintf(stderr, "FATAL: gc1-cues two runs differ (nondeterministic targeting/cues)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("gc1-cues: battle two-run BYTE-IDENTICAL {trace:%s}\n",
+                        cuens::DigestHex(run.traceDigest).c_str());
+
+            // PROOF (3) lockstep: a peer fed ONLY the command stream re-derives the target sets + cue stream.
+            bool identical = false;
+            const cuens::CuesWorld authority = cuens::RunCuesLockstep(
+                cuens::MakeBattleWorld(reg), cuens::MakeCuesKit(), cuens::MakeCuesTagRules(),
+                cuens::MakeCueRules(reg), reg, cuens::MakeBattleStream(reg), cuens::kBattleTicks, &identical);
+            if (!identical || !cuens::CuesStatesEqual(authority, run.finalWorld)) {
+                std::fprintf(stderr, "FATAL: gc1-cues lockstep peers diverged\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("gc1-cues: lockstep peer re-derives the battle bit-for-bit {identical:true}\n");
+
+            // PROOF (4) rollback corrects a GENUINELY-diverged mispredict (the t3 box fireball mispredicted as
+            // a self-shield -> the 3 enemy deaths never fire), the divergence asserted non-vacuous.
+            std::vector<cuens::AreaCommand> mispredict = cuens::MakeBattleStream(reg);
+            for (cuens::AreaCommand& c : mispredict)
+                if (c.tick == 3u) { c.abilityId = cuens::kAbShield; c.shape = cuens::MakeSingleShape(1u); }
+            bool corrected = false, diverged = false;
+            (void)cuens::RunCuesRollback(cuens::MakeBattleWorld(reg), cuens::MakeCuesKit(),
+                                         cuens::MakeCuesTagRules(), cuens::MakeCueRules(reg), reg,
+                                         cuens::MakeBattleStream(reg), mispredict, cuens::kBattleTicks, 3u,
+                                         &corrected, &diverged);
+            if (!corrected || !diverged) {
+                std::fprintf(stderr, "FATAL: gc1-cues rollback failed {diverged:%d, corrected:%d}\n",
+                             (int)diverged, (int)corrected);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("gc1-cues: rollback corrects a mispredicted area hit {diverged:true, corrected:true}\n");
+
+            // --- The SHARED viz (RenderGc1CuesViz), rendered twice — byte-identical BY CONSTRUCTION. ---
+            std::vector<uint8_t> img1, img2;
+            cuens::Gc1VizStats s1{}, s2{};
+            cuens::RenderGc1CuesViz(img1, s1);
+            cuens::RenderGc1CuesViz(img2, s2);
+            if (img1.size() != img2.size() || std::memcmp(img1.data(), img2.data(), img1.size()) != 0 ||
+                s1.pixDigest != s2.pixDigest) {
+                std::fprintf(stderr, "FATAL: gc1-cues viz two runs differ\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("gc1-cues: viz two-run BYTE-IDENTICAL {pixDigest:0x%016llx}\n",
+                        (unsigned long long)s1.pixDigest);
+            std::printf("gc1-cues: stats {entities:%u, shapes:%u, targetsHit:%u, cues:%u, ticks:%u, digest:%s}\n",
+                        s1.entities, s1.shapes, s1.targetsHit, s1.cues, s1.ticks,
+                        cuens::DigestHex(s1.battleDigest).c_str());
+
+            bool ok = WriteBMP(gc1CuesShotPath, img1, s1.width, s1.height);
+            if (ok) std::printf("wrote %s (%ux%u) — gc1 targeting-shapes + cue-stream battle (%u entities, %u shapes, %u hits, %u cues)\n",
+                                gc1CuesShotPath, s1.width, s1.height, s1.entities, s1.shapes, s1.targetsHit, s1.cues);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gc1CuesShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
