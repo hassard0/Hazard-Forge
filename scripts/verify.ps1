@@ -390,6 +390,7 @@ $Goldens = @(
     @{ Name = 'fo1_impostor';     Flag = '--fo1-impostor' }        # FO1 deterministic foliage impostor addressing + cross-fade LOD (audit FO-B; octahedral cell select + Bayer dither cross-fade, digest 0x104198cb9fd5dfaf; GPU billboard render deferred to FO2)
     @{ Name = 'ac1_verify';       Flag = '--ac1-verify' }          # AC1 server-authoritative re-sim verifier / provable anti-cheat (MOAT #1; re-sims a suspect client stream, rejects at exact divergence tick; UE5 float can't re-derive client physics)
     @{ Name = 'fk1_fork';         Flag = '--fk1-fork' }            # FK1 what-if fork replay / counterfactual timelines (MOAT #2; Seek->mutate->re-sim a bit-exact divergent timeline; UE5 float has no reproducible counterfactual)
+    @{ Name = 'game1_duel';       Flag = '--game1-duel' }          # GAME1 the engine's first GAME: deterministic rollback-physics knockout duel (BEAT_UE5 P0; composes fpx+lockstep+abilities+tags+cues+replay+AC1+FK1 -> all 5 moat proofs; matchDigest 0x78123003c3a55a37)
     @{ Name = 'lod_gen';       Flag = '--lod-gen-shot' }     # LOD1 deterministic QEM auto-LOD (superiority S6; 3 LODs side-by-side, digests 0xeade209d8e61838f/0xbedec704837c71f4/0x1a9821628ab77e80)
     @{ Name = 'manylight';     Flag = '--manylight' }        # ML1 many-light SSBO path (superiority S7; 128 lights, assignDigest 0x42d5535632f152ea)
     @{ Name = 'hr1_hair';      Flag = '--hr1-hair-shot' }    # HR1 deterministic strand sim (superiority S2; stiffness fan, digest 0x4f241b7fbdadbadc)
