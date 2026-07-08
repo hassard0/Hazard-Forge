@@ -147,6 +147,7 @@
 #include "sim/hulljoint.h"           // Slice HF4: hull friction + joints HULL JOINTS COMPOSED (JointedHullWorld/JointedHullStepConfig/StepJointedHullWorld(N)/MeasureJointedHull — the joint.h ball/angular-limit solvers composed with the HF3 hull friction contacts in ONE deterministic tick) — int64 -> hulljoint_step.comp is Vulkan-only (NOT in hf_gen_msl); the Metal --hf4-joint runs the CPU hulljoint::StepJointedHullWorldN (byte-identical to the Vulkan GPU result by construction)
 #include "game/verdict.h"            // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Metal --vd1-world runs the IDENTICAL pure-CPU script the Vulkan --vd1-world-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "net/authority_verify.h"    // Slice AC1: SERVER-AUTHORITATIVE RE-SIMULATION VERIFIER (provable anti-cheat, hf::net) — a server RE-SIMULATES a suspect client's input stream + compares per-tick DigestSnapshot to REJECT a faked outcome at the EXACT tick of divergence; composes verdict.h + session.h (NS5 DesyncDetector) READ-ONLY; the Metal --ac1-verify runs the IDENTICAL pure-integer RenderAc1VerifyViz the Vulkan --ac1-verify-shot runs (strict-zero cross-backend BY CONSTRUCTION, NO shader). UE5's float physics can't re-derive a client's outcomes bit-for-bit.
+#include "replay/fork.h"             // Slice FK1: WHAT-IF FORK REPLAY (counterfactual timelines, hf::replay) — Seek a recorded replay to any tick, MUTATE one input, RE-SIMULATE a bit-exact divergent COUNTERFACTUAL timeline (itself reproducible); composes replay.h (RP4 Seek) + session.h (NS6 CatchUp) + verdict.h READ-ONLY; the Metal --fk1-fork runs the IDENTICAL pure-integer RenderFk1ForkViz the Vulkan --fk1-fork-shot runs (strict-zero cross-backend BY CONSTRUCTION, NO shader). UE5's float, inverse-less sim can't re-derive a reproducible what-if.
 #include "game/ability.h"            // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Metal --gas1-duel runs the IDENTICAL pure-CPU 60-tick duel the Vulkan --gas1-duel-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "game/gameplay_tags.h"      // Slice GT1: A DETERMINISTIC GAMEPLAY-TAG LAYER (TagRegistry/TagContainer/HasTagQuery/TagRules/TryActivateTagged/StepTagged/RunTaggedLockstep/RunTaggedRollback/RunSkirmish — hierarchical interned tags gating GAS1 abilities/effects via a thin adapter; PURE CPU integer) — a NEW additive sibling #including game/ability.h READ-ONLY/BYTE-UNTOUCHED; the Metal --gt1-tags runs the IDENTICAL pure-CPU 14-tick tag skirmish the Vulkan --gt1-tags-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "game/gameplay_cues.h"       // Slice GC1: DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES (sphere/box/cone overlap -> ascending-id target set + GT1 tag filter; a deterministic impact/buff/death cue EVENT stream; AreaActivate composes GAS1/GT1 via an adapter; RenderGc1CuesViz; PURE CPU integer geometry, cone half-angle a pinned host cos threshold — NO runtime trig) — a NEW additive sibling #including game/gameplay_tags.h READ-ONLY/BYTE-UNTOUCHED; the Metal --gc1-cues runs the IDENTICAL pure-CPU cue battle + RenderGc1CuesViz the Vulkan --gc1-cues-shot runs (strict-zero cross-backend BY CONSTRUCTION; cues are the EVENT layer, NOT rendered VFX)
@@ -47168,6 +47169,61 @@ static int RunAc1VerifyShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FK1 — WHAT-IF FORK REPLAY showcase (--fk1-fork) (counterfactual timelines, engine/replay/fork.h,
+// hf::replay). PURE CPU — NO GPU compute, NO new shader, NO new RHI; fork.h is header-only pure-integer, composing
+// replay.h (RP4 Seek) + session.h (NS6 CatchUp) + verdict.h (VD1-VD6 world) READ-ONLY, so on Metal it builds the
+// IDENTICAL canonical fork tree (a recorded match Seek'd to the fork tick, re-simulated over two MUTATED command
+// streams — a physics shove + a gameplay ability) the Vulkan --fk1-fork-shot builds on Windows and calls the SAME
+// RenderFk1ForkViz -> the timeline-tree report is bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-
+// pixel). The proof lines (null fork == original, both branches diverge @ the fork tick, outcome changed, two-run
+// identical) match the Vulkan side EXACTLY. New golden tests/golden/metal/fk1_fork.png (baked on the Mac by the
+// controller). UE5's float, inverse-less sim can't re-derive a reproducible what-if -> a category it is disqualified from.
+static int RunFk1ForkShowcase(const char* outPath) {
+    namespace fknet = hf::replay;
+    std::vector<uint8_t> img1, img2;
+    fknet::Fk1VizStats s1{}, s2{};
+    fknet::RenderFk1ForkViz(img1, s1);
+    fknet::RenderFk1ForkViz(img2, s2);
+    const bool twoRunIdentical = (img1.size() == img2.size()) &&
+                                 (std::memcmp(img1.data(), img2.data(), img1.size()) == 0) &&
+                                 (s1.pixDigest == s2.pixDigest);
+    if (!twoRunIdentical) return fail("fk1-fork: two runs differ");
+
+    hf::game::verdict::VerdictWorld world0;
+    const fknet::Fk1Scenario sc = fknet::BuildFk1Scenario(world0);
+    fknet::ForkedTimeline nullFork =
+        fknet::ForkAt(sc.demo, sc.original, sc.params, fknet::kFk1ForkTick, sc.originalStream);
+    const fknet::Timeline nullTl = fknet::ResimulateFork(nullFork);
+    const bool forkOk = (nullTl.fullDigest == sc.original.fullDigest) &&
+                        (sc.diffA.firstDivergence == (int)fknet::kFk1ForkTick) &&
+                        (sc.diffB.firstDivergence == (int)fknet::kFk1ForkTick) &&
+                        (sc.original.fullDigest != sc.resimA.fullDigest) &&
+                        (sc.original.fullDigest != sc.resimB.fullDigest) &&
+                        (sc.resimA.fullDigest != sc.resimB.fullDigest) &&
+                        s1.outcomeChanged;
+    if (!forkOk) return fail("fk1-fork: correctness control failed");
+
+    std::printf("fk1-fork: Seek a recorded replay to tick %u, MUTATE one input, RE-SIMULATE a counterfactual\n",
+                fknet::kFk1ForkTick);
+    std::printf("fk1-fork: NULL fork (no mutation) == the original {digest:0x%016llx}\n",
+                (unsigned long long)sc.original.fullDigest);
+    std::printf("fk1-fork: branch A (physics shove) DIVERGES @ tick %d {digest:0x%016llx}\n",
+                sc.diffA.firstDivergence, (unsigned long long)sc.resimA.fullDigest);
+    std::printf("fk1-fork: branch B (gameplay ability) DIVERGES @ tick %d {digest:0x%016llx, playerHP:%d->%d}\n",
+                sc.diffB.firstDivergence, (unsigned long long)sc.resimB.fullDigest,
+                sc.outOriginal.playerHealth, sc.outB.playerHealth);
+    std::printf("fk1-fork: two-run BYTE-IDENTICAL {pixDigest:0x%016llx}\n",
+                (unsigned long long)s1.pixDigest);
+    std::printf("fk1-fork: {ticks:%u, forkTick:%u, branches:%u, firstDivergence:%d, outcomeChanged:%s}\n",
+                s1.ticks, s1.forkTick, s1.branches, s1.firstDivergenceA,
+                s1.outcomeChanged ? "true" : "false");
+
+    if (!WritePNG(outPath, img1, s1.width, s1.height)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fk1 what-if fork replay timeline tree (original + 2 reproducible counterfactuals, diverge @ %u)\n",
+                outPath, s1.width, s1.height, s1.forkTick);
+    return 0;
+}
+
 static int RunSq2CinematicShowcase(const char* outPath) {
     namespace sq = hf::seq;
     std::vector<uint8_t> img1, img2;
@@ -83102,6 +83158,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ac1-verify") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ac1_verify.png";
             try { return RunAc1VerifyShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fk1-fork <out.png>: render the WHAT-IF FORK REPLAY showcase (Slice FK1, counterfactual timelines). PURE
+        // CPU — runs the IDENTICAL fork.h scenario + shared RenderFk1ForkViz the Vulkan --fk1-fork-shot runs (a
+        // recorded match Seek'd to the fork tick, re-simulated over two MUTATED command streams -> a 3-node timeline
+        // tree) -> bit-identical cross-backend BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY. NO shader.
+        if (argc > 1 && std::strcmp(argv[1], "--fk1-fork") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fk1_fork.png";
+            try { return RunFk1ForkShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --we1-clouddensity <out.png>: render the Deterministic integer DRIFTING CLOUD-DENSITY showcase (Slice WE1,

@@ -1489,6 +1489,22 @@ hf_add_pure_test(verdict_test)
 # trivially + an under-claim is rejected. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(authority_verify_test)
 
+# Slice FK1 — WHAT-IF FORK REPLAY (counterfactual timelines, engine/replay/fork.h, hf::replay). Because the whole
+# HF sim is bit-exact deterministic (VD1-VD6 whole-world lockstep from an input stream ALONE) AND seek/rollback-
+# capable (replay.h RP1-6), you can Seek a recorded replay to ANY tick, MUTATE one input, and RE-SIMULATE a
+# COUNTERFACTUAL timeline that is itself perfectly reproducible — a "what-if" replay (a category UE5's float,
+# inverse-less sim is structurally disqualified from). fork.h composes replay.h (RP4 Seek) + session.h (NS6 CatchUp)
+# + verdict.h (VD1-VD6 world) READ-ONLY; it adds NO field, edits NO frozen function. ForkAt rewinds via RP4 Seek
+# (which reuses net::CatchUp); the counterfactual re-sim IS net::CatchUp over the MUTATED command stream, seeded
+# from the Seek'd forkTick state. Pins: a NULL fork (no mutation) == the original bit-exact; CAUSAL divergence (a
+# mutation at T leaves ticks < T identical + diverges at exactly T, even when forkTick < T); a REPRODUCIBLE
+# counterfactual (two re-sims of the same fork == identical, + a from-scratch rebuild re-derives the same branch
+# digests); FORK@0 + mutate == a fresh sim from the mutated initial; a TIMELINE TREE (original + 2 counterfactuals
+# -> 3 distinct digests, shared prefixes byte-identical); an OUTCOME CHANGE (an ability counterfactual flips the
+# player's final Health; a physics shove flips the final world digest); and the timeline-tree viz is two-run
+# byte-identical. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(fork_test)
+
 # Deterministic AI Slice 1 (Slice AI1, the BEACHHEAD of the DETERMINISTIC AI flagship, issue #28, hf::ai):
 # the integer BLACKBOARD + the FLAT decision-tree node graph + the deterministic TICK. Asserts: TickTree
 # two-run determinism (same tree+blackboard -> same Status + same DigestBlackboard); selector returns the
