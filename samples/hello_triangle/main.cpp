@@ -33,6 +33,7 @@
 #include "net/transport.h"           // Slice BU: simulated transport + client jitter-buffer/interp (pure CPU)
 #include "net/prediction.h"          // Slice BY: client prediction + server reconciliation (pure CPU)
 #include "ui/text.h"
+#include "ui/sdf_text.h"           // Slice UF1: DETERMINISTIC SDF TEXT (signed-distance-field glyph gen + proportional layout/kerning over a hand-authored vector-stroke subset; hf::ui::sdf) — the parity++ UI-text gap beyond the fixed 8x8 bitmap; the Vulkan --uf1-text-shot + Metal --uf1-text run the IDENTICAL pure-CPU RunUf1TextScenario + shared strict-zero integer coverage raster (NO shader). ui/text.h composed READ-ONLY.
 #include "vfx/particles.h"           // Slice CC: CPU particle / VFX emitter system (pure CPU)
 #include "render/render_graph.h"
 #include "render/csm.h"
@@ -4433,6 +4434,19 @@ int main(int argc, char** argv) {
     const char* sk1ImportShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--sk1-import-shot") == 0) { sk1ImportShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice UF1: --uf1-text-shot <out.bmp> (DETERMINISTIC SDF TEXT — signed-distance-field glyph
+    // generation + proportional text layout/shaping, hf::ui::sdf; the parity++ UI-text gap: ui/text.h
+    // is a FIXED 8x8 monospace bitmap, so UF1 adds scalable SDF glyphs + real advances/kerning). PURE
+    // CPU: NO GPU dispatch, NO new shader, NO new RHI; both backends run the IDENTICAL sdf_text.h
+    // scenario (a hand-authored A-Z/0-9/punct vector-stroke subset -> integer SDF atlas + a crisp
+    // proportionally-laid-out + kerned "HAZARD FORGE" line, sampled to coverage at large size) + the
+    // SHARED strict-zero integer coverage raster -> strict-zero cross-backend BY CONSTRUCTION. Its OWN
+    // loop (the standalone-loop pattern, C1061).
+    const char* uf1TextShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--uf1-text-shot") == 0) { uf1TextShotPath = argv[i + 1]; break; }
     }
 
     // Slice FF1: --ff1-fields-shot <out.bmp> (RIGID-BODY FORCE-FIELD VOLUMES — the PT2 particle field
@@ -60480,6 +60494,46 @@ int main(int argc, char** argv) {
         // forward-kinematics for the model-space joints) and the SHARED pure-integer side-by-side stick-
         // figure raster (SOURCE posed by the clip left, TARGET playing the retargeted motion right) ->
         // strict-zero cross-backend BY CONSTRUCTION. Asserts two-run identity + the pinned stat line.
+        // Slice UF1: --uf1-text-shot — DETERMINISTIC SDF TEXT. Both backends run the IDENTICAL pure-CPU
+        // sdf_text.h scenario (RunUf1TextScenario — build the integer SDF atlas over the hand-authored
+        // vector-stroke subset, lay out + kern "HAZARD FORGE" + a digit/punct row, sample crisp coverage)
+        // and the SHARED strict-zero integer coverage raster (RenderUf1Shot) -> strict-zero cross-backend
+        // BY CONSTRUCTION. Asserts two-run identity + the pinned stat line. NO shader.
+        if (uf1TextShotPath) {
+            namespace sdf = hf::ui::sdf;
+
+            const sdf::Uf1Run r1 = sdf::RunUf1TextScenario();
+            const sdf::Uf1Run r2 = sdf::RunUf1TextScenario();
+
+            // PROOF (1) two-run IDENTICAL (atlas + SDF + layout digests).
+            if (r1.digest != r2.digest || r1.atlasDigest != r2.atlasDigest ||
+                r1.sdfDigest != r2.sdfDigest || r1.layoutDigest != r2.layoutDigest) {
+                std::fprintf(stderr, "FATAL: uf1-text two runs differ (nondeterministic SDF/layout)\n");
+                device->WaitIdle(); return 1;
+            }
+            // PROOF (2) the pipeline actually built a subset + packed atlas + laid the string out.
+            if (r1.glyphCount != 40 || r1.atlas.w <= 0 || r1.atlas.h <= 0 || r1.line1.glyphs.empty()) {
+                std::fprintf(stderr, "FATAL: uf1-text produced no glyphs/atlas/layout\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("uf1-text: two-run IDENTICAL {atlas:%016llx, sdf:%016llx, layout:%016llx}\n",
+                        (unsigned long long)r1.atlasDigest, (unsigned long long)r1.sdfDigest,
+                        (unsigned long long)r1.layoutDigest);
+            std::printf("uf1-text: stats {glyphs:%d, atlasW:%d, atlasH:%d, stringLen:%d, digest:%016llx}\n",
+                        r1.glyphCount, r1.atlas.w, r1.atlas.h, r1.stringLen,
+                        (unsigned long long)r1.digest);
+
+            std::vector<uint8_t> tImg; uint32_t tW = 0, tH = 0;
+            sdf::RenderUf1Shot(r1, tImg, tW, tH);
+            bool ok = WriteBMP(uf1TextShotPath, tImg, tW, tH);
+            if (ok) std::printf("wrote %s (%ux%u) — uf1 deterministic SDF text (%d-glyph vector-stroke "
+                                "subset, proportional + kerned layout, crisp at scale)\n",
+                                uf1TextShotPath, tW, tH, r1.glyphCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", uf1TextShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
         // Slice SK1: --sk1-import-shot — DETERMINISTIC SKELETAL-ANIMATION ASSET IMPORT (USD/UsdSkel). The
         // Vulkan sample and Metal-Mac run the IDENTICAL pure-CPU scenario (usd_skel_shot.h::RunSk1ShotScenario
         // — import the hand-authored UsdSkel rig via the real device-free parser, then pose the imported

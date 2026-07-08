@@ -2006,6 +2006,13 @@ hf_add_pure_test(prediction_test)
 # out-of-range char => blank. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(text_test)
 
+# DETERMINISTIC SDF TEXT (Slice UF1, engine/ui/sdf_text.h): signed-distance-field glyph generation +
+# proportional layout/shaping over a hand-authored vector-stroke subset (A-Z/0-9/space/.-!). Asserts
+# the integer SDF sign/zero-contour + pinned glyph digest, crisp coverage at 1x AND 2x (bounded edge
+# band), proportional pen positions + pair kerning + width wrap, and the shelf-packed atlas rects
+# (no overlaps). Pure C++ (hf_core), ASan-eligible. Composes ui/text.h READ-ONLY.
+hf_add_pure_test(sdf_text_test)
+
 # Material-graph introspection (Slice BI): DescribeGraphJson + ToDot over the in-memory material
 # Graph. Asserts structure (nodeCount/edgeCount/output + per-node type/params/inputs/output + edge
 # from/to with the right port names), unconnected PBROutput defaults (source:null + the documented

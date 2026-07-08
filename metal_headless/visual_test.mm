@@ -54,6 +54,7 @@
 #include "net/transport.h"         // Slice BU: simulated transport + client jitter-buffer/interp (pure CPU, shared)
 #include "net/prediction.h"        // Slice BY: client prediction + server reconciliation (pure CPU, shared)
 #include "ui/text.h"               // Slice BA: baked 8x8 font atlas + screen-space text layout (pure CPU)
+#include "ui/sdf_text.h"           // Slice UF1: DETERMINISTIC SDF TEXT (hf::ui::sdf) — signed-distance-field glyph gen + proportional layout/kerning over a hand-authored vector-stroke subset; header-only, so on Metal it runs the IDENTICAL pure-CPU RunUf1TextScenario + SHARED strict-zero integer coverage raster the Vulkan --uf1-text-shot runs (NO shader). ui/text.h composed READ-ONLY.
 #include "ui/widget_render.h"      // Slice WIDGET-S6: UI labeled-layout render bridge (WidgetTreeToLabels / DigestLabels / kLabelInset) — the ONE float crossing of FLAGSHIP #30's UI; the Metal --ui-shot runs the IDENTICAL MakeLayoutShowcase + SolveLayout + WidgetTreeToLabels + the SAME names + LayoutText the Vulkan --ui-shot runs (the label placements byte-identical BY CONSTRUCTION). widget.h stays self-contained.
 #include "vfx/particles.h"         // Slice CC: CPU particle / VFX emitter system (pure CPU, shared)
 #include "render/render_graph.h"
@@ -48809,6 +48810,47 @@ static int RunAn1BlendShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice UF1 — DETERMINISTIC SDF TEXT showcase (--uf1-text) (signed-distance-field glyph generation
+// + proportional text layout/shaping over a hand-authored vector-stroke subset; hf::ui::sdf — the parity++
+// UI-text gap beyond ui/text.h's fixed 8x8 monospace bitmap). PURE CPU — NO GPU compute, NO new shader, NO
+// new RHI; sdf_text.h is header-only, so on Metal it runs the IDENTICAL fixed scenario the Vulkan
+// --uf1-text-shot runs on Windows (RunUf1TextScenario — build the integer SDF atlas over the A-Z/0-9/punct
+// vector-stroke subset, lay out + kern "HAZARD FORGE" + a digit/punct row, sample crisp coverage) AND the
+// SHARED strict-zero integer coverage raster (RenderUf1Shot — the identical function both backends call) ->
+// bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). The proof lines match the
+// Vulkan side EXACTLY. New golden tests/golden/metal/uf1_text.png (baked on the Mac by the controller);
+// two runs DIFF 0.0000.
+static int RunUf1TextShowcase(const char* outPath) {
+    namespace sdf = hf::ui::sdf;
+
+    const sdf::Uf1Run r1 = sdf::RunUf1TextScenario();
+    const sdf::Uf1Run r2 = sdf::RunUf1TextScenario();
+
+    // PROOF (1) two-run IDENTICAL (atlas + SDF + layout digests).
+    if (r1.digest != r2.digest || r1.atlasDigest != r2.atlasDigest ||
+        r1.sdfDigest != r2.sdfDigest || r1.layoutDigest != r2.layoutDigest)
+        return fail("uf1-text: two runs differ (nondeterministic SDF/layout)");
+    // PROOF (2) the pipeline actually built a subset + packed atlas + laid the string out.
+    if (r1.glyphCount != 40 || r1.atlas.w <= 0 || r1.atlas.h <= 0 || r1.line1.glyphs.empty())
+        return fail("uf1-text: produced no glyphs/atlas/layout");
+    std::printf("uf1-text: two-run IDENTICAL {atlas:%016llx, sdf:%016llx, layout:%016llx}\n",
+                (unsigned long long)r1.atlasDigest, (unsigned long long)r1.sdfDigest,
+                (unsigned long long)r1.layoutDigest);
+    std::printf("uf1-text: stats {glyphs:%d, atlasW:%d, atlasH:%d, stringLen:%d, digest:%016llx}\n",
+                r1.glyphCount, r1.atlas.w, r1.atlas.h, r1.stringLen, (unsigned long long)r1.digest);
+
+    // --- Golden: the SHARED pure-integer coverage raster (sdf_text.h::RenderUf1Shot — the identical
+    // function the Vulkan --uf1-text-shot calls; strict-zero BY CONSTRUCTION). ---
+    std::vector<uint8_t> tImg;
+    uint32_t tW = 0, tH = 0;
+    sdf::RenderUf1Shot(r1, tImg, tW, tH);
+    if (!WritePNG(outPath, tImg, tW, tH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — uf1 deterministic SDF text (%d-glyph vector-stroke subset, "
+                "proportional + kerned layout, crisp at scale)\n",
+                outPath, tW, tH, r1.glyphCount);
+    return 0;
+}
+
 // ===== Slice SK1 — DETERMINISTIC SKELETAL-ANIMATION ASSET IMPORT showcase (--sk1-import) (import a rigged
 // + animated character from USD/UsdSkel text into anim::Skeleton + scene::SkinnedVertex + anim::Animation;
 // hf::asset::ImportUsdSkel — the parity++ asset-import gap: glTF already imports skeletal but is device-
@@ -82532,6 +82574,17 @@ int main(int argc, char** argv) {
                          std::strcmp(argv[1], "--an2-retarget-shot") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_an2_retarget.png";
             try { return RunAn2RetargetShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --uf1-text <out.png>: render the DETERMINISTIC SDF TEXT showcase (Slice UF1, hf::ui::sdf —
+        // signed-distance-field glyph generation + proportional layout/kerning over a hand-authored vector-
+        // stroke subset, beyond ui/text.h's fixed 8x8 bitmap). PURE CPU — runs the IDENTICAL sdf_text.h
+        // scenario + SHARED strict-zero integer coverage raster the Vulkan --uf1-text-shot runs -> bit-
+        // identical cross-backend BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY. NO shader.
+        if (argc > 1 && (std::strcmp(argv[1], "--uf1-text") == 0 ||
+                         std::strcmp(argv[1], "--uf1-text-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_uf1_text.png";
+            try { return RunUf1TextShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --sk1-import <out.png>: render the DETERMINISTIC SKELETAL-ANIMATION ASSET IMPORT showcase (Slice
