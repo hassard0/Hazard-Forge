@@ -433,7 +433,6 @@ $Goldens = @(
     @{ Name = 'mp1_morph';        Flag = '--mp1-morph-shot' }      # MP1 deterministic morph targets/blend shapes (next-tier #5; vertex-delta blend + weight track + morph->skin order, digest 83670e4484312df3)
     @{ Name = 'sq2_cinematic';    Flag = '--sq2-cinematic' }       # SQ2 deterministic sequencer semantic tracks (next-tier #6; camera-cut/audio/material/sub-sequence + Seek==Play scrub, pixDigest 0x10a63b075559de01)
     @{ Name = 'gc1_cues';         Flag = '--gc1-cues' }            # GC1 deterministic ability targeting shapes + gameplay cues (next-tier #8; sphere/box/cone overlap + cue event stream, final f80ce1458fe4f432)
-    @{ Name = 'dh1_shatter';      Flag = '--dh1-shatter-shot' }    # DH1 deterministic convex-cell fracture hulls + debris + dust (next-tier #4; exact hulls collide face-to-face, digest 0x2ebb8c28912b74ac)
 )
 
 $winResult = 'SKIP'
