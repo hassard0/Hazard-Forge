@@ -129,6 +129,7 @@
 #include "anim/ik.h"                 // Slice IK1: deterministic IK control-rig fixed-point ANGLE LUT (FxAcosLut/FxSinLut/FxCosLut/FxAtan2Lut) — shared verbatim with ik_angle.comp + the Vulkan --ik1-angle-shot
 #include "audio/audio_graph.h"       // Slice AU1: deterministic procedural audio GRAPH + 3D spatialization (Track-S S10) — graph::RenderAu1Showcase, the SAME shared fixture the Vulkan --au1-graph-shot renders; audio is pure integer CPU so the Metal --au1-graph WAV bytes are IDENTICAL cross-backend BY CONSTRUCTION
 #include "audio/wav.h"               // Slice AU1: the deterministic 44-byte PCM WAV encoder (wav.cpp added to this target) — the --au1-graph output path
+#include "audio/reverb.h"            // Slice AU2: deterministic convolution reverb + submix buses (reverb::RunAu2ShotScenario/RenderReverbShot) — the SAME shared fixture the Vulkan --au2-reverb-shot renders; pure integer CPU so the Metal --au2-reverb-shot viz bytes are IDENTICAL cross-backend BY CONSTRUCTION
 #include "sim/joint.h"               // Slice JT1: deterministic articulated-body ragdoll JOINT GRAPH + BALL-JOINT constraint (FxJoint/WorldAnchor/SolveBallJoint/StepJointWorld) — shared verbatim with joint_ball_solve.comp + the Vulkan --joint-ball-shot
 #include "sim/vehicle.h"             // Slice VH1: deterministic vehicle physics SUSPENSION SPRING JOINT (FxSpringJoint/SolveSpringJoint/SpringLength/StepSpringWorld) — shared verbatim with vehicle_spring_solve.comp + the Vulkan --vehicle-spring-shot (int64 solve -> Vulkan-only; Metal --vehicle-spring runs the CPU StepSpringWorld)
 #include "sim/active.h"              // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot (int64 solve -> Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld)
@@ -79462,6 +79463,26 @@ int main(int argc, char** argv) {
                         stats.nodes, stats.edges, stats.frames, buffer.size(),
                         static_cast<unsigned long long>(stats.digest));
             std::printf("au1-graph: wrote %s\n", out);
+            return 0;
+        }
+        // --au2-reverb-shot <out.png> (Slice AU2): render the FIXED AU2 showcase scenario — a dry CLICK
+        // convolved through the synthetic room IR (early reflections + a decaying-noise diffuse tail) into
+        // a reverb tail, plus a 3-voice submix (voices -> a shared reverb send -> master) — via
+        // reverb::RunAu2ShotScenario (the SAME shared fixture the Vulkan --au2-reverb-shot renders) and
+        // draw the three stacked integer WAVEFORM lanes (top dry / middle IR / bottom wet) via the SHARED
+        // reverb::RenderReverbShot. Pure integer CPU (no Metal device): the viz bytes are IDENTICAL to the
+        // Vulkan/Windows side BY CONSTRUCTION (strict zero-differing-pixel).
+        if (argc > 2 && std::strcmp(argv[1], "--au2-reverb-shot") == 0) {
+            const char* out = argv[2];
+            const hf::audio::reverb::Au2ShotRun run = hf::audio::reverb::RunAu2ShotScenario();
+            std::vector<uint8_t> img; uint32_t w = 0, h = 0;
+            hf::audio::reverb::RenderReverbShot(run, img, w, h);
+            if (!WritePNG(out, img, w, h)) return fail("PNG write failed");
+            std::printf("au2-reverb: {irLen:%d, dryLen:%d, wetLen:%d, buses:%u, digest:0x%016llx}\n",
+                        run.irLen, run.dryLen, run.wetLen, run.buses,
+                        static_cast<unsigned long long>(run.digest));
+            std::printf("OK wrote %s (%ux%u) — au2 convolution reverb + submix (dry/IR/wet lanes)\n",
+                        out, w, h);
             return 0;
         }
         // --agent-query <cmds.json> <out.json> (Slice DX2, FLAGSHIP #31): build the SAME default scene

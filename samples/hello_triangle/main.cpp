@@ -27,6 +27,7 @@
 #include "audio/wav.h"
 #include "audio/dsp.h"   // Slice DSP6: procedural-phrase capstone (--dsp-song showcase)
 #include "audio/audio_graph.h"   // Slice AU1: deterministic procedural audio GRAPH + 3D spatialization (--au1-graph-shot showcase)
+#include "audio/reverb.h"   // Slice AU2: deterministic convolution reverb + submix buses (--au2-reverb-shot showcase)
 #include "game/roll_game.h"
 #include "net/snapshot.h"            // Slice BQ: replication snapshot layer (pure CPU)
 #include "net/transport.h"           // Slice BU: simulated transport + client jitter-buffer/interp (pure CPU)
@@ -878,6 +879,7 @@ int main(int argc, char** argv) {
     const char* audioRenderPath = nullptr;   // --audio-render <out.wav> (Slice BB: deterministic audio)
     const char* dspSongPath = nullptr;       // --dsp-song <out.wav> (Slice DSP6: procedural-phrase capstone)
     const char* au1GraphShotPath = nullptr;  // --au1-graph-shot <out.wav> (Slice AU1: procedural audio graph + 3D spatialization)
+    const char* au2ReverbShotPath = nullptr; // --au2-reverb-shot <out.bmp> (Slice AU2: convolution reverb + submix buses)
     const char* decalShotPath = nullptr;     // --decal-shot <out.bmp> (Slice BH: screen-space decals)
     const char* postStackShotPath = nullptr; // --poststack-shot <out.bmp> (Slice BN: data-driven post stack)
     const char* vfxShotPath = nullptr;       // --vfx-shot <out.bmp> (Slice CC: CPU particle/VFX emitter)
@@ -912,6 +914,15 @@ int main(int argc, char** argv) {
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--au1-graph-shot") == 0) {
             au1GraphShotPath = argv[i + 1];
+            break;
+        }
+    }
+    // Slice AU2: --au2-reverb-shot <out.bmp> — same small pre-scan idiom (the giant if/else chain below
+    // is at MSVC's C1061 block-nesting limit). Pure flag capture; the handler runs as a pre-device
+    // pure-CPU block (the self-contained reverb.h waveform viz -> WriteBMP).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--au2-reverb-shot") == 0) {
+            au2ReverbShotPath = argv[i + 1];
             break;
         }
     }
@@ -5132,6 +5143,28 @@ int main(int argc, char** argv) {
                     stats.nodes, stats.edges, stats.frames, buffer.size(),
                     static_cast<unsigned long long>(stats.digest));
         std::printf("au1-graph: wrote %s\n", au1GraphShotPath);
+        return 0;
+    }
+
+    // --au2-reverb-shot <out.bmp> (Slice AU2): fully headless (no window/GPU). Render the FIXED AU2
+    // showcase scenario — a dry CLICK convolved through the synthetic room IR (early reflections + a
+    // decaying-noise diffuse tail) into a reverb tail, plus a 3-voice submix (voices -> a shared reverb
+    // send -> master) — via reverb::RunAu2ShotScenario (the SAME shared fixture the Metal --au2-reverb-shot
+    // runs, so the viz bytes are IDENTICAL cross-backend BY CONSTRUCTION), and draw it as three stacked
+    // integer WAVEFORM lanes (top dry / middle IR / bottom wet) via the SHARED reverb::RenderReverbShot.
+    // Pure integer CPU: byte-identical run-to-run, platform-to-platform, backend-to-backend (strict-zero).
+    if (au2ReverbShotPath) {
+        const audio::reverb::Au2ShotRun run = audio::reverb::RunAu2ShotScenario();
+        std::vector<uint8_t> img; uint32_t w = 0, h = 0;
+        audio::reverb::RenderReverbShot(run, img, w, h);
+        if (!WriteBMP(au2ReverbShotPath, img, w, h)) {
+            std::fprintf(stderr, "FATAL: cannot write au2-reverb output '%s'\n", au2ReverbShotPath);
+            return 1;
+        }
+        std::printf("au2-reverb: {irLen:%d, dryLen:%d, wetLen:%d, buses:%u, digest:0x%016llx}\n",
+                    run.irLen, run.dryLen, run.wetLen, run.buses,
+                    static_cast<unsigned long long>(run.digest));
+        std::printf("au2-reverb: wrote %s (%ux%u)\n", au2ReverbShotPath, w, h);
         return 0;
     }
 

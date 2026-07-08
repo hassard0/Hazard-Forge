@@ -114,6 +114,15 @@ hf_add_pure_test(dsp_test)
 # EXISTING mixer.h Render path, and the pinned AU1 showcase-scene digest (the --au1-graph-shot WAV
 # source). Pure CPU (hf_core), integer end to end, ASan-eligible.
 hf_add_pure_test(audio_graph_test)
+# Slice AU2 — DETERMINISTIC CONVOLUTION REVERB + SUBMIX BUSES (engine/audio/reverb.h): impulse-response
+# room reverb (an INTEGER Q15 multiply-accumulate: wet[n]=clamp((Σ dry[n-k]*ir[k])>>15), IR coeffs Q15
+# int32 so unity 32768 is exact -> a BIT-EXACT convolution identity) + a submix bus graph (voices ->
+# a shared reverb send -> master, id-ascending order, int32-accumulate/single-clamp -> permutation-
+# invariant). Pins: unit-impulse identity + the hand-computed [100,250,100] conv; the synthetic room IR
+# (early taps @ pinned offsets/gains + a monotonically-decaying noise tail); the submix master digest +
+# mute + reorder-invariance; the wet/dry send sweep growing the tail energy; the AU2 showcase scenario
+# digest + the shared strict-zero waveform viz. Pure CPU (hf_core), integer end to end, ASan-eligible.
+hf_add_pure_test(reverb_test)
 # Generic deterministic SESSION core (Slice NS1, flagship #24 NETCODE beachhead): engine/net/session.h
 # — a header-only, transport-agnostic, templated Session<World,Input> that drives N ticks of a caller-
 # supplied deterministic Step from a per-tick InputRing and exposes an FNV-1a-64 DigestBytes state
