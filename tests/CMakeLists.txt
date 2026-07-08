@@ -1993,6 +1993,19 @@ hf_add_pure_test(water_body_test)
 # raster digests (MSVC == clang). Pure C++ (hf_core), pure integer, ASan-eligible; ZERO backend symbols.
 hf_add_pure_test(force_field_test)
 
+# Slice LA1 — LANDSCAPE AUTHORING (engine/terrain/terrain_author.h, hf::terrain::author): heightmap
+# brush sculpting + splat-layer painting + spline-carved roads — the deterministic authoring core the
+# procedural-only terrain lacked. Pins: the designed-exact brush falloff profile (flat core + integer
+# smoothstep ramp — exact integers at sampled radii), flatten EXACT across the flat core, the pinned
+# smooth-after-K digest, the largest-remainder splat renorm (every texel sums to EXACTLY 255, asserted
+# globally + exact single-stamp weights), the SP1-composed road carve (bed EXACTLY the spline height +
+# road layer painted + monotone shoulder + off-band texels bit-untouched + the pinned bumpy-terrain
+# staircase profile), the TERRAIN-LOCAL history rect-memento proof (every Recorded op kind: Undo ->
+# pre-op digest BIT-EXACT, Redo -> post-op digest; branch-kill; no-op records nothing — edit_history.h
+# byte-UNTOUCHED, the documented enrollment choice), and the pinned showcase scenario + raster digests
+# (MSVC == clang). Pure C++ (hf_core), pure integer authoring, ASan-eligible; ZERO backend symbols.
+hf_add_pure_test(terrain_author_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

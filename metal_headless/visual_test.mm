@@ -146,6 +146,7 @@
 #include "sim/water_body.h"          // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Metal --wv1-float runs the IDENTICAL pure-CPU 480-tick scenario + SHARED raster the Vulkan --wv1-float-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "spline/spline.h"           // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Metal --sp1-road runs the IDENTICAL pure-CPU scenario + SHARED top-down raster the Vulkan --sp1-road-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/force_field.h"         // Slice FF1: RIGID-BODY FORCE-FIELD VOLUMES (FieldVolume/EvalFieldForce/ApplyFields/StepFieldWorld/SimFieldTick/RunFieldLockstep/RunFieldRollback/RunFieldShotScenario/RenderFieldShot — the PT2 particle field math (radial/vortex/wind, particles.h read-only) applied to fpx RIGID BODIES with bounded AABB volumes; velocities mutated pre-step (the WV1 discipline), dv = F*invMass*dt, LINEAR force only; PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/particles.h read-only; the Metal --ff1-fields runs the IDENTICAL pure-CPU 240-tick scenario + SHARED top-down raster the Vulkan --ff1-fields-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "terrain/terrain_author.h"  // Slice LA1: LANDSCAPE AUTHORING (AuthoredTerrain/MakeFlatTerrain/MakeProcTerrain/ApplyRaiseBrush/ApplyFlattenBrush/ApplySmoothBrush/ApplyPaintBrush/ApplyCarveRoad + the Recorded* twins + TerrainHistory Undo/Redo + BuildAuthoredTerrainMesh + RunLandscapeShotScenario/RenderLandscapeShot — heightmap brush sculpting (flat-core integer-smoothstep falloff) + splat-layer painting (largest-remainder renorm to exactly 255) + the SP1 spline-carved road (flatten-to-spline-height bed + smoothstep shoulder + road-layer paint); PURE CPU Q16.16 integer, every op recorded/reversible via the TERRAIN-LOCAL ED5-recipe history — edit_history.h byte-untouched) — a NEW additive sibling #including terrain/procterrain.h + spline/spline.h + net/session.h read-only; the Metal --la1-landscape runs the IDENTICAL pure-CPU scenario + SHARED shaded-relief raster the Vulkan --la1-landscape-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "anim/blend_space.h"        // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Metal --an1-blend runs the IDENTICAL pure-CPU 240-tick scenario + SHARED raster the Vulkan --an1-blend-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
@@ -48873,6 +48874,59 @@ static int RunFf1FieldsShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice LA1 — LANDSCAPE AUTHORING showcase (--la1-landscape) (heightmap brush sculpting + splat-layer
+// painting + spline-carved roads, hf::terrain::author). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
+// terrain_author.h is header-only Q16.16 integer math, so on Metal it runs the IDENTICAL fixed scenario the
+// Vulkan --la1-landscape-shot runs on Windows (terrain_author.h::RunLandscapeShotScenario — the 128x128
+// fBm-seeded terrain sculpted with two recorded raise stamps + a recorded flatten + a recorded smooth pass +
+// rock/snow splat paint + the SP1 spline road carved as ONE recorded command; the undo-all/redo-all digest
+// round-trip is proven INSIDE the scenario) AND the SHARED pure-integer shaded-relief raster
+// (terrain_author.h::RenderLandscapeShot — the identical function both backends call) -> bit-identical
+// cross-backend BY CONSTRUCTION (strict zero-differing-pixel). The history is TERRAIN-LOCAL (the ED5
+// capture-before/apply/record recipe over rect mementos; edit_history.h byte-untouched). The proof lines
+// match the Vulkan side EXACTLY. New golden tests/golden/metal/la1_landscape.png (baked on the Mac by the
+// controller); two runs DIFF 0.0000.
+static int RunLa1LandscapeShowcase(const char* outPath) {
+    namespace au = hf::terrain::author;
+
+    // THE SCENARIO (== terrain_author_test): the FIXED authored landscape, run twice.
+    const au::LandscapeShotRun laRun  = au::RunLandscapeShotScenario();
+    const au::LandscapeShotRun laRun2 = au::RunLandscapeShotScenario();
+
+    // PROOF (1) two-run BYTE-IDENTICAL (the pure-integer authoring determinism proof).
+    if (laRun.digest != laRun2.digest || laRun.seedDigest != laRun2.seedDigest)
+        return fail("la1-landscape: two runs differ (nondeterministic authoring)");
+    std::printf("la1-landscape: two-run BYTE-IDENTICAL {digest:%016llx}\n",
+                (unsigned long long)laRun.digest);
+
+    // PROOF (2) the undo-all/redo-all round-trip (ran inside the scenario): undo N -> the seed digest
+    // BIT-EXACT, redo N -> the authored digest (the rect-memento proof).
+    if (!laRun.undoRedoOk) return fail("la1-landscape: undo/redo round-trip broke");
+    std::printf("la1-landscape: undo-all -> seed digest %016llx BIT-EXACT, redo-all -> authored "
+                "digest (the rect-memento proof)\n", (unsigned long long)laRun.seedDigest);
+
+    // PROOF (3) the authoring invariants live: splat weights sum to EXACTLY 255 on every texel (the
+    // largest-remainder renorm) + the plateau flat core hit the flatten target EXACTLY.
+    if (!laRun.splatSum255 || !laRun.flattenExact)
+        return fail("la1-landscape: splat-renorm/flatten-exact invariant broke");
+    std::printf("la1-landscape: splat renorm sums 255 everywhere + flatten EXACT in the flat core\n");
+
+    std::printf("la1-landscape: stats {size:%dx%d, ops:%u, roadTexels:%u, digest:%016llx}\n",
+                au::kShowSize, au::kShowSize, laRun.ops, laRun.roadTexels,
+                (unsigned long long)laRun.digest);
+
+    // --- Golden: the SHARED pure-integer shaded-relief raster (terrain_author.h::RenderLandscapeShot —
+    // the identical function the Vulkan --la1-landscape-shot calls; strict-zero BY CONSTRUCTION). ---
+    std::vector<uint8_t> laImg;
+    uint32_t laW = 0, laH = 0;
+    au::RenderLandscapeShot(laRun, laImg, laW, laH);
+    if (!WritePNG(outPath, laImg, laW, laH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — la1 landscape authoring (sculpted hill + plateau + splat paint + "
+                "spline-carved road)\n",
+                outPath, laW, laH);
+    return 0;
+}
+
 // ===== Slice GAS1 — A DETERMINISTIC GAMEPLAY ABILITY SYSTEM showcase (--gas1-duel) (attributes + effects +
 // cooldowns, the GAS-class core, hf::game::gas). PURE CPU — NO GPU compute, NO new shader, NO new RHI;
 // ability.h is header-only Q16.16 integer math, so on Metal it runs the IDENTICAL pure-CPU 60-tick duel the
@@ -81943,6 +81997,18 @@ int main(int argc, char** argv) {
                          std::strcmp(argv[1], "--ff1-fields-shot") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_ff1_fields.png";
             try { return RunFf1FieldsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --la1-landscape <out.png>: render the LANDSCAPE AUTHORING showcase (Slice LA1,
+        // hf::terrain::author — heightmap brush sculpting + splat-layer painting + the SP1 spline-carved
+        // road, every op recorded/reversible via the terrain-local ED5-recipe history). PURE CPU — runs
+        // the IDENTICAL terrain_author.h authored-landscape scenario + SHARED shaded-relief raster the
+        // Vulkan --la1-landscape-shot runs -> bit-identical cross-backend BY CONSTRUCTION; the 3 proof
+        // lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && (std::strcmp(argv[1], "--la1-landscape") == 0 ||
+                         std::strcmp(argv[1], "--la1-landscape-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_la1_landscape.png";
+            try { return RunLa1LandscapeShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gas1-duel <out.png>: render the DETERMINISTIC GAMEPLAY ABILITY SYSTEM showcase (Slice GAS1,

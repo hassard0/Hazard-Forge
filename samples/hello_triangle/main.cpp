@@ -120,6 +120,7 @@
 #include "sim/water_body.h"     // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer, the render ocean and the physics ocean are the same equation) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Vulkan --wv1-float-shot + Metal --wv1-float run the IDENTICAL pure-CPU 480-tick float scenario + shared raster
 #include "spline/spline.h"      // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Vulkan --sp1-road-shot + Metal --sp1-road run the IDENTICAL pure-CPU scenario + shared top-down raster
 #include "sim/force_field.h"    // Slice FF1: RIGID-BODY FORCE-FIELD VOLUMES (FieldVolume/EvalFieldForce/ApplyFields/StepFieldWorld/SimFieldTick/RunFieldLockstep/RunFieldRollback/RunFieldShotScenario/RenderFieldShot — the PT2 particle field math (radial/vortex/wind, particles.h read-only) applied to fpx RIGID BODIES with bounded AABB volumes; velocities mutated pre-step (the WV1 discipline), dv = F*invMass*dt, LINEAR force only (no field torque — documented v1); PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/particles.h read-only; the Vulkan --ff1-fields-shot + Metal --ff1-fields run the IDENTICAL pure-CPU 240-tick scenario + shared top-down raster
+#include "terrain/terrain_author.h"  // Slice LA1: LANDSCAPE AUTHORING (AuthoredTerrain/MakeFlatTerrain/MakeProcTerrain/ApplyRaiseBrush/ApplyFlattenBrush/ApplySmoothBrush/ApplyPaintBrush/ApplyCarveRoad + the Recorded* twins + TerrainHistory Undo/Redo + BuildAuthoredTerrainMesh + RunLandscapeShotScenario/RenderLandscapeShot — heightmap brush sculpting (flat-core integer-smoothstep falloff) + splat-layer painting (largest-remainder renorm to exactly 255) + the SP1 spline-carved road (flatten-to-spline-height bed + smoothstep shoulder + road-layer paint); PURE CPU Q16.16 integer, every op recorded/reversible via the TERRAIN-LOCAL ED5-recipe history — edit_history.h byte-untouched, the documented enrollment choice) — a NEW additive sibling #including terrain/procterrain.h + spline/spline.h + net/session.h read-only; the Vulkan --la1-landscape-shot + Metal --la1-landscape run the IDENTICAL pure-CPU scenario + shared shaded-relief raster
 #include "anim/blend_space.h"   // Slice AN1: DETERMINISTIC BLEND SPACES (BlendSpace1D/2D, EvaluateWeights1D/2D, EvaluatePose1D/2D, SlewParam/SlewParam2/AdvancePhase, BlendDriver1D, RunBlendShotScenario/RenderBlendShot — 1D idle/walk/run-by-speed + 2D strafe-by-speed-x-direction parametric blending; INTEGER params/weights/barycentrics + tick-based slew + NORMALIZED-PHASE clip sync over the EXISTING SampleLocalPose/BlendLocalPoses seam; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + state_machine.h + motion_match.h read-only; the Vulkan --an1-blend-shot + Metal --an1-blend run the IDENTICAL pure-CPU 240-tick scenario + shared raster
 #include "sim/boids.h"          // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids, brute-force all-pairs Reynolds seek+separation) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
@@ -4378,6 +4379,19 @@ int main(int argc, char** argv) {
     const char* ff1FieldsShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--ff1-fields-shot") == 0) { ff1FieldsShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice LA1: --la1-landscape-shot <out.bmp> (LANDSCAPE AUTHORING — heightmap brush sculpting +
+    // splat-layer painting + spline-carved roads, hf::terrain::author; the pure-integer authored
+    // terrain, every op recorded/reversible via the terrain-local ED5-recipe history). PURE CPU: NO GPU
+    // dispatch, NO new shader, NO new RHI; both backends run the IDENTICAL terrain_author.h fixed
+    // scenario (the 128x128 fBm seed sculpted with hill/plateau/smooth stamps, rock/snow paint, and the
+    // SP1 spline road carved through it — undo-all/redo-all digest round-trip proven live) + the SHARED
+    // pure-integer shaded-relief raster -> strict-zero cross-backend BY CONSTRUCTION. Its OWN loop (the
+    // standalone-loop pattern, C1061).
+    const char* la1LandscapeShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--la1-landscape-shot") == 0) { la1LandscapeShotPath = argv[i + 1]; break; }
     }
 
     // Slice GJ5: --gjk-lockstep-shot <out.bmp> (Deterministic General Convex-Hull Contacts LOCKSTEP + ROLLBACK
@@ -60434,6 +60448,68 @@ int main(int argc, char** argv) {
                                 "vortex swirl + wind lane, %d ticks)\n",
                                 ff1FieldsShotPath, ffW, ffH, fld::kShotSteps);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ff1FieldsShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- LANDSCAPE AUTHORING (--la1-landscape-shot <out.bmp>, Slice LA1, hf::terrain::author). PURE
+        // CPU — NO GPU dispatch, NO new shader, NO new RHI; both Vulkan-Windows and Metal-Mac run the
+        // IDENTICAL pure-CPU scenario (terrain_author.h::RunLandscapeShotScenario — the 128x128 fBm-seeded
+        // terrain sculpted with two recorded raise stamps (the hill), a recorded flatten (the plateau), a
+        // recorded smooth pass, rock/snow splat paint (largest-remainder renorm to exactly 255), and the
+        // SP1 spline road carved through it all as ONE recorded command; the undo-all/redo-all digest
+        // round-trip is proven INSIDE the scenario) and the SHARED pure-integer shaded-relief raster
+        // (terrain_author.h::RenderLandscapeShot) -> strict-zero cross-backend BY CONSTRUCTION. The
+        // history is TERRAIN-LOCAL (the ED5 capture-before/apply/record recipe over rect mementos;
+        // edit_history.h byte-untouched — the documented enrollment choice).
+        if (la1LandscapeShotPath) {
+            namespace au = hf::terrain::author;
+
+            // THE SCENARIO (== terrain_author_test): the FIXED authored landscape, run twice.
+            const au::LandscapeShotRun laRun  = au::RunLandscapeShotScenario();
+            const au::LandscapeShotRun laRun2 = au::RunLandscapeShotScenario();
+
+            // PROOF (1) two-run BYTE-IDENTICAL (the pure-integer authoring determinism proof).
+            if (laRun.digest != laRun2.digest || laRun.seedDigest != laRun2.seedDigest) {
+                std::fprintf(stderr, "FATAL: la1-landscape two runs differ (nondeterministic authoring)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("la1-landscape: two-run BYTE-IDENTICAL {digest:%016llx}\n",
+                        (unsigned long long)laRun.digest);
+
+            // PROOF (2) the undo-all/redo-all round-trip (ran inside the scenario): undo N -> the seed
+            // digest BIT-EXACT, redo N -> the authored digest (the rect-memento proof).
+            if (!laRun.undoRedoOk) {
+                std::fprintf(stderr, "FATAL: la1-landscape undo/redo round-trip broke\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("la1-landscape: undo-all -> seed digest %016llx BIT-EXACT, redo-all -> authored "
+                        "digest (the rect-memento proof)\n", (unsigned long long)laRun.seedDigest);
+
+            // PROOF (3) the authoring invariants live: splat weights sum to EXACTLY 255 on every texel
+            // (the largest-remainder renorm) + the plateau flat core hit the flatten target EXACTLY.
+            if (!laRun.splatSum255 || !laRun.flattenExact) {
+                std::fprintf(stderr, "FATAL: la1-landscape splat-renorm/flatten-exact invariant broke\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("la1-landscape: splat renorm sums 255 everywhere + flatten EXACT in the flat "
+                        "core\n");
+
+            std::printf("la1-landscape: stats {size:%dx%d, ops:%u, roadTexels:%u, digest:%016llx}\n",
+                        au::kShowSize, au::kShowSize, laRun.ops, laRun.roadTexels,
+                        (unsigned long long)laRun.digest);
+
+            // --- Golden: the SHARED pure-integer shaded-relief raster (terrain_author.h::
+            // RenderLandscapeShot — the identical function both backends call; strict-zero BY
+            // CONSTRUCTION). ---
+            std::vector<uint8_t> laImg;
+            uint32_t laW = 0, laH = 0;
+            au::RenderLandscapeShot(laRun, laImg, laW, laH);
+            bool ok = WriteBMP(la1LandscapeShotPath, laImg, laW, laH);
+            if (ok) std::printf("wrote %s (%ux%u) — la1 landscape authoring (sculpted hill + plateau + "
+                                "splat paint + spline-carved road)\n",
+                                la1LandscapeShotPath, laW, laH);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", la1LandscapeShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
