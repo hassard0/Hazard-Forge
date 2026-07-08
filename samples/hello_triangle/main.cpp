@@ -130,6 +130,7 @@
 #include "anim/retarget.h"      // Slice AN2: DETERMINISTIC ANIMATION RETARGETING (RetargetMap/BuildRetargetMap, Retarget, FxQuat algebra, ForwardKinematics, RunRetargetShotScenario/RenderRetargetShot — play one skeleton's clip on a DIFFERENTLY-PROPORTIONED skeleton via the bind-delta rotation retarget + root-motion height scale; INTEGER Q16.16 quats past the ONE QuantizeFx boundary; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + motion_match.h read-only; the Vulkan --an2-retarget-shot + Metal --an2-retarget run the IDENTICAL pure-CPU scenario + shared stick-figure raster (strict-zero cross-backend BY CONSTRUCTION)
 #include "anim/anim_layer.h"     // Slice AL1: DETERMINISTIC ANIMATION LAYERING (NotifyTrack/SampleNotifies, ApplyAdditive, AnimLayerStack/EvaluateLayers, Montage/MontagePlayer/StepMontage/JumpToSection, the notify->GT1/GAS1 tagged-effect bridge, RunAl1ShotScenario/RenderAl1Shot — clip notifies/events + additive poses + layered blend-per-bone slot blending + montages, all Q16.16 integer past the ONE QuantizeFx boundary over the EXISTING retarget FxQuat algebra + SampleLocalPose; PURE CPU) — a NEW additive sibling #including anim/animation.h + retarget.h + skeleton.h + seq/seq.h + game/gameplay_tags.h read-only; the Vulkan --al1-layer-shot + Metal --al1-layer run the IDENTICAL pure-CPU scenario (walking legs + an upper-body attack montage + a spine lean + notify markers + the target's health reacting at the hit notify) + shared stick-figure raster (strict-zero cross-backend BY CONSTRUCTION)
 #include "asset/usd_skel_shot.h" // Slice SK1: DETERMINISTIC SKELETAL-ANIMATION ASSET IMPORT (USD/UsdSkel; ImportUsdSkel/UsdSkelImport/DigestUsdSkel/NormalizeInfluences + RunSk1ShotScenario/RenderSk1Shot) — a SECOND, DEVICE-FREE, clean-room skeletal importer (glTF already imports skeletal but is device-coupled; fbx/usd were geometry-only) parsing UsdSkel text -> anim::Skeleton + scene::SkinnedVertex + anim::Animation; a NEW additive sibling #including asset/usd_skel.h (usd_loader.h/skeleton.h/animation.h/scene/vertex.h read-only) + anim/retarget.h read-only for the shot; the Vulkan --sk1-import-shot + Metal --sk1-import run the IDENTICAL pure-CPU scenario (import -> SampleLocalPose -> QuantizePose -> integer FK) + shared stick-figure raster (strict-zero cross-backend BY CONSTRUCTION)
+#include "anim/morph_shot.h"    // Slice MP1: DETERMINISTIC MORPH TARGETS / BLEND SHAPES (anim/morph.h hf::anim::morph; MorphSet/WeightTrack/BuildMorphSet/ApplyMorphFx/SampleMorphWeightsFx + mp1::RunMp1ShotScenario/RenderMp1Shot) — per-vertex morph deltas + a weighted blend + an animated weight track composing with skinning (morph BEFORE skin); next-tier parity gap #5 (gltf_loader.cpp skips morph, "YAGNI: morph"). A NEW additive sibling #including anim/morph.h (anim/animation.h + motion_match.h read-only) + anim/retarget.h read-only for the compose proof; gltf_loader.cpp BYTE-UNTOUCHED; the Vulkan --mp1-morph-shot + Metal --mp1-morph run the IDENTICAL pure-CPU scenario (import -> SampleMorphWeightsFx -> ApplyMorphFx -> SkinPointFx) + shared strict-zero deformed-grid raster (cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"          // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids, brute-force all-pairs Reynolds seek+separation) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot
 #include "sim/crowd.h"          // Slice CR1: DETERMINISTIC CROWD AT 10k+ AGENTS (Mass-class archetype crowd, hf::sim::crowd) — composes the byte-frozen BD2 boids.h grid for O(N) separation (vs BD1's all-pairs O(N²)), 3-archetype types + goal-seek + lockstep/rollback; RunCrowdShotScenario/RenderCrowdShot shared verbatim with the Metal --cr1-crowd; PURE CPU strict-integer, NO new shader
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
@@ -4475,6 +4476,18 @@ int main(int argc, char** argv) {
     const char* sk1ImportShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--sk1-import-shot") == 0) { sk1ImportShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice MP1: --mp1-morph-shot <out.bmp> (DETERMINISTIC MORPH TARGETS / BLEND SHAPES, hf::anim::morph;
+    // next-tier parity gap #5: gltf_loader.cpp skips morph, "YAGNI: morph"). PURE CPU: NO GPU dispatch, NO
+    // new shader, NO new RHI; both backends run the IDENTICAL morph_shot.h scenario (reshape the authored
+    // glTF-style morph asset -> a 49-vert face grid + smile/blink blend shapes + a weight track, sample the
+    // weights LINEARLY at 5 times, INTEGER Q16.16 morph-blend the grid, + compose a rigged witness vertex
+    // morph-THEN-skin) + the SHARED strict-zero deformed-grid raster -> cross-backend BY CONSTRUCTION. Its
+    // OWN loop (the standalone-loop pattern, C1061).
+    const char* mp1MorphShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--mp1-morph-shot") == 0) { mp1MorphShotPath = argv[i + 1]; break; }
     }
 
     // Slice UF1: --uf1-text-shot <out.bmp> (DETERMINISTIC SDF TEXT — signed-distance-field glyph
@@ -60619,6 +60632,55 @@ int main(int argc, char** argv) {
                                 "by the clip, %d bones / %d keyframes)\n",
                                 sk1ImportShotPath, skW, skH, run.bones, run.keyframes);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", sk1ImportShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // Slice MP1: --mp1-morph-shot — DETERMINISTIC MORPH TARGETS / BLEND SHAPES. The Vulkan sample and
+        // Metal-Mac run the IDENTICAL pure-CPU scenario (morph_shot.h::RunMp1ShotScenario — reshape the
+        // authored glTF-style morph asset into a face grid + smile/blink blend shapes + a weight track, sample
+        // the weights LINEARLY at 5 times, INTEGER Q16.16 morph-blend the grid, + compose a rigged witness
+        // vertex morph-THEN-skin) and the SHARED strict-zero deformed-grid raster -> cross-backend BY
+        // CONSTRUCTION. Asserts two-run identity + the compose ORDER witness + the pinned stat line.
+        if (mp1MorphShotPath) {
+            namespace mp1 = hf::anim::morph::mp1;
+
+            const mp1::Mp1ShotRun run  = mp1::RunMp1ShotScenario();
+            const mp1::Mp1ShotRun run2 = mp1::RunMp1ShotScenario();
+
+            // PROOF (1) two-run IDENTICAL (import + blend + compose digests).
+            if (run.digest != run2.digest || run.importDigest != run2.importDigest ||
+                run.blendDigest != run2.blendDigest || run.composeDigest != run2.composeDigest) {
+                std::fprintf(stderr, "FATAL: mp1-morph two runs differ (nondeterministic morph/blend)\n");
+                device->WaitIdle(); return 1;
+            }
+            // PROOF (2) the reshape decoded the morph set (49 verts, 2 targets, 3 weight keys).
+            if (run.verts != 49 || run.targets != 2 || run.weightKeys != 3) {
+                std::fprintf(stderr, "FATAL: mp1-morph bad reshape {verts:%d targets:%d weightKeys:%d}\n",
+                             run.verts, run.targets, run.weightKeys);
+                device->WaitIdle(); return 1;
+            }
+            // PROOF (3) the morph->skin ORDER matters (delta rotated with the vertex != delta added after).
+            if (run.morphThenSkin.y == run.skinThenMorph.y) {
+                std::fprintf(stderr, "FATAL: mp1-morph compose order does not matter (bug)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("mp1-morph: two-run IDENTICAL {import:%016llx, blend:%016llx, compose:%016llx}\n",
+                        (unsigned long long)run.importDigest, (unsigned long long)run.blendDigest,
+                        (unsigned long long)run.composeDigest);
+            std::printf("mp1-morph: order {morph->skin.y:%d, skin->morph.y:%d} (differ -> morph BEFORE skin)\n",
+                        run.morphThenSkin.y, run.skinThenMorph.y);
+            std::printf("mp1-morph: stats {verts:%d, targets:%d, weights:%d, frames:%d, digest:%016llx}\n",
+                        run.verts, run.targets, run.weightKeys, (int)run.frames.size(),
+                        (unsigned long long)run.digest);
+
+            std::vector<uint8_t> moImg; uint32_t moW = 0, moH = 0;
+            mp1::RenderMp1Shot(run, moImg, moW, moH);
+            bool ok = WriteBMP(mp1MorphShotPath, moImg, moW, moH);
+            if (ok) std::printf("wrote %s (%ux%u) — mp1 deterministic morph targets (face grid at %d weight "
+                                "settings, %d blend shapes)\n",
+                                mp1MorphShotPath, moW, moH, (int)run.frames.size(), run.targets);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", mp1MorphShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

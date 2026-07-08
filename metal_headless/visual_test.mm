@@ -157,6 +157,7 @@
 #include "anim/anim_layer.h"          // Slice AL1: DETERMINISTIC ANIMATION LAYERING (NotifyTrack/SampleNotifies, ApplyAdditive, AnimLayerStack/EvaluateLayers, Montage/MontagePlayer/StepMontage/JumpToSection, the notify->GT1/GAS1 tagged-effect bridge, RunAl1ShotScenario/RenderAl1Shot — clip notifies/events + additive poses + layered blend-per-bone slot blending + montages, all Q16.16 integer past the ONE QuantizeFx boundary over the EXISTING retarget FxQuat algebra + SampleLocalPose; PURE CPU) — a NEW additive sibling #including anim/animation.h + retarget.h + skeleton.h + seq/seq.h + game/gameplay_tags.h read-only; the Metal --al1-layer runs the IDENTICAL pure-CPU scenario + SHARED stick-figure raster the Vulkan --al1-layer-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "anim/retarget.h"           // Slice AN2: DETERMINISTIC ANIMATION RETARGETING (RetargetMap/BuildRetargetMap, Retarget, FxQuat algebra, ForwardKinematics, RunRetargetShotScenario/RenderRetargetShot — play one skeleton's clip on a DIFFERENTLY-PROPORTIONED skeleton via the bind-delta rotation retarget + root-motion height scale; INTEGER Q16.16 quats past the ONE QuantizeFx boundary; PURE CPU) — a NEW additive sibling #including anim/animation.h + skeleton.h + motion_match.h read-only; the Metal --an2-retarget runs the IDENTICAL pure-CPU scenario + SHARED stick-figure raster the Vulkan --an2-retarget-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "asset/usd_skel_shot.h"     // Slice SK1: DETERMINISTIC SKELETAL-ANIMATION ASSET IMPORT (USD/UsdSkel; ImportUsdSkel/RunSk1ShotScenario/RenderSk1Shot) — a SECOND, DEVICE-FREE, clean-room skeletal importer (glTF's is device-coupled; fbx/usd were geometry-only) parsing UsdSkel text -> anim::Skeleton + scene::SkinnedVertex + anim::Animation; header-only, so on Metal it runs the IDENTICAL pure-CPU scenario + SHARED stick-figure raster the Vulkan --sk1-import-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "anim/morph_shot.h"         // Slice MP1: DETERMINISTIC MORPH TARGETS / BLEND SHAPES (anim/morph.h hf::anim::morph; MorphSet/WeightTrack/BuildMorphSet/ApplyMorphFx/SampleMorphWeightsFx + mp1::RunMp1ShotScenario/RenderMp1Shot) — per-vertex morph deltas + weighted blend + animated weight track composing with skinning (morph BEFORE skin); next-tier parity gap #5 (gltf_loader.cpp skips morph). Header-only, so on Metal it runs the IDENTICAL pure-CPU scenario + SHARED strict-zero deformed-grid raster the Vulkan --mp1-morph-shot runs (cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "sim/crowd.h"               // Slice CR1: DETERMINISTIC CROWD AT 10k+ AGENTS (Mass-class archetype crowd, hf::sim::crowd) — composes the byte-frozen BD2 boids.h grid for O(N) separation; RunCrowdShotScenario/RenderCrowdShot run IDENTICAL to the Vulkan --cr1-crowd-shot (strict-zero cross-backend BY CONSTRUCTION); PURE CPU, NO new shader
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
@@ -48901,6 +48902,53 @@ static int RunSk1ImportShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice MP1 — DETERMINISTIC MORPH TARGETS / BLEND SHAPES showcase (--mp1-morph) (per-vertex morph
+// deltas + a weighted blend + an animated weight track composing with skinning; hf::anim::morph — next-tier
+// parity gap #5: gltf_loader.cpp skips morph, "YAGNI: morph"). PURE CPU — NO GPU compute, NO new shader, NO
+// new RHI; morph_shot.h is header-only, so on Metal it runs the IDENTICAL fixed scenario the Vulkan
+// --mp1-morph-shot runs on Windows (RunMp1ShotScenario — reshape the authored glTF-style morph asset into a
+// 49-vert face grid + smile/blink blend shapes + a weight track, sample the weights LINEARLY at 5 times,
+// INTEGER Q16.16 morph-blend the grid, + compose a rigged witness vertex morph-THEN-skin) AND the SHARED
+// pure-integer deformed-grid raster (RenderMp1Shot — the identical function both backends call) ->
+// bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). Proof lines match the Vulkan side
+// EXACTLY. New golden tests/golden/metal/mp1_morph.png (baked on the Mac by the controller); two runs DIFF 0.
+static int RunMp1MorphShowcase(const char* outPath) {
+    namespace mp1 = hf::anim::morph::mp1;
+
+    const mp1::Mp1ShotRun run  = mp1::RunMp1ShotScenario();
+    const mp1::Mp1ShotRun run2 = mp1::RunMp1ShotScenario();
+
+    // PROOF (1) two-run IDENTICAL (import + blend + compose digests).
+    if (run.digest != run2.digest || run.importDigest != run2.importDigest ||
+        run.blendDigest != run2.blendDigest || run.composeDigest != run2.composeDigest)
+        return fail("mp1-morph: two runs differ (nondeterministic morph/blend)");
+    // PROOF (2) the reshape decoded the morph set.
+    if (run.verts != 49 || run.targets != 2 || run.weightKeys != 3)
+        return fail("mp1-morph: bad reshape");
+    // PROOF (3) the morph->skin ORDER matters (delta rotated with the vertex != delta added after).
+    if (run.morphThenSkin.y == run.skinThenMorph.y)
+        return fail("mp1-morph: compose order does not matter (bug)");
+    std::printf("mp1-morph: two-run IDENTICAL {import:%016llx, blend:%016llx, compose:%016llx}\n",
+                (unsigned long long)run.importDigest, (unsigned long long)run.blendDigest,
+                (unsigned long long)run.composeDigest);
+    std::printf("mp1-morph: order {morph->skin.y:%d, skin->morph.y:%d} (differ -> morph BEFORE skin)\n",
+                run.morphThenSkin.y, run.skinThenMorph.y);
+    std::printf("mp1-morph: stats {verts:%d, targets:%d, weights:%d, frames:%d, digest:%016llx}\n",
+                run.verts, run.targets, run.weightKeys, (int)run.frames.size(),
+                (unsigned long long)run.digest);
+
+    // --- Golden: the SHARED pure-integer raster (morph_shot.h::RenderMp1Shot — the identical function the
+    // Vulkan --mp1-morph-shot calls; strict-zero BY CONSTRUCTION). ---
+    std::vector<uint8_t> moImg;
+    uint32_t moW = 0, moH = 0;
+    mp1::RenderMp1Shot(run, moImg, moW, moH);
+    if (!WritePNG(outPath, moImg, moW, moH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — mp1 deterministic morph targets (face grid at %d weight settings, "
+                "%d blend shapes)\n",
+                outPath, moW, moH, (int)run.frames.size(), run.targets);
+    return 0;
+}
+
 // ===== Slice AN2 — DETERMINISTIC ANIMATION RETARGETING showcase (--an2-retarget) (play one skeleton's
 // clip on a DIFFERENTLY-PROPORTIONED skeleton — the bind-delta rotation retarget R = (tbind (x)
 // conj(sbind)) (x) sanim in INTEGER Q16.16 quats + the root-motion height scale; hf::anim::retarget).
@@ -82849,6 +82897,18 @@ int main(int argc, char** argv) {
                          std::strcmp(argv[1], "--sk1-import-shot") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_sk1_import.png";
             try { return RunSk1ImportShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --mp1-morph <out.png>: render the DETERMINISTIC MORPH TARGETS / BLEND SHAPES showcase (Slice MP1,
+        // hf::anim::morph — per-vertex morph deltas + a weighted blend + an animated weight track composing
+        // with skinning, morph BEFORE skin; next-tier parity gap #5, gltf_loader.cpp skips morph). PURE CPU —
+        // runs the IDENTICAL morph_shot.h reshape->sample->blend->compose scenario + SHARED strict-zero
+        // deformed-grid raster the Vulkan --mp1-morph-shot runs -> bit-identical cross-backend BY CONSTRUCTION;
+        // the proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && (std::strcmp(argv[1], "--mp1-morph") == 0 ||
+                         std::strcmp(argv[1], "--mp1-morph-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_mp1_morph.png";
+            try { return RunMp1MorphShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --cr1-crowd <out.png>: render the DETERMINISTIC CROWD AT 10k+ AGENTS showcase (Slice CR1,

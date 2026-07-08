@@ -1778,6 +1778,24 @@ hf_add_pure_test(anim_layer_test)
 # imported through the real parser (no .usd file on disk).
 hf_add_pure_test(usd_skel_test)
 
+# Slice MP1 — DETERMINISTIC MORPH TARGETS / BLEND SHAPES (engine/anim/morph.h, hf::anim::morph; next-tier
+# parity gap #5). gltf_loader.cpp explicitly SKIPS morph ("YAGNI: morph" drops the glTF `weights` channel) and
+# CAPABILITIES.md confirms none built; UE5 ships morph targets (facial animation). MP1 adds per-vertex morph
+# deltas + a weighted blend (deformed[v]=base[v]+Sum_t w[t]*delta_t[v], ascending fixed accumulation order) +
+# an animated weight track (LINEAR scalar keyframes) + composition with skinning (morph BEFORE skin). A NEW
+# header composing anim/animation.h + motion_match.h + retarget.h READ-ONLY (gltf_loader.cpp BYTE-UNTOUCHED);
+# the "import" reshapes a glTF-style authored accessor literal (base positions + per-target flat delta
+# accessors + mesh default weights + a weights channel) into a MorphSet + WeightTrack. Determinism: scene
+# positions are FLOAT so a FLOAT ApplyMorph (authoring) + an INTEGER Q16.16 ApplyMorphFx (the pinned path,
+# fxmul past the ONE QuantizeFx boundary) agree on exact binary-fraction authored data. Pins: the reshape vs
+# the asset, weights-0==base + single/multi/fractional blend exact, weight-track AT/BETWEEN keys, the
+# morph->skin ORDER witness (delta rotated with the vertex vs not), and the import/blend/compose/combined shot
+# digests PINNED identical MSVC + clang. Pure C++ (hf_core), ASan-eligible. Standalone: clang++ -std=c++20 -I
+# engine -I tests tests/morph_test.cpp engine/anim/animation.cpp. Asset is a hand-authored accessor LITERAL
+# (Mp1MorphAsset, the SK1 discipline — no .glb on disk); the Vulkan --mp1-morph-shot + Metal --mp1-morph run
+# the IDENTICAL scenario + shared strict-zero deformed-grid raster (cross-backend BY CONSTRUCTION).
+hf_add_pure_test(morph_test)
+
 # Slice FO1 (the BEACHHEAD of FLAGSHIP #25, DETERMINISTIC FOLIAGE AT SCALE): the deterministic integer WIND FIELD
 # (engine/foliage/foliage.h) — WindBend(wind,pos,frame) is a Q16.16 bend angle from a sum of host-baked sine "gust"
 # waves indexed by an integer phase accumulator into the committed kFoliageWind16 LUT (the audio kSineTable copied
