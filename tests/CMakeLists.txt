@@ -2119,6 +2119,28 @@ hf_add_pure_test(replication_test)
 # Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(net_transport_test)
 
+# Slice NW1 — REAL UDP TRANSPORT for the deterministic rollback netcode (engine/net/udp_transport.h,
+# hf::net::udp; the BEAT_UE5 "Rollback Kit" post-P0 step). The ONE nondeterministic-I/O integration test:
+# it opens REAL UDP sockets (Winsock on Windows / BSD sockets elsewhere) on 127.0.0.1 and exchanges REAL
+# datagrams. 🔵 HONEST BOUNDARY: real sockets are nondeterministic I/O (arrival order/loss vary run-to-
+# run), so the gate asserts the deterministic OUTCOME — two peers exchanging inputs over real UDP each
+# INDEPENDENTLY re-derive the IDENTICAL match/world digest == a pinned value (deterministic rollback over
+# a real network, which UE5's float architecture cannot do). NON-FLAKY BY CONSTRUCTION: a same-process
+# two-socket loopback + a bounded ACK+resend reliability loop (drop-then-resend converges); the digest
+# assertions are the pinned deterministic part. Pins: (a) basic real send/recv, (b) the GAME1 duel over
+# real UDP -> both digests == the pinned matchDigest, (c) resilience under injected reorder/dup/drop-then-
+# resend, (d) transport-invariance (over-UDP == in-process), (e) per-tick predict+rollback over real UDP
+# -> the pinned NS6 authority, (f) the showcase's pinned constants == the socket outcome. Composes
+# game/duel.h + net/session.h READ-ONLY; udp_transport.h is a NEW impl of the transport interface. Links
+# ws2_32 on Windows for Winsock. Not ASan-instrumented like the pure tests (it drives real OS sockets);
+# it still runs as an ordinary ctest. NO goldens committed.
+add_executable(udp_transport_test udp_transport_test.cpp)
+target_link_libraries(udp_transport_test PRIVATE hf_core)
+if(WIN32)
+  target_link_libraries(udp_transport_test PRIVATE ws2_32)   # Winsock (WSAStartup/socket/sendto/recvfrom)
+endif()
+add_test(NAME udp_transport_test COMMAND udp_transport_test)
+
 # Client prediction + server reconciliation (Slice BY): the deterministic, socket-free PredictedClient
 # over the AX roll-game (engine/net/prediction). Asserts prediction advances (PredictTick moves the
 # predicted player ahead under local input without a snapshot), reconcile with NO misprediction

@@ -128,6 +128,7 @@
 #include "game/gameplay_tags.h" // Slice GT1: A DETERMINISTIC GAMEPLAY-TAG LAYER (TagRegistry/TagContainer/HasTagQuery/TagRules/TryActivateTagged/StepTagged/RunTaggedLockstep/RunTaggedRollback/RunSkirmish — hierarchical interned tags gating GAS1 abilities/effects via a thin adapter; PURE CPU integer) — a NEW additive sibling #including game/ability.h READ-ONLY/BYTE-UNTOUCHED; the Vulkan --gt1-tags-shot + Metal --gt1-tags run the IDENTICAL pure-CPU 14-tick tag skirmish
 #include "game/gameplay_cues.h" // Slice GC1: DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES (sphere/box/cone overlap -> ascending-id target set + GT1 tag filter; a deterministic cue EVENT stream impact/buff/death; AreaActivate composes GAS1/GT1 via an adapter; RenderGc1CuesViz; PURE CPU integer geometry, cone half-angle a pinned host cos threshold — NO runtime trig) — a NEW additive sibling #including game/gameplay_tags.h READ-ONLY/BYTE-UNTOUCHED; the Vulkan --gc1-cues-shot + Metal --gc1-cues run the IDENTICAL pure-CPU cue battle (cues are the EVENT layer, NOT rendered VFX)
 #include "game/duel.h"          // Slice GAME1: A COMPLETE DETERMINISTIC ROLLBACK-PHYSICS GAME — a 2-player physics KNOCKOUT DUEL (hf::game::duel) that COMPOSES the whole moat stack (bit-exact fpx/verdict physics + whole-world lockstep/rollback + replay + what-if fork + provable anti-cheat) PLUS the gameplay framework (GAS1 shove cost+cooldown, GT1 State.Stunned gate, GC1 cue stream) into the engine's first actual GAME; a headless deterministic match SIMULATION + the moat proofs; composes verdict.h/ability.h/gameplay_tags.h/gameplay_cues.h/authority_verify.h/fork.h/replay.h READ-ONLY; the Vulkan --game1-duel-shot + Metal --game1-duel run the IDENTICAL pure-integer duel report (RenderDuelViz). UE5's float architecture is disqualified from a bit-exact, rollback-replayable, fork-able, provably-fair game.
+#include "net/nw1_report.h"     // Slice NW1: REAL UDP TRANSPORT showcase report (hf::net::nw1). PURE-INTEGER, NO socket code (the real sockets live in net/udp_transport.h, exercised by tests/udp_transport_test.cpp); the Vulkan --nw1-udp-shot + Metal --nw1-udp render the IDENTICAL pinned network-match report (RenderNw1UdpViz): two peers exchanging inputs over REAL UDP each re-derive the pinned GAME1 matchDigest + the NS6 rollback authority == deterministic rollback over a real network, which UE5's float architecture cannot do. The showcase renders the PINNED loopback OUTCOME (sockets are nondeterministic I/O; the outcome is bit-exact) so the bake is two-run byte-identical.
 #include "sim/water_body.h"     // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer, the render ocean and the physics ocean are the same equation) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Vulkan --wv1-float-shot + Metal --wv1-float run the IDENTICAL pure-CPU 480-tick float scenario + shared raster
 #include "spline/spline.h"      // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Vulkan --sp1-road-shot + Metal --sp1-road run the IDENTICAL pure-CPU scenario + shared top-down raster
 #include "sim/force_field.h"    // Slice FF1: RIGID-BODY FORCE-FIELD VOLUMES (FieldVolume/EvalFieldForce/ApplyFields/StepFieldWorld/SimFieldTick/RunFieldLockstep/RunFieldRollback/RunFieldShotScenario/RenderFieldShot — the PT2 particle field math (radial/vortex/wind, particles.h read-only) applied to fpx RIGID BODIES with bounded AABB volumes; velocities mutated pre-step (the WV1 discipline), dv = F*invMass*dt, LINEAR force only (no field torque — documented v1); PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/particles.h read-only; the Vulkan --ff1-fields-shot + Metal --ff1-fields run the IDENTICAL pure-CPU 240-tick scenario + shared top-down raster
@@ -4169,6 +4170,21 @@ int main(int argc, char** argv) {
     const char* game1DuelShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--game1-duel-shot") == 0) { game1DuelShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice NW1: --nw1-udp-shot <out.bmp> (REAL UDP TRANSPORT for the deterministic rollback netcode,
+    // engine/net/udp_transport.h + the pure-integer report engine/net/nw1_report.h, hf::net). PURE CPU: NO
+    // GPU dispatch, NO new shader, NO new RHI; both backends render the IDENTICAL pinned network-match report
+    // (RenderNw1UdpViz) -> strict-zero cross-backend BY CONSTRUCTION. The report visualizes the PINNED
+    // loopback OUTCOME: two peers exchanging inputs over REAL UDP (real send/recv syscalls, exercised by
+    // tests/udp_transport_test.cpp) each re-derive the pinned GAME1 matchDigest + the NS6 rollback authority
+    // == deterministic rollback over a real network. 🔵 The sockets are the ONE nondeterministic-I/O
+    // exception (arrival order/loss vary run-to-run); the OUTCOME digest is bit-exact, so the SHOWCASE never
+    // opens a socket at bake time — it renders the pinned outcome, staying two-run byte-identical even in a
+    // headless bake env that can't open sockets. Its OWN parse loop (the standalone-loop C1061 pattern).
+    const char* nw1UdpShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--nw1-udp-shot") == 0) { nw1UdpShotPath = argv[i + 1]; break; }
     }
 
     // Slice WE1: --we1-clouddensity-shot <out.bmp> (Deterministic integer DRIFTING CLOUD-DENSITY field —
@@ -59158,6 +59174,57 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — game1 deterministic rollback-physics knockout duel (best-of-3, Player%d wins %u-%u, all 5 moat proofs green)\n",
                                 game1DuelShotPath, s1.width, s1.height, s1.matchWinner, s1.score0, s1.score1);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", game1DuelShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        if (nw1UdpShotPath) {
+            namespace gnw1 = hf::net::nw1;
+            // REAL UDP TRANSPORT report (Slice NW1). PURE CPU: the IDENTICAL RenderNw1UdpViz the Metal
+            // --nw1-udp runs -> the pixels are bit-identical cross-backend BY CONSTRUCTION (strict zero-
+            // differing-pixel). NO shader. The showcase renders the PINNED loopback OUTCOME (the sockets run
+            // in tests/udp_transport_test.cpp; the report visualizes the pinned deterministic outcome), so it
+            // is two-run byte-identical even though real sockets are nondeterministic I/O.
+            std::vector<uint8_t> img1, img2;
+            gnw1::Nw1VizStats s1{}, s2{};
+            gnw1::RenderNw1UdpViz(img1, s1);
+            gnw1::RenderNw1UdpViz(img2, s2);
+            const bool twoRunIdentical = (img1.size() == img2.size()) &&
+                                         (std::memcmp(img1.data(), img2.data(), img1.size()) == 0) &&
+                                         (s1.pixDigest == s2.pixDigest);
+            if (!twoRunIdentical) {
+                std::fprintf(stderr, "FATAL: nw1-udp two runs differ\n");
+                device->WaitIdle(); return 1;
+            }
+            // CORRECTNESS CONTROL (match the Metal --nw1-udp side EXACTLY): the pinned outcome IS the live
+            // deterministic recompute (RunDuelMatch matchDigest + the NS6 rollback authority).
+            const bool nw1Ok = (s1.converged && s1.rollbackOk && s1.resilient &&
+                                s1.matchDigest == gnw1::kNw1MatchDigest &&
+                                s1.rollbackDigest == gnw1::kNw1RollbackDigest &&
+                                s1.peers == 2u);
+            if (!nw1Ok) {
+                std::fprintf(stderr, "FATAL: nw1-udp correctness control failed\n");
+                device->WaitIdle(); return 1;
+            }
+            // PROOF lines (match the Metal --nw1-udp side EXACTLY).
+            std::printf("nw1-udp: REAL UDP transport for the deterministic rollback netcode (Winsock/BSD sockets)\n");
+            std::printf("nw1-udp: two peers exchange inputs over real 127.0.0.1 datagrams -> IDENTICAL pinned digest\n");
+            std::printf("nw1-udp: MATCH over real UDP converges {peer0==peer1==matchDigest:0x%016llx}\n",
+                        (unsigned long long)s1.matchDigest);
+            std::printf("nw1-udp: ROLLBACK over real UDP converges {digest:0x%016llx} (NS6 authority)\n",
+                        (unsigned long long)s1.rollbackDigest);
+            std::printf("nw1-udp: RESILIENT under reorder/dup/drop-then-resend {converged:%s}\n",
+                        s1.resilient ? "true" : "false");
+            std::printf("nw1-udp: [I/O] sockets are nondeterministic I/O; the OUTCOME digest is bit-exact\n");
+            std::printf("nw1-udp: two-run BYTE-IDENTICAL {pixDigest:0x%016llx}\n", (unsigned long long)s1.pixDigest);
+            std::printf("nw1-udp: {peers:%u, ticks:%u, packetsSent:%u, converged:%s, matchDigest:0x%016llx}\n",
+                        s1.peers, s1.ticks, s1.packetsSent, s1.converged ? "true" : "false",
+                        (unsigned long long)s1.matchDigest);
+
+            bool ok = WriteBMP(nw1UdpShotPath, img1, s1.width, s1.height);
+            if (ok) std::printf("wrote %s (%ux%u) — nw1 deterministic rollback netcode over REAL UDP (two peers converge to pinned matchDigest 0x%016llx)\n",
+                                nw1UdpShotPath, s1.width, s1.height, (unsigned long long)s1.matchDigest);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", nw1UdpShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

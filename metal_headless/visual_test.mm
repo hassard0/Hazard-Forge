@@ -152,6 +152,7 @@
 #include "game/gameplay_tags.h"      // Slice GT1: A DETERMINISTIC GAMEPLAY-TAG LAYER (TagRegistry/TagContainer/HasTagQuery/TagRules/TryActivateTagged/StepTagged/RunTaggedLockstep/RunTaggedRollback/RunSkirmish — hierarchical interned tags gating GAS1 abilities/effects via a thin adapter; PURE CPU integer) — a NEW additive sibling #including game/ability.h READ-ONLY/BYTE-UNTOUCHED; the Metal --gt1-tags runs the IDENTICAL pure-CPU 14-tick tag skirmish the Vulkan --gt1-tags-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "game/gameplay_cues.h"       // Slice GC1: DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES (sphere/box/cone overlap -> ascending-id target set + GT1 tag filter; a deterministic impact/buff/death cue EVENT stream; AreaActivate composes GAS1/GT1 via an adapter; RenderGc1CuesViz; PURE CPU integer geometry, cone half-angle a pinned host cos threshold — NO runtime trig) — a NEW additive sibling #including game/gameplay_tags.h READ-ONLY/BYTE-UNTOUCHED; the Metal --gc1-cues runs the IDENTICAL pure-CPU cue battle + RenderGc1CuesViz the Vulkan --gc1-cues-shot runs (strict-zero cross-backend BY CONSTRUCTION; cues are the EVENT layer, NOT rendered VFX)
 #include "game/duel.h"                // Slice GAME1: A COMPLETE DETERMINISTIC ROLLBACK-PHYSICS GAME — a 2-player physics KNOCKOUT DUEL (hf::game::duel) composing the whole moat stack (fpx/verdict physics + lockstep/rollback + replay + what-if fork + provable anti-cheat) PLUS the gameplay framework (GAS1 shove cost+cooldown, GT1 State.Stunned, GC1 cues); the engine's first actual GAME (a headless deterministic match SIMULATION + the moat proofs); composes verdict.h/ability.h/gameplay_tags.h/gameplay_cues.h/authority_verify.h/fork.h/replay.h READ-ONLY; the Metal --game1-duel runs the IDENTICAL pure-integer RenderDuelViz the Vulkan --game1-duel-shot runs (strict-zero cross-backend BY CONSTRUCTION, NO shader)
+#include "net/nw1_report.h"           // Slice NW1: REAL UDP TRANSPORT showcase report (hf::net::nw1). PURE-INTEGER, NO socket code (the real Winsock/BSD sockets live in net/udp_transport.h, exercised by tests/udp_transport_test.cpp); the Metal --nw1-udp runs the IDENTICAL RenderNw1UdpViz the Vulkan --nw1-udp-shot runs (strict-zero cross-backend BY CONSTRUCTION, NO shader) — two peers exchanging inputs over REAL UDP each re-derive the pinned GAME1 matchDigest + NS6 rollback authority == deterministic rollback over a real network. The showcase renders the PINNED loopback OUTCOME (sockets are nondeterministic I/O; the outcome is bit-exact), so the bake is two-run byte-identical.
 #include "ai/ai.h"                   // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Metal --ai1-tree runs the IDENTICAL pure-CPU tick + 2D node-graph viz the Vulkan --ai1-tree-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "ai/behavior_tree.h"        // Slice BT1: DETERMINISTIC BEHAVIOR-TREE DEPTH + UTILITY AI (parallel/cooldown/observer-abort/retry/loop/service/utility node kinds + BuildGuardTree/RunBt1Scenario/RenderBt1Shot) — a NEW additive header COMPOSING ai/ai.h READ-ONLY (Blackboard/Status/kMaxBbKeys byte-untouched); the Metal --bt1-behavior runs the IDENTICAL pure-CPU guard scenario + SHARED strict-zero integer timeline raster the Vulkan --bt1-behavior-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "foliage/impostor.h"        // Slice FO1 (impostor arc, audit item FO-B): DETERMINISTIC FOLIAGE IMPOSTORS + CROSS-FADE LOD (OctEncode/Decode/ImpostorCell octahedral atlas addressing + CrossFadeWeight + Bayer/per-instance-hash dither + RunImpostorScene/RenderImpostorShot) — a NEW header COMPOSING foliage/foliage.h READ-ONLY (BYTE-UNTOUCHED); the Metal --fo1-impostor runs the IDENTICAL pure-CPU fly-through + SHARED strict-zero integer viz the Vulkan --fo1-impostor-shot runs (NO shader; the GPU atlas BAKE + billboard render is DEFERRED to FO2)
@@ -47284,6 +47285,52 @@ static int RunGame1DuelShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice NW1 — REAL UDP TRANSPORT showcase (--nw1-udp) (engine/net/udp_transport.h + net/nw1_report.h,
+// hf::net). PURE CPU — NO GPU compute, NO new shader, NO new RHI; nw1_report.h is header-only pure-integer
+// (NO socket code — the real Winsock/BSD sockets live in udp_transport.h, exercised by udp_transport_test),
+// so on Metal it renders the IDENTICAL pinned network-match report RenderNw1UdpViz the Vulkan --nw1-udp-shot
+// renders -> bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). The report
+// visualizes the PINNED loopback OUTCOME: two peers exchanging inputs over REAL UDP each re-derive the
+// pinned GAME1 matchDigest + the NS6 rollback authority == deterministic rollback over a real network. 🔵
+// The sockets are the ONE nondeterministic-I/O exception; the OUTCOME digest is bit-exact, so the SHOWCASE
+// never opens a socket (bake-env-safe). New golden tests/golden/metal/nw1_udp.png (baked on the Mac by the
+// controller). UE5's float architecture is disqualified from deterministic rollback over a real network.
+static int RunNw1UdpShowcase(const char* outPath) {
+    namespace gnw1 = hf::net::nw1;
+    std::vector<uint8_t> img1, img2;
+    gnw1::Nw1VizStats s1{}, s2{};
+    gnw1::RenderNw1UdpViz(img1, s1);
+    gnw1::RenderNw1UdpViz(img2, s2);
+    const bool twoRunIdentical = (img1.size() == img2.size()) &&
+                                 (std::memcmp(img1.data(), img2.data(), img1.size()) == 0) &&
+                                 (s1.pixDigest == s2.pixDigest);
+    if (!twoRunIdentical) return fail("nw1-udp: two runs differ");
+
+    const bool nw1Ok = (s1.converged && s1.rollbackOk && s1.resilient &&
+                        s1.matchDigest == gnw1::kNw1MatchDigest &&
+                        s1.rollbackDigest == gnw1::kNw1RollbackDigest && s1.peers == 2u);
+    if (!nw1Ok) return fail("nw1-udp: correctness control failed");
+
+    std::printf("nw1-udp: REAL UDP transport for the deterministic rollback netcode (Winsock/BSD sockets)\n");
+    std::printf("nw1-udp: two peers exchange inputs over real 127.0.0.1 datagrams -> IDENTICAL pinned digest\n");
+    std::printf("nw1-udp: MATCH over real UDP converges {peer0==peer1==matchDigest:0x%016llx}\n",
+                (unsigned long long)s1.matchDigest);
+    std::printf("nw1-udp: ROLLBACK over real UDP converges {digest:0x%016llx} (NS6 authority)\n",
+                (unsigned long long)s1.rollbackDigest);
+    std::printf("nw1-udp: RESILIENT under reorder/dup/drop-then-resend {converged:%s}\n",
+                s1.resilient ? "true" : "false");
+    std::printf("nw1-udp: [I/O] sockets are nondeterministic I/O; the OUTCOME digest is bit-exact\n");
+    std::printf("nw1-udp: two-run BYTE-IDENTICAL {pixDigest:0x%016llx}\n", (unsigned long long)s1.pixDigest);
+    std::printf("nw1-udp: {peers:%u, ticks:%u, packetsSent:%u, converged:%s, matchDigest:0x%016llx}\n",
+                s1.peers, s1.ticks, s1.packetsSent, s1.converged ? "true" : "false",
+                (unsigned long long)s1.matchDigest);
+
+    if (!WritePNG(outPath, img1, s1.width, s1.height)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — nw1 deterministic rollback netcode over REAL UDP (two peers converge to pinned matchDigest 0x%016llx)\n",
+                outPath, s1.width, s1.height, (unsigned long long)s1.matchDigest);
+    return 0;
+}
+
 static int RunSq2CinematicShowcase(const char* outPath) {
     namespace sq = hf::seq;
     std::vector<uint8_t> img1, img2;
@@ -83236,6 +83283,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--game1-duel") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_game1_duel.png";
             try { return RunGame1DuelShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --nw1-udp <out.png>: render the REAL UDP TRANSPORT showcase (Slice NW1). PURE CPU — renders the
+        // shared RenderNw1UdpViz the Vulkan --nw1-udp-shot renders (the pinned network-match report: two
+        // peers exchanging inputs over REAL UDP converge to the pinned GAME1 matchDigest + the NS6 rollback
+        // authority = deterministic rollback over a real network) -> bit-identical cross-backend BY
+        // CONSTRUCTION; the proof lines match the Vulkan side EXACTLY. NO shader; NO socket at bake time.
+        if (argc > 1 && std::strcmp(argv[1], "--nw1-udp") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_nw1_udp.png";
+            try { return RunNw1UdpShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --we1-clouddensity <out.png>: render the Deterministic integer DRIFTING CLOUD-DENSITY showcase (Slice WE1,
