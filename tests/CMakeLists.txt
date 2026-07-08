@@ -1023,6 +1023,17 @@ hf_add_pure_test(mc_test)
 # classifies byte-identical). Pure C++ (hf_core), ASan-eligible. fract.h #includes sim/fpx.h read-only.
 hf_add_pure_test(fract_test)
 
+# Deterministic Convex-Cell Fracture Hulls + Debris + Dust (Slice DH1): the exact convex-cell hull upgrade of
+# the fracture flagship's approximated fragments (engine/sim/fracture_hull.h, hf::sim::fhull) — a NEW header
+# composing fract.h + gjk.h/manifold.h + particles.h READ-ONLY. Pins the deterministic integer 3D convex-hull
+# builder (a cube point cloud -> its 8 corners / 6 planes / exact volume; tetra/octa -> 4/6 verts; collinear/
+# coplanar rejected), a solid box CELL -> an 8-vert box hull with EXACT volume+inertia and hull-vol <= AABB-vol
+# (tightness), a shard resting FACE-flat on a floor (axis contact normal, not radial), a shatter settle
+# (determinism + face-dominant contacts + a pinned full-scene digest + honest exact-vs-fallback hull count),
+# debris count + dust one-mote-per-severed-bond (placement + digest), and lockstep/rollback bit-exactness.
+# fract.h/gjk.h/manifold.h/particles.h byte-UNTOUCHED (composed read-only). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(fracture_hull_test)
+
 # Deterministic IK Control-Rig Slice 1 (Slice IK1, the BEACHHEAD of FLAGSHIP #32): the host-baked Q16.16
 # ANGLE LUT integer core (engine/anim/ik.h) the GPU shaders/ik_angle.comp copies VERBATIM + proves
 # bit-identical. Pins FxAcosLut within an LSB band vs std::acos over a dense cosine sweep + endpoints

@@ -137,6 +137,7 @@
 #include "sim/active.h"              // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot (int64 solve -> Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld)
 #include "sim/convex.h"              // Slice CX1: deterministic convex contacts BOX-BOX SAT (FxMat3/FxCross/FxDot/FxBox/SatResult/BoxSat/MeasureSat, the 15-axis box-box separating-axis test) — shared verbatim with convex_sat.comp + the Vulkan --convex-sat-shot (int64 -> Vulkan-only; Metal --convex-sat runs the CPU BoxSat)
 #include "sim/gjk.h"                  // Slice GJ1: deterministic general convex-hull contacts THE SUPPORT FUNCTION (FxHull/SupportLocal/Support/SupportMinkowski/MeasureSupport + canonical hull builders) — shared verbatim with gjk_support.comp + the Vulkan --gjk-support-shot (int64 -> Vulkan-only; Metal --gjk-support runs the CPU Support)
+#include "sim/fracture_hull.h"        // Slice DH1: deterministic convex-cell fracture hulls + debris + dust (fhull::BuildCellHull/SpawnFractureHullScene/StepFractureHullN/Measure/lockstep + SpawnFractureDust) — a NEW header composing fract.h/gjk.h/manifold.h/particles.h READ-ONLY; the Metal --dh1-shatter runs the IDENTICAL CPU code the Vulkan --dh1-shatter-shot runs (cross-backend bit-identical BY CONSTRUCTION)
 #include "sim/ccd.h"                  // Slice CD1: deterministic integer CCD THE TIME-OF-IMPACT PRIMITIVE (FxToi/kContactEps/kToiMaxIter/BodyMaxRadius/ClosingSpeedBound/ConservativeAdvance(Pose)/MeasureCcdToi, conservative advancement) — shared verbatim with ccd_toi.comp + the Vulkan --ccd-toi-shot (int64 -> Vulkan-only; Metal --ccd-toi runs the CPU ConservativeAdvance)
 #include "sim/manifold.h"             // Slice MF1: hull narrowphase hardening HULL FACE TOPOLOGY (FxHullFaces/BuildCanonicalFaces/FaceNormalWorld/FaceCentroidWorld/SupportFace/IncidentFace + render-only FacesToRenderInstances) — the new primitive, the BEACHHEAD of FLAGSHIP #25; #includes sim/ccd.h read-only (gjk/broad/convex/fpx BYTE-FROZEN); NO new shader (the Metal --mf1-faces render reuses the lit pipeline)
 #include "sim/fric.h"                // Slice FC1: deterministic contact friction THE TANGENT BASIS (TangentBasis/LeastAlignedAxis/MakeTangentBasis/MeasureBasis, the fixed integer Gram-Schmidt) — shared verbatim with fric_basis.comp + the Vulkan --fric-basis-shot (int64 -> Vulkan-only; Metal --fric-basis runs the CPU MakeTangentBasis)
@@ -25360,6 +25361,198 @@ static int RunFr8HullShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
     std::printf("OK wrote %s (%ux%u) — fr8 convex-shard rubble (%u dynamic boxes, %u rotated, %u ticks)\n",
                 outPath, imgW, imgH, st.dynamic, st.rotated, kTicks);
+    return 0;
+}
+
+// ===== Slice DH1 — DETERMINISTIC CONVEX-CELL FRACTURE HULLS + DEBRIS + DUST showcase (--dh1-shatter) =======
+// Upgrades the documented fracture fidelity gap (FR4 spheres / FR8 AABB boxes -> the EXACT convex cell hull per
+// fragment). PURE CPU on BOTH backends: this runs the IDENTICAL CPU code (fhull::SpawnFractureHullScene +
+// gjk::StepHullWorld, gjk.h AS-IS) the Vulkan --dh1-shatter-shot runs, so the golden is cross-backend
+// bit-identical BY CONSTRUCTION. The golden is a STRICT-ZERO INTEGER side-view wireframe of the settled
+// convex-hull shards (their exact polygon silhouettes) + dust points + a piece-coloured center. New golden
+// tests/golden/metal/dh1_shatter.png (baked on the Mac by the controller); two runs DIFF 0.0000. NO GPU
+// compute, NO new shader, NO new RHI.
+static int RunDh1ShatterShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fract = hf::sim::fract;
+    namespace fpx = hf::sim::fpx;
+    namespace convex = hf::sim::convex;
+    namespace gjk = hf::sim::gjk;
+    namespace fhull = hf::sim::fhull;
+    namespace particles = hf::sim::particles;
+    namespace vg = render::vg;
+
+    // ---- the shatter (FR1 classify + FR2 extract + FR3 bond/break — byte-identical fract.h reuse). ----
+    fract::FractField field; field.nx = 8; field.ny = 8; field.nz = 6;
+    const std::vector<fract::FractSeed> seeds = {
+        {1, 1, 1}, {6, 1, 4}, {1, 6, 1}, {6, 6, 4}, {3, 3, 2}, {5, 2, 1},
+        {2, 5, 3}, {4, 6, 2}, {6, 3, 3}, {3, 5, 4},
+    };
+    const int kM = (int)seeds.size();
+    fract::FractCells cells; fract::ClassifyFractCells(field, seeds, cells);
+    fract::FractFragments frags; fract::ExtractFragments(field, cells, kM, frags);
+    fract::FractBonds bonds; fract::BuildFractBonds(field, cells, frags, bonds);
+    fract::BreakImpact hardImpact{0u, (fract::fx)(800 * (int)fpx::kOne)};
+    std::vector<uint8_t> severed;
+    fract::ApplyImpactBreak(bonds, frags, hardImpact, 4, severed);
+    std::vector<uint32_t> clusters;
+    const uint32_t kPieces = fract::CountFractPieces(frags, bonds, severed, &clusters);
+
+    const fract::fx kGravY = (fract::fx)((int64_t)(-98 * (int)fpx::kOne) / 10);
+    fhull::FractHullConfig scfg;
+    scfg.worldCellSize = fpx::kOne / 2;
+    scfg.gravity = fract::FxVec3{0, kGravY, 0};
+    scfg.groundY = 0;
+    scfg.impactDir = fract::FxVec3{fpx::kOne / 2, -fpx::kOne, 0};
+    scfg.impactSpeed = (fract::fx)(3 * (int)fpx::kOne);
+    scfg.floorHalfExtents = fract::FxVec3{(fract::fx)(12 * (int)fpx::kOne), fpx::kOne,
+                                          (fract::fx)(12 * (int)fpx::kOne)};
+    const fhull::FractHullScene scene0 =
+        fhull::SpawnFractureHullScene(field, cells, frags, bonds, severed, clusters, hardImpact, scfg);
+
+    convex::ConvexStepConfig cfg;
+    cfg.gravity = fract::FxVec3{0, kGravY, 0};
+    cfg.dt = fpx::kOne / 60; cfg.solveIters = 10; cfg.restitution = 0; cfg.slop = fpx::kOne / 64;
+    cfg.beta = (fract::fx)((int64_t)4 * fpx::kOne / 10); cfg.posIters = 4;
+    cfg.linDamp = (fract::fx)((int64_t)99 * fpx::kOne / 100);
+    cfg.angDamp = (fract::fx)((int64_t)9 * fpx::kOne / 10);
+    const uint32_t kSteps = 200u;
+
+    gjk::HullWorld world = scene0.world;
+    fhull::StepFractureHullN(world, cfg, kSteps);
+    {   // determinism
+        gjk::HullWorld w2 = scene0.world;
+        fhull::StepFractureHullN(w2, cfg, kSteps);
+        if (!convex::ConvexBodiesEqual(world.bodies, w2.bodies)) return fail("dh1-shatter: two settles differ");
+    }
+    std::printf("dh1-shatter determinism: two settles BYTE-IDENTICAL\n");
+
+    const fhull::FractHullState fst = fhull::MeasureFractureHull(scene0, world, fpx::kOne);
+    if (!(fst.dynamic >= 1u && fst.faceRestPairs >= 1u && fst.maxSpeed < (fract::fx)(2 * (int)fpx::kOne)))
+        return fail("dh1-shatter: did not settle interlocked");
+    std::printf("dh1-shatter settle: exactHulls=%u/%u dynamic=%u faceRest=%u rested=%u maxSpeed=%d\n",
+                scene0.exactHulls, (uint32_t)scene0.cells.size(), fst.dynamic, fst.faceRestPairs, fst.rested,
+                (int)fst.maxSpeed);
+
+    {   // lockstep + rollback
+        uint32_t kick = 0xFFFFFFFFu;
+        for (uint32_t i = 0; i < (uint32_t)scene0.world.bodies.size(); ++i)
+            if ((i != scene0.floorIndex) && (scene0.world.bodies[i].flags & fpx::kFlagDynamic)) { kick = i; break; }
+        const std::vector<convex::ConvexCommand> authStream = {
+            convex::ConvexCommand{2u, convex::kConvexCmdAddImpulse, kick,
+                                  fract::FxVec3{(fract::fx)(1500 * (int)fpx::kOne), 0, 0}},
+            convex::ConvexCommand{5u, convex::kConvexCmdSetAngVel, kick, fract::FxVec3{0, fpx::kOne, 0}},
+        };
+        bool identical = false;
+        const gjk::HullWorld authority = fhull::RunFractureHullLockstep(scene0.world, cfg, authStream, 60u, &identical);
+        std::vector<convex::ConvexCommand> mispredict = authStream;
+        mispredict.push_back(convex::ConvexCommand{20u, convex::kConvexCmdAddImpulse, kick,
+                             fract::FxVec3{0, 0, (fract::fx)(3000 * (int)fpx::kOne)}});
+        bool corrected = false, diverged = false;
+        const gjk::HullWorld rolled = fhull::RunFractureHullRollback(scene0.world, cfg, authStream, mispredict,
+                                                                     60u, 20u, &corrected, &diverged);
+        if (!(identical && corrected && diverged && convex::ConvexBodiesEqual(rolled.bodies, authority.bodies)))
+            return fail("dh1-shatter: lockstep/rollback failed");
+    }
+    std::printf("dh1-shatter lockstep: peer re-derived BIT-EXACT + rollback corrected a real divergence\n");
+
+    const particles::ParticlePool dust =
+        fhull::SpawnFractureDust(bonds, severed, scfg, (fract::fx)(2 * (int)fpx::kOne), 256u);
+    const uint32_t dustCount = particles::CountAlive(dust);
+    uint32_t hullVerts = 0;
+    for (const fhull::CellHull& ch : scene0.cells) hullVerts += ch.hullVerts;
+    const uint64_t digest = fhull::SceneBodiesFnv64(world);
+    std::printf("dh1-shatter: {fragments:%u, hullVerts:%u, debris:%u, dustParticles:%u, steps:%u, "
+                "digest:0x%016llx, pieces:%u}\n", (uint32_t)scene0.cells.size(), hullVerts, scene0.debrisCount,
+                dustCount, kSteps, (unsigned long long)digest, kPieces);
+
+    // --- Golden: the strict-zero integer wireframe (== the Vulkan --dh1-shatter-shot, byte-identical). ---
+    const int kPxPerUnit = 40;
+    const int kMargin = 28;
+    const int kWorldXMin = -7, kWorldYMin = -3;
+    const int kWorldW = 14, kWorldH = 11;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int x, int y, uint8_t bl, uint8_t gr, uint8_t rd) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = bl; d[1] = gr; d[2] = rd; d[3] = 255;
+    };
+    auto worldToPx = [&](fpx::fx px, fpx::fx py, int& ix, int& iy) {
+        const int64_t sx = (((int64_t)px - (int64_t)kWorldXMin * fpx::kOne) * kPxPerUnit) >> fpx::kFrac;
+        const int64_t sy = (((int64_t)py - (int64_t)kWorldYMin * fpx::kOne) * kPxPerUnit) >> fpx::kFrac;
+        ix = kMargin + (int)sx;
+        iy = (int)imgH - kMargin - (int)sy;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t bl, uint8_t gr, uint8_t rd) {
+        auto clampi = [](int v) { return v < -20000 ? -20000 : (v > 20000 ? 20000 : v); };
+        x0 = clampi(x0); y0 = clampi(y0); x1 = clampi(x1); y1 = clampi(y1);
+        int dx = x1 - x0; if (dx < 0) dx = -dx;
+        int dy = y1 - y0; if (dy < 0) dy = -dy;
+        dy = -dy;
+        const int sxs = x0 < x1 ? 1 : -1, sys = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            putPx(x0, y0, bl, gr, rd);
+            if (x0 == x1 && y0 == y1) break;
+            const int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sxs; }
+            if (e2 <= dx) { err += dx; y0 += sys; }
+        }
+    };
+    {   // the ground line
+        int gx0, gy0; worldToPx(0, scfg.groundY, gx0, gy0);
+        if (gy0 >= 0 && gy0 < (int)imgH)
+            for (int x = 0; x < (int)imgW; ++x) {
+                uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+                d[0] = 90; d[1] = 90; d[2] = 90; d[3] = 255;
+            }
+    }
+    for (uint32_t i = 0; i < (uint32_t)scene0.cells.size(); ++i) {
+        const fpx::FxBody& b = world.bodies[i];
+        const gjk::FxHull& hl = world.hulls[i];
+        const bool isDyn = (b.flags & fpx::kFlagDynamic) != 0u;
+        Vec3 col = isDyn ? vg::hashColor(i + 1u) : Vec3{0.45f, 0.45f, 0.5f};
+        const uint8_t rd = (uint8_t)(col.x * 255.0f + 0.5f);
+        const uint8_t gr = (uint8_t)(col.y * 255.0f + 0.5f);
+        const uint8_t bl = (uint8_t)(col.z * 255.0f + 0.5f);
+        std::vector<int> vx((size_t)hl.count), vy((size_t)hl.count);
+        for (uint32_t k = 0; k < hl.count; ++k) {
+            const fract::FxVec3 w = fpx::FxAdd(fpx::FxRotate(b.orient, hl.verts[k]), b.pos);
+            worldToPx(w.x, w.y, vx[k], vy[k]);
+        }
+        std::vector<fract::FxVec3> lpts((size_t)hl.count);
+        for (uint32_t k = 0; k < hl.count; ++k) lpts[k] = hl.verts[k];
+        const fhull::HullBuild hb = fhull::BuildConvexHull(lpts);
+        if (hb.ok) {
+            for (const fhull::HullTri& t : hb.tris) {
+                drawLine(vx[t.a], vy[t.a], vx[t.b], vy[t.b], bl, gr, rd);
+                drawLine(vx[t.b], vy[t.b], vx[t.c], vy[t.c], bl, gr, rd);
+                drawLine(vx[t.c], vy[t.c], vx[t.a], vy[t.a], bl, gr, rd);
+            }
+        } else {
+            for (uint32_t k = 0; k + 1 < hl.count; ++k) drawLine(vx[k], vy[k], vx[k + 1], vy[k + 1], bl, gr, rd);
+        }
+        if (isDyn) {
+            int cx, cy; worldToPx(b.pos.x, b.pos.y, cx, cy);
+            const int rpx = 3;
+            for (int dy = -rpx; dy <= rpx; ++dy)
+                for (int dx = -rpx; dx <= rpx; ++dx)
+                    if (dx * dx + dy * dy <= rpx * rpx) putPx(cx + dx, cy + dy, bl, gr, rd);
+        }
+    }
+    for (const particles::FxParticle& pt : dust.particles) {
+        if (!(pt.flags & particles::kFlagAlive)) continue;
+        int dx, dy; worldToPx(pt.pos.x, pt.pos.y, dx, dy);
+        putPx(dx, dy, 180, 210, 235); putPx(dx + 1, dy, 180, 210, 235); putPx(dx, dy + 1, 180, 210, 235);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — dh1 convex-cell shards (%u exact hulls, %u dust, %u steps)\n",
+                outPath, imgW, imgH, scene0.exactHulls, dustCount, kSteps);
     return 0;
 }
 
@@ -80997,6 +81190,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fr8-hull-shot") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fr8_hull.png";
             try { return RunFr8HullShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --dh1-shatter <out.png>: render the DH1 DETERMINISTIC CONVEX-CELL FRACTURE HULLS + DEBRIS + DUST
+        // showcase (Track-R). PURE CPU: runs the IDENTICAL CPU code (fhull::SpawnFractureHullScene +
+        // gjk::StepHullWorld, gjk.h AS-IS) the Vulkan --dh1-shatter-shot runs, so the strict-zero integer
+        // convex-hull-wireframe golden is bit-identical cross-backend BY CONSTRUCTION. New golden
+        // tests/golden/metal/dh1_shatter.png; two runs DIFF 0.0000. NO GPU compute, NO new shader, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--dh1-shatter-shot") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_dh1_shatter.png";
+            try { return RunDh1ShatterShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fract-lockstep <out.png>: render the Deterministic Rigid-Body Fracture LOCKSTEP + ROLLBACK

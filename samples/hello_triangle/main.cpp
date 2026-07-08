@@ -111,6 +111,7 @@
 #include "sim/active.h"         // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot
 #include "sim/convex.h"         // Slice CX1: deterministic convex contacts BOX-BOX SAT (FxMat3/FxCross/FxDot/FxBox/SatResult/BoxSat/MeasureSat, the 15-axis box-box separating-axis test) — shared verbatim with convex_sat.comp + the Vulkan --convex-sat-shot (int64 -> Vulkan-only; Metal --convex-sat runs the CPU BoxSat)
 #include "sim/gjk.h"             // Slice GJ1: deterministic general convex-hull contacts THE SUPPORT FUNCTION (FxHull/SupportLocal/Support/SupportMinkowski/MeasureSupport + canonical hull builders) — shared verbatim with gjk_support.comp + the Vulkan --gjk-support-shot (int64 -> Vulkan-only; Metal --gjk-support runs the CPU Support)
+#include "sim/fracture_hull.h"   // Slice DH1: deterministic convex-cell fracture hulls + debris + dust (fhull::BuildCellHull/SpawnFractureHullScene/StepFractureHullN/Measure/lockstep + SpawnFractureDust) — a NEW header composing fract.h/gjk.h/manifold.h/particles.h READ-ONLY; the --dh1-shatter-shot showcase (pure CPU, NO new shader)
 #include "sim/broad.h"           // Slice BP1: deterministic integer broadphase THE BODY GRID + CSR CELL TABLE (BodyGrid/MakeBodyGrid/BodyCellOf/FlatBodyCellId/BodyCellTable/BuildBodyCellTable/BodyGridMeasure) — shared verbatim with broad_cell_{count,scan,emit}.comp (MSL-NATIVE) + the Vulkan --broad-cell-shot; Metal --broad-cell runs the SHADERS
 #include "sim/ccd.h"             // Slice CD1: deterministic integer CCD THE TIME-OF-IMPACT PRIMITIVE (FxToi/kContactEps/kToiMaxIter/BodyMaxRadius/ClosingSpeedBound/ConservativeAdvance(Pose)/MeasureCcdToi, conservative advancement) — shared verbatim with ccd_toi.comp + the Vulkan --ccd-toi-shot (int64 -> Vulkan-only; Metal --ccd-toi runs the CPU ConservativeAdvance)
 #include "sim/manifold.h"        // Slice MF1: hull narrowphase hardening HULL FACE TOPOLOGY (FxHullFaces/BuildCanonicalFaces/FaceNormalWorld/FaceCentroidWorld/SupportFace/IncidentFace + render-only FacesToRenderInstances) — the new primitive, the BEACHHEAD of FLAGSHIP #25; #includes sim/ccd.h read-only (gjk/broad/convex/fpx BYTE-FROZEN); NO new shader (the --mf1-faces-shot render reuses the lit pipeline)
@@ -617,6 +618,7 @@ int main(int argc, char** argv) {
     const char* fractRecursiveShotPath = nullptr; // --fract-recursive-shot <out.bmp> (Slice FR7, Issue #37: RECURSIVE FRACTURE-ON-IMPACT. A HARD impact during the FR4 settle SPLITS a chunk AGAIN (plane-split into childPieces=2 sub-spheres along a lineage-hashed fixed integer split-direction; child radius = parent·kCbrtHalf (host 2^(-1/3) literal, NO cbrt), child volume = parent/childPieces (integer divide), retire the parent IN PLACE — never erase — keeping the parallel FractChunk[] index-aligned to bodies[]), and the children split AGAIN on a further hard slam — a deterministic CASCADE terminating at a host-fixed minVolume floor. The trigger T1 is the sphere-contact impulse PROXY computed the same way fpx::SolveContacts does (closingSpeed·overlapDepth over BuildPairs' fixed order, int64) — the faithful sphere-world analog of issue #40's hull normalImpulse (FR7 does NOT read the #40 field; children are sub-SPHERES not re-tessellated shards — honest simplifications). PURE-CPU host recursion on BOTH backends (the per-tick StepFracture is the FR4 int64 solve, byte-identical Vulkan==Metal -> GPU==CPU by construction); the Metal --fract-recursive runs the IDENTICAL CPU StepFractureRecursiveSteps. PROOFS: cascade (final-bodies>root-bodies + max-depth>=2), piece-count non-decreasing, two-run BYTE-IDENTICAL over bodies AND chunks, floor termination (min-live-volume<=minVolume + extra ticks add zero bodies), soft control (very-high threshold -> zero re-fracture). The image golden is a pure-integer side-view of the live bodies coloured by DEPTH (retired parents not drawn). NO GPU dispatch, NO new shader, NO new RHI; FR1-FR6 + fpx.h UNCHANGED (FR7 additive — fract.h append-only). STANDALONE arg-parse loop (the C1061 lesson))
     const char* fractBreakShotPath = nullptr; // --fract-break-shot <out.bmp> (Slice FR3: GPU Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK — THE NEW PHYSICS, host-built bond graph + int64 Jacobi load-diffusion break (Vulkan-only fract_break.comp) -> GPU per-bond {loadAccum,severed} memcmp'd vs CPU ApplyImpactBreak, fragments coloured by cluster/piece id with severed bonds marked red)
     const char* fr8HullShotPath = nullptr; // --fr8-hull-shot <out.bmp> (Slice FR8, Track-R R4: CONVEX-SHARD RUBBLE — closes the documented FR4 caveat "fragments solved as bounding SPHERES -> rounded rubble". The SAME FR1-FR3 break (32x32x16 lattice, 16 seeds, hard impact — byte-identical reuse) spawns each fragment as an ORIENTED BOX (fract::FragmentToBox — the AABB-box about the centroid, the DOCUMENTED approximation of the Voronoi cell, NOT the exact hull) into the SHIPPED FC4 convex-SAT + Coulomb-friction world (fract::SpawnFractHullWorld: anchor piece STATIC, dislodged pieces DYNAMIC, a static floor box appended last), then K=480 fric::StepFrictionWorld ticks (called AS-IS — fric.h/convex.h byte-untouched; angDamp=kOne, mu=kOne — friction holds the rubble) settle it as ANGULAR rubble: pieces gain REAL rotation from the manifold torque (the upgrade proof — FR4's sphere path keeps orient identity EXACTLY) and rest flat/stacked. PURE CPU on BOTH backends (fric.h's step is int64 -> its shader is Vulkan-only and the Metal fric path is CPU; FR8 adds NO shader — the FR5/FR7 pure-CPU convention, cross-backend bit-identical BY CONSTRUCTION). PROOFS: settle (max dynamic speed below band), >=1 piece ROTATED (non-trivial quaternion), resting interpenetration ~slop, two-run BYTE-IDENTICAL, lockstep peer re-derives the box rubble bit-for-bit + rollback corrects a real divergence. The golden is a PURE-INTEGER side-view wireframe of the settled ORIENTED boxes (the tilt is visible — the money proof) + piece-coloured centers. STANDALONE arg-parse loop (the C1061 lesson). NO new shader, NO new RHI; FR1-FR7 + fric.h/convex.h/fpx.h UNCHANGED (FR8 additive — fract.h append-only))
+    const char* dh1ShatterShotPath = nullptr; // --dh1-shatter-shot <out.bmp> (Slice DH1, Track-R: DETERMINISTIC CONVEX-CELL FRACTURE HULLS + DEBRIS + DUST — upgrades the documented fracture fidelity gap "shards are centroid-AABB boxes/spheres, not exact Voronoi cell hulls". A shatter (fract.h FR1 classify + FR2 extract + FR3 bond/break, byte-identical reuse) has each fragment's EXACT convex cell hull built from its Voronoi VERTEX SET (fhull::BuildCellHull — a deterministic integer 3D convex hull over the cell's lattice samples; box cells canonicalized for WH-exact inertia; degenerate/over-cap -> AABB fallback, honestly flagged) and settled as CONVEX bodies through the SHIPPED gjk::StepHullWorld GJK/EPA solver (gjk.h AS-IS, byte-untouched) so the shards rest on their FLAT FACES + interlock instead of rolling as spheres. Adds small-shard DEBRIS + an impact DUST puff (particles.h integer motes at the severed-bond fracture surface). PURE CPU on BOTH backends (gjk's int64 step has no Metal shader + DH1 adds NO shader — the FR5/FR7/FR8 convention), so the golden is cross-backend bit-identical BY CONSTRUCTION. PROOFS: settle determinism (two runs BYTE-IDENTICAL), >=1 shard face-resting, lockstep peer re-derives the convex rubble bit-for-bit + rollback corrects a real divergence. The golden is a STRICT-ZERO INTEGER side-view wireframe of the settled convex-hull shards (their exact polygon silhouettes) + dust points + a metric panel. STANDALONE arg-parse loop (the C1061 lesson). NO new shader, NO new RHI; fract.h/gjk.h/manifold.h/particles.h/fpx.h UNCHANGED (DH1 is a NEW composing header))
     const char* mcCountShotPath = nullptr; // --mc-count-shot <out.bmp> (Slice MC2: GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT — 256-case kTriTable lookup + InterlockedAdd grand total, integer compute over an SDF VoxelField, GPU==CPU counts+total bit-exact, count-grid Z-slice debug-viz)
     const char* mcEmitShotPath = nullptr; // --mc-emit-shot <out.bmp> (Slice MC3: GPU Isosurface Meshing prefix-sum compaction + triangle EMISSION — single-thread exclusive scan of the per-cell counts + one-thread-per-cell emit of edge-MIDPOINT vertices (integer half-units) + identity indices, integer compute over an SDF VoxelField, GPU==CPU vertex+index buffers bit-exact, 2D orthographic mesh-projection debug-viz)
     const char* mcInterpShotPath = nullptr; // --mc-interp-shot <out.bmp> (Slice MC4: GPU Isosurface Meshing FIXED-POINT INTERPOLATED vertex placement — mc_emit with EdgeInterp instead of EdgeMidpoint (the vertex on the ACTUAL isosurface crossing, t=((iso-s0)*kSub)/(s1-s0) on the 1/kSub=256 lattice, the same truncating integer divide both sides -> bit-exact GPU==CPU + cross-backend), reuses mc_scan UNCHANGED, GPU==CPU mesh bit-exact, a SMOOTHER 2D mesh-projection debug-viz than mc-emit)
@@ -3653,6 +3655,15 @@ int main(int argc, char** argv) {
     // pattern — NOT the big else-if ladder, the C1061 nested-block limit). NO new shader, NO new RHI.
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--fr8-hull-shot") == 0) { fr8HullShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice DH1: --dh1-shatter-shot <out.bmp> (Track-R, DETERMINISTIC CONVEX-CELL FRACTURE HULLS + DEBRIS +
+    // DUST). PURE-CPU host settle (no GPU dispatch — the FR5/FR7/FR8 pattern): the FR1-FR3 break becomes EXACT
+    // convex-cell hull shards settled through the SHIPPED gjk::StepHullWorld GJK/EPA solver (called AS-IS),
+    // plus small-shard debris + an impact dust puff. Its OWN loop (the standalone-loop C1061 pattern). NO new
+    // shader, NO new RHI.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--dh1-shatter-shot") == 0) { dh1ShatterShotPath = argv[i + 1]; break; }
     }
 
     // Slice LOD1: --lod-gen-shot <out.bmp> (Track-S S6, DETERMINISTIC AUTOMATIC LOD GENERATION —
@@ -28934,6 +28945,233 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — fr8 convex-shard rubble (%u dynamic boxes, %u rotated, "
                                 "%u ticks)\n", fr8HullShotPath, imgW, imgH, st.dynamic, st.rotated, kTicks);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fr8HullShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // === Slice DH1 — DETERMINISTIC CONVEX-CELL FRACTURE HULLS + DEBRIS + DUST (--dh1-shatter-shot) ======
+        // Upgrades the documented fracture fidelity gap: FR4 spheres / FR8 AABB boxes -> the EXACT convex cell
+        // hull per fragment (fhull::BuildCellHull, a deterministic integer 3D convex hull over the cell's
+        // Voronoi VERTEX SET), settled as CONVEX bodies through the SHIPPED gjk::StepHullWorld GJK/EPA solver
+        // (gjk.h AS-IS) so shards rest FACE-flat + interlock, plus small-shard debris + an impact dust puff.
+        // PURE CPU on both backends (== the Metal --dh1-shatter, byte-identical by construction). The golden is
+        // a STRICT-ZERO INTEGER side-view wireframe of the settled convex-hull shards (their exact polygon
+        // silhouettes) + dust points + a metric panel. NO GPU dispatch, NO new shader, NO new RHI.
+        if (dh1ShatterShotPath) {
+            using math::Vec3;
+            namespace fract = hf::sim::fract;
+            namespace fpx = hf::sim::fpx;
+            namespace convex = hf::sim::convex;
+            namespace gjk = hf::sim::gjk;
+            namespace fhull = hf::sim::fhull;
+            namespace particles = hf::sim::particles;
+            namespace vg = hf::render::vg;
+
+            // ---- the shatter (FR1 classify + FR2 extract + FR3 bond/break — byte-identical fract.h reuse). ----
+            fract::FractField field; field.nx = 8; field.ny = 8; field.nz = 6;
+            const std::vector<fract::FractSeed> seeds = {
+                {1, 1, 1}, {6, 1, 4}, {1, 6, 1}, {6, 6, 4}, {3, 3, 2}, {5, 2, 1},
+                {2, 5, 3}, {4, 6, 2}, {6, 3, 3}, {3, 5, 4},
+            };
+            const int kM = (int)seeds.size();
+            fract::FractCells cells; fract::ClassifyFractCells(field, seeds, cells);
+            fract::FractFragments frags; fract::ExtractFragments(field, cells, kM, frags);
+            fract::FractBonds bonds; fract::BuildFractBonds(field, cells, frags, bonds);
+            fract::BreakImpact hardImpact{0u, (fract::fx)(800 * (int)fpx::kOne)};
+            std::vector<uint8_t> severed;
+            fract::ApplyImpactBreak(bonds, frags, hardImpact, 4, severed);
+            std::vector<uint32_t> clusters;
+            const uint32_t kPieces = fract::CountFractPieces(frags, bonds, severed, &clusters);
+
+            // ---- DH1 spawn: one EXACT convex-cell hull per fragment + a static floor hull. ----
+            const fract::fx kGravY = (fract::fx)((int64_t)(-98 * (int)fpx::kOne) / 10);
+            fhull::FractHullConfig scfg;
+            scfg.worldCellSize = fpx::kOne / 2;
+            scfg.gravity = fract::FxVec3{0, kGravY, 0};
+            scfg.groundY = 0;
+            scfg.impactDir = fract::FxVec3{fpx::kOne / 2, -fpx::kOne, 0};
+            scfg.impactSpeed = (fract::fx)(3 * (int)fpx::kOne);
+            scfg.floorHalfExtents = fract::FxVec3{(fract::fx)(12 * (int)fpx::kOne), fpx::kOne,
+                                                  (fract::fx)(12 * (int)fpx::kOne)};
+            const fhull::FractHullScene scene0 =
+                fhull::SpawnFractureHullScene(field, cells, frags, bonds, severed, clusters, hardImpact, scfg);
+
+            convex::ConvexStepConfig cfg;
+            cfg.gravity = fract::FxVec3{0, kGravY, 0};
+            cfg.dt = fpx::kOne / 60; cfg.solveIters = 10; cfg.restitution = 0; cfg.slop = fpx::kOne / 64;
+            cfg.beta = (fract::fx)((int64_t)4 * fpx::kOne / 10); cfg.posIters = 4;
+            cfg.linDamp = (fract::fx)((int64_t)99 * fpx::kOne / 100);
+            cfg.angDamp = (fract::fx)((int64_t)9 * fpx::kOne / 10);
+            const uint32_t kSteps = 200u;
+
+            gjk::HullWorld world = scene0.world;
+            fhull::StepFractureHullN(world, cfg, kSteps);
+
+            // PROOF (1) determinism: a second full settle is BYTE-IDENTICAL.
+            {
+                gjk::HullWorld w2 = scene0.world;
+                fhull::StepFractureHullN(w2, cfg, kSteps);
+                if (!convex::ConvexBodiesEqual(world.bodies, w2.bodies)) {
+                    std::fprintf(stderr, "FATAL: dh1-shatter two settles differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("dh1-shatter determinism: two settles BYTE-IDENTICAL\n");
+
+            // PROOF (2) THE UPGRADE: exact convex shards settle + interlock FACE-to-face (not rolling spheres).
+            const fhull::FractHullState fst = fhull::MeasureFractureHull(scene0, world, fpx::kOne);
+            if (!(fst.dynamic >= 1u && fst.faceRestPairs >= 1u && fst.maxSpeed < (fract::fx)(2 * (int)fpx::kOne))) {
+                std::fprintf(stderr, "FATAL: dh1-shatter did not settle interlocked (dynamic=%u faceRest=%u "
+                             "maxSpeed=%d)\n", fst.dynamic, fst.faceRestPairs, (int)fst.maxSpeed);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("dh1-shatter settle: exactHulls=%u/%u dynamic=%u faceRest=%u rested=%u maxSpeed=%d "
+                        "(convex shards rest on FACES)\n", scene0.exactHulls, (uint32_t)scene0.cells.size(),
+                        fst.dynamic, fst.faceRestPairs, fst.rested, (int)fst.maxSpeed);
+
+            // PROOF (3) lockstep + rollback: a peer re-derives the convex rubble bit-for-bit; a mispredicted
+            // shove is corrected by snapshot-restore + re-sim.
+            {
+                uint32_t kick = 0xFFFFFFFFu;
+                for (uint32_t i = 0; i < (uint32_t)scene0.world.bodies.size(); ++i)
+                    if ((i != scene0.floorIndex) && (scene0.world.bodies[i].flags & fpx::kFlagDynamic)) { kick = i; break; }
+                const std::vector<convex::ConvexCommand> authStream = {
+                    convex::ConvexCommand{2u, convex::kConvexCmdAddImpulse, kick,
+                                          fract::FxVec3{(fract::fx)(1500 * (int)fpx::kOne), 0, 0}},
+                    convex::ConvexCommand{5u, convex::kConvexCmdSetAngVel, kick, fract::FxVec3{0, fpx::kOne, 0}},
+                };
+                bool identical = false;
+                const gjk::HullWorld authority =
+                    fhull::RunFractureHullLockstep(scene0.world, cfg, authStream, 60u, &identical);
+                std::vector<convex::ConvexCommand> mispredict = authStream;
+                mispredict.push_back(convex::ConvexCommand{20u, convex::kConvexCmdAddImpulse, kick,
+                                     fract::FxVec3{0, 0, (fract::fx)(3000 * (int)fpx::kOne)}});
+                bool corrected = false, diverged = false;
+                const gjk::HullWorld rolled =
+                    fhull::RunFractureHullRollback(scene0.world, cfg, authStream, mispredict, 60u, 20u,
+                                                   &corrected, &diverged);
+                if (!(identical && corrected && diverged &&
+                      convex::ConvexBodiesEqual(rolled.bodies, authority.bodies))) {
+                    std::fprintf(stderr, "FATAL: dh1-shatter lockstep/rollback failed (identical=%d corrected=%d "
+                                 "diverged=%d)\n", identical ? 1 : 0, corrected ? 1 : 0, diverged ? 1 : 0);
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("dh1-shatter lockstep: peer re-derived BIT-EXACT + rollback corrected a real divergence\n");
+
+            // ---- DUST puff: one integer mote per severed bond at the fracture surface. ----
+            const particles::ParticlePool dust =
+                fhull::SpawnFractureDust(bonds, severed, scfg, (fract::fx)(2 * (int)fpx::kOne), 256u);
+            const uint32_t dustCount = particles::CountAlive(dust);
+
+            // total hull vert count (the stat line) + the full-scene digest (the cross-backend pin).
+            uint32_t hullVerts = 0;
+            for (const fhull::CellHull& ch : scene0.cells) hullVerts += ch.hullVerts;
+            const uint64_t digest = fhull::SceneBodiesFnv64(world);
+            std::printf("dh1-shatter: {fragments:%u, hullVerts:%u, debris:%u, dustParticles:%u, steps:%u, "
+                        "digest:0x%016llx, pieces:%u}\n", (uint32_t)scene0.cells.size(), hullVerts,
+                        scene0.debrisCount, dustCount, kSteps, (unsigned long long)digest, kPieces);
+
+            // --- Golden: a STRICT-ZERO INTEGER side-view wireframe of the settled CONVEX-HULL shards (their
+            // exact polygon silhouettes via the bit-exact pos/orient/hull verts -> the hull triangles' Bresenham
+            // edges) + dust points + a piece-coloured center disc; the anchor pieces neutral grey, the floor
+            // dark. Every pixel is a pure-integer function of the bit-exact world -> two runs identical. ---
+            const int kPxPerUnit = 40;
+            const int kMargin = 28;
+            const int kWorldXMin = -7, kWorldYMin = -3;
+            const int kWorldW = 14, kWorldH = 11;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto putPx = [&](int x, int y, uint8_t bl, uint8_t gr, uint8_t rd) {
+                if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+                uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+                d[0] = bl; d[1] = gr; d[2] = rd; d[3] = 255;
+            };
+            auto worldToPx = [&](fpx::fx px, fpx::fx py, int& ix, int& iy) {
+                const int64_t sx = (((int64_t)px - (int64_t)kWorldXMin * fpx::kOne) * kPxPerUnit) >> fpx::kFrac;
+                const int64_t sy = (((int64_t)py - (int64_t)kWorldYMin * fpx::kOne) * kPxPerUnit) >> fpx::kFrac;
+                ix = kMargin + (int)sx;
+                iy = (int)imgH - kMargin - (int)sy;
+            };
+            auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t bl, uint8_t gr, uint8_t rd) {
+                auto clampi = [](int v) { return v < -20000 ? -20000 : (v > 20000 ? 20000 : v); };
+                x0 = clampi(x0); y0 = clampi(y0); x1 = clampi(x1); y1 = clampi(y1);
+                int dx = x1 - x0; if (dx < 0) dx = -dx;
+                int dy = y1 - y0; if (dy < 0) dy = -dy;
+                dy = -dy;
+                const int sxs = x0 < x1 ? 1 : -1, sys = y0 < y1 ? 1 : -1;
+                int err = dx + dy;
+                for (;;) {
+                    putPx(x0, y0, bl, gr, rd);
+                    if (x0 == x1 && y0 == y1) break;
+                    const int e2 = 2 * err;
+                    if (e2 >= dy) { err += dy; x0 += sxs; }
+                    if (e2 <= dx) { err += dx; y0 += sys; }
+                }
+            };
+            {   // the ground line (the floor top face at groundY)
+                int gx0, gy0; worldToPx(0, scfg.groundY, gx0, gy0);
+                if (gy0 >= 0 && gy0 < (int)imgH)
+                    for (int x = 0; x < (int)imgW; ++x) {
+                        uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+                        d[0] = 90; d[1] = 90; d[2] = 90; d[3] = 255;
+                    }
+            }
+            // each fragment: transform its EXACT hull verts to world (bit-exact int64), re-derive the hull
+            // triangles, and draw their edges — the exact convex silhouette (interlocked shards, not spheres).
+            for (uint32_t i = 0; i < (uint32_t)scene0.cells.size(); ++i) {
+                const fpx::FxBody& b = world.bodies[i];
+                const gjk::FxHull& hl = world.hulls[i];
+                const bool isDyn = (b.flags & fpx::kFlagDynamic) != 0u;
+                Vec3 col = isDyn ? vg::hashColor(i + 1u) : Vec3{0.45f, 0.45f, 0.5f};
+                const uint8_t rd = (uint8_t)(col.x * 255.0f + 0.5f);
+                const uint8_t gr = (uint8_t)(col.y * 255.0f + 0.5f);
+                const uint8_t bl = (uint8_t)(col.z * 255.0f + 0.5f);
+                // world verts (int64 FxRotate + translate) + their pixel coords.
+                std::vector<fract::FxVec3> wpts((size_t)hl.count);
+                std::vector<int> vx((size_t)hl.count), vy((size_t)hl.count);
+                for (uint32_t k = 0; k < hl.count; ++k) {
+                    const fract::FxVec3 w = fpx::FxAdd(fpx::FxRotate(b.orient, hl.verts[k]), b.pos);
+                    wpts[k] = w;
+                    worldToPx(w.x, w.y, vx[k], vy[k]);
+                }
+                // re-derive the hull triangles from the local verts (deterministic) -> draw their edges.
+                std::vector<fract::FxVec3> lpts((size_t)hl.count);
+                for (uint32_t k = 0; k < hl.count; ++k) lpts[k] = hl.verts[k];
+                const fhull::HullBuild hb = fhull::BuildConvexHull(lpts);
+                if (hb.ok) {
+                    for (const fhull::HullTri& t : hb.tris) {
+                        drawLine(vx[t.a], vy[t.a], vx[t.b], vy[t.b], bl, gr, rd);
+                        drawLine(vx[t.b], vy[t.b], vx[t.c], vy[t.c], bl, gr, rd);
+                        drawLine(vx[t.c], vy[t.c], vx[t.a], vy[t.a], bl, gr, rd);
+                    }
+                } else {   // fallback: just the vertex ring
+                    for (uint32_t k = 0; k + 1 < hl.count; ++k)
+                        drawLine(vx[k], vy[k], vx[k + 1], vy[k + 1], bl, gr, rd);
+                }
+                if (isDyn) {   // filled center disc (the piece marker)
+                    int cx, cy; worldToPx(b.pos.x, b.pos.y, cx, cy);
+                    const int rpx = 3;
+                    for (int dy = -rpx; dy <= rpx; ++dy)
+                        for (int dx = -rpx; dx <= rpx; ++dx)
+                            if (dx * dx + dy * dy <= rpx * rpx) putPx(cx + dx, cy + dy, bl, gr, rd);
+                }
+            }
+            // dust motes: bright warm points at their settled positions.
+            for (const particles::FxParticle& pt : dust.particles) {
+                if (!(pt.flags & particles::kFlagAlive)) continue;
+                int dx, dy; worldToPx(pt.pos.x, pt.pos.y, dx, dy);
+                putPx(dx, dy, 180, 210, 235); putPx(dx + 1, dy, 180, 210, 235);
+                putPx(dx, dy + 1, 180, 210, 235);
+            }
+            bool ok = WriteBMP(dh1ShatterShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — dh1 convex-cell shards (%u exact hulls, %u dust, %u steps)\n",
+                                dh1ShatterShotPath, imgW, imgH, scene0.exactHulls, dustCount, kSteps);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", dh1ShatterShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
