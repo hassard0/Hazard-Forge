@@ -450,9 +450,16 @@ int main(int argc, char** argv) {
     // renders a fixed INTERIOR atrium camera, sun + shadows + full PBR with the real textures.
     const char* sc1HeroShotPath = nullptr;
     // --sponza-explore: INTERACTIVE windowed fly-through of the REAL Khronos PBR Sponza (the same
-    // asset + pipelines + shadow/scene/post graph as --sc1-hero-shot), driven by a live fly camera
+    // asset + PBR/cutout/shadow draws as --sc1-hero-shot) upgraded to the FULL visual pipeline:
+    // HDR RGBA16F scene target -> bloom chain -> ACES composite (the --fly post stack) and the
+    // PHYSICAL Rayleigh+Mie sky (render/atmosphere.h, the AT1 math) baked into an equirect HDR
+    // environment for the scene's sun and drawn camera-tracked via sky_hdr. Live fly camera
     // (WASD + right-button mouse-look, like --fly) presenting to the swapchain each frame. ESC quits.
     bool sponzaExplore = false;
+    // --sponza-explore-shot <out.bmp>: ONE frame of the SAME upgraded explore pipeline (HDR + bloom
+    // + physical sky) rendered from the start pose and captured to a BMP, then exit — the verifiable
+    // artifact / regression hook for the interactive path. Own parse loop below (MSVC C1061).
+    const char* sponzaExploreShotPath = nullptr;
     // Slice SC3 (GAP_CLOSING Tier 2 — SPONZA THROUGH THE VIRTUAL-GEOMETRY STACK): --sc3-stack-shot
     // <out.bmp> pushes the REAL Sponza's heterogeneous geometry through meshlet decomposition ->
     // per-cluster frustum cull (SC1 hero camera) -> auto-LOD (top-10 meshes) and renders the
@@ -3309,6 +3316,16 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--sponza-explore") == 0) {
             sponzaExplore = true;
+            break;
+        }
+    }
+
+    // --sponza-explore-shot <out.bmp>: one captured frame of the upgraded explore pipeline (HDR +
+    // bloom + physical sky) from the start pose. Parsed in its OWN loop (MSVC C1061 — the SC1
+    // pattern).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--sponza-explore-shot") == 0) {
+            sponzaExploreShotPath = argv[i + 1];
             break;
         }
     }
@@ -110213,17 +110230,28 @@ int main(int argc, char** argv) {
         }
 
         // --- SPONZA FLY-THROUGH (--sponza-explore, INTERACTIVE windowed): a real-time navigable
-        // fly-through of the REAL Khronos PBR Sponza. Loads the SAME fetched asset and builds the
-        // SAME shadow -> scene -> post render graph + IDENTICAL pipelines (lit_pbr / lit_pbr_cutout /
-        // shadow / sky / post) as --sc1-hero-shot, so what you fly through is the hero render — but
-        // instead of one capture->BMP, it drives a live runtime::Camera (WASD + right-button
-        // mouse-look, exactly like --fly) and the post pass PRESENTS to the swapchain every frame.
-        // The sun + shadow ortho are WORLD-FIXED (folded into a FrameData template ONCE, camera-
+        // fly-through of the REAL Khronos PBR Sponza through the FULL visual pipeline. Loads the
+        // SAME fetched asset + the SAME lit_pbr / lit_pbr_cutout / shadow draws as --sc1-hero-shot,
+        // but upgraded to the --fly post stack: the scene renders to an HDR RGBA16F target, runs the
+        // bloom chain (prefilter -> 4x down -> 4x up) and composites to the swapchain with the
+        // shared exposure/ACES/grade composite (the gold curtain medallions + the bright roof
+        // opening bloom). The sky is the PHYSICAL Rayleigh+Mie single-scattering sky (Slice AT1,
+        // render/atmosphere.h) evaluated for the SAME sun the scene light uses: atmosphere.frag is a
+        // fixed 3-panel PANORAMA (its view dirs come from panel-local uv, not the camera basis) so
+        // it cannot track a fly camera — instead the shared-math header bakes the sky ONCE at load
+        // into a 512x256 equirect RGBA16F environment texture (sunDir = -lightDir) that the EXISTING
+        // camera-basis sky_hdr shader samples per frame in LINEAR HDR (the composite tonemaps).
+        // Camera: a live runtime::Camera (WASD + right-button mouse-look, exactly like --fly). The
+        // sun + shadow ortho are WORLD-FIXED (folded into a FrameData template ONCE, camera-
         // independent); only vp/viewPos/basis/skyParams update per frame from the fly camera. ESC
-        // quits. Reuses the shared window+device; NO new shaders, NO golden (interactive-only). ------
-        if (sponzaExplore) {
+        // quits. --sponza-explore-shot <out.bmp> instead renders ONE frame of the SAME graph from
+        // the start pose, captures it to a BMP and exits (the verifiable artifact). Reuses the
+        // shared window+device; NO new shaders, NO golden committed here. ---------------------------
+        if (sponzaExplore || sponzaExploreShotPath) {
             using math::Mat4; using math::Vec3;
-            std::printf("Sponza fly-through — WASD move, hold RIGHT mouse to look, ESC to quit\n");
+            const bool exploreShotMode = (sponzaExploreShotPath != nullptr);
+            if (!exploreShotMode)
+                std::printf("Sponza fly-through — WASD move, hold RIGHT mouse to look, ESC to quit\n");
 
             uint32_t w = window.FramebufferWidth();
             uint32_t h = window.FramebufferHeight();
@@ -110244,8 +110272,11 @@ int main(int argc, char** argv) {
                 std::fclose(probe);
             }
 
-            // Pipelines — IDENTICAL to --sc1-hero-shot (lit.vert + lit_pbr.frag, the lit_cutout pair,
-            // depth-only shadow, sky, post). swapchain-format LDR; the post pass writes the swapchain.
+            // Pipelines — scene draws IDENTICAL to --sc1-hero-shot (lit.vert + lit_pbr.frag, the
+            // lit_cutout pair, depth-only shadow) but rebuilt handler-locally against the HDR
+            // RGBA16F scene target (the --fly convention); the bloom chain + composite replace the
+            // plain post pass, and the camera-basis sky_hdr shader replaces the procedural sky.
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
             auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
             auto pbrFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_pbr.frag.hlsl.spv");
             auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
@@ -110254,7 +110285,7 @@ int main(int argc, char** argv) {
             pbrDesc.vertex = litVs.get();
             pbrDesc.fragment = pbrFs.get();
             pbrDesc.vertexLayout = scene::MeshVertexLayout();
-            pbrDesc.colorFormat = device->Swapchain().ColorFormat();
+            pbrDesc.colorFormat = kHdr;
             pbrDesc.depthTest = true;
             pbrDesc.usesFrameUniforms = true;
             pbrDesc.usesTexture = true;
@@ -110285,30 +110316,142 @@ int main(int argc, char** argv) {
             shDesc.pushConstantSize = sizeof(float) * 16;
             auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
 
+            // Camera-tracked HDR sky: the existing sky_hdr shader (camera-basis view ray ->
+            // equirect sample, linear HDR out) over the physical-sky environment baked below.
             auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
-            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky_hdr.frag.hlsl.spv");
             auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
             auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
             rhi::GraphicsPipelineDesc skyD;
             skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
-            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.colorFormat = kHdr;
             skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            skyD.usesEnvironment = true;
             auto skyPipe = device->CreateGraphicsPipeline(skyD);
 
+            // Bloom chain pipelines (prefilter/downsample/upsample in HDR, composite to the
+            // swapchain) — descriptors mirrored VERBATIM from the --fly loop's post stack.
             auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
-            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
             auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
-            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
-            rhi::GraphicsPipelineDesc postD;
-            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
-            postD.colorFormat = device->Swapchain().ColorFormat();
-            postD.depthTest = false; postD.usesFrameUniforms = false;
-            postD.usesTexture = true; postD.fullscreen = true;
-            auto postPipe = device->CreateGraphicsPipeline(postD);
+            auto loadFs = [&](const char* name) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name + ".spv");
+                return device->CreateShaderModule({std::span<const uint32_t>(words)});
+            };
+            struct BloomParams { float texel[2]; float threshold; float knee; float strength; float intensity; };
+            const uint32_t kBloomPC = sizeof(BloomParams);
+            auto makeBloomPipe = [&](rhi::IShaderModule* fs, rhi::Format colorFmt) {
+                rhi::GraphicsPipelineDesc d;
+                d.vertex = postVsM.get(); d.fragment = fs;
+                d.colorFormat = colorFmt;
+                d.depthTest = false; d.usesFrameUniforms = false;
+                d.usesTexture = true; d.fullscreen = true;
+                d.fragmentPushConstants = true; d.pushConstantSize = kBloomPC;
+                return device->CreateGraphicsPipeline(d);
+            };
+            auto prefilterFs  = loadFs("bloom_prefilter.frag.hlsl");
+            auto downsampleFs = loadFs("bloom_downsample.frag.hlsl");
+            auto upsampleFs   = loadFs("bloom_upsample.frag.hlsl");
+            auto compositeFs  = loadFs("bloom_composite.frag.hlsl");
+            auto prefilterPipe  = makeBloomPipe(prefilterFs.get(), kHdr);
+            auto downsamplePipe = makeBloomPipe(downsampleFs.get(), kHdr);
+            auto upsamplePipe   = makeBloomPipe(upsampleFs.get(), kHdr);
+            auto compositePipe  = makeBloomPipe(compositeFs.get(), device->Swapchain().ColorFormat());
 
-            auto rt = device->CreateRenderTarget(w, h);           // swapchain-format LDR RT
+            // Bloom tuning — the --fly / capstone constants (exposure 1.7, threshold 1.0 HDR,
+            // knee 0.6, strength 0.14). No extra exposure fudge: the baked sky's radiance scale
+            // below keeps the interior/sky balance under the shared composite curve.
+            const float kExposure = 1.7f, kThreshold = 1.0f, kKnee = 0.6f;
+            const float kUpStrength = 1.0f, kBloomStrength = 0.14f;
+            auto mkPC = [&](uint32_t tw, uint32_t th, float strength) {
+                BloomParams p{}; p.texel[0] = 1.0f / (float)tw; p.texel[1] = 1.0f / (float)th;
+                p.threshold = kThreshold; p.knee = kKnee; p.strength = strength; p.intensity = kExposure;
+                return p;
+            };
+
+            auto rt = device->CreateRenderTarget(w, h, kHdr);     // HDR scene target
             auto shadowMap = device->CreateShadowMap(2048);       // fixed size (no resize recreate)
             device->SetShadowMap(*shadowMap);
+            const int kMips = 5;
+            std::vector<std::unique_ptr<rhi::IRenderTarget>> down, up;
+            std::vector<uint32_t> mw(kMips), mh(kMips);
+            auto buildMips = [&](uint32_t fw, uint32_t fh) {
+                down.clear(); up.clear();
+                for (int i = 0; i < kMips; ++i) {
+                    uint32_t dw = std::max(1u, fw >> (i + 1));
+                    uint32_t dh = std::max(1u, fh >> (i + 1));
+                    mw[i] = dw; mh[i] = dh;
+                    down.push_back(device->CreateRenderTarget(dw, dh, kHdr));
+                    up.push_back(device->CreateRenderTarget(dw, dh, kHdr));
+                }
+            };
+            buildMips(w, h);
+
+            // Physical-sky environment (Slice AT1 -> live): bake the Rayleigh+Mie single-scattering
+            // sky (render/atmosphere.h SkyColor — the SAME shared math --at1-sky-shot showcases)
+            // into a 512x256 equirect RGBA16F environment texture for the SAME sun the scene light
+            // uses (sunDir = -lightDir = normalize(0.25, 1, -0.45), elevation ~62.7 deg). The
+            // equirect mapping is the exact inverse of sky_hdr's EquirectUV (u = atan2(z,x)/2pi+0.5,
+            // v = acos(y)/pi). Radiance goes in LINEAR (no tonemap — the bloom composite applies
+            // exposure/ACES), scaled by kSkyRadiance so the through-the-roof sky sits in the same
+            // HDR band as the sunlit interior and crosses the bloom threshold where it should.
+            std::unique_ptr<rhi::ITexture> skyEnvTex;
+            {
+                namespace atmo = render::atmo;
+                const Vec3 sunDir = math::normalize(Vec3{0.25f, 1.0f, -0.45f});  // toward the sun
+                const uint32_t kEnvW = 512, kEnvH = 256;
+                // Linear radiance scale into the composite's HDR range. The raw single-scattering
+                // sky peaks ~1.16 at this sun (zenith B ~0.48) — under the bloom threshold (1.0
+                // HDR), so at 1.0 the roof opening reads dim and never blooms against the sunlit
+                // interior (lightColor ~1.0). 2.5x puts the visible sky band at ~1.2-2.9 HDR: a
+                // convincing bright-daylight opening that crosses the threshold and blooms softly
+                // over the roof edges, while the interior exposure is untouched (documented fudge —
+                // single scattering has no multiple-scatter energy, so it underestimates sky
+                // brightness; see atmosphere.h HONEST LIMITS).
+                const float kSkyRadiance = 2.5f;
+                auto floatToHalf = [](float f) -> uint16_t {
+                    uint32_t bits; std::memcpy(&bits, &f, sizeof(bits));
+                    uint32_t sign = (bits >> 16) & 0x8000u;
+                    int32_t  expo = (int32_t)((bits >> 23) & 0xFF) - 127 + 15;
+                    uint32_t mant = bits & 0x7FFFFFu;
+                    if (expo <= 0) return (uint16_t)sign;                       // flush to zero
+                    if (expo >= 31) return (uint16_t)(sign | 0x7BFFu);          // clamp to max half
+                    return (uint16_t)(sign | ((uint32_t)expo << 10) | (mant >> 13));
+                };
+                const auto bakeT0 = std::chrono::steady_clock::now();
+                std::vector<uint16_t> halfPx((size_t)kEnvW * kEnvH * 4);
+                float peak = 0.0f;
+                for (uint32_t y = 0; y < kEnvH; ++y) {
+                    float v = ((float)y + 0.5f) / (float)kEnvH;
+                    float theta = v * atmo::kPi;                 // 0 = zenith (+Y), pi = nadir
+                    float sy = std::cos(theta), st = std::sin(theta);
+                    for (uint32_t x = 0; x < kEnvW; ++x) {
+                        float u = ((float)x + 0.5f) / (float)kEnvW;
+                        float phi = (u - 0.5f) * 2.0f * atmo::kPi;
+                        Vec3 dir{std::cos(phi) * st, sy, std::sin(phi) * st};
+                        Vec3 c = atmo::SkyColor(dir, sunDir) * kSkyRadiance;
+                        peak = std::max(peak, std::max(c.x, std::max(c.y, c.z)));
+                        size_t o = ((size_t)y * kEnvW + x) * 4;
+                        halfPx[o + 0] = floatToHalf(c.x);
+                        halfPx[o + 1] = floatToHalf(c.y);
+                        halfPx[o + 2] = floatToHalf(c.z);
+                        halfPx[o + 3] = 0x3C00;                  // A = 1.0
+                    }
+                }
+                rhi::TextureDesc envDesc;
+                envDesc.width = kEnvW; envDesc.height = kEnvH;
+                envDesc.format = rhi::Format::RGBA16_Float;
+                envDesc.data = halfPx.data();
+                envDesc.dataSize = halfPx.size() * sizeof(uint16_t);
+                envDesc.environment = true;                      // repeat U (longitude), clamp V
+                skyEnvTex = device->CreateTexture(envDesc);
+                Vec3 zen = atmo::SkyColor(Vec3{0, 1, 0}, sunDir) * kSkyRadiance;
+                std::printf("[sponza-explore] physical sky baked: %ux%u equirect, sun elev %.1f deg, "
+                            "zenith (%.3f,%.3f,%.3f), peak %.2f (%.2fs)\n",
+                            kEnvW, kEnvH, std::asin(sunDir.y) * 180.0f / atmo::kPi,
+                            zen.x, zen.y, zen.z, peak,
+                            std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - bakeT0).count());
+            }
 
             // Import Sponza (same load options as the hero bake: full deterministic CPU mip chains).
             hf::asset::GltfScene sponza;
@@ -110383,44 +110526,26 @@ int main(int argc, char** argv) {
                 return fd;
             };
 
-            // === Live loop: pump -> camera update -> makeFrameData -> shadow/scene/post -> present. ===
-            bool prevRight = false;
-            auto last = std::chrono::steady_clock::now();
-            bool running = true;
-            while (running) {
-                running = window.PumpEvents();
-                const runtime::InputState& in = window.Input();
-                if (in.Down(runtime::Key::Esc)) running = false;
-                if (window.ConsumeResized()) {
-                    device->WaitIdle();
-                    w = window.FramebufferWidth();
-                    h = window.FramebufferHeight();
-                    device->Swapchain().Recreate(w, h);
-                    rt = device->CreateRenderTarget(w, h);   // shadow map is fixed 2048 — no recreate
-                    cam.aspect = (h > 0) ? (float)w / (float)h : 1.0f;
-                }
-
-                // Mouse-look on RIGHT button (engages/releases relative mouse), like --fly.
-                bool nowRight = in.mouseButtons[1];
-                if (nowRight && !prevRight) window.SetRelativeMouse(true);
-                if (!nowRight && prevRight) window.SetRelativeMouse(false);
-                prevRight = nowRight;
-
-                auto now = std::chrono::steady_clock::now();
-                float dt = std::min(std::chrono::duration<float>(now - last).count(), 0.1f);
-                last = now;
-                controller.Update(cam, in, dt);
-
-                FrameData fd = makeFrameData(cam);
-                render::RenderGraph graph;
+            // Record one full frame into `graph`: shadow -> scene(HDR: physical sky + PBR/cutout)
+            // -> bloom prefilter -> down chain -> up chain -> composite(swapchain). The bloom pass
+            // structure mirrors the --fly loop's recordFrame verbatim. fd is captured BY VALUE in
+            // each pass lambda (the graph may outlive the caller's local).
+            auto recordFrame = [&](render::RenderGraph& graph, const FrameData& fd) {
                 render::RgResource rgShadow = graph.ImportTarget(
                     "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
                 render::RgResource rgScene = graph.ImportTarget(
                     "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                std::vector<render::RgResource> rgDown(kMips), rgUp(kMips);
+                for (int i = 0; i < kMips; ++i) {
+                    rgDown[i] = graph.ImportTarget("down" + std::to_string(i),
+                                                   render::RgResourceKind::SceneColor, *down[i]);
+                    rgUp[i]   = graph.ImportTarget("up" + std::to_string(i),
+                                                   render::RgResourceKind::SceneColor, *up[i]);
+                }
                 render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
 
                 graph.AddPass("shadow", {}, {rgShadow},
-                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    [&, fd](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
                         dev.SetFrameUniforms(&fd, sizeof(FrameData));
                         cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
                         cmd.BindPipeline(*shadowPipeline);
@@ -110434,10 +110559,11 @@ int main(int argc, char** argv) {
                     });
 
                 graph.AddPass("scene", {rgShadow}, {rgScene},
-                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    [&, fd](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
                         dev.SetFrameUniforms(&fd, sizeof(FrameData));
                         cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
                         cmd.BindPipeline(*skyPipe);
+                        cmd.BindEnvironment(*skyEnvTex);   // the baked physical sky, linear HDR
                         cmd.Draw(3);
                         auto drawInstance = [&](const hf::asset::SceneInstance& inst) {
                             const hf::asset::PbrMaterial& m = *inst.material;
@@ -110462,16 +110588,119 @@ int main(int argc, char** argv) {
                         cmd.EndRenderPass();
                     });
 
-                graph.AddPass("post", {rgScene}, {rgSwap},
+                graph.AddPass("prefilter", {rgScene}, {rgDown[0]},
                     [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        BloomParams p = mkPC(w, h, kBloomStrength);
                         cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
-                        cmd.BindPipeline(*postPipe);
+                        cmd.BindPipeline(*prefilterPipe);
                         cmd.BindTexture(*rt);
+                        cmd.PushConstants(&p, sizeof(p));
                         cmd.Draw(3);
                         cmd.EndRenderPass();
                     });
+                for (int i = 1; i < kMips; ++i) {
+                    graph.AddPass("down" + std::to_string(i), {rgDown[i - 1]}, {rgDown[i]},
+                        [&, i](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            BloomParams p = mkPC(mw[i - 1], mh[i - 1], kUpStrength);
+                            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                            cmd.BindPipeline(*downsamplePipe);
+                            cmd.BindTexture(*down[i - 1]);
+                            cmd.PushConstants(&p, sizeof(p));
+                            cmd.Draw(3);
+                            cmd.EndRenderPass();
+                        });
+                }
+                graph.AddPass("upTop", {rgDown[kMips - 1]}, {rgUp[kMips - 1]},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        BloomParams p = mkPC(mw[kMips - 1], mh[kMips - 1], 0.0f);
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*upsamplePipe);
+                        cmd.BindTexturePair(*down[kMips - 1], *down[kMips - 1]);
+                        cmd.PushConstants(&p, sizeof(p));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                for (int i = kMips - 2; i >= 0; --i) {
+                    graph.AddPass("up" + std::to_string(i), {rgUp[i + 1], rgDown[i]}, {rgUp[i]},
+                        [&, i](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            BloomParams p = mkPC(mw[i + 1], mh[i + 1], kUpStrength);
+                            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                            cmd.BindPipeline(*upsamplePipe);
+                            cmd.BindTexturePair(*up[i + 1], *down[i]);
+                            cmd.PushConstants(&p, sizeof(p));
+                            cmd.Draw(3);
+                            cmd.EndRenderPass();
+                        });
+                }
+                graph.AddPass("composite", {rgScene, rgUp[0]}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        BloomParams p = mkPC(w, h, kBloomStrength);
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*compositePipe);
+                        cmd.BindTexturePair(*rt, *up[0]);
+                        cmd.PushConstants(&p, sizeof(p));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+            };
 
-                graph.Execute(*device);   // post pass presents to the swapchain
+            // === --sponza-explore-shot: ONE frame of the SAME upgraded graph from the start pose,
+            // captured to a BMP (the sc1 capture pattern), then exit. ===
+            if (exploreShotMode) {
+                FrameData fd = makeFrameData(cam);
+                render::RenderGraph graph;
+                recordFrame(graph, fd);
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+                bool ok = false;
+                if (device->GetCapturedPixels(px, cw, ch2)) {
+                    ok = WriteBMP(sponzaExploreShotPath, px, cw, ch2);
+                    if (ok) std::printf("wrote %s (%ux%u) — sponza-explore upgraded pipeline "
+                                        "(HDR+bloom+physical sky)\n", sponzaExploreShotPath, cw, ch2);
+                    else std::fprintf(stderr, "FATAL: could not write BMP to %s\n",
+                                      sponzaExploreShotPath);
+                } else {
+                    std::fprintf(stderr, "FATAL: no captured pixels\n");
+                }
+                device->WaitIdle();
+                return ok ? 0 : 1;
+            }
+
+            // === Live loop: pump -> camera update -> makeFrameData -> recordFrame -> present. ===
+            bool prevRight = false;
+            auto last = std::chrono::steady_clock::now();
+            bool running = true;
+            while (running) {
+                running = window.PumpEvents();
+                const runtime::InputState& in = window.Input();
+                if (in.Down(runtime::Key::Esc)) running = false;
+                if (window.ConsumeResized()) {
+                    device->WaitIdle();
+                    w = window.FramebufferWidth();
+                    h = window.FramebufferHeight();
+                    device->Swapchain().Recreate(w, h);
+                    rt = device->CreateRenderTarget(w, h, kHdr);   // shadow map fixed 2048 — no recreate
+                    buildMips(w, h);                               // bloom mip chain follows the size
+                    cam.aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+                }
+
+                // Mouse-look on RIGHT button (engages/releases relative mouse), like --fly.
+                bool nowRight = in.mouseButtons[1];
+                if (nowRight && !prevRight) window.SetRelativeMouse(true);
+                if (!nowRight && prevRight) window.SetRelativeMouse(false);
+                prevRight = nowRight;
+
+                auto now = std::chrono::steady_clock::now();
+                float dt = std::min(std::chrono::duration<float>(now - last).count(), 0.1f);
+                last = now;
+                controller.Update(cam, in, dt);
+
+                FrameData fd = makeFrameData(cam);
+                render::RenderGraph graph;
+                recordFrame(graph, fd);
+                graph.Execute(*device);   // the bloom composite presents to the swapchain
             }
             window.SetRelativeMouse(false);
             device->WaitIdle();
