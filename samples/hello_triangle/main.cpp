@@ -94,6 +94,7 @@
 #include "seq/seq_tracks.h"      // Slice SQ2: DETERMINISTIC SEQUENCER SEMANTIC TRACK TYPES (camera-cut/audio/material/sub-sequence) composing seq.h read-only; the pure-integer --sq2-cinematic-shot timeline-editor viz (strict-zero cross-backend, NO shader)
 #include "seq/seq_render.h"      // Slice SEQ-S6: SEQ LIT 3D render bridge (SeqTransformToMat4 / SeqToRenderInstances / MakeCutsceneTrail) — the ONE float crossing of FLAGSHIP #25 (the deterministic cinematic sequencer); turns the bit-exact Q16.16 transform timeline (seq::SampleTransform along a FIXED cutscene TransformTrack) into a ghosted motion-trail of cube transforms for the --seq-render-shot money-shot. seq.h stays the <cmath>-free bit-exact header.
 #include "foliage/foliage.h"    // Slice FO1 (FLAGSHIP #25 beachhead): deterministic integer WIND FIELD (kFoliageWind16 LUT / Gust / WindField / WindBend) Q16.16 — the audio kSineTable copied verbatim, NO runtime sin; the Vulkan --fo1-wind-shot pure-integer wind heatmap (strict-zero cross-backend)
+#include "foliage/impostor.h"   // Slice FO1 (impostor arc, audit item FO-B): DETERMINISTIC FOLIAGE IMPOSTORS + CROSS-FADE LOD (OctEncode/Decode/ImpostorCell octahedral atlas addressing + CrossFadeWeight + Bayer/per-instance-hash dither + RunImpostorScene/RenderImpostorShot) — a NEW header COMPOSING foliage.h READ-ONLY (BYTE-UNTOUCHED); the Vulkan --fo1-impostor-shot + Metal --fo1-impostor run the IDENTICAL pure-CPU fly-through + SHARED strict-zero integer viz (NO shader; the GPU atlas BAKE + billboard render is DEFERRED to FO2)
 #include "terrain/procterrain.h" // Slice PT1 (FLAGSHIP #26 beachhead): deterministic integer fBm HEIGHTFIELD (IntHashLattice/IntValueNoise/IntHeight/GenHeightField) Q16.16 — the strict-integer twin of the FLOAT terrain::Height, NO runtime sin/sqrt/floor; the Vulkan --pt1-height-shot pure-integer grayscale heightmap (strict-zero cross-backend)
 #include "weather/weather.h"      // Slice WE1 (FLAGSHIP #27 beachhead): deterministic integer DRIFTING CLOUD-DENSITY field (IntCloudDensity/GenCloudSlice) Q16.16 — a drifted integer fBm value-noise (terrain::IntValueNoise basis) advected per-frame + carved by coverage, NO runtime sin/frac(sin()); the Vulkan --we1-clouddensity-shot pure-integer grayscale density slab (strict-zero cross-backend)
 #include "terrain/erosion.h"     // Slice PT2 (FLAGSHIP #26 headline+crux): deterministic integer HYDRAULIC EROSION (ErodeHydraulic/GridSum/CountChanged) Q16.16 — a mass-conserving contractive integer flux over the PT1 field, NO float; the Vulkan --pt2-hydraulic-shot pure-integer erosion-delta heatmap (strict-zero cross-backend)
@@ -4486,6 +4487,18 @@ int main(int argc, char** argv) {
     const char* bt1BehaviorShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--bt1-behavior-shot") == 0) { bt1BehaviorShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice FO1 (impostor arc, audit item FO-B): --fo1-impostor-shot <out.bmp> (DETERMINISTIC FOLIAGE
+    // IMPOSTORS + CROSS-FADE LOD — engine/foliage/impostor.h, hf::foliage::impostor; the octahedral impostor-
+    // atlas ADDRESSING + dithered CROSS-FADE that replaces foliage.h FO4's hard LOD pop). PURE CPU: NO GPU
+    // dispatch, NO new shader, NO new RHI; both backends run the IDENTICAL impostor.h fly-through scene
+    // (RunImpostorScene — a 144-plant field + a 24-tick camera path, each plant addressing an octahedral atlas
+    // cell + cross-fading through the transition band with a stable Bayer/hash dither) + the SHARED pure-integer
+    // viz (RenderImpostorShot) -> strict-zero cross-backend BY CONSTRUCTION. Its OWN loop (C1061).
+    const char* fo1ImpostorShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--fo1-impostor-shot") == 0) { fo1ImpostorShotPath = argv[i + 1]; break; }
     }
 
     // Slice CR1: --cr1-crowd-shot <out.bmp> (DETERMINISTIC CROWD AT 10k+ AGENTS, the Mass-class archetype
@@ -61100,6 +61113,58 @@ int main(int argc, char** argv) {
                                 "attack montage + additive lean, %d notifies, hit@%d)\n",
                                 al1LayerShotPath, alW, alH, r1.notifies, r1.hitTick);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", al1LayerShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DETERMINISTIC FOLIAGE IMPOSTORS + CROSS-FADE LOD (--fo1-impostor-shot <out.bmp>, Slice FO1
+        // impostor arc, audit item FO-B, hf::foliage::impostor; engine/foliage/impostor.h). PURE CPU — NO GPU
+        // dispatch, NO new shader, NO new RHI; both Vulkan-Windows and Metal-Mac run the IDENTICAL pure-CPU
+        // fly-through scene (impostor.h::RunImpostorScene — a 144-plant lattice + a 24-tick camera path; each
+        // plant addresses an octahedral impostor-atlas cell for its view direction, and plants crossing the LOD
+        // transition band cross-fade with a STABLE Bayer/per-instance-hash dither instead of the FO4 hard pop)
+        // + the SHARED pure-integer viz (impostor.h::RenderImpostorShot — the top-down field colored by LOD/fade
+        // mode with the dither checkerboard on cross-fade plants, the N×N octahedral atlas inset with a dot per
+        // impostor plant in the cell it addresses) -> strict-zero cross-backend BY CONSTRUCTION. Asserts two-run
+        // digest identity + the pinned mix. STANDALONE branch (C1061). NOTE: the GPU atlas BAKE + textured
+        // billboard render is DEFERRED to FO2 — this ships the deterministic ADDRESSING + CROSS-FADE core. ---
+        if (fo1ImpostorShotPath) {
+            namespace impo = hf::foliage::impostor;
+
+            // THE SCENARIO (== impostor_test's scene case): the fixed 144-plant 24-tick fly-through, run twice.
+            const impo::ImpostorSceneRun r1 = impo::RunImpostorScene();
+            const impo::ImpostorSceneRun r2 = impo::RunImpostorScene();
+
+            // PROOF (1) two-run IDENTICAL fade/addressing digest.
+            if (r1.digest != r2.digest) {
+                std::fprintf(stderr, "FATAL: fo1-impostor two runs differ (nondeterministic addressing/cross-fade)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fo1-impostor determinism: two runs BYTE-IDENTICAL {digest:0x%016llx}\n",
+                        (unsigned long long)r1.digest);
+
+            // PROOF (2) the pinned reference-frame mix (near + cross-fade + impostor plants all present -> the
+            // cross-fade genuinely spans the transition; no hard pop).
+            const bool mix = r1.nearOnly == 36 && r1.inBand == 100 && r1.farOnly == 8 &&
+                             r1.impostorCells == 28 && r1.instances == 144 && r1.gridN == 8;
+            if (!mix) {
+                std::fprintf(stderr, "FATAL: fo1-impostor reference mix broken (near=%d cross=%d far=%d cells=%d)\n",
+                             r1.nearOnly, r1.inBand, r1.farOnly, r1.impostorCells);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fo1-impostor: {instances:%d, gridN:%d, inBand:%d, impostorCells:%d, digest:0x%016llx}\n",
+                        r1.instances, r1.gridN, r1.inBand, r1.impostorCells, (unsigned long long)r1.digest);
+
+            // --- Golden: the SHARED pure-integer raster (impostor.h::RenderImpostorShot — the identical
+            // function both backends call; strict-zero BY CONSTRUCTION). ---
+            std::vector<uint8_t> impImg;
+            uint32_t impW = 0, impH = 0;
+            impo::RenderImpostorShot(r1, impImg, impW, impH);
+            bool ok = WriteBMP(fo1ImpostorShotPath, impImg, impW, impH);
+            if (ok) std::printf("wrote %s (%ux%u) — fo1 deterministic foliage impostors + cross-fade LOD "
+                                "(octahedral atlas addressing + dithered transition; GPU atlas bake DEFERRED to FO2)\n",
+                                fo1ImpostorShotPath, impW, impH);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fo1ImpostorShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

@@ -151,6 +151,7 @@
 #include "game/gameplay_cues.h"       // Slice GC1: DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES (sphere/box/cone overlap -> ascending-id target set + GT1 tag filter; a deterministic impact/buff/death cue EVENT stream; AreaActivate composes GAS1/GT1 via an adapter; RenderGc1CuesViz; PURE CPU integer geometry, cone half-angle a pinned host cos threshold — NO runtime trig) — a NEW additive sibling #including game/gameplay_tags.h READ-ONLY/BYTE-UNTOUCHED; the Metal --gc1-cues runs the IDENTICAL pure-CPU cue battle + RenderGc1CuesViz the Vulkan --gc1-cues-shot runs (strict-zero cross-backend BY CONSTRUCTION; cues are the EVENT layer, NOT rendered VFX)
 #include "ai/ai.h"                   // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Metal --ai1-tree runs the IDENTICAL pure-CPU tick + 2D node-graph viz the Vulkan --ai1-tree-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "ai/behavior_tree.h"        // Slice BT1: DETERMINISTIC BEHAVIOR-TREE DEPTH + UTILITY AI (parallel/cooldown/observer-abort/retry/loop/service/utility node kinds + BuildGuardTree/RunBt1Scenario/RenderBt1Shot) — a NEW additive header COMPOSING ai/ai.h READ-ONLY (Blackboard/Status/kMaxBbKeys byte-untouched); the Metal --bt1-behavior runs the IDENTICAL pure-CPU guard scenario + SHARED strict-zero integer timeline raster the Vulkan --bt1-behavior-shot runs (strict-zero cross-backend BY CONSTRUCTION)
+#include "foliage/impostor.h"        // Slice FO1 (impostor arc, audit item FO-B): DETERMINISTIC FOLIAGE IMPOSTORS + CROSS-FADE LOD (OctEncode/Decode/ImpostorCell octahedral atlas addressing + CrossFadeWeight + Bayer/per-instance-hash dither + RunImpostorScene/RenderImpostorShot) — a NEW header COMPOSING foliage/foliage.h READ-ONLY (BYTE-UNTOUCHED); the Metal --fo1-impostor runs the IDENTICAL pure-CPU fly-through + SHARED strict-zero integer viz the Vulkan --fo1-impostor-shot runs (NO shader; the GPU atlas BAKE + billboard render is DEFERRED to FO2)
 #include "sim/water_body.h"          // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Metal --wv1-float runs the IDENTICAL pure-CPU 480-tick scenario + SHARED raster the Vulkan --wv1-float-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "spline/spline.h"           // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Metal --sp1-road runs the IDENTICAL pure-CPU scenario + SHARED top-down raster the Vulkan --sp1-road-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/force_field.h"         // Slice FF1: RIGID-BODY FORCE-FIELD VOLUMES (FieldVolume/EvalFieldForce/ApplyFields/StepFieldWorld/SimFieldTick/RunFieldLockstep/RunFieldRollback/RunFieldShotScenario/RenderFieldShot — the PT2 particle field math (radial/vortex/wind, particles.h read-only) applied to fpx RIGID BODIES with bounded AABB volumes; velocities mutated pre-step (the WV1 discipline), dv = F*invMass*dt, LINEAR force only; PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/particles.h read-only; the Metal --ff1-fields runs the IDENTICAL pure-CPU 240-tick scenario + SHARED top-down raster the Vulkan --ff1-fields-shot runs (strict-zero cross-backend BY CONSTRUCTION)
@@ -49354,6 +49355,45 @@ static int RunAl1LayerShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FO1 (impostor arc, audit item FO-B) — DETERMINISTIC FOLIAGE IMPOSTORS + CROSS-FADE LOD showcase
+// (--fo1-impostor). PURE CPU — runs the IDENTICAL impostor.h fly-through (RunImpostorScene — a 144-plant lattice
+// + a 24-tick camera path; each plant addresses an octahedral impostor-atlas cell for its view direction, and
+// plants crossing the LOD transition band CROSS-FADE with a STABLE Bayer/per-instance-hash dither instead of the
+// FO4 hard pop) + the SHARED pure-integer viz (impostor.h::RenderImpostorShot — the identical function the Vulkan
+// --fo1-impostor-shot calls) -> bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). The
+// proof lines match the Vulkan side EXACTLY. NO shader added. NOTE: the GPU octahedral-atlas BAKE + textured
+// billboard render is DEFERRED to FO2 — this ships the deterministic ADDRESSING + CROSS-FADE core only. =====
+static int RunFo1ImpostorShowcase(const char* outPath) {
+    namespace impo = hf::foliage::impostor;
+
+    // THE SCENARIO (== impostor_test's scene case): the fixed 144-plant 24-tick fly-through, run twice.
+    const impo::ImpostorSceneRun r1 = impo::RunImpostorScene();
+    const impo::ImpostorSceneRun r2 = impo::RunImpostorScene();
+
+    // PROOF (1) two-run IDENTICAL fade/addressing digest.
+    if (r1.digest != r2.digest)
+        return fail("fo1-impostor: two runs differ (nondeterministic addressing/cross-fade)");
+    std::printf("fo1-impostor determinism: two runs BYTE-IDENTICAL {digest:0x%016llx}\n",
+                (unsigned long long)r1.digest);
+
+    // PROOF (2) the pinned reference-frame mix (near + cross-fade + impostor plants all present).
+    const bool mix = r1.nearOnly == 36 && r1.inBand == 100 && r1.farOnly == 8 &&
+                     r1.impostorCells == 28 && r1.instances == 144 && r1.gridN == 8;
+    if (!mix) return fail("fo1-impostor: reference-frame mix broken");
+    std::printf("fo1-impostor: {instances:%d, gridN:%d, inBand:%d, impostorCells:%d, digest:0x%016llx}\n",
+                r1.instances, r1.gridN, r1.inBand, r1.impostorCells, (unsigned long long)r1.digest);
+
+    // --- Golden: the SHARED pure-integer raster (impostor.h::RenderImpostorShot — the identical function the
+    // Vulkan --fo1-impostor-shot calls; strict-zero BY CONSTRUCTION). ---
+    std::vector<uint8_t> impImg;
+    uint32_t impW = 0, impH = 0;
+    impo::RenderImpostorShot(r1, impImg, impW, impH);
+    if (!WritePNG(outPath, impImg, impW, impH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fo1 deterministic foliage impostors + cross-fade LOD (octahedral atlas "
+                "addressing + dithered transition; GPU atlas bake DEFERRED to FO2)\n", outPath, impW, impH);
+    return 0;
+}
+
 // ===== Slice BT1 — DETERMINISTIC BEHAVIOR-TREE DEPTH + UTILITY AI showcase (--bt1-behavior). PURE CPU —
 // runs the IDENTICAL behavior_tree.h guard scenario (a SERVICE refreshes threat every 4 ticks, a UTILITY
 // selector picks patrol/chase/attack/flee, the chosen branch runs a PARALLEL move+aim + a COOLDOWN-gated
@@ -83205,6 +83245,17 @@ int main(int argc, char** argv) {
                          std::strcmp(argv[1], "--bt1-behavior-shot") == 0)) {
             const char* out = argc > 2 ? argv[2] : "metal_bt1_behavior.png";
             try { return RunBt1BehaviorShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fo1-impostor <out.png>: DETERMINISTIC FOLIAGE IMPOSTORS + CROSS-FADE LOD (Slice FO1 impostor arc,
+        // audit item FO-B, hf::foliage::impostor — octahedral impostor-atlas addressing + dithered cross-fade
+        // LOD over foliage.h FO4). PURE CPU — runs the IDENTICAL impostor.h fly-through + SHARED strict-zero
+        // integer viz the Vulkan --fo1-impostor-shot runs -> bit-identical cross-backend BY CONSTRUCTION; proof
+        // lines match EXACTLY. NO shader. The GPU atlas BAKE + billboard render is DEFERRED to FO2.
+        if (argc > 1 && (std::strcmp(argv[1], "--fo1-impostor") == 0 ||
+                         std::strcmp(argv[1], "--fo1-impostor-shot") == 0)) {
+            const char* out = argc > 2 ? argv[2] : "metal_fo1_impostor.png";
+            try { return RunFo1ImpostorShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --uf1-text <out.png>: render the DETERMINISTIC SDF TEXT showcase (Slice UF1, hf::ui::sdf —

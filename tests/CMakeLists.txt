@@ -1824,6 +1824,17 @@ hf_add_pure_test(morph_test)
 # no-op + frame-sensitivity + LUT provenance. Pure C++ (hf_core), ASan-eligible. foliage.h #includes fpx.h read-only.
 hf_add_pure_test(foliage_test)
 
+# Slice FO1 (impostor arc, the LAST FLAGSHIP #25 audit item FO-B): DETERMINISTIC FOLIAGE IMPOSTORS + CROSS-FADE
+# LOD (engine/foliage/impostor.h) — the deterministic CORE of octahedral impostor-atlas ADDRESSING (OctEncode/
+# Decode/ImpostorCell, the integer Cigolle octahedral unit-vector<->square map, Y-pole fold) + DITHERED CROSS-
+# FADE LOD (CrossFadeWeight ramp over a transition band + a Bayer-4x4 / per-instance-hash screen-door that makes
+# the fade stable + shimmer-free) — replacing foliage.h FO4's hard LOD POP. Pins the oct round-trip band +
+# cardinal/oblique cells, the cross-fade ramp + dither coverage {0,1/4,1/2,3/4,1}->{0,4,8,12,16}/16, dither
+# stability (same weight->same mask), the fade trace (far->cross->near), and the fly-through scene digest. Pure
+# integer (STRICT-ZERO, bit-identical MSVC/clang), NO transcendentals, NO shader. impostor.h #includes foliage.h
+# (BYTE-UNTOUCHED) read-only. The GPU octahedral-atlas BAKE + textured billboard render is DEFERRED to FO2.
+hf_add_pure_test(impostor_test)
+
 # Deterministic Procedural Terrain Slice 1 (Slice PT1, the BEACHHEAD of FLAGSHIP #26): the integer fBm
 # HEIGHTFIELD core (engine/terrain/procterrain.h) — IntHashLattice/IntValueNoise/IntHeight/GenHeightField,
 # the strict-integer twin of the FLOAT terrain::Height (heightmap.cpp, FROZEN). procterrain_test pins
