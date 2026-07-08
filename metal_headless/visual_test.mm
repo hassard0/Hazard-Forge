@@ -151,6 +151,7 @@
 #include "game/ability.h"            // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Metal --gas1-duel runs the IDENTICAL pure-CPU 60-tick duel the Vulkan --gas1-duel-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "game/gameplay_tags.h"      // Slice GT1: A DETERMINISTIC GAMEPLAY-TAG LAYER (TagRegistry/TagContainer/HasTagQuery/TagRules/TryActivateTagged/StepTagged/RunTaggedLockstep/RunTaggedRollback/RunSkirmish — hierarchical interned tags gating GAS1 abilities/effects via a thin adapter; PURE CPU integer) — a NEW additive sibling #including game/ability.h READ-ONLY/BYTE-UNTOUCHED; the Metal --gt1-tags runs the IDENTICAL pure-CPU 14-tick tag skirmish the Vulkan --gt1-tags-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "game/gameplay_cues.h"       // Slice GC1: DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES (sphere/box/cone overlap -> ascending-id target set + GT1 tag filter; a deterministic impact/buff/death cue EVENT stream; AreaActivate composes GAS1/GT1 via an adapter; RenderGc1CuesViz; PURE CPU integer geometry, cone half-angle a pinned host cos threshold — NO runtime trig) — a NEW additive sibling #including game/gameplay_tags.h READ-ONLY/BYTE-UNTOUCHED; the Metal --gc1-cues runs the IDENTICAL pure-CPU cue battle + RenderGc1CuesViz the Vulkan --gc1-cues-shot runs (strict-zero cross-backend BY CONSTRUCTION; cues are the EVENT layer, NOT rendered VFX)
+#include "game/duel.h"                // Slice GAME1: A COMPLETE DETERMINISTIC ROLLBACK-PHYSICS GAME — a 2-player physics KNOCKOUT DUEL (hf::game::duel) composing the whole moat stack (fpx/verdict physics + lockstep/rollback + replay + what-if fork + provable anti-cheat) PLUS the gameplay framework (GAS1 shove cost+cooldown, GT1 State.Stunned, GC1 cues); the engine's first actual GAME (a headless deterministic match SIMULATION + the moat proofs); composes verdict.h/ability.h/gameplay_tags.h/gameplay_cues.h/authority_verify.h/fork.h/replay.h READ-ONLY; the Metal --game1-duel runs the IDENTICAL pure-integer RenderDuelViz the Vulkan --game1-duel-shot runs (strict-zero cross-backend BY CONSTRUCTION, NO shader)
 #include "ai/ai.h"                   // Slice AI1: deterministic AI THE BLACKBOARD + DECISION-TREE NODE GRAPH + DETERMINISTIC TICK (Blackboard/BtNode/NodeKind/DecisionTree/Status/TickTree/DigestBlackboard/BuildAi1Tree) — a NEW additive sibling #including game/verdict.h + sim/fpx.h read-only; the Metal --ai1-tree runs the IDENTICAL pure-CPU tick + 2D node-graph viz the Vulkan --ai1-tree-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "ai/behavior_tree.h"        // Slice BT1: DETERMINISTIC BEHAVIOR-TREE DEPTH + UTILITY AI (parallel/cooldown/observer-abort/retry/loop/service/utility node kinds + BuildGuardTree/RunBt1Scenario/RenderBt1Shot) — a NEW additive header COMPOSING ai/ai.h READ-ONLY (Blackboard/Status/kMaxBbKeys byte-untouched); the Metal --bt1-behavior runs the IDENTICAL pure-CPU guard scenario + SHARED strict-zero integer timeline raster the Vulkan --bt1-behavior-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "foliage/impostor.h"        // Slice FO1 (impostor arc, audit item FO-B): DETERMINISTIC FOLIAGE IMPOSTORS + CROSS-FADE LOD (OctEncode/Decode/ImpostorCell octahedral atlas addressing + CrossFadeWeight + Bayer/per-instance-hash dither + RunImpostorScene/RenderImpostorShot) — a NEW header COMPOSING foliage/foliage.h READ-ONLY (BYTE-UNTOUCHED); the Metal --fo1-impostor runs the IDENTICAL pure-CPU fly-through + SHARED strict-zero integer viz the Vulkan --fo1-impostor-shot runs (NO shader; the GPU atlas BAKE + billboard render is DEFERRED to FO2)
@@ -47224,6 +47225,65 @@ static int RunFk1ForkShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GAME1 — A COMPLETE DETERMINISTIC ROLLBACK-PHYSICS GAME showcase (--game1-duel) (a 2-player physics
+// KNOCKOUT DUEL, engine/game/duel.h, hf::game::duel). PURE CPU — NO GPU compute, NO new shader, NO new RHI; duel.h is
+// header-only pure-integer, composing verdict.h/ability.h/gameplay_tags.h/gameplay_cues.h/authority_verify.h/fork.h/
+// replay.h READ-ONLY, so on Metal it plays the IDENTICAL canonical best-of-3 knockout duel + runs ALL FIVE moat proofs
+// on the winning round's emitted stream, then calls the SAME RenderDuelViz the Vulkan --game1-duel-shot runs -> the
+// arena/scoreboard/moat-proof report is bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). The
+// proof lines match the Vulkan side EXACTLY. New golden tests/golden/metal/game1_duel.png (baked on the Mac by the
+// controller). UE5's float architecture is disqualified from a bit-exact, rollback-replayable, fork-able, provably-fair game.
+static int RunGame1DuelShowcase(const char* outPath) {
+    namespace gduel = hf::game::duel;
+    std::vector<uint8_t> img1, img2;
+    gduel::Duel1VizStats s1{}, s2{};
+    gduel::RenderDuelViz(img1, s1);
+    gduel::RenderDuelViz(img2, s2);
+    const bool twoRunIdentical = (img1.size() == img2.size()) &&
+                                 (std::memcmp(img1.data(), img2.data(), img1.size()) == 0) &&
+                                 (s1.pixDigest == s2.pixDigest);
+    if (!twoRunIdentical) return fail("game1-duel: two runs differ");
+
+    const gduel::MatchResult mr = gduel::RunDuelMatch();
+    hf::game::verdict::VerdictWorld pw;
+    const gduel::DuelScene scene = gduel::BuildDuelScene(pw);
+    const std::vector<hf::game::verdict::Command> stream = mr.rounds[0].emittedStream;
+    const uint32_t ticks = mr.rounds[0].ticks;
+    bool lockId = false; const std::string lockDig = gduel::DuelLockstep(scene, stream, ticks, &lockId);
+    bool corrected = false, diverged = false; gduel::DuelRollback(scene, stream, ticks, 6u, &corrected, &diverged);
+    uint64_t demoHash = 0; bool replayOk = false; (void)gduel::DuelReplayDemo(scene, stream, ticks, &demoHash, &replayOk);
+    const gduel::DuelForkProof fk = gduel::DuelForkChangeWinner(scene, stream, ticks, gduel::kForkTick, gduel::MakeForkCounterShove(scene));
+    const gduel::DuelAntiCheatProof ac = gduel::DuelAntiCheat(scene, stream, ticks, 6u);
+    const bool gameOk = (mr.score[0] == 2 && mr.score[1] == 1 && mr.matchWinner == 0 &&
+                         mr.rounds[0].verdictOut.knockoutTick == 14 && mr.rounds[0].verdictOut.winner == 0 &&
+                         lockId && (lockDig == mr.rounds[0].finalDigest) && corrected && diverged && replayOk &&
+                         fk.origWinner == 0 && fk.forkWinner == 1 && fk.winnerChanged &&
+                         ac.honestVerified && ac.cheaterCaughtTick == 6 &&
+                         s1.deterministic && s1.lockstep && s1.replayOk && s1.forkChanged && s1.cheaterCaught == 6);
+    if (!gameOk) return fail("game1-duel: correctness control failed");
+
+    std::printf("game1-duel: a 2-player physics KNOCKOUT DUEL composing the whole determinism moat\n");
+    std::printf("game1-duel: MATCH best-of-3 score %u-%u winner=Player%d {matchDigest:0x%016llx}\n",
+                mr.score[0], mr.score[1], mr.matchWinner, (unsigned long long)mr.matchDigest);
+    std::printf("game1-duel: round 0 KNOCKOUT @ tick %d (winner Player%d) {digest:%s}\n",
+                mr.rounds[0].verdictOut.knockoutTick, mr.rounds[0].verdictOut.winner, mr.rounds[0].finalDigest.c_str());
+    std::printf("game1-duel: LOCKSTEP identical=%s + ROLLBACK{corrected=%s,diverged=%s}\n",
+                lockId ? "true" : "false", corrected ? "true" : "false", diverged ? "true" : "false");
+    std::printf("game1-duel: REPLAY record==replay {demoHash:0x%016llx}\n", (unsigned long long)demoHash);
+    std::printf("game1-duel: FORK what-if -> winner flips Player%d -> Player%d {orig:0x%016llx fork:0x%016llx}\n",
+                fk.origWinner, fk.forkWinner, (unsigned long long)fk.origFullDigest, (unsigned long long)fk.forkFullDigest);
+    std::printf("game1-duel: ANTI-CHEAT honest VERIFIED + cheater REJECTED @ tick %d {commit:%s}\n",
+                ac.cheaterCaughtTick, ac.inputCommitment.c_str());
+    std::printf("game1-duel: two-run BYTE-IDENTICAL {pixDigest:0x%016llx}\n", (unsigned long long)s1.pixDigest);
+    std::printf("game1-duel: {players:%u, rounds:%u, winner:Player%d, knockoutTick:%d, matchDigest:0x%016llx}\n",
+                s1.players, s1.rounds, s1.matchWinner, s1.knockoutTick, (unsigned long long)s1.matchDigest);
+
+    if (!WritePNG(outPath, img1, s1.width, s1.height)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — game1 deterministic rollback-physics knockout duel (best-of-3, Player%d wins %u-%u, all 5 moat proofs green)\n",
+                outPath, s1.width, s1.height, s1.matchWinner, s1.score0, s1.score1);
+    return 0;
+}
+
 static int RunSq2CinematicShowcase(const char* outPath) {
     namespace sq = hf::seq;
     std::vector<uint8_t> img1, img2;
@@ -83167,6 +83227,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fk1-fork") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fk1_fork.png";
             try { return RunFk1ForkShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --game1-duel <out.png>: render A COMPLETE DETERMINISTIC ROLLBACK-PHYSICS GAME showcase (Slice GAME1, a
+        // 2-player physics KNOCKOUT DUEL). PURE CPU — plays the IDENTICAL canonical best-of-3 duel + runs all five
+        // moat proofs + calls the shared RenderDuelViz the Vulkan --game1-duel-shot runs -> bit-identical
+        // cross-backend BY CONSTRUCTION; the proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--game1-duel") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_game1_duel.png";
+            try { return RunGame1DuelShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --we1-clouddensity <out.png>: render the Deterministic integer DRIFTING CLOUD-DENSITY showcase (Slice WE1,

@@ -127,6 +127,7 @@
 #include "game/ability.h"       // Slice GAS1: A DETERMINISTIC GAMEPLAY ABILITY SYSTEM (AttributeSet/EffectDef/AbilityKit/KitBuilder/TryActivate/StepAbilities/RunGasLockstep/RunGasRollback/RunDuelScenario — attributes + effects + cooldowns, the GAS-class core; PURE CPU Q16.16 integer) — a NEW additive sibling #including game/verdict.h read-only; the Vulkan --gas1-duel-shot + Metal --gas1-duel run the IDENTICAL pure-CPU 60-tick duel
 #include "game/gameplay_tags.h" // Slice GT1: A DETERMINISTIC GAMEPLAY-TAG LAYER (TagRegistry/TagContainer/HasTagQuery/TagRules/TryActivateTagged/StepTagged/RunTaggedLockstep/RunTaggedRollback/RunSkirmish — hierarchical interned tags gating GAS1 abilities/effects via a thin adapter; PURE CPU integer) — a NEW additive sibling #including game/ability.h READ-ONLY/BYTE-UNTOUCHED; the Vulkan --gt1-tags-shot + Metal --gt1-tags run the IDENTICAL pure-CPU 14-tick tag skirmish
 #include "game/gameplay_cues.h" // Slice GC1: DETERMINISTIC ABILITY TARGETING SHAPES + GAMEPLAY CUES (sphere/box/cone overlap -> ascending-id target set + GT1 tag filter; a deterministic cue EVENT stream impact/buff/death; AreaActivate composes GAS1/GT1 via an adapter; RenderGc1CuesViz; PURE CPU integer geometry, cone half-angle a pinned host cos threshold — NO runtime trig) — a NEW additive sibling #including game/gameplay_tags.h READ-ONLY/BYTE-UNTOUCHED; the Vulkan --gc1-cues-shot + Metal --gc1-cues run the IDENTICAL pure-CPU cue battle (cues are the EVENT layer, NOT rendered VFX)
+#include "game/duel.h"          // Slice GAME1: A COMPLETE DETERMINISTIC ROLLBACK-PHYSICS GAME — a 2-player physics KNOCKOUT DUEL (hf::game::duel) that COMPOSES the whole moat stack (bit-exact fpx/verdict physics + whole-world lockstep/rollback + replay + what-if fork + provable anti-cheat) PLUS the gameplay framework (GAS1 shove cost+cooldown, GT1 State.Stunned gate, GC1 cue stream) into the engine's first actual GAME; a headless deterministic match SIMULATION + the moat proofs; composes verdict.h/ability.h/gameplay_tags.h/gameplay_cues.h/authority_verify.h/fork.h/replay.h READ-ONLY; the Vulkan --game1-duel-shot + Metal --game1-duel run the IDENTICAL pure-integer duel report (RenderDuelViz). UE5's float architecture is disqualified from a bit-exact, rollback-replayable, fork-able, provably-fair game.
 #include "sim/water_body.h"     // Slice WV1: THE WATER GAMEPLAY VOLUME (WaterBody/SurfaceHeight/SurfaceVelY/StepFloatBody/SimWaterTick/RunWaterLockstep/RunWaterRollback/RunWaterShotScenario/RenderWaterShot — the analytic integer Gerstner surface, host-baked ik.h sine LUT, driving CP7 SphereCapVolume Archimedes buoyancy + drag on fpx bodies; PURE CPU Q16.16 integer, the render ocean and the physics ocean are the same equation) — a NEW additive sibling #including sim/fpx.h + sim/couple.h + anim/ik.h read-only; the Vulkan --wv1-float-shot + Metal --wv1-float run the IDENTICAL pure-CPU 480-tick float scenario + shared raster
 #include "spline/spline.h"      // Slice SP1: FIRST-CLASS DETERMINISTIC SPLINES (Spline/Eval/Tangent/BuildArcTable/EvalByDistance/ScatterAlongSpline/SweepStrip/CameraAlongSpline/RunSplineShotScenario/RenderSplineShot — the Q16.16 uniform Catmull-Rom core + fixed-K arc-length reparam + the three consumers: scatter->pcg, the swept road strip, the rail camera; PURE CPU integer, STATELESS so no lockstep harness by design) — a NEW additive sibling #including sim/fpx.h + pcg/pcg.h + scene/vertex.h read-only; the Vulkan --sp1-road-shot + Metal --sp1-road run the IDENTICAL pure-CPU scenario + shared top-down raster
 #include "sim/force_field.h"    // Slice FF1: RIGID-BODY FORCE-FIELD VOLUMES (FieldVolume/EvalFieldForce/ApplyFields/StepFieldWorld/SimFieldTick/RunFieldLockstep/RunFieldRollback/RunFieldShotScenario/RenderFieldShot — the PT2 particle field math (radial/vortex/wind, particles.h read-only) applied to fpx RIGID BODIES with bounded AABB volumes; velocities mutated pre-step (the WV1 discipline), dv = F*invMass*dt, LINEAR force only (no field torque — documented v1); PURE CPU Q16.16 integer) — a NEW additive sibling #including sim/fpx.h + sim/particles.h read-only; the Vulkan --ff1-fields-shot + Metal --ff1-fields run the IDENTICAL pure-CPU 240-tick scenario + shared top-down raster
@@ -4155,6 +4156,19 @@ int main(int argc, char** argv) {
     const char* fk1ForkShotPath = nullptr;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--fk1-fork-shot") == 0) { fk1ForkShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice GAME1: --game1-duel-shot <out.bmp> (A COMPLETE DETERMINISTIC ROLLBACK-PHYSICS GAME — a 2-player
+    // physics KNOCKOUT DUEL, engine/game/duel.h, hf::game::duel). PURE CPU: NO GPU dispatch, NO new shader, NO
+    // new RHI; both backends play the IDENTICAL canonical best-of-3 duel (two fpx avatars on a platform over a
+    // void; a GAS1 shove ability — mana cost + cooldown — lowers to a verdict impulse; a GT1 State.Stunned tag
+    // gates the stunned player; GC1 impact/knockout cues), run ALL FIVE moat proofs on the winning round's
+    // emitted stream (deterministic / lockstep / replay / fork->different-winner / anti-cheat), then call the
+    // SAME RenderDuelViz (arena side-view + avatar trails + impact/knockout markers + scoreboard + moat-proof
+    // panel) -> strict-zero cross-backend BY CONSTRUCTION. Its OWN parse loop (the standalone-loop C1061 pattern).
+    const char* game1DuelShotPath = nullptr;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--game1-duel-shot") == 0) { game1DuelShotPath = argv[i + 1]; break; }
     }
 
     // Slice WE1: --we1-clouddensity-shot <out.bmp> (Deterministic integer DRIFTING CLOUD-DENSITY field —
@@ -59078,6 +59092,72 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — fk1 what-if fork replay timeline tree (original + 2 reproducible counterfactuals, diverge @ %u)\n",
                                 fk1ForkShotPath, s1.width, s1.height, s1.forkTick);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fk1ForkShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        if (game1DuelShotPath) {
+            namespace gduel = hf::game::duel;
+            // A COMPLETE DETERMINISTIC ROLLBACK-PHYSICS GAME (Slice GAME1). PURE CPU: the IDENTICAL
+            // RenderDuelViz the Metal --game1-duel runs (the canonical best-of-3 knockout duel + all five moat
+            // proofs) -> the pixels are bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel).
+            // NO shader added.
+            std::vector<uint8_t> img1, img2;
+            gduel::Duel1VizStats s1{}, s2{};
+            gduel::RenderDuelViz(img1, s1);
+            gduel::RenderDuelViz(img2, s2);
+            const bool twoRunIdentical = (img1.size() == img2.size()) &&
+                                         (std::memcmp(img1.data(), img2.data(), img1.size()) == 0) &&
+                                         (s1.pixDigest == s2.pixDigest);
+            if (!twoRunIdentical) {
+                std::fprintf(stderr, "FATAL: game1-duel two runs differ\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // CORRECTNESS CONTROLS (match the Metal --game1-duel side EXACTLY): re-play the match + re-run the
+            // moat proofs on the winning round and assert the game outcome + ALL FIVE proofs.
+            const gduel::MatchResult mr = gduel::RunDuelMatch();
+            hf::game::verdict::VerdictWorld pw;
+            const gduel::DuelScene scene = gduel::BuildDuelScene(pw);
+            const std::vector<hf::game::verdict::Command> stream = mr.rounds[0].emittedStream;
+            const uint32_t ticks = mr.rounds[0].ticks;
+            bool lockId = false; const std::string lockDig = gduel::DuelLockstep(scene, stream, ticks, &lockId);
+            bool corrected = false, diverged = false; gduel::DuelRollback(scene, stream, ticks, 6u, &corrected, &diverged);
+            uint64_t demoHash = 0; bool replayOk = false; (void)gduel::DuelReplayDemo(scene, stream, ticks, &demoHash, &replayOk);
+            const gduel::DuelForkProof fk = gduel::DuelForkChangeWinner(scene, stream, ticks, gduel::kForkTick, gduel::MakeForkCounterShove(scene));
+            const gduel::DuelAntiCheatProof ac = gduel::DuelAntiCheat(scene, stream, ticks, 6u);
+            const bool gameOk = (mr.score[0] == 2 && mr.score[1] == 1 && mr.matchWinner == 0 &&
+                                 mr.rounds[0].verdictOut.knockoutTick == 14 && mr.rounds[0].verdictOut.winner == 0 &&
+                                 lockId && (lockDig == mr.rounds[0].finalDigest) && corrected && diverged && replayOk &&
+                                 fk.origWinner == 0 && fk.forkWinner == 1 && fk.winnerChanged &&
+                                 ac.honestVerified && ac.cheaterCaughtTick == 6 &&
+                                 s1.deterministic && s1.lockstep && s1.replayOk && s1.forkChanged && s1.cheaterCaught == 6);
+            if (!gameOk) {
+                std::fprintf(stderr, "FATAL: game1-duel correctness control failed\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // PROOF lines (match the Metal --game1-duel side EXACTLY).
+            std::printf("game1-duel: a 2-player physics KNOCKOUT DUEL composing the whole determinism moat\n");
+            std::printf("game1-duel: MATCH best-of-3 score %u-%u winner=Player%d {matchDigest:0x%016llx}\n",
+                        mr.score[0], mr.score[1], mr.matchWinner, (unsigned long long)mr.matchDigest);
+            std::printf("game1-duel: round 0 KNOCKOUT @ tick %d (winner Player%d) {digest:%s}\n",
+                        mr.rounds[0].verdictOut.knockoutTick, mr.rounds[0].verdictOut.winner, mr.rounds[0].finalDigest.c_str());
+            std::printf("game1-duel: LOCKSTEP identical=%s + ROLLBACK{corrected=%s,diverged=%s}\n",
+                        lockId ? "true" : "false", corrected ? "true" : "false", diverged ? "true" : "false");
+            std::printf("game1-duel: REPLAY record==replay {demoHash:0x%016llx}\n", (unsigned long long)demoHash);
+            std::printf("game1-duel: FORK what-if -> winner flips Player%d -> Player%d {orig:0x%016llx fork:0x%016llx}\n",
+                        fk.origWinner, fk.forkWinner, (unsigned long long)fk.origFullDigest, (unsigned long long)fk.forkFullDigest);
+            std::printf("game1-duel: ANTI-CHEAT honest VERIFIED + cheater REJECTED @ tick %d {commit:%s}\n",
+                        ac.cheaterCaughtTick, ac.inputCommitment.c_str());
+            std::printf("game1-duel: two-run BYTE-IDENTICAL {pixDigest:0x%016llx}\n", (unsigned long long)s1.pixDigest);
+            std::printf("game1-duel: {players:%u, rounds:%u, winner:Player%d, knockoutTick:%d, matchDigest:0x%016llx}\n",
+                        s1.players, s1.rounds, s1.matchWinner, s1.knockoutTick, (unsigned long long)s1.matchDigest);
+
+            bool ok = WriteBMP(game1DuelShotPath, img1, s1.width, s1.height);
+            if (ok) std::printf("wrote %s (%ux%u) — game1 deterministic rollback-physics knockout duel (best-of-3, Player%d wins %u-%u, all 5 moat proofs green)\n",
+                                game1DuelShotPath, s1.width, s1.height, s1.matchWinner, s1.score0, s1.score1);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", game1DuelShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

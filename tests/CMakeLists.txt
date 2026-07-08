@@ -1505,6 +1505,24 @@ hf_add_pure_test(authority_verify_test)
 # byte-identical. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(fork_test)
 
+# Slice GAME1 — A COMPLETE DETERMINISTIC ROLLBACK-PHYSICS GAME: a 2-player physics KNOCKOUT DUEL
+# (engine/game/duel.h, hf::game::duel). The engine's BEAT-UE5 P0 — the first actual GAME (samples/ held only
+# hello_triangle). A small-but-complete headless deterministic match SIMULATION that COMPOSES the whole
+# determinism moat stack into ONE deliverable: bit-exact integer physics (fpx/verdict) + whole-world
+# lockstep/rollback (RunVerdictLockstep/RunVerdictRollback) + replay (verdict ReplayFile) + what-if fork
+# (fork.h) + provable anti-cheat (authority_verify.h), PLUS the shipped gameplay framework (GAS1 shove
+# ability with mana cost+cooldown, GT1 State.Stunned gate, GC1 cue event stream) — a category UE5's float
+# architecture is structurally disqualified from. duel.h composes verdict.h/ability.h/gameplay_tags.h/
+# gameplay_cues.h/authority_verify.h/fork.h/replay.h READ-ONLY (a NEW additive header; adds NO field, edits
+# NO frozen function). Pins: a scripted shove sequence rings-out the opponent at the EXACT tick (winner
+# pinned); a best-of-3 canonical match -> pinned score 2-1 + winner + match digest; two runs byte-identical
+# (MSVC==clang); a peer re-derives the round from the emitted stream ALONE + a rollback corrects a mispredict;
+# the round records + replays bit-identically (pinned demo hash); a fork flips the winner (both pinned); the
+# honest match verifies + a faked claim is rejected at the exact tick; shove costs stamina + cooldown, a
+# stunned shove is BLOCKED, impact cues fire at the exact hit ticks; the report viz is two-run byte-identical.
+# Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(duel_test)
+
 # Deterministic AI Slice 1 (Slice AI1, the BEACHHEAD of the DETERMINISTIC AI flagship, issue #28, hf::ai):
 # the integer BLACKBOARD + the FLAT decision-tree node graph + the deterministic TICK. Asserts: TickTree
 # two-run determinism (same tree+blackboard -> same Status + same DigestBlackboard); selector returns the
