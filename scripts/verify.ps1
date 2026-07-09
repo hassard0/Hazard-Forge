@@ -392,6 +392,7 @@ $Goldens = @(
     @{ Name = 'fk1_fork';         Flag = '--fk1-fork' }            # FK1 what-if fork replay / counterfactual timelines (MOAT #2; Seek->mutate->re-sim a bit-exact divergent timeline; UE5 float has no reproducible counterfactual)
     @{ Name = 'game1_duel';       Flag = '--game1-duel' }          # GAME1 the engine's first GAME: deterministic rollback-physics knockout duel (BEAT_UE5 P0; composes fpx+lockstep+abilities+tags+cues+replay+AC1+FK1 -> all 5 moat proofs; matchDigest 0x78123003c3a55a37)
     @{ Name = 'nw1_udp';          Flag = '--nw1-udp' }             # NW1 REAL UDP transport for deterministic rollback netcode (Rollback Kit; two peers converge to identical match digest over real 127.0.0.1 datagrams w/ reorder/loss; UE5 can't do deterministic rollback over a network)
+    @{ Name = 'mg1_material';     Flag = '--mg1-material' }        # MG1 material-graph depth (surpass-UE5 #3; 17->45 nodes incl procedural noise/FBM/functions/layers, bit-identical codegen digest 0xe323a0ff1e26d461 MSVC==clang)
     @{ Name = 'lod_gen';       Flag = '--lod-gen-shot' }     # LOD1 deterministic QEM auto-LOD (superiority S6; 3 LODs side-by-side, digests 0xeade209d8e61838f/0xbedec704837c71f4/0x1a9821628ab77e80)
     @{ Name = 'manylight';     Flag = '--manylight' }        # ML1 many-light SSBO path (superiority S7; 128 lights, assignDigest 0x42d5535632f152ea)
     @{ Name = 'hr1_hair';      Flag = '--hr1-hair-shot' }    # HR1 deterministic strand sim (superiority S2; stiffness fan, digest 0x4f241b7fbdadbadc)
