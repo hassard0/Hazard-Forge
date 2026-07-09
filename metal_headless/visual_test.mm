@@ -102,6 +102,7 @@
 #include "render/rtrace.h"          // Slice RT1: deterministic Q16.16 SW reference ray tracer (RtScene/RtRay/IntersectSphere/IntersectAabb/TraceClosest/ShadeHitInt/RenderScene/BuildRt1Scene) — Metal runs the CPU reference (rt_trace.comp is int64/Vulkan-only) + the Vulkan --rt1-trace-shot
 #include "render/rtd.h"             // Slice RTD1: deterministic STOCHASTIC RT soft shadows + SVGF-lite denoiser (RtdAreaLight/RtdSampleIndex/TraceAnyHitRanged/AccumulateSoftShadowVis/DenoiseSoftShadowVis) — Metal runs the CPU reference (rt_softshadow.comp is int64+RayQuery/Vulkan-only) + the Vulkan --rtd1-softshadow-shot
 #include "render/gi.h"              // Slice GI1: deterministic integer RT probe trace + shade (GiProbeGrid/kGiProbeDirs/TraceProbeRays/GiProbesToImage/BuildGi1Scene) — Metal runs the CPU reference (gi_probe_trace.comp is int64/Vulkan-only) + the Vulkan --gi1-probe-shot
+#include "render/pathtrace.h"       // Slice PTR1: BYTE-REPRODUCIBLE multi-bounce path-traced Cornell GI reference (RenderPtr1Showcase/PtRender) — pure-CPU integer, byte-identical to the Vulkan --ptr1-pathtrace-shot BY CONSTRUCTION (no GPU path)
 #include "sim/fpx.h"                // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp + the Vulkan --fpx-shot
 #include "rt5_simrender_scene.h"    // Slice RT5: the SHARED sim->RT bridge (rt5::BuildRt5World/BuildRt5Stream/BodiesToRtScene) used by --rt5-simrender (here) + the Vulkan --rt5-simrender-shot + rt_simrender_test — lives under tests/ to keep rtrace.h sim-free + fpx.h render-free
 #include "sim/cloth.h"              // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp + the Vulkan --cloth-integrate-shot
@@ -27183,6 +27184,79 @@ static int RunRtReflectGraphicsShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
     std::printf("OK wrote %s (%ux%u) — RT reflections from a GRAPHICS/fragment pass [CPU SW reference] (%u reflective)\n",
                 outPath, kRtW, kRtH, reflective);
+    return 0;
+}
+
+// ===== Slice PTR1 — A BYTE-REPRODUCIBLE MULTI-BOUNCE PATH-TRACED REFERENCE RENDER showcase (--ptr1-pathtrace).
+// PTR1 is a per-pixel Monte-Carlo PATH TRACER (next-event estimation + cosine-weighted MULTI-BOUNCE global
+// illumination) — the ground-truth GI reference the shipped RT arc lacked (rtrace::rt1_trace is DIRECT-ONLY;
+// gi.h ships a PROBE/SH GI APPROXIMATION, not a path-traced reference). It is PURE CPU (there is NO GPU path
+// — a CPU reference renderer), accumulated in Q16.16 INTEGER with a deterministic pcg hash sampler + a FROZEN
+// cos/sin LUT (integer literals) so the image is BYTE-IDENTICAL run-to-run AND cross-platform. On Metal the
+// SAME header-shared pt::RenderPtr1Showcase runs, so the image is byte-identical to the Vulkan --ptr1-
+// pathtrace-shot BY CONSTRUCTION. The moat UE5's float GPU path tracer + temporal denoiser cannot claim.
+static int RunPtr1PathtraceShowcase(const char* outPath) {
+    namespace pt = hf::render::pt;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    pt::Ptr1Shot shot = pt::RenderPtr1Showcase();
+    const auto t1 = std::chrono::steady_clock::now();
+    const double bakeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const uint32_t w = shot.w, h = shot.h;
+    const size_t kPixels = (size_t)w * h;
+    std::printf("ptr1-pathtrace: {res:%ux%u, spp:%u, bounces:%d, bakeMs:%.1f, imageDigest:0x%016llx, "
+                "energy:%llu, noiseMAE:%u} [Metal: pure-CPU integer GI path tracer, byte-identical to the "
+                "Vulkan --ptr1-pathtrace-shot by construction]\n",
+                w, h, shot.stats.spp, shot.stats.maxBounces, bakeMs,
+                (unsigned long long)shot.stats.digest, (unsigned long long)shot.stats.energy,
+                shot.stats.noiseMAE);
+
+    // GI proof: a multi-bounce render carries MORE energy than direct-only (indirect added) + Cornell
+    // COLOR BLEEDING (floor near the red wall reads red, near the green wall reads green).
+    {
+        pt::PtScene1 S = pt::BuildPtr1Scene();
+        const uint32_t gw = 96, gh = 72, gspp = 16;
+        std::vector<uint32_t> i1((size_t)gw * gh), i4((size_t)gw * gh);
+        pt::PtStats s1 = pt::PtRender(S, gw, gh, gspp, 1, std::span<uint32_t>(i1));
+        pt::PtStats s4 = pt::PtRender(S, gw, gh, gspp, 4, std::span<uint32_t>(i4));
+        if (!(s4.energy > s1.energy))
+            return fail("ptr1-pathtrace: multi-bounce is not brighter than direct-only (no GI)");
+        auto reg = [&](uint32_t x0, uint32_t x1, double& R, double& G, double& B) {
+            double r = 0, g = 0, b = 0; uint64_t n = 0;
+            for (uint32_t y = gh * 3 / 4; y < gh; ++y) for (uint32_t x = x0; x < x1; ++x) {
+                uint32_t c = i4[(size_t)y * gw + x]; r += c & 0xFF; g += (c >> 8) & 0xFF; b += (c >> 16) & 0xFF; ++n;
+            }
+            R = r / n; G = g / n; B = b / n;
+        };
+        double lr, lg, lb, rr, rg, rb; reg(0, gw / 4, lr, lg, lb); reg(gw * 3 / 4, gw, rr, rg, rb);
+        if (!(lr > lg && lr > lb && rg > rr && rg > rb))
+            return fail("ptr1-pathtrace: color bleeding absent (the multi-bounce GI is wrong)");
+        std::printf("ptr1-pathtrace: GI ok (indirect brightens: b1 energy %llu < b4 %llu; red-wall floor R>G,B; "
+                    "green-wall floor G>R,B)\n", (unsigned long long)s1.energy, (unsigned long long)s4.energy);
+    }
+
+    // Two-run determinism (the reference is a pure function — byte-identical).
+    {
+        pt::Ptr1Shot shot2 = pt::RenderPtr1Showcase();
+        if (shot.stats.digest != shot2.stats.digest ||
+            std::memcmp(shot.rgba.data(), shot2.rgba.data(), kPixels * sizeof(uint32_t)) != 0)
+            return fail("ptr1-pathtrace: two CPU renders differ (nondeterministic)");
+        std::printf("ptr1-pathtrace determinism: two runs BYTE-IDENTICAL (digest 0x%016llx)\n",
+                    (unsigned long long)shot.stats.digest);
+    }
+
+    // --- Write the image (RGBA8 row-major top-first -> BGRA for WritePNG). ---
+    std::vector<uint8_t> bgra(kPixels * 4, 0);
+    for (size_t p = 0; p < kPixels; ++p) {
+        uint32_t px = shot.rgba[p];
+        bgra[p * 4 + 0] = (uint8_t)((px >> 16) & 0xFF);
+        bgra[p * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+        bgra[p * 4 + 2] = (uint8_t)(px & 0xFF);
+        bgra[p * 4 + 3] = (uint8_t)((px >> 24) & 0xFF);
+    }
+    if (!WritePNG(outPath, bgra, w, h)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — the byte-reproducible multi-bounce path-traced Cornell GI reference "
+                "[pure-CPU integer]\n", outPath, w, h);
     return 0;
 }
 
@@ -81661,6 +81735,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--rt6-hero") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_rt6_hero.png";
             try { return RunRt6HeroShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ptr1-pathtrace <out.png>: render the BYTE-REPRODUCIBLE MULTI-BOUNCE PATH-TRACED Cornell GI
+        // reference (Slice PTR1). Pure-CPU integer path tracer (NO GPU path); the header-shared
+        // pt::RenderPtr1Showcase produces an image byte-identical to the Vulkan --ptr1-pathtrace-shot BY
+        // CONSTRUCTION. New golden tests/golden/metal/ptr1_pathtrace.png.
+        if (argc > 1 && std::strcmp(argv[1], "--ptr1-pathtrace") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ptr1_pathtrace.png";
+            try { return RunPtr1PathtraceShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --rt5-simrender <out.png>: render the Hardware Ray Tracing DETERMINISM-ENVELOPE + LOCKSTEP TIE-IN

@@ -80,6 +80,7 @@
 #include "render/rtrace.h"      // Slice RT1: deterministic Q16.16 SW reference ray tracer (RtScene/RtRay/IntersectSphere/IntersectAabb/TraceClosest/ShadeHitInt/RenderScene/BuildRt1Scene) — shared verbatim with rt_trace.comp (Vulkan-only)
 #include "render/rtd.h"         // Slice RTD1: deterministic STOCHASTIC RT soft shadows + SVGF-lite denoiser (RtdAreaLight/RtdSampleIndex/TraceAnyHitRanged/AccumulateSoftShadowVis/ShadeSoftShadowInt/DenoiseSoftShadowVis) — shared verbatim with rt_softshadow.comp (Vulkan-only)
 #include "render/gi.h"          // Slice GI1: deterministic integer RT probe trace + shade (GiProbeGrid/kGiProbeDirs/TraceProbeRays/GiProbesToImage/BuildGi1Scene) — shared verbatim with gi_probe_trace.comp (Vulkan-only)
+#include "render/pathtrace.h"   // Slice PTR1: BYTE-REPRODUCIBLE multi-bounce path-traced Cornell GI reference (RenderPtr1Showcase/PtRender) — pure-CPU integer, byte-identical cross-backend (no GPU path)
 #include "sim/fpx.h"            // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp
 #include "rt5_simrender_scene.h" // Slice RT5: the SHARED sim->RT bridge (rt5::BuildRt5World/BuildRt5Stream/BodiesToRtScene) used by --rt5-simrender-shot (here) + --rt5-simrender (Metal) + rt_simrender_test — lives under tests/ to keep rtrace.h sim-free + fpx.h render-free
 #include "sim/cloth.h"          // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp
@@ -914,6 +915,7 @@ int main(int argc, char** argv) {
     const char* dspSongPath = nullptr;       // --dsp-song <out.wav> (Slice DSP6: procedural-phrase capstone)
     const char* au1GraphShotPath = nullptr;  // --au1-graph-shot <out.wav> (Slice AU1: procedural audio graph + 3D spatialization)
     const char* au2ReverbShotPath = nullptr; // --au2-reverb-shot <out.bmp> (Slice AU2: convolution reverb + submix buses)
+    const char* ptr1PathtraceShotPath = nullptr; // --ptr1-pathtrace-shot <out.bmp> (Slice PTR1: byte-reproducible multi-bounce path-traced Cornell GI reference — pure-CPU integer)
     const char* decalShotPath = nullptr;     // --decal-shot <out.bmp> (Slice BH: screen-space decals)
     const char* postStackShotPath = nullptr; // --poststack-shot <out.bmp> (Slice BN: data-driven post stack)
     const char* vfxShotPath = nullptr;       // --vfx-shot <out.bmp> (Slice CC: CPU particle/VFX emitter)
@@ -957,6 +959,15 @@ int main(int argc, char** argv) {
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--au2-reverb-shot") == 0) {
             au2ReverbShotPath = argv[i + 1];
+            break;
+        }
+    }
+    // Slice PTR1: --ptr1-pathtrace-shot <out.bmp> — same pre-scan idiom (C1061 discipline). Pure flag
+    // capture; the handler runs as a pre-device pure-CPU block (the header-shared pt::RenderPtr1Showcase
+    // Cornell GI reference render -> WriteBMP; byte-identical to the Metal --ptr1-pathtrace by construction).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--ptr1-pathtrace-shot") == 0) {
+            ptr1PathtraceShotPath = argv[i + 1];
             break;
         }
     }
@@ -5391,6 +5402,41 @@ int main(int argc, char** argv) {
                     run.irLen, run.dryLen, run.wetLen, run.buses,
                     static_cast<unsigned long long>(run.digest));
         std::printf("au2-reverb: wrote %s (%ux%u)\n", au2ReverbShotPath, w, h);
+        return 0;
+    }
+
+    // --ptr1-pathtrace-shot <out.bmp> (Slice PTR1): fully headless (no window/GPU). Render the PINNED
+    // Cornell-box GLOBAL-ILLUMINATION reference via pt::RenderPtr1Showcase (the SAME header-shared producer
+    // the Metal --ptr1-pathtrace runs, so the image bytes are IDENTICAL cross-backend BY CONSTRUCTION — this
+    // is a PURE-CPU integer path tracer, there is no GPU path). Multi-bounce next-event-estimation GI (soft
+    // area-light shadows + color bleeding + indirect fill) accumulated in Q16.16 integer with a deterministic
+    // hash sampler + a frozen cos/sin LUT -> BYTE-IDENTICAL run-to-run AND cross-platform. The moat UE5's
+    // float GPU path tracer + temporal denoiser structurally cannot claim. Stat line = res/spp/bounces/
+    // bakeMs/imageDigest.
+    if (ptr1PathtraceShotPath) {
+        namespace pt = hf::render::pt;
+        const auto t0 = std::chrono::steady_clock::now();
+        pt::Ptr1Shot shot = pt::RenderPtr1Showcase();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double bakeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::vector<uint8_t> bgra((size_t)shot.w * shot.h * 4, 0);
+        for (size_t p = 0; p < (size_t)shot.w * shot.h; ++p) {
+            uint32_t c = shot.rgba[p];
+            bgra[p * 4 + 0] = (uint8_t)((c >> 16) & 0xFF);  // B
+            bgra[p * 4 + 1] = (uint8_t)((c >> 8) & 0xFF);   // G
+            bgra[p * 4 + 2] = (uint8_t)(c & 0xFF);          // R
+            bgra[p * 4 + 3] = (uint8_t)((c >> 24) & 0xFF);  // A
+        }
+        if (!WriteBMP(ptr1PathtraceShotPath, bgra, shot.w, shot.h)) {
+            std::fprintf(stderr, "FATAL: cannot write ptr1-pathtrace output '%s'\n", ptr1PathtraceShotPath);
+            return 1;
+        }
+        std::printf("ptr1-pathtrace: {res:%ux%u, spp:%u, bounces:%d, bakeMs:%.1f, imageDigest:0x%016llx, "
+                    "energy:%llu, noiseMAE:%u} [pure-CPU integer GI path tracer, byte-identical cross-backend]\n",
+                    shot.stats.width, shot.stats.height, shot.stats.spp, shot.stats.maxBounces, bakeMs,
+                    (unsigned long long)shot.stats.digest, (unsigned long long)shot.stats.energy,
+                    shot.stats.noiseMAE);
+        std::printf("ptr1-pathtrace: wrote %s (%ux%u)\n", ptr1PathtraceShotPath, shot.w, shot.h);
         return 0;
     }
 

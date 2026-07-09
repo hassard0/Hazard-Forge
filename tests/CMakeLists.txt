@@ -1328,6 +1328,25 @@ hf_add_pure_test(gi_occ_test)
 # rtrace.h #includes sim/fpx.h read-only. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(gi_hero_test)
 
+# Slice PTR1 — A BYTE-REPRODUCIBLE MULTI-BOUNCE PATH-TRACED REFERENCE RENDER (engine/render/pathtrace.h,
+# hf::render::pt): the per-pixel Monte-Carlo PATH TRACER the shipped RT arc lacked (rtrace.h::rt1_trace is
+# DIRECT-ONLY — primary + closest-hit + integer Lambert; RT3 one shadow ray, RT4 one mirror bounce — NO
+# hemisphere-sampled indirect diffuse, NO Monte-Carlo GI). PTR1 adds next-event estimation + cosine-weighted
+# MULTI-BOUNCE global illumination, accumulated in PURE Q16.16 INTEGER with a deterministic pcg hash sampler
+# + a FROZEN cos/sin LUT (integer literals, NO runtime transcendental, NO libm-at-init) -> the render is
+# BYTE-IDENTICAL run-to-run AND cross-platform (MSVC == clang == Apple — true byte-identity, not a quantized-
+# float band; UE5's float GPU path tracer + temporal denoiser structurally cannot claim this). Pins: (a) the
+# deterministic sampler (pinned PtSample01 values MSVC==clang, [0,kOne) range, NxN stratification covers each
+# stratum once); (b) GI — a multi-bounce render has strictly MORE energy than direct-only (indirect added,
+# pinned) + Cornell COLOR BLEEDING (white floor near the red wall reads red, near the green wall reads green,
+# differential-tint robust); (c) REPRODUCIBLE — two renders byte-identical + a PINNED image digest+energy;
+# (d) CONVERGENCE — 4x spp reduces the half-split noise metric (pinned monotone); (e) RADIANCE SANITY — the
+# NEE geometry term matches the closed form E=Le*A*cos*cos/d^2 within Q16.16 tolerance. The full-res
+# reproducible Cornell reference render is the --ptr1-pathtrace-shot showcase (pure CPU, byte-identical
+# cross-backend BY CONSTRUCTION). pathtrace.h #includes render/rtrace.h + pcg/pcg.h + sim/fpx.h READ-ONLY
+# (all BYTE-FROZEN — PTR1 composes, never edits, them). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(pathtrace_test)
+
 # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
 # integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
 # copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/
