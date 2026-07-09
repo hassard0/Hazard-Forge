@@ -49,6 +49,35 @@ const char* NodeKindName(NodeKind k) {
         case NodeKind::Saturate:      return "Saturate";
         case NodeKind::NormalMap:     return "NormalMap";
         case NodeKind::PBROutput:     return "PBROutput";
+        // --- Slice MG1 ---
+        case NodeKind::ValueNoise:    return "ValueNoise";
+        case NodeKind::PerlinNoise:   return "PerlinNoise";
+        case NodeKind::VoronoiNoise:  return "VoronoiNoise";
+        case NodeKind::FBM:           return "FBM";
+        case NodeKind::Sin:           return "Sin";
+        case NodeKind::Cos:           return "Cos";
+        case NodeKind::Abs:           return "Abs";
+        case NodeKind::Floor:         return "Floor";
+        case NodeKind::Ceil:          return "Ceil";
+        case NodeKind::Frac:          return "Frac";
+        case NodeKind::Sqrt:          return "Sqrt";
+        case NodeKind::Sign:          return "Sign";
+        case NodeKind::Min:           return "Min";
+        case NodeKind::Max:           return "Max";
+        case NodeKind::Step:          return "Step";
+        case NodeKind::Modulo:        return "Modulo";
+        case NodeKind::Distance:      return "Distance";
+        case NodeKind::Reflect:       return "Reflect";
+        case NodeKind::Clamp:         return "Clamp";
+        case NodeKind::Smoothstep:    return "Smoothstep";
+        case NodeKind::Remap:         return "Remap";
+        case NodeKind::Time:          return "Time";
+        case NodeKind::Panner:        return "Panner";
+        case NodeKind::Rotator:       return "Rotator";
+        case NodeKind::BlendLayer:    return "BlendLayer";
+        case NodeKind::FunctionInput: return "FunctionInput";
+        case NodeKind::FunctionOutput:return "FunctionOutput";
+        case NodeKind::FunctionCall:  return "FunctionCall";
     }
     return "Constant";
 }
@@ -81,6 +110,35 @@ std::optional<NodeKind> ParseNodeKind(const std::string& s) {
     if (s == "Saturate")      return NodeKind::Saturate;
     if (s == "NormalMap")     return NodeKind::NormalMap;
     if (s == "PBROutput")     return NodeKind::PBROutput;
+    // --- Slice MG1 ---
+    if (s == "ValueNoise")    return NodeKind::ValueNoise;
+    if (s == "PerlinNoise")   return NodeKind::PerlinNoise;
+    if (s == "VoronoiNoise")  return NodeKind::VoronoiNoise;
+    if (s == "FBM")           return NodeKind::FBM;
+    if (s == "Sin")           return NodeKind::Sin;
+    if (s == "Cos")           return NodeKind::Cos;
+    if (s == "Abs")           return NodeKind::Abs;
+    if (s == "Floor")         return NodeKind::Floor;
+    if (s == "Ceil")          return NodeKind::Ceil;
+    if (s == "Frac")          return NodeKind::Frac;
+    if (s == "Sqrt")          return NodeKind::Sqrt;
+    if (s == "Sign")          return NodeKind::Sign;
+    if (s == "Min")           return NodeKind::Min;
+    if (s == "Max")           return NodeKind::Max;
+    if (s == "Step")          return NodeKind::Step;
+    if (s == "Modulo")        return NodeKind::Modulo;
+    if (s == "Distance")      return NodeKind::Distance;
+    if (s == "Reflect")       return NodeKind::Reflect;
+    if (s == "Clamp")         return NodeKind::Clamp;
+    if (s == "Smoothstep")    return NodeKind::Smoothstep;
+    if (s == "Remap")         return NodeKind::Remap;
+    if (s == "Time")          return NodeKind::Time;
+    if (s == "Panner")        return NodeKind::Panner;
+    if (s == "Rotator")       return NodeKind::Rotator;
+    if (s == "BlendLayer")    return NodeKind::BlendLayer;
+    if (s == "FunctionInput") return NodeKind::FunctionInput;
+    if (s == "FunctionOutput")return NodeKind::FunctionOutput;
+    if (s == "FunctionCall")  return NodeKind::FunctionCall;
     return std::nullopt;
 }
 
@@ -125,6 +183,35 @@ int InputPortCount(NodeKind k) {
         case NodeKind::Saturate:      return 1;  // in
         case NodeKind::NormalMap:     return 1;  // uv (optional; defaults to interpolated UV)
         case NodeKind::PBROutput:     return kPbrInputCount;
+        // --- Slice MG1 ---
+        case NodeKind::ValueNoise:
+        case NodeKind::PerlinNoise:
+        case NodeKind::VoronoiNoise:
+        case NodeKind::FBM:           return 1;  // p (float2)
+        case NodeKind::Sin:
+        case NodeKind::Cos:
+        case NodeKind::Abs:
+        case NodeKind::Floor:
+        case NodeKind::Ceil:
+        case NodeKind::Frac:
+        case NodeKind::Sqrt:
+        case NodeKind::Sign:          return 1;  // in
+        case NodeKind::Min:
+        case NodeKind::Max:
+        case NodeKind::Step:
+        case NodeKind::Modulo:
+        case NodeKind::Distance:
+        case NodeKind::Reflect:       return 2;  // a, b
+        case NodeKind::Clamp:
+        case NodeKind::Smoothstep:
+        case NodeKind::Remap:         return 1;  // in
+        case NodeKind::Time:          return 0;
+        case NodeKind::Panner:
+        case NodeKind::Rotator:       return 1;  // uv (float2)
+        case NodeKind::BlendLayer:    return 3;  // base, top, mask
+        case NodeKind::FunctionInput: return 0;  // a source (function parameter)
+        case NodeKind::FunctionOutput:return 1;  // in
+        case NodeKind::FunctionCall:  return 0;  // dynamic ports resolved by FlattenFunctions (by name)
     }
     return 0;
 }
@@ -145,6 +232,32 @@ const char* InputPortName(NodeKind k, int idx) {
         case NodeKind::Dot:
         case NodeKind::Power:         return idx == 0 ? "a" : (idx == 1 ? "b" : "");
         case NodeKind::PBROutput:     return PbrInputName(idx);
+        // --- Slice MG1 ---
+        case NodeKind::ValueNoise:
+        case NodeKind::PerlinNoise:
+        case NodeKind::VoronoiNoise:
+        case NodeKind::FBM:           return idx == 0 ? "p" : "";
+        case NodeKind::Sin:
+        case NodeKind::Cos:
+        case NodeKind::Abs:
+        case NodeKind::Floor:
+        case NodeKind::Ceil:
+        case NodeKind::Frac:
+        case NodeKind::Sqrt:
+        case NodeKind::Sign:
+        case NodeKind::Clamp:
+        case NodeKind::Smoothstep:
+        case NodeKind::Remap:
+        case NodeKind::FunctionOutput: return idx == 0 ? "in" : "";
+        case NodeKind::Min:
+        case NodeKind::Max:
+        case NodeKind::Step:
+        case NodeKind::Modulo:
+        case NodeKind::Distance:
+        case NodeKind::Reflect:       return idx == 0 ? "a" : (idx == 1 ? "b" : "");
+        case NodeKind::Panner:
+        case NodeKind::Rotator:       return idx == 0 ? "uv" : "";
+        case NodeKind::BlendLayer:    return idx == 0 ? "base" : (idx == 1 ? "top" : (idx == 2 ? "mask" : ""));
         default:                      return "";
     }
 }
@@ -176,6 +289,33 @@ Type InputPortType(NodeKind k, int idx) {
         case NodeKind::MakeFloat3:
         case NodeKind::MakeFloat4:    return Type::Float;         // each component input is scalar
         case NodeKind::PBROutput:     return PbrInputType(idx);
+        // --- Slice MG1 ---
+        case NodeKind::ValueNoise:
+        case NodeKind::PerlinNoise:
+        case NodeKind::VoronoiNoise:
+        case NodeKind::FBM:
+        case NodeKind::Panner:
+        case NodeKind::Rotator:       return Type::Float2;        // p / uv are float2
+        case NodeKind::Sin:
+        case NodeKind::Cos:
+        case NodeKind::Abs:
+        case NodeKind::Floor:
+        case NodeKind::Ceil:
+        case NodeKind::Frac:
+        case NodeKind::Sqrt:
+        case NodeKind::Sign:
+        case NodeKind::Clamp:
+        case NodeKind::Smoothstep:
+        case NodeKind::Remap:
+        case NodeKind::FunctionOutput:
+        case NodeKind::Min:
+        case NodeKind::Max:
+        case NodeKind::Step:
+        case NodeKind::Modulo:
+        case NodeKind::Distance:
+        case NodeKind::Reflect:       return Type::Float4;        // wildcard (any vector)
+        case NodeKind::BlendLayer:
+            return idx == 2 ? Type::Float : Type::Float3;         // base/top float3, mask scalar
         default:                      return Type::Float;
     }
 }
@@ -211,10 +351,28 @@ static Type OutputTypeImpl(const Graph& g, const Node& n, int depth) {
             }
         }
         case NodeKind::PBROutput:     return Type::Float;  // sink; no output.
+        // --- Slice MG1 fixed-output kinds ---
+        case NodeKind::ValueNoise:
+        case NodeKind::PerlinNoise:
+        case NodeKind::VoronoiNoise:
+        case NodeKind::FBM:
+        case NodeKind::Distance:
+        case NodeKind::Time:          return Type::Float;         // scalar outputs.
+        case NodeKind::Panner:
+        case NodeKind::Rotator:       return Type::Float2;        // animated UV.
+        case NodeKind::BlendLayer:    return Type::Float3;        // layer blend -> color.
+        case NodeKind::FunctionInput: return n.outType;           // declared parameter type.
+        case NodeKind::FunctionCall:  return Type::Float4;        // only exists pre-flatten.
         case NodeKind::Multiply:
         case NodeKind::Add:
         case NodeKind::Lerp:
-        case NodeKind::Power: {
+        case NodeKind::Power:
+        // Slice MG1: binary math that matches input 'a'.
+        case NodeKind::Min:
+        case NodeKind::Max:
+        case NodeKind::Step:
+        case NodeKind::Modulo:
+        case NodeKind::Reflect: {
             if (depth > (int)g.nodes.size()) return Type::Float4;  // cycle guard.
             // Resolve from input 'a' (the first data port).
             for (const Edge& e : g.edges) {
@@ -227,7 +385,20 @@ static Type OutputTypeImpl(const Graph& g, const Node& n, int depth) {
         }
         case NodeKind::Normalize:
         case NodeKind::OneMinus:
-        case NodeKind::Saturate: {
+        case NodeKind::Saturate:
+        // Slice MG1: unary math + ranged + function-output that match the single 'in' port.
+        case NodeKind::Sin:
+        case NodeKind::Cos:
+        case NodeKind::Abs:
+        case NodeKind::Floor:
+        case NodeKind::Ceil:
+        case NodeKind::Frac:
+        case NodeKind::Sqrt:
+        case NodeKind::Sign:
+        case NodeKind::Clamp:
+        case NodeKind::Smoothstep:
+        case NodeKind::Remap:
+        case NodeKind::FunctionOutput: {
             if (depth > (int)g.nodes.size()) return Type::Float4;  // cycle guard.
             // Resolve from the single 'in' port.
             for (const Edge& e : g.edges) {
@@ -321,7 +492,18 @@ ValidationResult Validate(const Graph& g) {
                           // Dot/Power 'a'/'b') accept any vector type; per-node rules below refine this.
                           to->kind == NodeKind::Swizzle || to->kind == NodeKind::Normalize ||
                           to->kind == NodeKind::OneMinus || to->kind == NodeKind::Saturate ||
-                          to->kind == NodeKind::Dot || to->kind == NodeKind::Power));
+                          to->kind == NodeKind::Dot || to->kind == NodeKind::Power ||
+                          // Slice MG1: the vector-wildcard ports (unary math 'in', binary math a/b,
+                          // ranged 'in', FunctionOutput 'in') accept any vector type.
+                          to->kind == NodeKind::Sin || to->kind == NodeKind::Cos ||
+                          to->kind == NodeKind::Abs || to->kind == NodeKind::Floor ||
+                          to->kind == NodeKind::Ceil || to->kind == NodeKind::Frac ||
+                          to->kind == NodeKind::Sqrt || to->kind == NodeKind::Sign ||
+                          to->kind == NodeKind::Min || to->kind == NodeKind::Max ||
+                          to->kind == NodeKind::Step || to->kind == NodeKind::Modulo ||
+                          to->kind == NodeKind::Distance || to->kind == NodeKind::Reflect ||
+                          to->kind == NodeKind::Clamp || to->kind == NodeKind::Smoothstep ||
+                          to->kind == NodeKind::Remap || to->kind == NodeKind::FunctionOutput));
         // PBROutput's float3 vector ports (baseColor/emissive) accept a float4 source by taking its
         // .xyz — a documented narrowing the codegen + interpreter both implement. Scalar ports
         // (metallic/roughness) still require a float source (so e.g. a float2 -> metallic is a real
@@ -334,10 +516,13 @@ ValidationResult Validate(const Graph& g) {
                         ", port expects " + TypeName(dstT));
     }
 
-    // Multiply/Add/Lerp + (Slice AZ) Dot/Power: 'a' and 'b' must agree in type (component-wise).
+    // Multiply/Add/Lerp + (Slice AZ) Dot/Power + (Slice MG1) Min/Max/Step/Modulo/Distance/Reflect:
+    // 'a' and 'b' must agree in type (component-wise / same-size operands).
     for (const Node& n : g.nodes) {
         if (n.kind != NodeKind::Multiply && n.kind != NodeKind::Add && n.kind != NodeKind::Lerp &&
-            n.kind != NodeKind::Dot && n.kind != NodeKind::Power)
+            n.kind != NodeKind::Dot && n.kind != NodeKind::Power &&
+            n.kind != NodeKind::Min && n.kind != NodeKind::Max && n.kind != NodeKind::Step &&
+            n.kind != NodeKind::Modulo && n.kind != NodeKind::Distance && n.kind != NodeKind::Reflect)
             continue;
         const Node* a = nullptr; const Node* b = nullptr;
         for (const Edge& e : g.edges) {
@@ -519,6 +704,79 @@ Value EvalNormalMap(const std::array<float, 4>& texel) {
     return EvalNormalize(decoded);  // normalize(decode(texel.rgb)) -> unit tangent-space normal.
 }
 
+// --- Slice MG1: procedural-noise primitives (the SINGLE source of truth) -------------------------
+// The integer hash below is the CPU twin of shaders/material_noise.hlsli — SAME uint constants, SAME
+// xor/shift/mul (which wrap mod 2^32 identically in C++ and HLSL/MSL) and SAME power-of-two float
+// divide, so the CPU value == the shader value bit-for-bit at grid corners. Coordinates are biased by
+// +1024 before the cast so the (small, possibly-negative) neighbour cells convert to uint identically.
+uint32_t HfHashU(uint32_t x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
+}
+uint32_t HfHash2(int ix, int iy) {
+    uint32_t ux = (uint32_t)(ix + 1024);
+    uint32_t uy = (uint32_t)(iy + 1024);
+    return HfHashU(HfHashU(ux * 0x9e3779b1u) ^ (uy * 0x85ebca77u));
+}
+float HfHash2f(int ix, int iy) {
+    return (float)(HfHash2(ix, iy) & 0xFFFFFFu) * (1.0f / 16777216.0f);  // [0,1)
+}
+namespace {
+inline float FFloor(float x) { return std::floor(x); }
+inline float Smooth(float t) { return t * t * (3.0f - 2.0f * t); }  // Hermite smoothstep basis.
+inline float Lin(float a, float b, float t) { return a + (b - a) * t; }
+}  // namespace
+float EvalValueNoise(float px, float py) {
+    float fpx = FFloor(px), fpy = FFloor(py);
+    int ix = (int)fpx, iy = (int)fpy;
+    float fx = px - fpx, fy = py - fpy;
+    float ux = Smooth(fx), uy = Smooth(fy);
+    float a = HfHash2f(ix, iy),     b = HfHash2f(ix + 1, iy);
+    float c = HfHash2f(ix, iy + 1), d = HfHash2f(ix + 1, iy + 1);
+    return Lin(Lin(a, b, ux), Lin(c, d, ux), uy);  // [0,1]
+}
+float EvalPerlin(float px, float py) {
+    float fpx = FFloor(px), fpy = FFloor(py);
+    int ix = (int)fpx, iy = (int)fpy;
+    float fx = px - fpx, fy = py - fpy;
+    float ux = Smooth(fx), uy = Smooth(fy);
+    auto grad = [](int gx, int gy, float dx, float dy) -> float {
+        float ang = HfHash2f(gx, gy) * 6.28318530718f;
+        return std::cos(ang) * dx + std::sin(ang) * dy;
+    };
+    float va = grad(ix,     iy,     fx,        fy);
+    float vb = grad(ix + 1, iy,     fx - 1.0f, fy);
+    float vc = grad(ix,     iy + 1, fx,        fy - 1.0f);
+    float vd = grad(ix + 1, iy + 1, fx - 1.0f, fy - 1.0f);
+    float n = Lin(Lin(va, vb, ux), Lin(vc, vd, ux), uy);  // ~[-0.7,0.7]
+    return n * 0.5f + 0.5f;                                // [~0.15,0.85]
+}
+float EvalVoronoi(float px, float py) {
+    float fpx = FFloor(px), fpy = FFloor(py);
+    int ix = (int)fpx, iy = (int)fpy;
+    float fx = px - fpx, fy = py - fpy;
+    float md = 8.0f;
+    for (int oy = -1; oy <= 1; ++oy)
+        for (int ox = -1; ox <= 1; ++ox) {
+            int cx = ix + ox, cy = iy + oy;
+            float rx = (float)ox + HfHash2f(cx, cy) - fx;
+            float ry = (float)oy + HfHash2f(cy, cx) - fy;  // swapped args = independent y jitter
+            float d = rx * rx + ry * ry;
+            if (d < md) md = d;
+        }
+    return std::sqrt(md);  // [0,~1.4]
+}
+float EvalFbm(float px, float py, int octaves) {
+    float sum = 0.0f, amp = 0.5f, freq = 1.0f, norm = 0.0f;
+    for (int i = 0; i < 8; ++i) {         // bounded loop (MSL-safe); `octaves` caps it below.
+        if (i >= octaves) break;
+        sum += amp * EvalValueNoise(px * freq, py * freq);
+        norm += amp;
+        amp *= 0.5f; freq *= 2.0f;
+    }
+    return (norm > 1e-6f) ? sum / norm : 0.0f;  // [0,1]
+}
+
 // --- Whole-graph CPU interpreter ----------------------------------------------------------------
 namespace {
 
@@ -645,6 +903,124 @@ PbrResult Evaluate(const Graph& g, float u, float v, float NoV,
                 out[id] = EvalNormalMap(t);
                 break;
             }
+            // --- Slice MG1 nodes ----------------------------------------------------------------
+            case NodeKind::ValueNoise:
+            case NodeKind::PerlinNoise:
+            case NodeKind::VoronoiNoise:
+            case NodeKind::FBM: {
+                Value p = inputValue(n, "p").value_or(Value{});
+                float r = 0.0f;
+                if (n.kind == NodeKind::ValueNoise)   r = EvalValueNoise(p.v[0], p.v[1]);
+                else if (n.kind == NodeKind::PerlinNoise)  r = EvalPerlin(p.v[0], p.v[1]);
+                else if (n.kind == NodeKind::VoronoiNoise) r = EvalVoronoi(p.v[0], p.v[1]);
+                else r = EvalFbm(p.v[0], p.v[1], n.octaves);
+                Value val; val.count = 1; val.v = {r, 0, 0, 0};
+                out[id] = val;
+                break;
+            }
+            case NodeKind::Sin: case NodeKind::Cos: case NodeKind::Abs: case NodeKind::Floor:
+            case NodeKind::Ceil: case NodeKind::Frac: case NodeKind::Sqrt: case NodeKind::Sign: {
+                Value in = inputValue(n, "in").value_or(Value{});
+                Value r; r.count = in.count;
+                for (int i = 0; i < 4; ++i) {
+                    float x = in.v[i];
+                    switch (n.kind) {
+                        case NodeKind::Sin:   x = std::sin(x); break;
+                        case NodeKind::Cos:   x = std::cos(x); break;
+                        case NodeKind::Abs:   x = std::fabs(x); break;
+                        case NodeKind::Floor: x = std::floor(x); break;
+                        case NodeKind::Ceil:  x = std::ceil(x); break;
+                        case NodeKind::Frac:  x = x - std::floor(x); break;
+                        case NodeKind::Sqrt:  x = std::sqrt(x); break;
+                        case NodeKind::Sign:  x = (x > 0.0f) ? 1.0f : (x < 0.0f ? -1.0f : 0.0f); break;
+                        default: break;
+                    }
+                    r.v[i] = x;
+                }
+                out[id] = r;
+                break;
+            }
+            case NodeKind::Min: case NodeKind::Max: case NodeKind::Step: case NodeKind::Modulo:
+            case NodeKind::Reflect: {
+                Value a = inputValue(n, "a").value_or(Value{});
+                Value b = inputValue(n, "b").value_or(Value{});
+                Value r; r.count = std::max(a.count, b.count);
+                if (n.kind == NodeKind::Reflect) {
+                    float d = 0.0f;
+                    for (int i = 0; i < r.count; ++i) d += a.v[i] * b.v[i];
+                    for (int i = 0; i < 4; ++i) r.v[i] = a.v[i] - 2.0f * d * b.v[i];
+                } else {
+                    for (int i = 0; i < 4; ++i) {
+                        float x = a.v[i], y = b.v[i], o = 0.0f;
+                        switch (n.kind) {
+                            case NodeKind::Min:    o = (x < y) ? x : y; break;
+                            case NodeKind::Max:    o = (x > y) ? x : y; break;
+                            case NodeKind::Step:   o = (y >= x) ? 1.0f : 0.0f; break;
+                            case NodeKind::Modulo: o = std::fmod(x, y); break;
+                            default: break;
+                        }
+                        r.v[i] = o;
+                    }
+                }
+                out[id] = r;
+                break;
+            }
+            case NodeKind::Distance: {
+                Value a = inputValue(n, "a").value_or(Value{});
+                Value b = inputValue(n, "b").value_or(Value{});
+                int cnt = std::max(a.count, b.count);
+                float s = 0.0f;
+                for (int i = 0; i < cnt; ++i) { float d = a.v[i] - b.v[i]; s += d * d; }
+                Value r; r.count = 1; r.v = {std::sqrt(s), 0, 0, 0};
+                out[id] = r;
+                break;
+            }
+            case NodeKind::Clamp: case NodeKind::Smoothstep: case NodeKind::Remap: {
+                Value in = inputValue(n, "in").value_or(Value{});
+                Value r; r.count = in.count;
+                for (int i = 0; i < 4; ++i) {
+                    float x = in.v[i], o = x;
+                    if (n.kind == NodeKind::Clamp) {
+                        o = x < n.lo ? n.lo : (x > n.hi ? n.hi : x);
+                    } else if (n.kind == NodeKind::Smoothstep) {
+                        float t = (n.hi != n.lo) ? (x - n.lo) / (n.hi - n.lo) : 0.0f;
+                        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+                        o = t * t * (3.0f - 2.0f * t);
+                    } else {  // Remap
+                        float t = (n.hi != n.lo) ? (x - n.lo) / (n.hi - n.lo) : 0.0f;
+                        o = n.outLo + t * (n.outHi - n.outLo);
+                    }
+                    r.v[i] = o;
+                }
+                out[id] = r;
+                break;
+            }
+            case NodeKind::Time: {
+                Value r; r.count = 1; r.v = {0.0f, 0, 0, 0};  // CPU interpreter samples at time=0.
+                out[id] = r;
+                break;
+            }
+            case NodeKind::Panner: case NodeKind::Rotator: {
+                // time=0 in the interpreter -> identity UV (the animation is a shader-time effect).
+                Value uv = inputValue(n, "uv").value_or(Value{});
+                Value r; r.count = 2; r.v = {uv.v[0], uv.v[1], 0, 0};
+                out[id] = r;
+                break;
+            }
+            case NodeKind::BlendLayer: {
+                Value base = inputValue(n, "base").value_or(Value{});
+                Value top  = inputValue(n, "top").value_or(Value{});
+                Value mask = inputValue(n, "mask").value_or(Value{});
+                float m = mask.v[0];
+                Value r; r.count = 3;
+                for (int i = 0; i < 3; ++i) r.v[i] = base.v[i] + (top.v[i] - base.v[i]) * m;
+                out[id] = r;
+                break;
+            }
+            case NodeKind::FunctionInput:
+            case NodeKind::FunctionOutput:
+            case NodeKind::FunctionCall:
+                break;  // functions are flattened before interpretation; not evaluated directly.
             case NodeKind::PBROutput:
                 break;  // handled below.
         }
@@ -669,6 +1045,115 @@ PbrResult Evaluate(const Graph& g, float u, float v, float NoV,
         if (auto em = pin("emissive"))  { r.emissive = {em->v[0], em->v[1], em->v[2]}; }
     }
     return r;
+}
+
+// --- Slice MG1: material functions (inline expansion) --------------------------------------------
+const Graph* FunctionLibrary::Find(const std::string& name) const {
+    for (const auto& kv : funcs) if (kv.first == name) return &kv.second;
+    return nullptr;
+}
+
+namespace {
+// The node id feeding (toNode,toPort) in graph g, or -1.
+int FnSourceOf(const Graph& g, int toNode, const std::string& toPort) {
+    for (const Edge& e : g.edges)
+        if (e.toNode == toNode && e.toPort == toPort) return e.fromNode;
+    return -1;
+}
+}  // namespace
+
+Graph FlattenFunctions(const Graph& g, const FunctionLibrary& lib) {
+    // Early out: a call-free graph flattens to ITSELF -> byte-identical codegen (frozen invariant).
+    bool hasCall = false;
+    for (const Node& n : g.nodes) if (n.kind == NodeKind::FunctionCall) hasCall = true;
+    if (!hasCall) return g;
+
+    Graph out;
+    int nextId = 0;
+    for (const Node& n : g.nodes) if (n.id >= nextId) nextId = n.id + 1;
+
+    // Copy all non-call parent nodes verbatim.
+    for (const Node& n : g.nodes)
+        if (n.kind != NodeKind::FunctionCall) out.nodes.push_back(n);
+
+    // callResult[callId] = the out-graph node id that represents that call's OUTPUT value.
+    std::unordered_map<int, int> callResult;
+
+    // Resolve a value that a call's port draws from (may itself be an already-expanded call).
+    auto resolveParentSrc = [&](int fromNode) -> int {
+        auto it = callResult.find(fromNode);
+        return (it != callResult.end()) ? it->second : fromNode;
+    };
+
+    // Expand each call in ASCENDING id order (so a call feeding a later call is resolved first).
+    std::vector<const Node*> calls;
+    for (const Node& n : g.nodes) if (n.kind == NodeKind::FunctionCall) calls.push_back(&n);
+    std::sort(calls.begin(), calls.end(), [](const Node* a, const Node* b) { return a->id < b->id; });
+
+    for (const Node* cp : calls) {
+        const Node& call = *cp;
+        const Graph* fn = lib.Find(call.texture);
+        if (!fn) { callResult[call.id] = -1; continue; }  // unknown function -> leave dangling (loud later).
+
+        // Map each function-interior node id -> a fresh out-graph id (FunctionInput/Output excluded).
+        std::unordered_map<int, int> idmap;
+        const Node* foNode = nullptr;
+        for (const Node& fnn : fn->nodes) {
+            if (fnn.kind == NodeKind::FunctionOutput) { foNode = &fnn; continue; }
+            if (fnn.kind == NodeKind::FunctionInput) continue;
+            int nid = nextId++;
+            idmap[fnn.id] = nid;
+            Node cloned = fnn;
+            cloned.id = nid;
+            out.nodes.push_back(cloned);
+        }
+
+        // Resolve a function-side source id to an out-graph id: a FunctionInput resolves to the
+        // caller's incoming edge for that input NAME; an interior node resolves via idmap.
+        auto resolveFnSrc = [&](int fnFrom) -> int {
+            const Node* src = fn->FindNode(fnFrom);
+            if (src && src->kind == NodeKind::FunctionInput) {
+                int parentFrom = FnSourceOf(g, call.id, src->texture);  // caller edge by param name.
+                return (parentFrom >= 0) ? resolveParentSrc(parentFrom) : -1;
+            }
+            auto it = idmap.find(fnFrom);
+            return (it != idmap.end()) ? it->second : -1;
+        };
+
+        // Clone interior edges (skip edges INTO the FunctionOutput; that becomes the call result).
+        for (const Edge& fe : fn->edges) {
+            if (foNode && fe.toNode == foNode->id) continue;
+            int rf = resolveFnSrc(fe.fromNode);
+            auto toIt = idmap.find(fe.toNode);
+            if (rf < 0 || toIt == idmap.end()) continue;
+            out.edges.push_back({rf, toIt->second, fe.toPort});
+        }
+
+        // The call's output = whatever feeds the FunctionOutput's "in".
+        int result = -1;
+        if (foNode) {
+            int foSrc = FnSourceOf(*fn, foNode->id, "in");
+            if (foSrc >= 0) result = resolveFnSrc(foSrc);
+        }
+        callResult[call.id] = result;
+    }
+
+    // Copy parent edges: drop edges INTO a call (consumed as params); rewire edges FROM a call to
+    // that call's result.
+    for (const Edge& e : g.edges) {
+        const Node* to = g.FindNode(e.toNode);
+        if (to && to->kind == NodeKind::FunctionCall) continue;  // param edge, already consumed.
+        int from = e.fromNode;
+        const Node* fromN = g.FindNode(e.fromNode);
+        if (fromN && fromN->kind == NodeKind::FunctionCall) {
+            auto it = callResult.find(e.fromNode);
+            from = (it != callResult.end()) ? it->second : -1;
+        }
+        if (from < 0) continue;
+        out.edges.push_back({from, e.toNode, e.toPort});
+    }
+
+    return out;
 }
 
 }  // namespace hf::material

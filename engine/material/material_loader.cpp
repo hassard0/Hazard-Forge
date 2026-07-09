@@ -90,6 +90,13 @@ LoadResult LoadGraphFromJson(const std::string& json) {
         n.texture = AsString(MemberOf(no, "texture"));
         if (IsNumber(MemberOf(no, "power"))) n.power = (float)AsNumber(MemberOf(no, "power"));
         n.swizzle = AsString(MemberOf(no, "swizzle"));  // Slice AZ: Swizzle mask param.
+        // --- Slice MG1 params (FBM octaves, Clamp/Smoothstep/Remap ranges, Panner/Rotator speed). ---
+        { int iv; if (HasInt(no, "octaves", iv)) n.octaves = iv; }
+        if (IsNumber(MemberOf(no, "lo")))    n.lo    = (float)AsNumber(MemberOf(no, "lo"));
+        if (IsNumber(MemberOf(no, "hi")))    n.hi    = (float)AsNumber(MemberOf(no, "hi"));
+        if (IsNumber(MemberOf(no, "outLo"))) n.outLo = (float)AsNumber(MemberOf(no, "outLo"));
+        if (IsNumber(MemberOf(no, "outHi"))) n.outHi = (float)AsNumber(MemberOf(no, "outHi"));
+        if (IsNumber(MemberOf(no, "speed"))) n.speed = (float)AsNumber(MemberOf(no, "speed"));
 
         g.nodes.push_back(n);
     }

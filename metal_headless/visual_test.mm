@@ -1033,6 +1033,14 @@ static int RunMaterialNormalShowcase(const char* outPath) {
     return RunMaterialShowcaseImpl(outPath, "mat_normalmap.frag.gen.metal", "material_normal_fragment",
                                    /*bumpyNormal=*/true);
 }
+// Slice MG1: the PROCEDURAL-MARBLE material — FBM turbulence warps a sine-vein field, BlendLayer mixes
+// two stone colours by the veins, and a ValueNoise Remap drives roughness (detail the frozen 17-node
+// set cannot express). Its generated MSL resolves the deterministic integer-hash noise via the
+// material_noise.hlsli #include (uint-only, MSL-native). Renders the mat_mg1.png golden. The material
+// shader computes baseColor/roughness from the graph, so the push-constant material is ignored.
+static int RunMaterialMg1Showcase(const char* outPath) {
+    return RunMaterialShowcaseImpl(outPath, "mat_mg1.frag.gen.metal", "material_mg1_fragment");
+}
 
 // --- Multi-material scene (Slice AZ). Mirrors the Vulkan --material-multi-shot path: three spheres
 // in a row, each shaded by a DISTINCT generated graph material (showcase / showcase2 / showcase3 —
@@ -84481,6 +84489,14 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--material-normal") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mat_normal.png";
             try { return RunMaterialNormalShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --mg1-material <out.png>: render the Slice MG1 PROCEDURAL-MARBLE material — a sphere shaded by
+        // mg1_marble.mat.json (FBM/Sin/Abs/ValueNoise/Remap/BlendLayer over deterministic integer-hash
+        // noise). Mirrors the Vulkan --mg1-material-shot. Renders the new mat_mg1.png golden.
+        if (argc > 1 && std::strcmp(argv[1], "--mg1-material") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mat_mg1.png";
+            try { return RunMaterialMg1Showcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --scene <out.png>: render the full glTF scene-graph import showcase (Slice V) — the

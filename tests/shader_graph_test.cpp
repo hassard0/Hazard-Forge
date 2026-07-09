@@ -531,6 +531,207 @@ int main() {
         }
     }
 
+    // ============================ 7. SLICE MG1 — NODE-LIBRARY DEPTH ===========================
+    // The "surpass UE5 material depth" batch: procedural noise (Value/Perlin/Voronoi/FBM), ~18
+    // math/utility nodes, UV animation, a material-LAYER blend, and reusable material FUNCTIONS —
+    // all deterministic + cross-platform. The pins here prove: (a) the existing 17-node codegen is
+    // BYTE-FROZEN (no perturbation, no noise include leaks in), (b) the noise is deterministic + the
+    // CPU value == the documented formula the shader emits, (c) functions inline correctly + reuse,
+    // (d) each new node emits pinned codegen + a rich whole-graph digest (MSVC==clang comparable).
+
+    // Stable FNV-1a-64 over the codegen text (compiler-independent, unlike std::hash) so the printed
+    // digest is directly comparable between the MSVC and clang builds of this test.
+    auto fnv1a = [](const std::string& s) -> uint64_t {
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+        return h;
+    };
+
+    // --- (a) FROZEN: the existing 17-node showcase codegens UNCHANGED (no MG1 perturbation). --------
+    {
+        Graph g = MakeShowcaseGraph();
+        std::string h = GenerateHlsl(g);
+        check(h.find("material_noise.hlsli") == std::string::npos,
+              "FROZEN: noise-free graph does NOT emit the MG1 noise include");
+        check(h.find("hfFbm") == std::string::npos && h.find("hfValueNoise") == std::string::npos,
+              "FROZEN: noise-free graph emits no MG1 noise intrinsics");
+        // The GenerateHlsl(g, {}) library overload must equal the frozen GenerateHlsl(g) byte-for-byte.
+        check(GenerateHlsl(g, FunctionLibrary{}) == h,
+              "FROZEN: GenerateHlsl(g, {}) == GenerateHlsl(g) (empty-library transparency)");
+    }
+
+    // --- (b) NOISE: pinned CPU sample values + determinism + grid-corner exactness. -----------------
+    {
+        // Two runs identical (deterministic integer hash, no global state).
+        check(EvalValueNoise(2.5f, 1.5f) == EvalValueNoise(2.5f, 1.5f), "ValueNoise is deterministic");
+        check(EvalFbm(2.5f, 1.5f, 5) == EvalFbm(2.5f, 1.5f, 5), "FBM is deterministic");
+        // Pinned integer-hash values (the CPU==shader anchor: HfHash2f is bit-exact CPU/GPU).
+        check(approx(HfHash2f(0, 0), 0.12865025f), "HfHash2f(0,0) pinned");
+        check(approx(HfHash2f(1, 2), 0.75222260f), "HfHash2f(1,2) pinned");
+        check(approx(HfHash2f(-1, 5), 0.88656968f), "HfHash2f(-1,5) pinned (negative-cell bias works)");
+        // Value noise AT A GRID CORNER equals the cell hash exactly (the exact CPU==shader point).
+        check(approx(EvalValueNoise(0.0f, 0.0f), HfHash2f(0, 0)),
+              "ValueNoise at a grid corner == HfHash2f (bit-exact CPU==shader anchor)");
+        // Pinned interior samples (match the shader to float tolerance = the visresolve bar).
+        check(approx(EvalValueNoise(2.5f, 1.5f), 0.48297733f), "ValueNoise(2.5,1.5) pinned");
+        check(approx(EvalPerlin(2.5f, 1.5f), 0.48256439f), "Perlin(2.5,1.5) pinned");
+        check(approx(EvalVoronoi(2.5f, 1.5f), 0.26895037f), "Voronoi(2.5,1.5) pinned");
+        check(approx(EvalFbm(2.5f, 1.5f, 5), 0.52771342f), "FBM(2.5,1.5,octaves=5) pinned");
+        // A single-octave FBM reduces to plain value noise (sanity of the fractal sum).
+        check(approx(EvalFbm(2.5f, 1.5f, 1), EvalValueNoise(2.5f, 1.5f)),
+              "FBM octaves=1 == ValueNoise (fractal-sum sanity)");
+        // Noise ranges are sane ([0,1] for value/perlin/fbm).
+        for (int k = 0; k < 32; ++k) {
+            float x = 0.137f * (float)k, y = 0.291f * (float)k;
+            float v = EvalValueNoise(x, y), p = EvalPerlin(x, y), f = EvalFbm(x, y, 5);
+            check(v >= 0.0f && v <= 1.0f && p >= 0.0f && p <= 1.0f && f >= 0.0f && f <= 1.0f,
+                  "noise stays within [0,1]");
+        }
+    }
+
+    // --- (b2) NOISE codegen emits the shared include + the exact intrinsic call the CPU replicates. --
+    {
+        Graph g;
+        Node uv;  uv.id = 1;  uv.kind = NodeKind::UV;
+        Node fbm; fbm.id = 2; fbm.kind = NodeKind::FBM; fbm.octaves = 4;
+        Node out; out.id = 99; out.kind = NodeKind::PBROutput;
+        g.nodes = {uv, fbm, out};
+        g.edges = { {1, 2, "p"}, {2, 99, "roughness"} };
+        check(Validate(g).ok, "UV->FBM->roughness validates");
+        std::string h = GenerateHlsl(g);
+        check(h.find("material_noise.hlsli") != std::string::npos,
+              "a noise graph emits the shared material_noise.hlsli include");
+        check(h.find("hfFbm(n1, 4)") != std::string::npos,
+              "FBM emits hfFbm(<p>, octaves) — the exact call the CPU EvalFbm replicates");
+    }
+
+    // --- (c) MATERIAL FUNCTIONS: a reusable subgraph inlines into a parent; reuse works. ------------
+    {
+        // Function "warmtint": out = in.c * float3(1.2, 1.0, 0.8).
+        Graph fn;
+        Node fi; fi.id = 1; fi.kind = NodeKind::FunctionInput; fi.texture = "c"; fi.outType = Type::Float3;
+        Node fc; fc.id = 2; fc.kind = NodeKind::Constant; fc.value = {1.2f, 1.0f, 0.8f, 1.0f}; fc.outType = Type::Float3;
+        Node fm; fm.id = 3; fm.kind = NodeKind::Multiply;
+        Node fo; fo.id = 4; fo.kind = NodeKind::FunctionOutput;
+        fn.nodes = {fi, fc, fm, fo};
+        fn.edges = { {1, 3, "a"}, {2, 3, "b"}, {3, 4, "in"} };
+        FunctionLibrary lib;
+        lib.Add("warmtint", fn);
+
+        // Parent calls warmtint TWICE (baseColor + emissive) -> proves REUSE (two inlined copies).
+        Graph parent;
+        Node c1; c1.id = 1; c1.kind = NodeKind::Constant; c1.value = {0.5f, 0.4f, 0.3f, 1.0f}; c1.outType = Type::Float3;
+        Node k1; k1.id = 2; k1.kind = NodeKind::FunctionCall; k1.texture = "warmtint";
+        Node c2; c2.id = 3; c2.kind = NodeKind::Constant; c2.value = {0.2f, 0.2f, 0.2f, 1.0f}; c2.outType = Type::Float3;
+        Node k2; k2.id = 4; k2.kind = NodeKind::FunctionCall; k2.texture = "warmtint";
+        Node po; po.id = 99; po.kind = NodeKind::PBROutput;
+        parent.nodes = {c1, k1, c2, k2, po};
+        parent.edges = { {1, 2, "c"}, {3, 4, "c"}, {2, 99, "baseColor"}, {4, 99, "emissive"} };
+
+        Graph flat = FlattenFunctions(parent, lib);
+        // 3 parent-kept (2 consts + sink) + 2 calls × 2 interior func nodes (Const + Multiply) = 7.
+        check(flat.nodes.size() == 7,
+              "FlattenFunctions inlines both calls (2 parent consts + sink + 2×2 func interior = 7 nodes)");
+        bool anyCall = false;
+        for (auto& n : flat.nodes) if (n.kind == NodeKind::FunctionCall) anyCall = true;
+        check(!anyCall, "no FunctionCall survives flattening");
+        ValidationResult vr = Validate(flat);
+        check(vr.ok, "flattened graph validates");
+        std::string h = GenerateHlsl(parent, lib);
+        check(h.find("// ERROR") == std::string::npos, "function-call graph codegens cleanly");
+        check(h.find("unexpanded function") == std::string::npos, "no unexpanded-function error marker");
+        // Two inlined multiplies by the warm tint constant (reuse -> two occurrences).
+        size_t f1 = h.find("float3(1.2");
+        size_t f2 = (f1 == std::string::npos) ? std::string::npos : h.find("float3(1.2", f1 + 1);
+        check(f1 != std::string::npos && f2 != std::string::npos,
+              "the reused function body appears TWICE (both call sites inlined)");
+        // Determinism.
+        check(GenerateHlsl(parent, lib) == h, "function codegen is deterministic");
+        // A call-free graph flattens to ITSELF (identity) -> frozen codegen.
+        Graph noCall = MakeShowcaseGraph();
+        Graph flatNoCall = FlattenFunctions(noCall, lib);
+        check(GenerateHlsl(flatNoCall) == GenerateHlsl(noCall),
+              "FlattenFunctions is identity on a call-free graph (frozen invariant)");
+    }
+
+    // --- (d) NEW NODE CODEGEN: each new math/utility node emits its pinned intrinsic. ----------------
+    {
+        // Build a kitchen-sink graph touching noise + ~20 math/anim/layer nodes; assert the intrinsics
+        // + pin the whole-graph codegen digest (deterministic; MSVC==clang comparable).
+        Graph g;
+        auto add = [&](int id, NodeKind k) { Node n; n.id = id; n.kind = k; g.nodes.push_back(n); return &g.nodes.back(); };
+        Node uv; uv.id = 1; uv.kind = NodeKind::UV; g.nodes.push_back(uv);
+        Node sc; sc.id = 2; sc.kind = NodeKind::Constant; sc.value = {3, 3, 0, 0}; sc.outType = Type::Float2; g.nodes.push_back(sc);
+        add(3, NodeKind::Multiply);                                  // p = uv*scale (float2)
+        Node pan; pan.id = 4; pan.kind = NodeKind::Panner; pan.speed = 0.2f; g.nodes.push_back(pan);
+        Node rot; rot.id = 5; rot.kind = NodeKind::Rotator; rot.speed = 0.5f; g.nodes.push_back(rot);
+        add(6, NodeKind::ValueNoise);
+        add(7, NodeKind::PerlinNoise);
+        add(8, NodeKind::VoronoiNoise);
+        Node fb; fb.id = 9; fb.kind = NodeKind::FBM; fb.octaves = 3; g.nodes.push_back(fb);
+        add(10, NodeKind::Sin); add(11, NodeKind::Cos); add(12, NodeKind::Abs);
+        add(13, NodeKind::Floor); add(14, NodeKind::Ceil); add(15, NodeKind::Frac);
+        add(16, NodeKind::Sqrt); add(17, NodeKind::Sign);
+        add(18, NodeKind::Min); add(19, NodeKind::Max); add(20, NodeKind::Step);
+        Node c5; c5.id = 21; c5.kind = NodeKind::Constant; c5.value = {0.5f, 0, 0, 0}; c5.outType = Type::Float; g.nodes.push_back(c5);
+        add(22, NodeKind::Modulo); add(23, NodeKind::Distance); add(24, NodeKind::Reflect);
+        Node cl; cl.id = 25; cl.kind = NodeKind::Clamp; cl.lo = 0.0f; cl.hi = 1.0f; g.nodes.push_back(cl);
+        Node ss; ss.id = 26; ss.kind = NodeKind::Smoothstep; ss.lo = 0.1f; ss.hi = 0.9f; g.nodes.push_back(ss);
+        Node rm; rm.id = 27; rm.kind = NodeKind::Remap; rm.lo = 0; rm.hi = 1; rm.outLo = 0; rm.outHi = 2; g.nodes.push_back(rm);
+        add(28, NodeKind::Time);
+        Node ba; ba.id = 29; ba.kind = NodeKind::Constant; ba.value = {0.1f, 0.2f, 0.3f, 1}; ba.outType = Type::Float3; g.nodes.push_back(ba);
+        Node bt; bt.id = 30; bt.kind = NodeKind::Constant; bt.value = {0.8f, 0.7f, 0.6f, 1}; bt.outType = Type::Float3; g.nodes.push_back(bt);
+        add(31, NodeKind::BlendLayer);
+        Node out; out.id = 99; out.kind = NodeKind::PBROutput; g.nodes.push_back(out);
+        g.edges = {
+            {1, 3, "a"}, {2, 3, "b"},
+            {3, 4, "uv"}, {3, 5, "uv"},
+            {3, 6, "p"}, {4, 7, "p"}, {5, 8, "p"}, {3, 9, "p"},
+            {6, 10, "in"}, {7, 11, "in"}, {10, 12, "in"},
+            {9, 13, "in"}, {8, 14, "in"}, {9, 15, "in"}, {6, 16, "in"}, {11, 17, "in"},
+            {6, 18, "a"}, {7, 18, "b"}, {8, 19, "a"}, {9, 19, "b"}, {6, 20, "a"}, {7, 20, "b"},
+            {9, 22, "a"}, {21, 22, "b"}, {3, 23, "a"}, {4, 23, "b"}, {3, 24, "a"}, {5, 24, "b"},
+            {6, 25, "in"}, {7, 26, "in"}, {8, 27, "in"},
+            {29, 31, "base"}, {30, 31, "top"}, {12, 31, "mask"},
+            {31, 99, "baseColor"}, {25, 99, "metallic"}, {26, 99, "roughness"},
+        };
+        ValidationResult vr = Validate(g);
+        check(vr.ok, (std::string("kitchen-sink graph validates: ") + vr.error).c_str());
+        std::string h1 = GenerateHlsl(g);
+        std::string h2 = GenerateHlsl(g);
+        check(h1 == h2, "kitchen-sink codegen is deterministic (byte-identical)");
+        check(h1.find("// ERROR") == std::string::npos, "kitchen-sink codegens cleanly");
+        // Spot-check the emitted intrinsics for the new node families.
+        const char* wants[] = {"hfValueNoise(", "hfPerlin(", "hfVoronoi(", "hfFbm(",
+                               "sin(", "cos(", "abs(", "floor(", "ceil(", "frac(", "sqrt(", "sign(",
+                               "min(", "max(", "step(", "fmod(", "distance(", "reflect(",
+                               "clamp(", "smoothstep(", "f.skyParams.z", "lerp("};
+        for (const char* w : wants)
+            check(h1.find(w) != std::string::npos, (std::string("kitchen-sink emits ") + w).c_str());
+        // The whole-graph codegen digest — pinned for the MSVC==clang cross-compiler proof (the printed
+        // value must MATCH between the two builds; the controller diffs the two runs' stdout).
+        uint64_t dig = fnv1a(h1);
+        std::printf("mg1-codegen-digest kitchen-sink = 0x%016llx (nodes=%zu)\n",
+                    (unsigned long long)dig, g.nodes.size());
+    }
+
+    // --- (d2) The mg1_marble showcase material (loaded from JSON) codegens cleanly + digest. --------
+    {
+        LoadResult lr = LoadGraphFromFile(std::string(HF_MG1_JSON));
+        check(lr.ok, "mg1_marble.mat.json loads + validates");
+        if (lr.ok) {
+            std::string h1 = GenerateHlsl(lr.graph);
+            std::string h2 = GenerateHlsl(lr.graph);
+            check(h1 == h2, "mg1_marble codegen is deterministic");
+            check(h1.find("// ERROR") == std::string::npos, "mg1_marble codegens cleanly");
+            check(h1.find("material_noise.hlsli") != std::string::npos, "mg1_marble includes the noise header");
+            check(h1.find("hfFbm(") != std::string::npos && h1.find("hfValueNoise(") != std::string::npos,
+                  "mg1_marble uses FBM + ValueNoise (procedural detail the 17-node set can't express)");
+            std::printf("mg1-codegen-digest marble = 0x%016llx (nodes=%zu)\n",
+                        (unsigned long long)fnv1a(h1), lr.graph.nodes.size());
+        }
+    }
+
     if (g_fail == 0) { std::printf("shader_graph_test OK\n"); return 0; }
     std::printf("shader_graph_test: %d failures\n", g_fail);
     return 1;

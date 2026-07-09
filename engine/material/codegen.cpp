@@ -44,11 +44,25 @@ int SourceOf(const Graph& g, int toNode, const char* port) {
 
 }  // namespace
 
-std::string GenerateHlsl(const Graph& g) {
+std::string GenerateHlsl(const Graph& g) { return GenerateHlsl(g, FunctionLibrary{}); }
+
+std::string GenerateHlsl(const Graph& gIn, const FunctionLibrary& lib) {
+    // Slice MG1: expand any FunctionCall nodes into primitives FIRST. A call-free graph flattens to
+    // itself, so this is byte-transparent for the frozen 17-node materials.
+    Graph g = FlattenFunctions(gIn, lib);
+
     ValidationResult vr = Validate(g);
     if (!vr) return "// ERROR: invalid material graph: " + vr.error + "\n";
 
     std::vector<int> order = TopoOrder(g);
+
+    // Slice MG1: emit the shared procedural-noise include ONLY when a noise node is present (so the
+    // existing materials' generated HLSL is byte-unchanged — no extra include line).
+    bool usesNoise = false;
+    for (const Node& n : g.nodes)
+        if (n.kind == NodeKind::ValueNoise || n.kind == NodeKind::PerlinNoise ||
+            n.kind == NodeKind::VoronoiNoise || n.kind == NodeKind::FBM)
+            usesNoise = true;
 
     // Resolved output type per node (for declaring temps + slicing into hfShadePBR args).
     std::unordered_map<int, Type> typeOf;
@@ -59,7 +73,10 @@ std::string GenerateHlsl(const Graph& g) {
     os << "// DO NOT EDIT — regenerate from the source JSON. Shares the PBR core in pbr_core.hlsli\n";
     os << "// with the hand-written lit_pbr.frag.hlsl (identical FrameData / varyings / bindings).\n";
     os << "// (Generated under shaders/generated/, so the PBR core include is one dir up.)\n";
-    os << "#include \"../pbr_core.hlsli\"\n\n";
+    os << "#include \"../pbr_core.hlsli\"\n";
+    if (usesNoise)
+        os << "#include \"../material_noise.hlsli\"  // Slice MG1: deterministic integer-hash noise\n";
+    os << "\n";
     os << "float4 main(PSInput i) : SV_Target {\n";
 
     // Emit a temporary per non-sink node, in topological order.
@@ -170,6 +187,111 @@ std::string GenerateHlsl(const Graph& g) {
                    << uvExpr << ").xyz * 2.0 - 1.0);\n";
                 break;
             }
+            // --- Slice MG1: procedural noise (the textual twin of shader_graph.cpp's Eval*/
+            // material_noise.hlsli; each emits a scalar float in [0,1]). --------------------------
+            case NodeKind::ValueNoise: {
+                os << "    float " << Tmp(id) << " = hfValueNoise(" << Tmp(SourceOf(g, id, "p")) << ");\n";
+                break;
+            }
+            case NodeKind::PerlinNoise: {
+                os << "    float " << Tmp(id) << " = hfPerlin(" << Tmp(SourceOf(g, id, "p")) << ");\n";
+                break;
+            }
+            case NodeKind::VoronoiNoise: {
+                os << "    float " << Tmp(id) << " = hfVoronoi(" << Tmp(SourceOf(g, id, "p")) << ");\n";
+                break;
+            }
+            case NodeKind::FBM: {
+                os << "    float " << Tmp(id) << " = hfFbm(" << Tmp(SourceOf(g, id, "p")) << ", "
+                   << n.octaves << ");\n";
+                break;
+            }
+            // --- Slice MG1: unary math (component-wise; output matches input). --------------------
+            case NodeKind::Sin: case NodeKind::Cos: case NodeKind::Abs: case NodeKind::Floor:
+            case NodeKind::Ceil: case NodeKind::Frac: case NodeKind::Sqrt: case NodeKind::Sign: {
+                const char* fn = "abs";
+                switch (n.kind) {
+                    case NodeKind::Sin: fn = "sin"; break;   case NodeKind::Cos: fn = "cos"; break;
+                    case NodeKind::Abs: fn = "abs"; break;   case NodeKind::Floor: fn = "floor"; break;
+                    case NodeKind::Ceil: fn = "ceil"; break; case NodeKind::Frac: fn = "frac"; break;
+                    case NodeKind::Sqrt: fn = "sqrt"; break; case NodeKind::Sign: fn = "sign"; break;
+                    default: break;
+                }
+                os << "    " << Ty(t) << " " << Tmp(id) << " = " << fn << "("
+                   << Tmp(SourceOf(g, id, "in")) << ");\n";
+                break;
+            }
+            // --- Slice MG1: binary math (component-wise; output matches 'a'). ---------------------
+            case NodeKind::Min: case NodeKind::Max: case NodeKind::Step: case NodeKind::Modulo:
+            case NodeKind::Reflect: {
+                const char* fn = "min";
+                switch (n.kind) {
+                    case NodeKind::Min: fn = "min"; break;   case NodeKind::Max: fn = "max"; break;
+                    case NodeKind::Step: fn = "step"; break; case NodeKind::Modulo: fn = "fmod"; break;
+                    case NodeKind::Reflect: fn = "reflect"; break; default: break;
+                }
+                os << "    " << Ty(t) << " " << Tmp(id) << " = " << fn << "("
+                   << Tmp(SourceOf(g, id, "a")) << ", " << Tmp(SourceOf(g, id, "b")) << ");\n";
+                break;
+            }
+            case NodeKind::Distance: {
+                os << "    float " << Tmp(id) << " = distance(" << Tmp(SourceOf(g, id, "a")) << ", "
+                   << Tmp(SourceOf(g, id, "b")) << ");\n";
+                break;
+            }
+            // --- Slice MG1: ranged (params). -----------------------------------------------------
+            case NodeKind::Clamp: {
+                os << "    " << Ty(t) << " " << Tmp(id) << " = clamp(" << Tmp(SourceOf(g, id, "in"))
+                   << ", " << Lit(n.lo) << ", " << Lit(n.hi) << ");\n";
+                break;
+            }
+            case NodeKind::Smoothstep: {
+                os << "    " << Ty(t) << " " << Tmp(id) << " = smoothstep(" << Lit(n.lo) << ", "
+                   << Lit(n.hi) << ", " << Tmp(SourceOf(g, id, "in")) << ");\n";
+                break;
+            }
+            case NodeKind::Remap: {
+                // out = outLo + (in - lo) * ((outHi-outLo)/(hi-lo)); scalars broadcast over a vector in.
+                float denom = (n.hi != n.lo) ? (n.hi - n.lo) : 1.0f;
+                float scale = (n.outHi - n.outLo) / denom;
+                os << "    " << Ty(t) << " " << Tmp(id) << " = " << Lit(n.outLo) << " + ("
+                   << Tmp(SourceOf(g, id, "in")) << " - " << Lit(n.lo) << ") * " << Lit(scale) << ";\n";
+                break;
+            }
+            // --- Slice MG1: animation (uniform time = f.skyParams.z). -----------------------------
+            case NodeKind::Time: {
+                os << "    float " << Tmp(id) << " = f.skyParams.z;\n";
+                break;
+            }
+            case NodeKind::Panner: {
+                os << "    float2 " << Tmp(id) << " = " << Tmp(SourceOf(g, id, "uv"))
+                   << " + f.skyParams.z * float2(" << Lit(n.speed) << ", 0.0);\n";
+                break;
+            }
+            case NodeKind::Rotator: {
+                std::string uvE = Tmp(SourceOf(g, id, "uv"));
+                os << "    float2 " << Tmp(id) << ";\n";
+                os << "    { float _a" << id << " = f.skyParams.z * " << Lit(n.speed) << ";\n";
+                os << "      float _c" << id << " = cos(_a" << id << "), _s" << id << " = sin(_a" << id << ");\n";
+                os << "      float2 _p" << id << " = " << uvE << " - float2(0.5, 0.5);\n";
+                os << "      " << Tmp(id) << " = float2(_p" << id << ".x * _c" << id << " - _p" << id
+                   << ".y * _s" << id << ", _p" << id << ".x * _s" << id << " + _p" << id << ".y * _c"
+                   << id << ") + float2(0.5, 0.5); }\n";
+                break;
+            }
+            // --- Slice MG1: material LAYER blend. ------------------------------------------------
+            case NodeKind::BlendLayer: {
+                os << "    float3 " << Tmp(id) << " = lerp(" << Tmp(SourceOf(g, id, "base")) << ", "
+                   << Tmp(SourceOf(g, id, "top")) << ", " << Tmp(SourceOf(g, id, "mask")) << ");\n";
+                break;
+            }
+            // Function nodes are removed by FlattenFunctions before codegen; if one survives (missing
+            // library) emit a loud error comment so the shader compile fails visibly.
+            case NodeKind::FunctionInput:
+            case NodeKind::FunctionOutput:
+            case NodeKind::FunctionCall:
+                os << "    // ERROR: unexpanded function node " << id << " (missing function library)\n";
+                break;
             case NodeKind::PBROutput:
                 break;
         }

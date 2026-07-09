@@ -21,4 +21,9 @@ namespace hf::material {
 // .mat.json fails the shader compile loudly rather than silently emitting garbage).
 std::string GenerateHlsl(const Graph& g);
 
+// Slice MG1: codegen with a function LIBRARY. FlattenFunctions(g, lib) inlines any FunctionCall nodes
+// into primitives first, then the SAME emitter runs. A graph with NO FunctionCall flattens to itself,
+// so GenerateHlsl(g) == GenerateHlsl(g, {}) byte-for-byte (the frozen-codegen invariant).
+std::string GenerateHlsl(const Graph& g, const FunctionLibrary& lib);
+
 }  // namespace hf::material

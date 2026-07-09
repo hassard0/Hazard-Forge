@@ -57,7 +57,20 @@ add_custom_command(
           "${CMAKE_SOURCE_DIR}/shaders/pbr_core.hlsli"
   COMMENT "material_codegen showcase3.mat.json -> mat_showcase3.frag.hlsl"
   VERBATIM)
-add_custom_target(hello_triangle_matgen DEPENDS "${MAT_GEN_HLSL}" "${MAT2_GEN_HLSL}" "${MAT3_GEN_HLSL}")
+# Slice MG1: the PROCEDURAL-MARBLE material exercising the node-library DEPTH batch (FBM/Sin/Abs/
+# ValueNoise/Remap/BlendLayer). Its generated fragment #includes the deterministic integer-hash noise
+# (shaders/material_noise.hlsli). Same build-time codegen path; drawn by --mg1-material-shot.
+set(MATMG1_JSON "${CMAKE_SOURCE_DIR}/assets/materials/mg1_marble.mat.json")
+set(MATMG1_GEN_HLSL "${CMAKE_SOURCE_DIR}/shaders/generated/mat_mg1.frag.hlsl")
+add_custom_command(
+  OUTPUT "${MATMG1_GEN_HLSL}"
+  COMMAND material_codegen "${MATMG1_JSON}" "${MATMG1_GEN_HLSL}"
+  DEPENDS material_codegen "${MATMG1_JSON}"
+          "${CMAKE_SOURCE_DIR}/shaders/pbr_core.hlsli"
+          "${CMAKE_SOURCE_DIR}/shaders/material_noise.hlsli"
+  COMMENT "material_codegen mg1_marble.mat.json -> mat_mg1.frag.hlsl"
+  VERBATIM)
+add_custom_target(hello_triangle_matgen DEPENDS "${MAT_GEN_HLSL}" "${MAT2_GEN_HLSL}" "${MAT3_GEN_HLSL}" "${MATMG1_GEN_HLSL}")
 # Slice BE: the NormalMap-node material (PBROutput.normal = NormalMap(slot="normalmap")). Same
 # build-time codegen path; its committed generated HLSL flows through the same DXC->SPIR-V (and
 # glslc->MSL) toolchain. The --material-normal-shot showcase renders a sphere shaded by it.
@@ -123,6 +136,9 @@ hf_compile_shaders(
     # map perturbs the shading normal via the same TBN as lit.frag). Drawn by --material-normal-shot;
     # also runtime-compiled via --material-live-shot to prove the NormalMap node survives the dxc path.
     "shaders/generated/mat_normalmap.frag.hlsl:ps"
+    # Slice MG1: the procedural-marble material's build-time-generated fragment (FBM/Sin/Abs/ValueNoise/
+    # Remap/BlendLayer + the deterministic integer-hash material_noise.hlsli). Drawn by --mg1-material-shot.
+    "shaders/generated/mat_mg1.frag.hlsl:ps"
     "shaders/sky_hdr.frag.hlsl:ps"
     "shaders/lit_skinned.vert.hlsl:vs"
     "shaders/shadow_skinned.vert.hlsl:vs"
@@ -2074,7 +2090,8 @@ target_compile_definitions(hello_triangle PRIVATE
   "HF_MAT_JSON=\"${MAT_JSON}\""
   "HF_MAT2_JSON=\"${MAT2_JSON}\""
   "HF_MAT3_JSON=\"${MAT3_JSON}\""
-  "HF_MATNORMAL_JSON=\"${MATNORMAL_JSON}\"")
+  "HF_MATNORMAL_JSON=\"${MATNORMAL_JSON}\""
+  "HF_MATMG1_JSON=\"${MATMG1_JSON}\"")
 # Absolute path to the glTF showcase model, baked at configure time (repo asset).
 target_compile_definitions(hello_triangle PRIVATE
   "HF_MODEL_PATH=\"${CMAKE_SOURCE_DIR}/assets/models/Duck.glb\"")

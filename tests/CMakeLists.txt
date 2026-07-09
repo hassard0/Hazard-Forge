@@ -2081,6 +2081,10 @@ target_compile_definitions(shader_graph_test PRIVATE
 # codegens (structural asserts on the TBN transform + perturbed-normal lighting).
 target_compile_definitions(shader_graph_test PRIVATE
   "HF_MATNORMAL_JSON=\"${CMAKE_SOURCE_DIR}/assets/materials/normalmap.mat.json\"")
+# Slice MG1: the procedural-marble showcase (FBM/Sin/Abs/ValueNoise/Remap/BlendLayer — depth the 17-node
+# set lacks) the test loads + codegens + digests (the deterministic-codegen proof).
+target_compile_definitions(shader_graph_test PRIVATE
+  "HF_MG1_JSON=\"${CMAKE_SOURCE_DIR}/assets/materials/mg1_marble.mat.json\"")
 
 # Live runtime material authoring (Slice AW): the reload-orchestration host logic — given a STUBBED
 # compiler (success/failure, no GPU/dxc), the LiveMaterial controller swaps on success, KEEPS the old

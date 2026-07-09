@@ -178,6 +178,7 @@
 // Slice AW (live runtime material authoring): in-process graph load + runtime dxc-subprocess compile
 // + the live-swap controller. Pure host logic (no backend symbols) above the RHI seam.
 #include "material/material_loader.h"
+#include "material/codegen.h"            // Slice MG1: GenerateHlsl for the --mg1-material-shot digest.
 #include "material/graph_introspect.h"  // Slice BI: pure-CPU material-graph introspection (JSON/DOT).
 #include "material/runtime_compile.h"
 #include "material/live_material.h"
@@ -447,6 +448,13 @@ int main(int argc, char** argv) {
     const char* animFsmShotPath = nullptr;
     const char* pbrShotPath = nullptr;
     const char* materialShotPath = nullptr;
+    // Slice MG1 (material node-library DEPTH): a sphere shaded by mg1_marble.mat.json — a PROCEDURAL
+    // MARBLE built from the new noise (FBM/ValueNoise) + math (Sin/Abs) + layer (BlendLayer) + Remap
+    // nodes: surface veining + varied roughness the frozen 17-node set (no noise, no sin/abs) cannot
+    // express. Routes through the SAME --material-shot render block; only the fragment .spv differs
+    // (mat_mg1.frag.hlsl.spv). The noise is a deterministic integer hash (byte-identical codegen + a
+    // cross-platform-identical render). Prints the nodes/newNodes/codegenDigest/graphHash stat line.
+    const char* mg1MaterialShotPath = nullptr;
     // Slice AW (live runtime material authoring): render the material showcase via the RUNTIME path
     // (in-process codegen -> dxc subprocess -> SPIR-V -> pipeline). For showcase.mat.json this is
     // byte-identical to --material-shot (same dxc -> same SPIR-V -> same image). An optional second
@@ -3664,6 +3672,14 @@ int main(int argc, char** argv) {
     // else-if ladder, the C1061 nested-block limit).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--at1-sky-shot") == 0) { at1SkyShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice MG1: --mg1-material-shot <out.bmp> (PROCEDURAL-MARBLE material — node-library DEPTH: FBM/Sin/
+    // Abs/ValueNoise/Remap/BlendLayer over deterministic integer-hash noise). Its OWN loop (the standalone-
+    // loop pattern — NOT the big else-if ladder, the C1061 nested-block limit). Routes through the shared
+    // --material-shot render block (only the fragment .spv differs: mat_mg1.frag.hlsl.spv).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--mg1-material-shot") == 0) { mg1MaterialShotPath = argv[i + 1]; break; }
     }
 
     // Slice FR7: --fract-recursive-shot <out.bmp> (Issue #37, RECURSIVE FRACTURE-ON-IMPACT). PURE-CPU host
@@ -110909,7 +110925,8 @@ int main(int argc, char** argv) {
         // SPIR-V) instead of the build-time .spv. For showcase.mat.json the SAME dxc + flags yield
         // BYTE-IDENTICAL SPIR-V -> a byte-identical image to --material-shot (the runtime==build-time
         // proof). `outPath` is whichever flag was given.
-        const char* matOutPath = materialShotPath ? materialShotPath : materialLiveShotPath;
+        const char* matOutPath = materialShotPath ? materialShotPath
+                               : (materialLiveShotPath ? materialLiveShotPath : mg1MaterialShotPath);
         if (matOutPath) {
             using math::Mat4; using math::Vec3;
             uint32_t w = window.FramebufferWidth();
@@ -110939,6 +110956,31 @@ int main(int argc, char** argv) {
                 matFsWords = std::move(*spv);
                 std::printf("material-live-shot: runtime-compiled %s (%zu SPIR-V words)\n",
                             matJson, matFsWords.size());
+            } else if (mg1MaterialShotPath) {
+                // Slice MG1 (--mg1-material-shot): the committed procedural-marble .spv. Print the
+                // node-graph stat line (nodes / newNodes / codegenDigest / graphHash) from the source
+                // JSON so the shot self-reports the material's depth + the deterministic-codegen digest.
+                matFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/mat_mg1.frag.hlsl.spv");
+                material::LoadResult lr = material::LoadGraphFromFile(HF_MATMG1_JSON);
+                if (lr.ok) {
+                    std::string hlsl = material::GenerateHlsl(lr.graph);
+                    // Count nodes whose kind is a Slice-MG1 addition (>= ValueNoise in the enum).
+                    int newNodes = 0;
+                    for (const material::Node& n : lr.graph.nodes)
+                        if ((int)n.kind >= (int)material::NodeKind::ValueNoise) ++newNodes;
+                    uint64_t codegenDig = 1469598103934665603ull;   // FNV-1a-64 over the emitted HLSL.
+                    for (unsigned char c : hlsl) { codegenDig ^= c; codegenDig *= 1099511628211ull; }
+                    uint64_t graphHash = 1469598103934665603ull;    // FNV-1a-64 over kinds+edges.
+                    for (const material::Node& n : lr.graph.nodes) {
+                        graphHash ^= (uint64_t)((int)n.kind + 1); graphHash *= 1099511628211ull;
+                    }
+                    for (const material::Edge& e : lr.graph.edges) {
+                        graphHash ^= (uint64_t)(e.fromNode * 131 + e.toNode); graphHash *= 1099511628211ull;
+                    }
+                    std::printf("mg1-material: nodes=%zu newNodes=%d codegenDigest=0x%016llx graphHash=0x%016llx\n",
+                                lr.graph.nodes.size(), newNodes,
+                                (unsigned long long)codegenDig, (unsigned long long)graphHash);
+                }
             } else {
                 // BUILD-TIME path (--material-shot, Slice AV): the committed generated .spv.
                 matFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/mat_showcase.frag.hlsl.spv");

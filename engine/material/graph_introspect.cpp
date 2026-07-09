@@ -60,6 +60,25 @@ bool IsWildcardPort(NodeKind k, int idx) {
         case NodeKind::Saturate:
         case NodeKind::Dot:
         case NodeKind::Power:
+        // Slice MG1: unary math 'in', binary math a/b, ranged 'in', FunctionOutput 'in' are wildcards.
+        case NodeKind::Sin:
+        case NodeKind::Cos:
+        case NodeKind::Abs:
+        case NodeKind::Floor:
+        case NodeKind::Ceil:
+        case NodeKind::Frac:
+        case NodeKind::Sqrt:
+        case NodeKind::Sign:
+        case NodeKind::Min:
+        case NodeKind::Max:
+        case NodeKind::Step:
+        case NodeKind::Modulo:
+        case NodeKind::Distance:
+        case NodeKind::Reflect:
+        case NodeKind::Clamp:
+        case NodeKind::Smoothstep:
+        case NodeKind::Remap:
+        case NodeKind::FunctionOutput:
             return true;  // the vector input(s)
         default:
             return false;
@@ -149,6 +168,41 @@ void AppendParams(std::ostream& os, const Node& n, int depth) {
         case NodeKind::Swizzle: {
             std::ostringstream sw; AppendString(sw, n.swizzle);
             kv.emplace_back("swizzle", sw.str());
+            break;
+        }
+        // --- Slice MG1 params ------------------------------------------------------------------
+        case NodeKind::FBM: {
+            kv.emplace_back("octaves", std::to_string(n.octaves));
+            break;
+        }
+        case NodeKind::Clamp:
+        case NodeKind::Smoothstep: {
+            kv.emplace_back("lo", num(n.lo));
+            kv.emplace_back("hi", num(n.hi));
+            break;
+        }
+        case NodeKind::Remap: {
+            kv.emplace_back("lo", num(n.lo));
+            kv.emplace_back("hi", num(n.hi));
+            kv.emplace_back("outLo", num(n.outLo));
+            kv.emplace_back("outHi", num(n.outHi));
+            break;
+        }
+        case NodeKind::Panner:
+        case NodeKind::Rotator: {
+            kv.emplace_back("speed", num(n.speed));
+            break;
+        }
+        case NodeKind::FunctionInput: {
+            std::ostringstream nm; AppendString(nm, n.texture);
+            kv.emplace_back("name", nm.str());
+            std::ostringstream ot; ot << '"' << TypeName(n.outType) << '"';
+            kv.emplace_back("outType", ot.str());
+            break;
+        }
+        case NodeKind::FunctionCall: {
+            std::ostringstream nm; AppendString(nm, n.texture);
+            kv.emplace_back("function", nm.str());
             break;
         }
         default:

@@ -125,6 +125,12 @@ hf_gen_msl(mat_showcase3.frag generated/mat_showcase3.frag.hlsl frag material3_f
 # world normal from the tangent-space sample via the SAME Gram-Schmidt TBN lit.frag uses and shades via
 # hfShadePBRN. Same HLSL->SPIR-V->MSL toolchain; renders the new mat_normal.png golden (--material-normal).
 hf_gen_msl(mat_normalmap.frag generated/mat_normalmap.frag.hlsl frag material_normal_fragment)
+# Slice MG1: the procedural-marble material's committed build-time-generated fragment (shaders/generated/
+# mat_mg1.frag.hlsl) — FBM/Sin/Abs/ValueNoise/Remap/BlendLayer over the deterministic integer-hash noise
+# (shaders/material_noise.hlsli, which the HLSL->SPIR-V->MSL toolchain resolves via the #include). The
+# noise uses only uint xor/shift/mul + power-of-two float divide (MSL-native, no int64) so spirv-cross
+# emits clean MSL. Renders the mat_mg1.png golden (--mg1-material).
+hf_gen_msl(mat_mg1.frag generated/mat_mg1.frag.hlsl frag material_mg1_fragment)
 # HDR environment IBL (Slice R): equirect skybox + full-PBR-with-HDR-IBL fragment shaders. Same
 # HLSL->SPIR-V->MSL toolchain; the env map binds at flat fragment texture(11)/sampler(12).
 hf_gen_msl(sky_hdr.frag      sky_hdr.frag.hlsl      frag sky_hdr_fragment)

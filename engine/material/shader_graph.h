@@ -49,6 +49,33 @@ enum class NodeKind {
     NormalMap,      // param normal-texture slot (default "normalmap"); input UV (default interpolated);
                     // output TANGENT-SPACE float3 = normalize(decode(sample(tex, uv))), decode(c)=c*2-1.
     PBROutput,      // SINK: baseColor(float3) metallic(float) roughness(float) emissive(float3) normal(float3)
+    // --- Slice MG1: node-library DEPTH (the "surpass UE5 material depth" batch). All ADDITIVE — the 17
+    // kinds above + their codegen are BYTE-FROZEN; these append after PBROutput so every existing
+    // enumerator keeps its value + existing material goldens codegen bit-identically. -----------------
+    // Procedural noise family (input "p" float2 -> scalar float in [0,1]). The noise is a LIVE integer
+    // hash (shaders/material_noise.hlsli) the CPU interpreter replicates bit-for-bit at grid corners
+    // (uint xor/shift/mul wraps mod 2^32 identically in C++ and HLSL/MSL); interior samples match to
+    // float tolerance (the visresolve bar). NO host-baked LUT, NO new binding — MSL-gen-safe.
+    ValueNoise,     // hfValueNoise(p): smoothstep-interpolated integer-hash value noise -> [0,1].
+    PerlinNoise,    // hfPerlin(p):     gradient/Perlin noise (angle-hash gradients) remapped -> [0,1].
+    VoronoiNoise,   // hfVoronoi(p):    cellular F1 nearest-feature distance -> [0,~1.4].
+    FBM,            // hfFbm(p,octaves): fractal sum of ValueNoise octaves (param `octaves`) -> [0,1].
+    // Math / utility unary (input "in"; output matches in, component-wise).
+    Sin, Cos, Abs, Floor, Ceil, Frac, Sqrt, Sign,
+    // Math binary (inputs "a","b" wildcard, a==b type; output matches a). Distance -> scalar.
+    Min, Max, Step, Modulo, Distance, Reflect,
+    // Ranged (input "in"; params). Clamp(lo,hi) / Smoothstep(lo,hi) / Remap(lo,hi -> outLo,outHi).
+    Clamp, Smoothstep, Remap,
+    // Animation: Time (uniform f.skyParams.z -> scalar); Panner/Rotator animate a UV (input "uv" float2
+    // -> float2) by `speed` * time.
+    Time, Panner, Rotator,
+    // Material LAYER blend: lerp(base, top, mask) — inputs base(float3) top(float3) mask(float) -> float3.
+    BlendLayer,
+    // Reusable material FUNCTIONS (INLINE-only subgraph reuse; no separate compilation). A function is a
+    // Graph with FunctionInput sources (named via `texture`, typed via `outType`) + one FunctionOutput
+    // sink; a parent FunctionCall (function named via `texture`) is expanded by FlattenFunctions BEFORE
+    // codegen into primitive nodes, so a graph WITHOUT calls flattens to itself (frozen codegen).
+    FunctionInput, FunctionOutput, FunctionCall,
 };
 
 const char* NodeKindName(NodeKind k);
@@ -74,6 +101,15 @@ struct Node {
     std::string texture;                      // TextureSample: slot name (e.g. "baseColorTex").
     float       power = 1.0f;                 // Fresnel: exponent.
     std::string swizzle;                      // Swizzle: component mask over xyzw/rgba (len 1..4).
+    // --- Slice MG1 params (additive; unused by the frozen 17 kinds so their codegen is unchanged) ---
+    int         octaves = 5;                  // FBM: number of fractal octaves (1..8).
+    float       lo = 0.0f;                    // Clamp/Smoothstep: low edge. Remap: input-range low.
+    float       hi = 1.0f;                    // Clamp/Smoothstep: high edge. Remap: input-range high.
+    float       outLo = 0.0f;                 // Remap: output-range low.
+    float       outHi = 1.0f;                 // Remap: output-range high.
+    float       speed = 1.0f;                 // Panner/Rotator: UV animation speed (× time).
+    // `texture` doubles as the FUNCTION NAME for FunctionInput (the input param name) + FunctionCall
+    // (the referenced function's name). `outType` doubles as a FunctionInput's declared type.
 };
 
 // Map a swizzle mask char (xyzw or rgba alias) to a component index 0..3, or -1 if not a valid char.
@@ -147,6 +183,35 @@ Value EvalSaturate(const Value& x);                   // component-wise clamp(x,
 // --- Slice BE: NormalMap decode (shared with the codegen) -------------------------------------
 float EvalNormalDecode(float c);                      // decode(c) = c*2 - 1 (single source of truth)
 Value EvalNormalMap(const std::array<float, 4>& texel);  // normalize(decode(texel.rgb)) -> float3
+
+// --- Slice MG1: procedural-noise primitives (the SINGLE source of truth, shared bit-for-bit with the
+// HLSL/MSL in shaders/material_noise.hlsli). The integer hash uses only uint xor/shift/mul (wraps mod
+// 2^32 identically in C++ and shader) + a power-of-two float divide, so CPU==shader is exact at grid
+// corners and float-tolerance-close in the interpolated interior (the visresolve bar). -------------
+uint32_t HfHashU(uint32_t x);                         // low-bias integer avalanche (Wang-style).
+uint32_t HfHash2(int ix, int iy);                     // 2D cell hash.
+float    HfHash2f(int ix, int iy);                    // cell hash -> [0,1).
+float    EvalValueNoise(float px, float py);          // smoothstep value noise -> [0,1].
+float    EvalPerlin(float px, float py);              // gradient/Perlin noise -> [0,1].
+float    EvalVoronoi(float px, float py);             // cellular F1 distance -> [0,~1.4].
+float    EvalFbm(float px, float py, int octaves);    // fractal sum of ValueNoise -> [0,1].
+
+// --- Slice MG1: reusable material FUNCTIONS -------------------------------------------------------
+// A named library of function subgraphs. Lookup is by name (no map iteration in codegen -> stays
+// deterministic). Each function Graph has FunctionInput sources + exactly one FunctionOutput sink.
+struct FunctionLibrary {
+    std::vector<std::pair<std::string, Graph>> funcs;
+    const Graph* Find(const std::string& name) const;
+    void Add(const std::string& name, Graph g) { funcs.emplace_back(name, std::move(g)); }
+};
+
+// Expand every FunctionCall node in `g` by INLINING the referenced function's subgraph (fresh node
+// ids, FunctionInput wired to the caller's incoming edge, the function result rewired to the call's
+// consumers). Deterministic. If `g` has NO FunctionCall node the input Graph is returned UNCHANGED
+// (so a call-free graph codegens byte-identically — the frozen-goldens invariant). Requires that each
+// referenced function exists in `lib`; a missing function leaves the call unexpanded (codegen then
+// fails loudly on the unknown FunctionCall kind).
+Graph FlattenFunctions(const Graph& g, const FunctionLibrary& lib);
 
 // Evaluate the whole graph at a sample point. `uv` feeds UV nodes; `NoV` feeds Fresnel; `sampleTex`
 // supplies a stub texture lookup (slot, uv) -> float4 so TextureSample is testable on the CPU. The
