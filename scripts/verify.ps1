@@ -545,6 +545,32 @@ if (-not `$agentOk) {
 }
 Write-Host 'agent-api JSON golden: exact match'
 
+# --- Capability-manifest JSON golden (Slice AX2, FLAGSHIP #31): an EXACT byte-for-byte match of the
+# live --capability-manifest output (agent::BuildCapabilityManifest — the machine-readable capability
+# discovery + agent-verify contract, sourced from the in-code registry in engine/agent/
+# capability_manifest.h) against the committed text golden. Like the --agent-api golden it is backend-
+# AGNOSTIC (pure hf_core header, no vk*/Metal symbols — identical bytes on Vulkan and Metal), so it is
+# verified once here on the Windows/Vulkan build and is NOT in `$Goldens`/`$vkShots` (the Mac IMAGE set).
+# schemaVersion governs SHAPE only; the contentHash covers the volatile capability content, so this
+# golden rebakes whenever the registry gains a capability while schemaVersion HOLDS at 1. The exe ALSO
+# self-checks determinism + the golden internally and fails loudly. ---
+Write-Host '--- capability-manifest JSON golden ---'
+`$cmExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$cmGolden = 'tests/golden/agent/capability_manifest.json'
+`$cmLive = Join-Path `$env:TEMP 'hf_capability_manifest_live.json'
+& `$cmExe --capability-manifest `$cmLive 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'capability-manifest run failed (determinism or byte-golden mismatch)'; exit 44 }
+# Compare RAW bytes (the program writes LF-only, no BOM); any difference is a failure.
+`$cmgBytes = [System.IO.File]::ReadAllBytes((Resolve-Path `$cmGolden).Path)
+`$cmlBytes = [System.IO.File]::ReadAllBytes(`$cmLive)
+`$cmOk = (`$cmgBytes.Length -eq `$cmlBytes.Length)
+if (`$cmOk) { for (`$ci = 0; `$ci -lt `$cmgBytes.Length; `$ci++) { if (`$cmgBytes[`$ci] -ne `$cmlBytes[`$ci]) { `$cmOk = `$false; break } } }
+if (-not `$cmOk) {
+    Write-Host 'capability-manifest JSON golden MISMATCH (tests/golden/agent/capability_manifest.json)'
+    exit 45
+}
+Write-Host 'capability-manifest JSON golden: exact match'
+
 # --- Agent query-responses JSON golden (Slice DX2, FLAGSHIP #31): an EXACT byte-for-byte match of a
 # fresh --agent-query (scene::RunQueries over assets/agent/dx2_queries.json against the default scene)
 # against the committed text golden. This is the agent-OBSERVE READ artifact (the selective,

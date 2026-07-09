@@ -126,3 +126,47 @@ inputs and trust every client to re-simulate the identical result.
 Each of those cores has its own pinned-digest test (`verdict_test`, `session_test`,
 `authority_verify_test`, `fork_test`, `pcg_test`, …) in the pure-core suite; this binary reuses them as
 the *proof surface* rather than re-deriving anything.
+
+---
+
+## agent_trial — the agent-feature-trial (BEAT_UE5_PLAN Phase 3 #4)
+
+A second runnable proof, on HF's *other* structural moat: it is an engine an AI agent can develop
+**end-to-end**. `benchmarks/agent_trial.cpp` (ctest `hf_agent_trial`) DEMONSTRATES + MEASURES the
+agent-dev loop this whole autonomous run embodies:
+
+```
+author  →  build  →  run-flag  →  byte-compare-golden   ==  PASS
+```
+
+**What it does:** scripts a tiny "feature" (adding a second entity to a scene) over the **real frozen**
+`scene::CanonicalizeSceneText` pipeline and shows the byte-identical golden acting as a machine-checkable
+oracle:
+
+1. **RED** — the *incomplete* feature's canonical bytes ≠ the golden → the oracle rejects it.
+2. **GREEN** — the *finished* feature's canonical bytes == the golden → the oracle accepts it.
+3. **Deterministic** — two runs of the finished feature are byte-identical (the pass/fail signal is
+   stable across runs and platforms).
+4. **Discriminating** — RED ≠ GREEN, so the oracle is meaningful, not vacuously passing.
+
+It reports the loop step count and the **wall-clock of the run+compare oracle** (the "verify latency"
+an agent pays per iteration), and **exits 0 iff the loop behaves correctly**.
+
+**Run it:**
+
+```sh
+ctest --test-dir build/windows-msvc-release -R hf_agent_trial -V
+```
+
+**What this is, and what it is not.** It is a measurement of the **loop mechanics** — the byte-compare
+golden is the pass/fail oracle, so an agent knows if its change is correct with **no human and no GUI**.
+It is **not** a live-LLM benchmark: it does not spawn a model and does not rebuild the tree; it
+exercises the *property* (a deterministic golden oracle over headless authoring) that makes HF
+agent-developable and UE5 not. UE5's authoritative simulation is float/non-deterministic (no
+byte-identical golden to compare against) and its authoring is GUI-bound (no headless
+authored-scene→verify path), so it is structurally excluded from this loop.
+
+**See also:** `docs/AGENT_NATIVE.md` (the full agent-native thesis) and the machine-readable
+**capability manifest** (`hello_triangle --capability-manifest`, `engine/agent/capability_manifest.h`)
+— the discovery API that enumerates, per capability, the flag that drives it, the golden that verifies
+it, and its moat property.

@@ -857,6 +857,18 @@ hf_add_pure_test(planar_reflection_test)
 # C++ (hf_core), ASan-eligible.
 hf_add_pure_test(introspect_test)
 
+# Machine-readable CAPABILITY MANIFEST (Slice AX2, FLAGSHIP #31): agent::BuildCapabilityManifest builds
+# a deterministic JSON enumerating the engine's major capability families (name/flag/golden/moat/desc,
+# grouped) + the agent-dev verifyContract, sourced from an in-code registry. Asserts: two runs
+# byte-identical; the JSON is well-formed; the shape (schemaVersion/verifyContract/moatProperties/groups)
+# + the group/capability counts agree with the walked arrays; every capability has a non-empty
+# name/flag(--)/golden/moat(in-vocab)/desc with unique names; and THE MANIFEST DOESN'T LIE — every cited
+# golden name actually appears in scripts/verify.ps1 (HF_VERIFY_PS1 injects its absolute path). Pure C++
+# (agent/capability_manifest.h header-only over hf_core), ASan-eligible.
+hf_add_pure_test(capability_manifest_test)
+target_compile_definitions(capability_manifest_test PRIVATE
+  "HF_VERIFY_PS1=\"${CMAKE_SOURCE_DIR}/scripts/verify.ps1\"")
+
 # Live editor: cursor-px->NDC->ray (PixelToNdc round-trip + ScreenRayThroughCamera), click-ray
 # picks the expected entity among world AABBs, ApplyDrag axis delta (prevRay/curRay), and
 # FileWatcher.Poll change detection via an injected fake-stat clock (Slice AM). The live mouse
@@ -2323,3 +2335,16 @@ target_link_libraries(hf_moat_proofs PRIVATE hf_core)
 target_include_directories(hf_moat_proofs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 hf_apply_sanitizer(hf_moat_proofs)
 add_test(NAME hf_moat_proofs COMMAND hf_moat_proofs)
+
+# benchmarks/agent_trial — the AGENT-FEATURE-TRIAL harness (Slice AX2, FLAGSHIP #31; BEAT_UE5_PLAN
+# Phase-3 #4). A pure-CPU micro-trial that DEMONSTRATES + MEASURES the agent-dev loop mechanics
+# (author -> run-flag -> byte-compare-golden = PASS) over the FROZEN scene::CanonicalizeSceneText
+# pipeline: the byte-identical golden is the machine-checkable oracle that REJECTS an incomplete
+# feature (RED) and ACCEPTS the finished one (GREEN), deterministically + discriminatingly. HONEST:
+# it measures the LOOP, not a live LLM. ALSO a ctest (hf_agent_trial), so verify.ps1 runs it. Source
+# in benchmarks/; needs the tests/ include dir for test_main.h. Pure C++ (hf_core), ASan-eligible.
+add_executable(hf_agent_trial ${CMAKE_CURRENT_SOURCE_DIR}/../benchmarks/agent_trial.cpp)
+target_link_libraries(hf_agent_trial PRIVATE hf_core)
+target_include_directories(hf_agent_trial PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+hf_apply_sanitizer(hf_agent_trial)
+add_test(NAME hf_agent_trial COMMAND hf_agent_trial)

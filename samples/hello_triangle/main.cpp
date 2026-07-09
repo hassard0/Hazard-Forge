@@ -162,6 +162,7 @@
 #include "editor/picking.h"
 #include "editor/gizmo.h"
 #include "editor/introspect.h"
+#include "agent/capability_manifest.h"  // Slice AX2: the machine-readable capability manifest (hf::agent).
 #include "editor/edit_ops.h"  // Slice BX: pure-CPU editor live-edit ops (ApplyTransformEdit/Material).
 #include "editor/edit_ops3.h"  // Slice ED4: multi-select set + transform-snap quantizers (SnapConfig).
 #include "editor/edit_history.h"  // Slice ED5: deterministic undo/redo command stack over the edit ops.
@@ -819,6 +820,13 @@ int main(int argc, char** argv) {
     // deterministic + backend-agnostic. Handled early (before device init), like --material-introspect.
     bool agentApi = false;
     const char* agentApiPath = nullptr;
+    // --capability-manifest [outpath] (Slice AX2, FLAGSHIP #31): emit the machine-readable CAPABILITY
+    // MANIFEST (agent::BuildCapabilityManifest) — the discovery + agent-verify contract enumerating the
+    // engine's major capability families (name/flag/golden/moat/desc) from an in-code registry. Pure CPU,
+    // no GPU/scene/Registry, deterministic + backend-agnostic. Handled early (before device init), like
+    // --agent-api. The verify.ps1 byte-golden block is the authoritative compare.
+    bool capabilityManifest = false;
+    const char* capabilityManifestPath = nullptr;
     // --agent-query <cmds.json> <out.json> (Slice DX2): build the default scene, run the JSON query
     // array via scene::RunQueries, write the deterministic {request,response} array to <out.json>
     // (LF-clean), print the 4 DX2 proofs, exit. The read half of the agent request/response loop.
@@ -3244,6 +3252,16 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--ed1-dry-run") == 0) {
             editor = true;
             ed1DryRun = true;
+        }
+        // Slice AX2 (--capability-manifest [out]): emit the machine-readable capability manifest. A
+        // SEPARATE `if` (the else-if ladder above is at MSVC's C1061 block-nesting limit). Takes an
+        // OPTIONAL output path (else stdout); handled headlessly before device init, like --agent-api.
+        if (std::strcmp(argv[i], "--capability-manifest") == 0) {
+            capabilityManifest = true;
+            if (i + 1 < argc && std::strncmp(argv[i + 1], "--", 2) != 0) {
+                capabilityManifestPath = argv[i + 1];
+                ++i;
+            }
         }
         // Slice ED2 (interactive authoring panels): --ed2-dry-run. A SEPARATE `if` (the else-if ladder
         // is at MSVC's C1061 limit). Headless synthetic-input proof that the flow/sequencer/widget
@@ -6160,6 +6178,65 @@ int main(int argc, char** argv) {
                     contentHash.c_str());
 
         if (agentApiPath) std::printf("agent-api: wrote %s\n", agentApiPath);
+        return 0;
+    }
+
+    // --capability-manifest [outpath] (Slice AX2, FLAGSHIP #31): emit the machine-readable CAPABILITY
+    // MANIFEST (agent::BuildCapabilityManifest) — the discovery + agent-verify contract. Fully headless
+    // (no window/GPU/scene), deterministic + backend-agnostic. Writes to outpath (or stdout), prints the
+    // AX2 proof lines + exits. The verify.ps1 byte-golden block is the authoritative compare; this path
+    // is the artifact emitter + self-check (determinism + the manifest-doesn't-lie golden cross-check).
+    if (capabilityManifest) {
+        const std::string text = agent::BuildCapabilityManifest();
+
+        // Emit the artifact (LF-only via binary; matches the other text goldens' storage).
+        if (capabilityManifestPath) {
+            std::ofstream f(capabilityManifestPath, std::ios::binary);
+            if (!f) {
+                std::fprintf(stderr, "FATAL: cannot write capability-manifest output '%s'\n",
+                             capabilityManifestPath);
+                return 1;
+            }
+            f << text;
+        } else {
+            std::fputs(text.c_str(), stdout);
+        }
+
+        const size_t caps   = agent::CapabilityCount();
+        const size_t groups = agent::CapabilityGroupCount();
+
+        // PROOF 1 (determinism): two independent builds are byte-identical.
+        if (agent::BuildCapabilityManifest() != text) {
+            std::fprintf(stderr, "FATAL: capability-manifest determinism FAILED (runs differ)\n");
+            return 1;
+        }
+        std::printf("ax2-capability-manifest: {schemaVersion:1, groups:%zu, capabilities:%zu, "
+                    "contentHash:%s} two runs BYTE-IDENTICAL\n",
+                    groups, caps, agent::ContentHash().c_str());
+
+        // PROOF 2 (byte-golden MATCH): compare the live manifest against the committed golden if present
+        // (the controller bakes it; before that this is a soft note, not a hard fail — the verify.ps1
+        // block is authoritative). cwd-relative, the path verify.ps1 uses.
+        {
+            const char* goldenPath = "tests/golden/agent/capability_manifest.json";
+            std::ifstream g(goldenPath, std::ios::binary);
+            if (g) {
+                std::string golden((std::istreambuf_iterator<char>(g)),
+                                   std::istreambuf_iterator<char>());
+                if (golden != text) {
+                    std::fprintf(stderr, "FATAL: capability-manifest byte-golden MISMATCH vs %s\n",
+                                 goldenPath);
+                    return 1;
+                }
+                std::printf("ax2-capability-manifest: byte-golden MATCH\n");
+            } else {
+                std::printf("ax2-capability-manifest: golden %s not present yet (controller bakes it)\n",
+                            goldenPath);
+            }
+        }
+
+        if (capabilityManifestPath)
+            std::printf("capability-manifest: wrote %s\n", capabilityManifestPath);
         return 0;
     }
 
