@@ -23,10 +23,19 @@ Companion to `GAP_CLOSING_ROADMAP.md` (the parity work) — this document is the
 | Netcode | lockstep + rollback proven over *every* sim family |
 | GitHub backlog | cleared (1 open, environment-blocked) |
 
-**Honest weaknesses:** no shipped game; content proven at fixture scale (~144 instances, 8 lights,
-hand-authored LODs), never a Sponza; the interactive editor is 60% built (UI plumbing missing);
-no real network transport (simulated channel only); no TSR upscaling; no mobile/console; zero
-external users; one maintainer.
+**Shipped since this review (the moat, productized):** ✅ **a real game** — a deterministic rollback-physics
+knockout duel (`--game1-duel`, golden `game1_duel`) composing the whole moat stack; ✅ **provable anti-cheat**
+by server re-simulation (`--ac1-verify`, golden `ac1_verify`); ✅ **what-if fork replay** — bit-exact
+counterfactual timelines (`--fk1-fork`, golden `fk1_fork`); ✅ **real UDP transport** for the rollback netcode
+(`--nw1-udp`, golden `nw1_udp`); ✅ **runnable benchmarks** — the six "proofs UE5 loses" as a ctest binary
+(`benchmarks/`, `hf_moat_proofs`). Phase 0 (the game), the first Rollback-Kit step (real UDP), and Phase 3 (the
+benchmark suite) are now on the board (see §3).
+
+**Honest weaknesses (still open):** the game is a **headless deterministic match simulation** — no live input
+window / interactive play loop yet; content proven at fixture scale (~144 instances, 8 lights, hand-authored
+LODs), never a Sponza; the interactive editor is 60% built (UI plumbing missing); real UDP ships but the
+committed gate is a same-process loopback (the two-process run is a documented script); no TSR upscaling; no
+mobile/console; zero external users; one maintainer.
 
 **The strategic read:** the weaknesses are all *productization*; the strengths are all *structural*.
 That asymmetry is the plan.
@@ -65,14 +74,18 @@ irrelevant, expand along adjacencies, let the incumbent's architecture prevent p
 
 ## 3. The plan
 
-### Phase 0 — Ship a game (the credibility gate)
-An engine without a shipped game beats nothing. Build one **small, complete, playable game** that
-is impossible-in-UE5 by construction: a **rollback-netcode physics arena** (two players, deterministic
-rigid/fracture/fluid interactions, instant rollback, replay files that re-simulate bit-exact anywhere).
-Built agent-first, golden-gated, on the existing vehicle/fpx/fract/couple substrate + the flow VM for
-game logic + seq for cinematics + widget UI for menus.
-*Deliverable:* an itch.io-shippable binary + a "this replay re-simulates bit-identically on your
-machine" demo. **The proof is a game, not a test suite.**
+### Phase 0 — Ship a game (the credibility gate) — ✅ FIRST GAME SHIPPED
+An engine without a shipped game beats nothing. **Shipped:** GAME1 (`engine/game/duel.h`, golden
+`game1_duel`, `--game1-duel`) — a **small, complete, deterministic rollback-physics knockout duel** that is
+impossible-in-UE5 by construction: two rigid-body avatars, a shove ability (GAS1 cost/cooldown), a stun tag
+(GT1), gameplay cues (GC1), best-of-3 rounds, ring-out wins. It composes the whole moat stack (bit-exact
+`fpx` physics + whole-world lockstep/rollback + FK1 what-if fork + AC1 anti-cheat) into one deliverable with a
+pinned match digest `0x78123003c3a55a37`. Built agent-first, golden-gated, on the existing fpx/verdict
+substrate + the GAS1/GT1/GC1 gameplay framework.
+*What's shipped vs the original deliverable:* the game **is** the "this match re-simulates bit-identically"
+proof (composed with `benchmarks/`), and it is provably fair, fork-able, and rollback-replayable. *Still to
+do:* a **live interactive input window / itch.io-shippable playable binary** — GAME1 is a headless
+deterministic match simulation today. **The proof is a game, not a test suite** — and it now exists.
 
 ### Phase 1 — Finish the weapon (parity table stakes)
 Execute `GAP_CLOSING_ROADMAP.md` Tiers 1–2 (already specced): **ED1-ED6** complete the interactive
@@ -85,23 +98,38 @@ deterministic TSR. Everything stays golden-verified.
 - **The Rollback Kit** ("GGPO for a whole engine"): NW1-NW4 real UDP transport + dedicated-server
   harness over the existing deterministic substrate. Every sim family becomes rollback-multiplayer
   out of the box — fighters, RTS, sports, racing (vehicles already lockstep-proven). No other engine
-  ships this.
+  ships this. **NW1 shipped (the first step):** real UDP transport (`engine/net/udp_transport.h`, golden
+  `nw1_udp`, `--nw1-udp`) — Winsock/BSD datagrams behind the same transport interface, so two peers converge
+  to the identical match digest over real `127.0.0.1` UDP despite injected reorder/duplicate/loss. Real
+  sockets are the one documented nondeterministic-I/O exception; the outcome digest stays bit-exact because
+  the rollback layer (NS3-6) tolerates arrival order + loss-with-resend. *Committed gate:* a same-process
+  two-socket loopback (the true two-process run is `benchmarks/udp_two_process.md`); NW2-NW4 (a
+  dedicated-server harness) remain.
 - **The Agent SDK** (flagship DX, shipped — now market it as the product): the headless, golden-gated,
   text-first dev loop packaged for AI-agent game development. Docs positioned at agents, not just
   humans: machine-readable capability maps (CAPABILITIES.md exists), deterministic verification
   hooks, one-command proof runs. First-mover in a category with no incumbent.
 
-### Phase 3 — Pick fights we win (reproducible benchmarks as marketing)
+### Phase 3 — Pick fights we win (reproducible benchmarks as marketing) — ✅ BENCHMARK SUITE SHIPPED
 Publish head-to-head, *runnable* comparisons UE5 structurally loses — in this repo's own ethos,
-every claim ships with the script that proves it:
-1. **The desync test:** identical inputs, two machines — UE5 Chaos diverges, HF is bit-identical.
-2. **The replay test:** a 10-minute gameplay replay file re-simulated on Windows/Mac/Linux — same
-   final state hash on all three.
-3. **The bandwidth test:** server-authoritative physics — HF sends inputs (bytes/tick), state-sync
-   engines send snapshots (kilobytes/tick).
+every claim ships with the script that proves it. **Shipped:** `benchmarks/` — a runnable proof binary
+(`moat_proofs.cpp`, ctest target `hf_moat_proofs`, run by `scripts/verify.ps1` + `benchmarks/run_all.ps1` /
+`run_all.sh`) that asserts **six** pinned deterministic outcomes and exits 0 iff all pass, each stating the
+structural reason UE5 is disqualified. It is a runnable proof binary, not a golden image.
+1. ✅ **The desync test** *(proof 1 cross-platform determinism + proof 2 desync detection)*: identical inputs,
+   two peers — HF is bit-identical (`DigestSnapshot 0x76a37a56d256c401`); `DesyncDetector` catches an injected
+   divergence at the exact tick. UE5 Chaos diverges.
+2. ✅ **The replay test** *(proof 4 reproducible counterfactual + `DETERMINISM_THREE_PLATFORMS.md`)*: a recorded
+   match re-simulates bit-for-bit; the same pure-core digests already reproduce on Windows/Mac/Linux (135/135
+   on Linux/gcc). *(Full three-machine same-hash demo needs three machines — each leg reproducible.)*
+   Also shipped beyond the original plan: **provable anti-cheat** (proof 3) and **reproducible procgen** (proof 5).
+3. ✅ **The bandwidth test** *(proof 6 inputs << state)*: server-authoritative physics — HF sends inputs
+   (48 B for the whole 24-tick stream) vs a state-sync engine's full snapshot every tick (884 B/tick × 24) —
+   ~442× for this scene. *(A specific-scene measurement, not a universal ratio.)*
 4. **The agent trial:** an AI agent implements + verifies a gameplay feature end-to-end, headless —
-   wall-clock HF vs UE5.
+   wall-clock HF vs UE5. *(Not yet in the benchmark binary — future.)*
 5. **The CI test:** cold clone → fully verified build (all goldens green) — minutes vs hours.
+   *(Not yet packaged as a benchmark — future.)*
 
 ### Phase 4 — Ecosystem seeding (the long game)
 Permissive license vs UE5's 5% royalty; the getting-started path (exists) hardened by external
@@ -113,10 +141,10 @@ not generic gamedev. Each vertical win is a case study the next one cites.
 
 | Phase | Runs | Done when |
 |---|---|---|
-| P0 game | first; everything serves it | a stranger plays it online; a replay re-simulates bit-exact on 3 OSes |
+| P0 game | first; everything serves it | a stranger plays it online; a replay re-simulates bit-exact on 3 OSes — 🟡 **first game shipped** (`game1_duel`, deterministic + replayable + provably fair); live-input/online play still to do |
 | P1 parity | interleaved with P0 (the game *needs* the editor + real content) | Sponza in a launchable editor at 60fps; TSR shipping |
-| P2 kits | after P0 proves the loop | `create-hf-game --rollback` works; Agent SDK has an external agent shipping a feature |
-| P3 benchmarks | as each proof becomes runnable | all 5 published with scripts; nobody refutes them |
+| P2 kits | after P0 proves the loop | `create-hf-game --rollback` works; Agent SDK has an external agent shipping a feature — 🟡 **real UDP transport shipped** (`nw1_udp`); dedicated-server harness (NW2-4) still to do |
+| P3 benchmarks | as each proof becomes runnable | all 5 published with scripts; nobody refutes them — 🟡 **suite shipped** (`benchmarks/`, `hf_moat_proofs`): the desync, replay, and bandwidth proofs run; agent-trial + CI-time proofs still to do |
 | P4 ecosystem | continuous after P0 | 10 external users in moat verticals; first external contribution merged |
 
 ## 5. What we refuse to do

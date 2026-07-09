@@ -14,7 +14,7 @@ backends, no per-platform drift.
 > 2. **Determinism as a first-class feature.** A fixed-point (Q16.16) physics / animation / AI stack produces
 >    *byte-identical* state on every platform and replays from inputs alone.
 >
-> Backed by **371 deterministic golden-image regression tests** (each diffs `0.0000` cross-vendor), three byte-exact
+> Backed by **376 deterministic golden-image regression tests** (each diffs `0.0000` cross-vendor), three byte-exact
 > data goldens (engine-state JSON, material-graph JSON, audio WAV), a large pure-C++-core suite that runs clean under
 > AddressSanitizer, and a graphics-validation-clean (core + synchronization) invariant across every showcase.
 
@@ -53,7 +53,7 @@ backends, no per-platform drift.
 | **Language / std** | C++20 |
 | **GPU backends** | Vulkan 1.3 (Windows) · Apple Metal (macOS, Apple Silicon) — one HLSL source → SPIR-V + MSL |
 | **Determinism** | Q16.16 fixed-point simulation, bit-identical CPU / Vulkan / Metal, lockstep + rollback replayable |
-| **Verification** | 371 golden images @ `DIFF 0.0000` · pure-C++-core test suite · AddressSanitizer-clean · graphics-validation-clean |
+| **Verification** | 376 golden images @ `DIFF 0.0000` · pure-C++-core test suite · AddressSanitizer-clean · graphics-validation-clean |
 | **Footprint** | header-only simulation models, slice-by-slice growth, zero backend symbols above the RHI seam |
 | **Repo** | `github.com/hassard0/Hazard-Forge` |
 
@@ -155,6 +155,35 @@ lockstep/rollback proof → lit 3D render` — and lands bit-identical on both b
 Each capability proves its determinism as a hard test — *two peers fed only an input stream converge byte-identical,
 and a rollback re-simulates from a snapshot bit-for-bit* — and ships a lit 3D render as the visual payoff.
 
+### Beyond parity — the determinism moat, now shipping as a game
+
+The determinism above is not just a substrate: it now ships as capabilities a floating-point engine is *structurally*
+disqualified from, not merely behind. UE5's Chaos physics is float — FPU evaluation order, fused-multiply-add
+contraction, and vendor math libraries diverge machine-to-machine — so a server cannot re-derive a client's outcomes
+bit-for-bit, and a reproducible counterfactual has no meaning. Hazard Forge's integer core makes all of the following
+real and backed by a committed golden or a runnable proof:
+
+- **Ships a real deterministic rollback game.** `--game1-duel` (golden `game1_duel`) is a complete best-of-3
+  knockout duel — two rigid-body avatars, a shove ability with cost/cooldown, a stun tag, cues, ring-out wins —
+  composing the entire moat stack into one game that is bit-exact deterministic, rollback-replayable, fork-able, and
+  provably fair. *(Honest scope: a headless deterministic match simulation + the proofs — no live input window yet.)*
+- **Provable anti-cheat by re-simulation.** `--ac1-verify` (golden `ac1_verify`): a server re-simulates a suspect
+  client's input stream and rejects a cheater at the *exact tick of divergence*. UE5 can't re-derive float physics
+  bit-for-bit. *(Boundary: proves simulation integrity, not input-level cheats like an aimbot.)*
+- **What-if replay.** `--fk1-fork` (golden `fk1_fork`): rewind a recorded match, change one input, and re-simulate a
+  bit-exact counterfactual timeline — shared prefix byte-identical, branches diverge causally, each reproducible.
+- **Rollback netcode over real UDP.** `--nw1-udp` (golden `nw1_udp`): two peers converge to the identical match
+  digest over real `127.0.0.1` datagrams even with injected reorder/duplicate/loss. *(The one nondeterministic-I/O
+  exception: real sockets — but the outcome digest is bit-exact; the committed gate is a same-process loopback, with
+  the true two-process run documented in `benchmarks/udp_two_process.md`.)*
+- **Runnable proofs UE5 loses (`benchmarks/`).** `ctest -R hf_moat_proofs` (or `benchmarks/run_all.ps1` / `run_all.sh`)
+  runs six pure-CPU proofs — cross-platform determinism, desync detection, provable anti-cheat, reproducible
+  counterfactual, reproducible procgen, and rollback bandwidth (inputs << state) — each stating the structural reason
+  UE5 is disqualified. It is a runnable proof binary, not a golden image, and exits 0 iff all six pass.
+
+See `docs/BEAT_UE5_PLAN.md` for the full strategy and `docs/CAPABILITIES.md` ("Beyond parity — the determinism moat")
+for the caveated capability map.
+
 ---
 
 ## How it compares to Unreal Engine 5
@@ -166,8 +195,11 @@ makes one deliberate, uncommon set of guarantees its whole reason for being:
 | Capability | Unreal Engine 5 (typical) | Hazard Forge |
 | --- | --- | --- |
 | Simulation determinism | Floating-point; varies run-to-run and machine-to-machine | Integer fixed-point; bit-identical every run and every platform |
-| Cross-platform reproducibility | Not guaranteed at the byte level | Byte-identical CPU ↔ Vulkan ↔ Metal, proven by 371 golden images |
-| Lockstep / rollback netcode | Hard — float simulations diverge across peers | Built in — every simulation replays from inputs; rollback re-sims bit-for-bit |
+| Cross-platform reproducibility | Not guaranteed at the byte level | Byte-identical CPU ↔ Vulkan ↔ Metal, proven by 376 golden images |
+| Lockstep / rollback netcode | Hard — float simulations diverge across peers | Built in — every simulation replays from inputs; rollback re-sims bit-for-bit, now proven over **real UDP** (`--nw1-udp`) |
+| Provable anti-cheat by re-simulation | Not possible — a server can't re-derive float physics bit-for-bit | Server re-simulates a client's inputs, rejects a cheater at the exact divergence tick (`--ac1-verify`) — proves *simulation integrity*, not input-level cheats |
+| Reproducible what-if / counterfactual replay | Not possible — float has no reproducible re-derivation | Rewind, change one input, re-simulate a bit-exact counterfactual timeline (`--fk1-fork`) |
+| A shipped game exercising all of the above | — | A deterministic rollback-physics knockout duel (`--game1-duel`) + runnable proofs UE5 loses (`benchmarks/`, `ctest -R hf_moat_proofs`) |
 | Scope of determinism | Mostly gameplay logic | The whole simulation stack: rigid bodies, cloth, fluid, granular media, fracture, ragdolls, vehicles, crowds, convex contacts |
 | Headless / CI verification | Manual and limited | First-class: every feature is a golden-image regression that must diff `0.0000` |
 | Renderer portability | Multiple backends, engine-internal | One engine over a clean RHI seam; Vulkan + Metal from a single HLSL source |
@@ -181,7 +213,7 @@ you need a turnkey AAA content pipeline today, a mature engine is the pragmatic 
 
 ## How correctness is verified
 
-- **Golden images (371).** Each is one headless `visual_test` flag compared to its committed reference at
+- **Golden images (376).** Each is one headless `visual_test` flag compared to its committed reference at
   threshold `0.0` — deterministic, two runs diff `0.0000`. The same scene on Windows/Vulkan must match the macOS/
   Metal reference cross-vendor.
 - **Byte-exact data goldens (3).** The engine-state JSON (`--introspect`), the material-graph JSON, and the audio
@@ -190,8 +222,10 @@ you need a turnkey AAA content pipeline today, a mature engine is the pragmatic 
   simulation model, codegen, networking, audio, editor — that runs clean under AddressSanitizer.
 - **Graphics-validation-clean.** Every showcase runs under the core + synchronization validation layers with zero
   errors; the render graph's auto-inserted barriers are proven hazard-free.
+- **Runnable moat proofs (`benchmarks/`).** A pure-CPU proof binary (`hf_moat_proofs`, run by `verify.ps1` as a ctest
+  target) asserts six pinned deterministic outcomes UE5 structurally cannot reproduce; it exits 0 iff all six pass.
 - **One-command cross-platform gate.** `scripts/verify.ps1` runs the Windows/Vulkan tests + the data-golden byte
-  matches, then drives a macOS machine over SSH to build the Metal target once and compare **all 371** references
+  matches, then drives a macOS machine over SSH to build the Metal target once and compare **all 376** references
   at `DIFF 0.0000`, printing a per-golden table and an overall `VERIFY: PASS/FAIL`.
 
 ---
@@ -251,7 +285,7 @@ scripts\verify.ps1
 ```
 
 Runs the Windows/Vulkan tests (plus the engine-state-JSON and audio-WAV byte matches) locally and drives a macOS
-machine over SSH to build the Metal target once and compare **all 371** references at threshold `0.0`. Prints a
+machine over SSH to build the Metal target once and compare **all 376** references at threshold `0.0`. Prints a
 per-golden DIFF table and an overall `VERIFY: PASS/FAIL`. (`-SkipWindows` / `-SkipMac` run one half.)
 
 ---
@@ -329,7 +363,8 @@ hazard-forge/
 ├── samples/hello_triangle/     Vulkan sample: every showcase via --*-shot capture + --fly + --introspect
 ├── metal_headless/             Standalone no-Conan/no-SDL Metal target (visual_test, every showcase)
 ├── tests/                      Pure unit tests + golden/{metal,introspect,material,audio}
-├── scripts/verify.ps1          Cross-platform gate: Windows tests + data goldens + Mac 371-image compare
+├── scripts/verify.ps1          Cross-platform gate: Windows tests + data goldens + Mac 376-image compare
+├── benchmarks/                 Runnable "proofs UE5 structurally loses" — moat_proofs (ctest hf_moat_proofs) + run_all scripts
 ├── ci/                         Staged GitHub Actions workflow (see ci/README.md)
 └── docs/                       ARCHITECTURE.md + per-slice specs/plans
 ```
