@@ -485,6 +485,17 @@ int main(int argc, char** argv) {
     // + physical sky) rendered from the start pose and captured to a BMP, then exit — the verifiable
     // artifact / regression hook for the interactive path. Own parse loop below (MSVC C1061).
     const char* sponzaExploreShotPath = nullptr;
+    // Slice GDW1 — AN INTERACTIVE PLAYABLE WINDOWED VERSION of the GAME1 deterministic rollback-physics
+    // duel. --duel-play opens a window and runs the duel.h match live at a fixed timestep from 2-player
+    // hotseat keyboard input (P1 WASD+Space, P2 arrows+Enter), rendering the arena LIT 3D; ESC quits,
+    // R restarts. --duel-play-replay <demo> plays back a recorded match demo (the live replay proof).
+    // --duel-play-headless-check drives the CANONICAL scripted inputs through the SAME incremental
+    // RunDuelRound stepping the window uses and asserts the pinned GAME1 matchDigest (the determinism
+    // regression proving the interactive front-end did not perturb the gated sim). Own parse loops below
+    // (MSVC C1061). duel.h/fpx.h/verdict.h/replay.h BYTE-UNTOUCHED — the handler composes them read-only.
+    bool duelPlay = false;
+    const char* duelPlayReplayPath = nullptr;
+    bool duelPlayHeadlessCheck = false;
     // Slice SC3 (GAP_CLOSING Tier 2 — SPONZA THROUGH THE VIRTUAL-GEOMETRY STACK): --sc3-stack-shot
     // <out.bmp> pushes the REAL Sponza's heterogeneous geometry through meshlet decomposition ->
     // per-cluster frustum cull (SC1 hero camera) -> auto-LOD (top-10 meshes) and renders the
@@ -3376,6 +3387,18 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Slice GDW1: --duel-play / --duel-play-replay <demo> / --duel-play-headless-check. Own parse loops
+    // (the else-if ladder is at the MSVC C1061 nested-block limit — the SC1/sponza-explore pattern).
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--duel-play") == 0) { duelPlay = true; break; }
+    }
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--duel-play-replay") == 0) { duelPlayReplayPath = argv[i + 1]; break; }
+    }
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--duel-play-headless-check") == 0) { duelPlayHeadlessCheck = true; break; }
+    }
+
     // Slice SC3 (GAP_CLOSING Tier 2 — SPONZA THROUGH THE VIRTUAL-GEOMETRY STACK): --sc3-stack-shot
     // <out.bmp>. Parsed in its OWN loop (the big else-if ladder above is at the MSVC C1061
     // nested-block limit). The model path is baked (HF_SPONZA_MODEL_PATH — the gitignored fetched
@@ -6076,6 +6099,74 @@ int main(int argc, char** argv) {
 
         if (agentApiPath) std::printf("agent-api: wrote %s\n", agentApiPath);
         return 0;
+    }
+
+    // Slice GDW1 — DETERMINISM REGRESSION (--duel-play-headless-check): drive the CANONICAL scripted
+    // MakeRoundScript inputs through the EXACT SAME incremental-RunDuelRound stepping the interactive
+    // window uses (append tick t, re-run the round to t+1 — the window's per-tick drive), tally the
+    // best-of-3 score + recompute the matchDigest EXACTLY like duel::RunDuelMatch, and assert it equals
+    // BOTH the frozen duel::RunDuelMatch() digest AND the pinned GAME1 constant. This proves the window
+    // front-end drives the IDENTICAL gated deterministic sim — a cheap gate that the interactive path
+    // (the incremental stepping) did not perturb determinism. Pure CPU, NO window/device — returns
+    // before the render bootstrap (the dx1-agent-api convention). duel.h is used byte-verbatim.
+    if (duelPlayHeadlessCheck) {
+        namespace duel    = hf::game::duel;
+        namespace verdict = hf::game::verdict;
+        namespace tags    = hf::game::tags;
+        const uint64_t kPinnedMatchDigest = 0x78123003c3a55a37ull;   // GAME1's pinned best-of-3 matchDigest
+
+        const tags::TagRegistry reg = duel::MakeDuelRegistry();
+        verdict::DigestFnv md;
+        uint32_t score[2] = {0, 0};
+        int      matchWinner = duel::kDraw;
+        uint32_t roundsPlayed = 0;
+        for (uint32_t r = 0; r < duel::kRounds; ++r) {
+            verdict::VerdictWorld world0;
+            const duel::DuelScene scene = duel::BuildDuelScene(world0);
+            const std::vector<duel::DuelInput> fullA = duel::MakeRoundScript(r, 0);
+            const std::vector<duel::DuelInput> fullB = duel::MakeRoundScript(r, 1);
+            // INCREMENTAL drive — exactly the window's per-tick model: grow the live-input vectors one
+            // tick at a time and re-run the round to the current length. The FINAL call (length ==
+            // kRoundTicks) is bit-identical to RunDuelMatch's single RunDuelRound(...kRoundTicks) call.
+            std::vector<duel::DuelInput> inA, inB;
+            duel::RoundResult rr;
+            for (uint32_t t = 0; t < duel::kRoundTicks; ++t) {
+                inA.push_back(t < fullA.size() ? fullA[t] : duel::DuelInput{});
+                inB.push_back(t < fullB.size() ? fullB[t] : duel::DuelInput{});
+                rr = duel::RunDuelRound(scene, reg, inA, inB, (uint32_t)inA.size());
+            }
+            ++roundsPlayed;
+            const int win = rr.verdictOut.winner;
+            if (win == 0 || win == 1) ++score[win];
+            md.mix(rr.traceDigest);
+            md.mix32(score[0]); md.mix32(score[1]); md.sep();
+            if (score[0] >= duel::kWinThreshold) { matchWinner = 0; break; }
+            if (score[1] >= duel::kWinThreshold) { matchWinner = 1; break; }
+        }
+        const uint64_t interactiveDigest = md.h;
+        const uint64_t frozenDigest = duel::RunDuelMatch().matchDigest;   // the GAME1-gated reference
+        const bool matchesFrozen = (interactiveDigest == frozenDigest);
+        const bool matchesPinned = (interactiveDigest == kPinnedMatchDigest);
+        std::printf("duel-play-headless-check: incremental-window-drive matchDigest:0x%016llx "
+                    "score %u-%u winner=Player%d rounds=%u\n",
+                    (unsigned long long)interactiveDigest, score[0], score[1], matchWinner + 1,
+                    roundsPlayed);
+        std::printf("duel-play-headless-check: == RunDuelMatch():%s (0x%016llx) | == pinned GAME1:%s "
+                    "(0x%016llx)\n",
+                    matchesFrozen ? "YES" : "NO", (unsigned long long)frozenDigest,
+                    matchesPinned ? "YES" : "NO", (unsigned long long)kPinnedMatchDigest);
+        if (!matchesFrozen) {
+            std::fprintf(stderr, "FATAL: duel-play interactive front-end PERTURBED the deterministic sim "
+                                 "(incremental drive != RunDuelMatch)\n");
+            return 1;
+        }
+        if (!matchesPinned) {
+            std::fprintf(stderr, "WARNING: duel-play matchDigest != the pinned GAME1 constant "
+                                 "(the pin may be stale; the front-end still drives the frozen sim)\n");
+        }
+        std::printf("duel-play-headless-check: PASS — the interactive stepping drives the IDENTICAL "
+                    "gated deterministic sim\n");
+        return matchesPinned ? 0 : 2;   // 0 = full pin match; 2 = drives-frozen-sim but pin stale
     }
 
     try {
@@ -63860,6 +63951,406 @@ int main(int argc, char** argv) {
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vd6GameShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
+        }
+
+        // === Slice GDW1 — AN INTERACTIVE PLAYABLE WINDOWED DUEL (--duel-play / --duel-play-replay <demo>) ===
+        // GAME1 (game/duel.h) is a HEADLESS deterministic best-of-3 knockout duel + the moat proofs. GDW1 makes
+        // it ACTUALLY PLAYABLE: it reuses the shared window+device (the --sponza-explore/--fly bootstrap), runs a
+        // FIXED-TIMESTEP game loop that steps the duel.h sim from LIVE 2-player hotseat keyboard input, and draws
+        // the arena LIT 3D through the EXISTING lit + shadow + sky + post pipeline (the VD6 convention — NO new
+        // shader, NO new RHI). This is VERIFY-BY-LAUNCH (like --sponza-explore); the deterministic CORE is
+        // already golden-gated by GAME1, and --duel-play-headless-check pins that this front-end drives the
+        // IDENTICAL sim. duel.h/fpx.h/verdict.h/replay.h are BYTE-UNTOUCHED — this handler composes them.
+        //
+        // THE SIM DRIVE (deterministic, tick-exact): the duel.h DuelInput is {moveX, shove}. Each fixed sim tick
+        // we poll held keys into a DuelInput per player, APPEND it to the round's growing live-input scripts, and
+        // re-run duel::RunDuelRound(scene, reg, inA, inB, roundTick) — the window's per-tick model is exactly the
+        // incremental drive --duel-play-headless-check pins against RunDuelMatch. RunDuelRound is the SAME frozen
+        // GAME1 entry (ability/tag/cue gating + the lowered verdict physics stream); we never re-implement it. The
+        // render world is a bit-exact re-sim of the round's emitted verdict command stream (ClonePeer +
+        // SimVerdictTick) turned into the LIT 3D soup by verdict::VerdictToRenderInstances (the ONE float crossing).
+        //
+        // CONTROLS: Player 1 = A/D move + Space/F shove; Player 2 = Left/Right move + Enter/Shift shove. R
+        // restarts the match, ESC quits. The fixed timestep runs at ~12 human-paced ticks/sec (the sim's dt/tick
+        // model is UNCHANGED — only the wall-clock PACING is chosen; the ticks stay discrete + deterministic).
+        //
+        // THE MOAT KICKER: the match-deciding round is RECORDED to a replay demo (duel::DuelReplayDemo -> the
+        // verdict ReplayFile JSON) on match end; --duel-play-replay <demo> re-simulates that demo deterministically
+        // (bit-exact final digest) rendered live — you played it, it's recorded, it's replayable (UE5 can't).
+        if (duelPlay || duelPlayReplayPath) {
+            using math::Mat4; using math::Vec3;
+            namespace duel    = hf::game::duel;
+            namespace verdict = hf::game::verdict;
+            namespace gjk     = hf::sim::gjk;
+            namespace tags    = hf::game::tags;
+            using verdict::fx;
+            const bool replayMode = (duelPlayReplayPath != nullptr);
+
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // ---- Reuse the EXISTING lit + shadow + sky + post pipeline wiring (the VD6 convention). ----
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get();
+            litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true;
+            litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;   // model(16) + material(metallic,rough,0,0)
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;   // model
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            const uint8_t whitePx[4] = {255, 255, 255, 255};
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto whiteTex   = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            // ---- A fixed 3/4 FRONT camera framing the arena: the platform x[-6,6] (ring |x|=5), the two avatars
+            // at spawn (+-2, 2), and the VOID below y=0 so knockouts (a body flung past the ring edge / into the
+            // void) are clearly visible. Rebuilt on resize via makeFd(aspect). ----
+            auto makeFd = [&](float asp) -> FrameData {
+                const Vec3 eye{7.5f, 8.5f, 18.0f};
+                const Vec3 center{0.0f, 1.5f, 0.0f};
+                FrameData fd{};
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, asp, 0.1f, 200.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = 0.35f; fd.lightDir[1] = -0.85f; fd.lightDir[2] = -0.40f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{0.35f, -0.85f, -0.40f});
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 30.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-12.0f, 12.0f, -12.0f, 12.0f, 1.0f, 64.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = asp;
+                return fd;
+            };
+            Mat4 identity = Mat4::Identity();
+
+            // ---- The game state (best-of-3 over fresh deterministic scenes — the RunDuelMatch shape). ----
+            const tags::TagRegistry reg = duel::MakeDuelRegistry();
+            verdict::VerdictWorld world0;
+            duel::DuelScene scene = duel::BuildDuelScene(world0);
+            uint32_t score[2] = {0, 0};
+            int      matchWinner = duel::kDraw;
+            uint32_t curRound = 0;
+            bool     matchOver = false;
+            std::vector<duel::DuelInput> inA, inB;
+            uint32_t roundTick = 0;
+            duel::RoundResult rr;
+            int lastKoAnnounced = -2;
+            // The recorded match-deciding round (the moat artifact).
+            std::vector<verdict::Command> recStream; uint32_t recTicks = 0; bool haveRec = false;
+
+            // ---- Replay-mode: parse the demo (verdict ReplayFile JSON) up front. ----
+            std::vector<verdict::Command> replayStream; uint32_t replayTicks = 0; std::string replayFinalDigest;
+            uint32_t replayTick = 0; bool replayVerified = false;
+            if (replayMode) {
+                std::FILE* f = std::fopen(duelPlayReplayPath, "rb");
+                if (!f) {
+                    std::fprintf(stderr, "FATAL: --duel-play-replay could not open '%s'\n", duelPlayReplayPath);
+                    device->WaitIdle(); return 1;
+                }
+                std::string text; std::fseek(f, 0, SEEK_END); long n = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+                if (n > 0) { text.resize((size_t)n); size_t got = std::fread(&text[0], 1, (size_t)n, f); text.resize(got); }
+                std::fclose(f);
+                const verdict::ReplayFile parsed = verdict::ParseReplay(text);
+                replayStream = parsed.stream; replayTicks = parsed.ticks; replayFinalDigest = parsed.finalDigest;
+                std::printf("--duel-play-replay: loaded %s {ticks:%u commands:%zu finalDigest:%s}\n",
+                            duelPlayReplayPath, replayTicks, replayStream.size(), replayFinalDigest.c_str());
+            }
+
+            // ---- Rebuild the render soup (VerdictToRenderInstances + score pips) into fresh VB/IB. ----
+            std::unique_ptr<rhi::IBuffer> soupVb, soupIb; uint32_t kIndexCount = 0;
+            auto rebuildSoup = [&](const verdict::VerdictWorld& rw) {
+                gjk::HullRenderMesh soup = verdict::VerdictToRenderInstances(rw);
+                // A floating scoreboard: one matte pip per round won (P1 blue left, P2 orange right), above the ring.
+                const float blue[3]   = {0.35f, 0.63f, 0.94f};
+                const float orange[3] = {0.94f, 0.59f, 0.27f};
+                for (uint32_t s = 0; s < score[0] && s < duel::kWinThreshold; ++s)
+                    verdict::AppendMarkerCube(soup, -3.6f - 1.0f * (float)s, 5.0f, 0.0f, 0.32f, blue);
+                for (uint32_t s = 0; s < score[1] && s < duel::kWinThreshold; ++s)
+                    verdict::AppendMarkerCube(soup, 3.6f + 1.0f * (float)s, 5.0f, 0.0f, 0.32f, orange);
+                std::vector<scene::Vertex> verts; verts.reserve(soup.verts.size());
+                for (const gjk::HullRenderVertex& hv : soup.verts) {
+                    scene::Vertex v{};
+                    v.pos[0] = hv.pos[0]; v.pos[1] = hv.pos[1]; v.pos[2] = hv.pos[2];
+                    v.color[0] = hv.color[0]; v.color[1] = hv.color[1]; v.color[2] = hv.color[2];
+                    v.uv[0] = 0.0f; v.uv[1] = 0.0f;
+                    v.normal[0] = hv.normal[0]; v.normal[1] = hv.normal[1]; v.normal[2] = hv.normal[2];
+                    v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+                    verts.push_back(v);
+                }
+                std::vector<uint32_t> indices(verts.size());
+                for (uint32_t k = 0; k < (uint32_t)verts.size(); ++k) indices[k] = k;
+                kIndexCount = (uint32_t)indices.size();
+                if (!verts.empty()) {
+                    rhi::BufferDesc vd; vd.size = (uint64_t)verts.size() * sizeof(scene::Vertex);
+                    vd.initialData = verts.data(); vd.usage = rhi::BufferUsage::Vertex;
+                    soupVb = device->CreateBuffer(vd);
+                    rhi::BufferDesc id; id.size = (uint64_t)indices.size() * sizeof(uint32_t);
+                    id.initialData = indices.data(); id.usage = rhi::BufferUsage::Index;
+                    soupIb = device->CreateBuffer(id);
+                } else { soupVb.reset(); soupIb.reset(); }
+            };
+
+            // Re-sim the current round/replay's emitted verdict stream to the current tick + rebuild the soup.
+            auto rebuildRenderWorld = [&]() {
+                const std::vector<verdict::Command>& stream = replayMode ? replayStream : rr.emittedStream;
+                const uint32_t simTicks = replayMode ? replayTick : roundTick;
+                verdict::VerdictWorld rw = verdict::ClonePeer(scene.world0Snap, scene.params);
+                for (uint32_t t = 0; t < simTicks; ++t) verdict::SimVerdictTick(rw, scene.params, stream, t);
+                rebuildSoup(rw);
+            };
+
+            auto resetMatch = [&]() {
+                score[0] = score[1] = 0; matchWinner = duel::kDraw; curRound = 0; matchOver = false;
+                scene = duel::BuildDuelScene(world0);
+                inA.clear(); inB.clear(); roundTick = 0; lastKoAnnounced = -2;
+                rr = duel::RoundResult{};
+                std::printf("[duel] --- NEW MATCH: round 0 --- (P1 A/D+Space, P2 arrows+Enter)\n");
+            };
+
+            if (replayMode) {
+                scene = duel::BuildDuelScene(world0);   // the deterministic scene the demo replays against
+                std::printf("--duel-play-replay: re-simulating the recorded match live — ESC to quit\n");
+            } else {
+                std::printf("--duel-play: PLAYABLE DETERMINISTIC DUEL — Player1 A/D move + Space/F shove, "
+                            "Player2 Left/Right move + Enter/Shift shove, R restart, ESC quit\n");
+                std::printf("[duel] --- round 0 --- shove your opponent past the ring edge (|x|>5) or into the void!\n");
+            }
+            std::fflush(stdout);
+            rebuildRenderWorld();   // the initial spawn frame
+
+            const fx kMoveImpulse = (fx)((int64_t)3 * (int64_t)verdict::kOne / 2);   // Q16.16 1.5 lateral nudge/tick
+            runtime::FixedTimestep clock(1.0f / 12.0f);   // ~12 human-paced deterministic sim ticks / sec
+            auto last = std::chrono::steady_clock::now();
+            bool running = true;
+            bool prevR = false;
+            int liveTicks = 0;
+
+            while (running) {
+                running = window.PumpEvents();
+                const runtime::InputState& in = window.Input();
+                if (in.Down(runtime::Key::Esc)) running = false;
+                if (window.ConsumeResized()) {
+                    device->WaitIdle();
+                    w = window.FramebufferWidth();
+                    h = window.FramebufferHeight();
+                    device->Swapchain().Recreate(w, h);
+                    rt = device->CreateRenderTarget(w, h);
+                    aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+                }
+                bool nowR = in.Down(runtime::Key::R);
+                if (nowR && !prevR && !replayMode) { resetMatch(); rebuildRenderWorld(); }
+                prevR = nowR;
+
+                auto now = std::chrono::steady_clock::now();
+                float dt = std::min(std::chrono::duration<float>(now - last).count(), 0.1f);
+                last = now;
+                int steps = clock.Tick(dt);
+
+                bool advanced = false;
+                for (int s = 0; s < steps; ++s) {
+                    if (matchOver) break;
+                    if (replayMode) {
+                        // Deterministic playback: advance one recorded tick.
+                        if (replayTick < replayTicks) { ++replayTick; advanced = true; }
+                        if (replayTick >= replayTicks) {
+                            matchOver = true;
+                            // The live replay proof: re-run lockstep over the demo stream -> the pinned final digest.
+                            bool ident = false;
+                            const std::string got = duel::DuelLockstep(scene, replayStream, replayTicks, &ident);
+                            replayVerified = (got == replayFinalDigest) && ident;
+                            std::printf("--duel-play-replay: playback complete — re-sim finalDigest:%s vs demo:%s "
+                                        "-> %s (lockstepIdentical:%s)\n",
+                                        got.c_str(), replayFinalDigest.c_str(),
+                                        replayVerified ? "MATCH (bit-exact deterministic replay)" : "MISMATCH",
+                                        ident ? "true" : "false");
+                            std::printf("--duel-play-replay: press ESC to quit\n");
+                            std::fflush(stdout);
+                        }
+                        continue;
+                    }
+                    // ---- LIVE game tick: poll held keys -> a DuelInput per player, append + re-run the round. ----
+                    duel::DuelInput a{}, b{};
+                    if (in.Down(runtime::Key::A))     a.moveX -= kMoveImpulse;
+                    if (in.Down(runtime::Key::D))     a.moveX += kMoveImpulse;
+                    a.shove = in.Down(runtime::Key::Space) || in.Down(runtime::Key::F);
+                    if (in.Down(runtime::Key::Left))  b.moveX -= kMoveImpulse;
+                    if (in.Down(runtime::Key::Right)) b.moveX += kMoveImpulse;
+                    b.shove = in.Down(runtime::Key::Enter) || in.Down(runtime::Key::Shift);
+                    inA.push_back(a); inB.push_back(b);
+                    ++roundTick; ++liveTicks; advanced = true;
+                    rr = duel::RunDuelRound(scene, reg, inA, inB, roundTick);   // the FROZEN GAME1 round entry
+                    if (rr.verdictOut.knockoutTick >= 0 && rr.verdictOut.knockoutTick != lastKoAnnounced) {
+                        lastKoAnnounced = rr.verdictOut.knockoutTick;
+                        std::printf("[duel] round %u KNOCKOUT @ tick %d — Player%d wins the round!\n",
+                                    curRound, rr.verdictOut.knockoutTick, rr.verdictOut.winner + 1);
+                    }
+                    if (roundTick >= duel::kRoundTicks) {
+                        const int win = rr.verdictOut.winner;
+                        if (win == 0 || win == 1) ++score[win];
+                        recStream = rr.emittedStream; recTicks = rr.ticks; haveRec = true;   // record this round
+                        std::printf("[duel] round %u complete — SCORE  P1 %u : %u P2\n", curRound, score[0], score[1]);
+                        std::fflush(stdout);
+                        if (score[0] >= duel::kWinThreshold) matchWinner = 0;
+                        else if (score[1] >= duel::kWinThreshold) matchWinner = 1;
+                        if (matchWinner != duel::kDraw || curRound + 1 >= duel::kRounds) {
+                            matchOver = true;
+                            if (matchWinner != duel::kDraw)
+                                std::printf("[duel] === MATCH OVER — Player%d WINS %u-%u! === Press R for a rematch, ESC to quit.\n",
+                                            matchWinner + 1, score[0], score[1]);
+                            else
+                                std::printf("[duel] === MATCH OVER — DRAW %u-%u === Press R for a rematch, ESC to quit.\n",
+                                            score[0], score[1]);
+                            // THE MOAT KICKER: write the deciding round to a replay demo (deterministic, replayable).
+                            if (haveRec) {
+                                verdict::VerdictWorld dw; duel::DuelScene dscene = duel::BuildDuelScene(dw);
+                                uint64_t demoHash = 0; bool replayOk = false;
+                                const std::string demoText =
+                                    duel::DuelReplayDemo(dscene, recStream, recTicks, &demoHash, &replayOk);
+                                const char* demoPath = "duel_play_match.demo.json";
+                                std::FILE* f = std::fopen(demoPath, "wb");
+                                if (f) {
+                                    std::fwrite(demoText.data(), 1, demoText.size(), f);
+                                    std::fclose(f);
+                                    std::printf("[duel] match recorded to %s {demoHash:0x%016llx replayOk:%s} — "
+                                                "verify with AC1 / fork with FK1; play it back with "
+                                                "--duel-play-replay %s\n",
+                                                demoPath, (unsigned long long)demoHash, replayOk ? "true" : "false",
+                                                demoPath);
+                                }
+                                std::fflush(stdout);
+                            }
+                        } else {
+                            ++curRound;
+                            scene = duel::BuildDuelScene(world0);   // fresh deterministic scene (round reset)
+                            inA.clear(); inB.clear(); roundTick = 0; lastKoAnnounced = -2;
+                            rr = duel::RoundResult{};
+                            std::printf("[duel] --- round %u ---\n", curRound);
+                        }
+                    }
+                }
+                if (advanced || steps > 0) rebuildRenderWorld();
+
+                // ---- Render: sky -> lit arena soup (matte, shadowed) -> post to swapchain. ----
+                FrameData fd = makeFd(aspect);
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        if (kIndexCount > 0 && soupVb && soupIb) {
+                            cmd.BindPipeline(*staticShadowPipeline);
+                            cmd.PushConstants(identity.m, sizeof(float) * 16);
+                            cmd.BindVertexBuffer(*soupVb);
+                            cmd.BindIndexBuffer(*soupIb);
+                            cmd.DrawIndexed(kIndexCount);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        if (kIndexCount > 0 && soupVb && soupIb) {
+                            cmd.BindPipeline(*litPipeline);
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = identity.m[k];
+                            pc[16] = 0.0f; pc[17] = 1.0f; pc[18] = 0.0f; pc[19] = 0.0f;   // matte (no iridescence)
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*whiteTex, *flatNormal);
+                            cmd.BindVertexBuffer(*soupVb);
+                            cmd.BindIndexBuffer(*soupIb);
+                            cmd.DrawIndexed(kIndexCount);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                graph.Execute(*device);   // composite -> swapchain -> present
+            }
+
+            if (replayMode)
+                std::printf("--duel-play-replay: exited (replayVerified:%s)\n", replayVerified ? "true" : "false");
+            else
+                std::printf("--duel-play: exited after %d live sim ticks (score %u-%u)\n",
+                            liveTicks, score[0], score[1]);
+            device->WaitIdle();
+            return (replayMode && !replayVerified) ? 1 : 0;
         }
 
         // --- Hull Narrowphase Hardening LOCKSTEP + ROLLBACK proof (--mf5-lockstep-shot <out.bmp>, Slice MF5,
