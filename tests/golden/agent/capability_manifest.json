@@ -1,0 +1,115 @@
+{
+  "schemaVersion": 1,
+  "engine": "Hazard Forge",
+  "thesis": "An AI agent can develop Hazard Forge end-to-end: discover capabilities here, drive each behind a headless flag, and verify its own change against a byte-identical golden oracle — no human, no GUI in the loop.",
+  "verifyContract": {
+    "loop": ["author", "build", "run-flag", "byte-compare-golden"],
+    "oracle": "a byte-identical golden (image or text) is the machine-checkable pass/fail; the digest is the correctness signal an agent reads without a human.",
+    "driver": "samples/hello_triangle (headless showcase flags) + ctest (pure-CPU deterministic tests)",
+    "harness": "scripts/verify.ps1",
+    "goldenDir": "tests/golden",
+    "howToVerify": "to add/verify capability X: run its flag F, byte-compare its golden G; equal bytes == PASS, any diff == FAIL.",
+    "moatVsUe5": "UE5 is structurally agent-hostile: a GUI-bound editor (no headless authored-scene->verify loop) and non-deterministic float simulation (no byte-identical golden oracle). HF is headless + deterministic by construction."
+  },
+  "moatProperties": ["deterministic", "lockstep-rollback", "cross-platform-bitexact", "reproducible", "headless-golden"],
+  "groups": [
+    {
+      "group": "deterministic-simulation",
+      "description": "Bit-exact, lockstep-replayable physics/sim (cross-platform) — the beyond-UE5 moat.",
+      "capabilities": [
+        { "name": "fixed-point-rigid-physics", "flag": "--fpx-render", "golden": "fpx_render", "moat": "lockstep-rollback", "description": "Q16.16 fixed-point rigid-body solver (bit-identical CPU/Vulkan/Metal)." },
+        { "name": "fixed-point-physics-lockstep", "flag": "--fpx-lockstep", "golden": "fpx_lockstep", "moat": "lockstep-rollback", "description": "Lockstep + rollback proof: two peers re-derive the pile bit-for-bit from inputs." },
+        { "name": "deterministic-cloth", "flag": "--cloth-render", "golden": "cloth_render", "moat": "lockstep-rollback", "description": "Position-based deterministic cloth (fixed-point PBD, lockstep-replayable)." },
+        { "name": "deterministic-fluid", "flag": "--fluid-render", "golden": "fluid_render", "moat": "lockstep-rollback", "description": "Position-based fluid (PBF) with a bit-exact density-constraint solve." },
+        { "name": "deterministic-granular", "flag": "--grain-render", "golden": "grain_render", "moat": "lockstep-rollback", "description": "Dry Coulomb-friction granular / sand (angle-of-repose), lockstep-replayable." },
+        { "name": "rigid-fluid-coupling", "flag": "--couple-render", "golden": "couple_render", "moat": "lockstep-rollback", "description": "Two-way rigid<->fluid coupling: a body buoyed/dragged by + displacing the fluid." },
+        { "name": "rigid-grain-coupling", "flag": "--cgrain-render", "golden": "cgrain_render", "moat": "lockstep-rollback", "description": "Two-way rigid<->grain coupling: a body sinks into + is supported by the sand bed." },
+        { "name": "grain-fluid-coupling", "flag": "--cgf-render", "golden": "cgf_render", "moat": "lockstep-rollback", "description": "Two-way grain<->fluid coupling (wet sand / mud / slurry)." },
+        { "name": "deterministic-fracture", "flag": "--fract-render", "golden": "fract_render", "moat": "lockstep-rollback", "description": "Rigid-body fracture/destruction, bit-exact + rollback-replayable (vs float Chaos)." },
+        { "name": "articulated-ragdoll", "flag": "--joint-ragdoll", "golden": "joint_ragdoll", "moat": "lockstep-rollback", "description": "Skeleton->ragdoll ball/cone joints; a bit-exact articulated mechanism." },
+        { "name": "vehicle-dynamics", "flag": "--vehicle-render", "golden": "vehicle_render", "moat": "lockstep-rollback", "description": "Deterministic sprung-wheel vehicle rig (traction + drive), lockstep-replayable." },
+        { "name": "continuous-collision", "flag": "--ccd-render", "golden": "ccd_render", "moat": "lockstep-rollback", "description": "Deterministic continuous collision / time-of-impact (bullet-through-paper)." },
+        { "name": "convex-collision", "flag": "--convex-render", "golden": "convex_render", "moat": "lockstep-rollback", "description": "Deterministic convex SAT + manifold + impulse solver." }
+      ]
+    },
+    {
+      "group": "rendering",
+      "description": "The AAA render pipeline, each feature behind a headless capture + committed golden.",
+      "capabilities": [
+        { "name": "physically-based-rendering", "flag": "--pbr", "golden": "pbr_helmet", "moat": "headless-golden", "description": "Metallic-roughness PBR (glTF DamagedHelmet showcase)." },
+        { "name": "image-based-lighting", "flag": "--ibl", "golden": "ibl_helmet", "moat": "headless-golden", "description": "HDR image-based lighting (prefiltered specular + irradiance)." },
+        { "name": "bloom", "flag": "--bloom", "golden": "bloom", "moat": "headless-golden", "description": "HDR threshold + separable-blur bloom." },
+        { "name": "screen-space-ambient-occlusion", "flag": "--ssao", "golden": "ssao", "moat": "headless-golden", "description": "Screen-space ambient occlusion." },
+        { "name": "screen-space-reflections", "flag": "--ssr", "golden": "ssr", "moat": "headless-golden", "description": "Screen-space reflections." },
+        { "name": "temporal-anti-aliasing", "flag": "--taa", "golden": "taa", "moat": "headless-golden", "description": "Temporal anti-aliasing (Halton jitter + history resolve)." },
+        { "name": "temporal-super-resolution", "flag": "--us2-tsr", "golden": "us2_tsr", "moat": "headless-golden", "description": "Temporal super-resolution upscaling." },
+        { "name": "dynamic-diffuse-gi", "flag": "--gi6-hero", "golden": "gi6_hero", "moat": "deterministic", "description": "DDGI-style dynamic diffuse global illumination (integer probe trace)." },
+        { "name": "virtual-shadow-maps", "flag": "--vsm-render", "golden": "vsm_atlas", "moat": "headless-golden", "description": "Clipmap virtual shadow maps." },
+        { "name": "point-shadows", "flag": "--point-shadow", "golden": "point_shadow", "moat": "headless-golden", "description": "Omnidirectional point-light shadow cubemaps." },
+        { "name": "volumetric-shadows", "flag": "--volshadows", "golden": "vol_shadows", "moat": "headless-golden", "description": "Froxel volumetric shadows." },
+        { "name": "contact-shadows", "flag": "--contactshadow", "golden": "contact_shadows", "moat": "headless-golden", "description": "Screen-space contact shadows." },
+        { "name": "skinned-animation", "flag": "--skinning", "golden": "skinning", "moat": "headless-golden", "description": "GPU skeletal skinning (joint-palette skinned mesh)." },
+        { "name": "ray-traced-shadows", "flag": "--rt3-shadow", "golden": "rt3_shadow", "moat": "deterministic", "description": "Deterministic integer ray-traced hard shadows." },
+        { "name": "ray-traced-hero", "flag": "--rt6-hero", "golden": "rt6_hero", "moat": "deterministic", "description": "Lit ray-traced hero capstone (deterministic RT pipeline)." },
+        { "name": "gpu-isosurface-meshing", "flag": "--mc-render", "golden": "mc_render", "moat": "deterministic", "description": "GPU Marching-Cubes isosurface meshing (voxel/SDF -> bit-exact mesh)." }
+      ]
+    },
+    {
+      "group": "gameplay-ai",
+      "description": "AI, navigation, crowds and character rigs — deterministic + lockstep where the moat applies.",
+      "capabilities": [
+        { "name": "behavior-tree-ai", "flag": "--ai6-render", "golden": "ai_render", "moat": "lockstep-rollback", "description": "Deterministic blackboard + decision-tree NPC agent (lit 3D render)." },
+        { "name": "ai-lockstep", "flag": "--ai5-lockstep", "golden": "ai5_lockstep", "moat": "lockstep-rollback", "description": "NPC AI lockstep + rollback (bit-identical replayable AI, vs float Detour)." },
+        { "name": "navmesh-pathfinding", "flag": "--nav-path", "golden": "nav_path", "moat": "deterministic", "description": "Recast/Detour-style navmesh + integer A* pathfinding." },
+        { "name": "navmesh-render", "flag": "--nav-render", "golden": "nav_render", "moat": "headless-golden", "description": "Navmesh generation pipeline capstone (lit 3D render)." },
+        { "name": "crowd-simulation", "flag": "--cr1-crowd", "golden": "cr1_crowd", "moat": "deterministic", "description": "Deterministic crowd simulation at 10k+ agents (O(N) grid separation)." },
+        { "name": "boids-flocking", "flag": "--boids-render", "golden": "boids_render", "moat": "lockstep-rollback", "description": "Deterministic boids flocking (neighbour grid), lockstep-replayable." },
+        { "name": "inverse-kinematics", "flag": "--ik6-render", "golden": "ik6_render", "moat": "deterministic", "description": "Deterministic IK control-rig (two-bone + FABRIK), fixed-point LUTs." },
+        { "name": "ik-lockstep", "flag": "--ik5-lockstep", "golden": "ik5_lockstep", "moat": "lockstep-rollback", "description": "IK-driven lockstep + rollback headline." }
+      ]
+    },
+    {
+      "group": "netcode",
+      "description": "The deterministic-lockstep netcode substrate (send inputs, re-simulate bit-for-bit).",
+      "capabilities": [
+        { "name": "deterministic-lockstep-match", "flag": "--vd5-net", "golden": "vd5_net", "moat": "lockstep-rollback", "description": "Gameplay-world lockstep: a peer re-simulates the whole match bit-for-bit." },
+        { "name": "friction-joint-lockstep", "flag": "--hf5-net", "golden": "hf5_net", "moat": "lockstep-rollback", "description": "Friction + joint hull lockstep + rollback." },
+        { "name": "network-transport-sim", "flag": "--netsim", "golden": "netsim", "moat": "reproducible", "description": "Deterministic network-transport simulation (loss/latency/jitter)." },
+        { "name": "client-prediction", "flag": "--netpredict", "golden": "netpredict", "moat": "reproducible", "description": "Client-side prediction + reconciliation." },
+        { "name": "state-replication", "flag": "--net", "golden": "net", "moat": "reproducible", "description": "Snapshot state-replication / delta encoding." }
+      ]
+    },
+    {
+      "group": "asset-authoring",
+      "description": "Asset import, animation and seed-reproducible procedural generation.",
+      "capabilities": [
+        { "name": "gltf-scene-import", "flag": "--scene", "golden": "scene_import", "moat": "headless-golden", "description": "glTF scene-graph import (nodes/meshes/materials)." },
+        { "name": "animation-blend", "flag": "--blend", "golden": "anim_blend", "moat": "headless-golden", "description": "Skeletal animation cross-fade blending." },
+        { "name": "animation-state-machine", "flag": "--anim-fsm", "golden": "anim_fsm", "moat": "headless-golden", "description": "Parameter-driven animation state machine." },
+        { "name": "procedural-terrain", "flag": "--pt6-hero", "golden": "pt6_hero", "moat": "reproducible", "description": "Procedural terrain (height + hydraulic/thermal erosion), seed-reproducible." },
+        { "name": "procedural-content-gen", "flag": "--pcg6-field", "golden": "pcg6_field", "moat": "reproducible", "description": "Procedural content generation (seed -> byte-identical field digest)." },
+        { "name": "wave-function-collapse", "flag": "--wfc6-render", "golden": "wfc6_render", "moat": "reproducible", "description": "Wave-function-collapse tiling generation, seed-reproducible." },
+        { "name": "dynamic-weather", "flag": "--we6-hero", "golden": "we6_hero", "moat": "reproducible", "description": "Deterministic dynamic weather (clouds/precip/time-of-day)." },
+        { "name": "foliage-scatter", "flag": "--fo6-hero", "golden": "fo6_hero", "moat": "reproducible", "description": "Deterministic foliage scatter + wind sway on terrain." }
+      ]
+    },
+    {
+      "group": "agent-native-tooling",
+      "description": "The discover/drive/verify surface an AI agent codes against — HF's unique axis.",
+      "capabilities": [
+        { "name": "engine-introspection", "flag": "--introspect", "golden": "default_scene.json", "moat": "deterministic", "description": "Machine-readable full engine+scene state dump (DescribeEngine)." },
+        { "name": "agent-sdk-contract", "flag": "--agent-api", "golden": "agent_api.json", "moat": "deterministic", "description": "Versioned Agent-SDK contract (capabilities + command schemas + contentHash)." },
+        { "name": "scene-query", "flag": "--agent-query", "golden": "query_responses.json", "moat": "deterministic", "description": "Selective scene-query read protocol (request/response over the command bus)." },
+        { "name": "scene-authoring", "flag": "--author-scene", "golden": "authored_scene.json", "moat": "deterministic", "description": "Declarative scene-spec authoring (LoadScene -> canonical DumpScene)." },
+        { "name": "headless-hot-reload", "flag": "--hot-reload", "golden": "reload_trace.json", "moat": "deterministic", "description": "Deterministic headless scene hot-reload (reload == cold-load, no residue)." },
+        { "name": "record-replay", "flag": "--replay-verify", "golden": "canonical.replay", "moat": "reproducible", "description": "Record -> replay -> assert-determinism harness (tamper-detecting digest)." },
+        { "name": "determinism-stress", "flag": "--determinism-stress", "golden": "stress_report.json", "moat": "reproducible", "description": "Rollback determinism-stress fuzzer (every snapshot point recovers authority)." },
+        { "name": "material-graph-introspection", "flag": "--material-introspect", "golden": "showcase3_graph.json", "moat": "deterministic", "description": "Pure-CPU material-graph introspection (deterministic JSON / DOT)." },
+        { "name": "capability-manifest", "flag": "--capability-manifest", "golden": "capability_manifest.json", "moat": "deterministic", "description": "THIS manifest: the machine-readable capability-discovery + agent-verify contract." }
+      ]
+    }
+  ],
+  "groupCount": 6,
+  "capabilityCount": 59,
+  "contentHash": "d8a7df96ea013f11"
+}
